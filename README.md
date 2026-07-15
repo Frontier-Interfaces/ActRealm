@@ -13,6 +13,13 @@ cargo run -p flow-agent -- hook --provider claude < fixture.json
 Runtime data defaults to `~/.flow-agent`. Override it in tests or development
 with `FLOW_AGENT_HOME=/path/to/data`.
 
+## v1 plan
+
+- [Full v1.1 implementation plan](docs/WIDGET_V1_PLAN.md)
+- [Executable milestone acceptance](docs/V1_ACCEPTANCE.md)
+- [Open Vibe Island / CodeIsland reference decisions](docs/REFERENCE_REVIEW.md)
+- [M0 verification record](docs/M0_VERIFICATION.md)
+
 ## Local quality gate
 
 ```bash
