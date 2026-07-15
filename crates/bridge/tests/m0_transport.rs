@@ -3,8 +3,9 @@
 use flow_agent_bridge::{BridgeClient, BridgeError};
 use flow_agent_core::{BridgeRequest, BridgeResponse, Decision, Provider};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::Shutdown;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -93,6 +94,45 @@ fn silent_runtime_honors_the_hook_owned_deadline() {
         .unwrap_err();
     assert!(matches!(error, BridgeError::DeadlineExceeded));
     assert!(started.elapsed() < Duration::from_millis(200));
+    server.join().unwrap();
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn client_write_half_close_still_receives_the_permission_decision() {
+    let path = temp_socket("half-close");
+    let listener = UnixListener::bind(&path).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let request: BridgeRequest = serde_json::from_str(&line).unwrap();
+        // EOF on the request side is a normal SHUT_WR from this client. The
+        // response side is still alive and must not be auto-denied or drained.
+        let response = BridgeResponse::decided(request.request_id.unwrap(), Decision::Allow);
+        serde_json::to_writer(&mut stream, &response).unwrap();
+        stream.write_all(b"\n").unwrap();
+    });
+
+    let request = BridgeRequest::from_hook_at(
+        Provider::Codex,
+        serde_json::json!({
+            "hook_event_name": "PermissionRequest",
+            "session_id": "session",
+            "turn_id": "turn"
+        }),
+        1,
+    );
+    let mut client = UnixStream::connect(&path).unwrap();
+    serde_json::to_writer(&mut client, &request).unwrap();
+    client.write_all(b"\n").unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    let response: BridgeResponse = serde_json::from_str(&response).unwrap();
+    assert_eq!(response.decision(), Some(Decision::Allow));
     server.join().unwrap();
     let _ = fs::remove_file(path);
 }

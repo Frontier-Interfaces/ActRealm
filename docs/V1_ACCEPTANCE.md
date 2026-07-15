@@ -41,17 +41,17 @@ not weaken or replace the full plan.
 
 ### M1 - runtime core
 
-- [ ] Core state machine and attention rules are fixture-tested.
-- [ ] SQLite WAL storage uses one writer and transactional business actions.
-- [ ] Envelope replay is idempotent.
-- [ ] Approve/deny/pass-through races have one winner.
-- [ ] Waiters are memory-only and stale approvals expire after restart.
-- [ ] Concurrent waiters are keyed by request/correlation ID, and duplicate
+- [x] Core state machine and attention rules are fixture-tested.
+- [x] SQLite WAL storage uses one writer and transactional business actions.
+- [x] Envelope replay is idempotent.
+- [x] Approve/deny/pass-through races have one winner.
+- [x] Waiters are memory-only and stale approvals expire after restart.
+- [x] Concurrent waiters are keyed by request/correlation ID, and duplicate
       requests resolve an older waiter without leaking its decision.
-- [ ] Socket half-close is not treated as user disconnect or auto-deny.
-- [ ] Stop remains turn-end; process liveness reconciles sessions that emit no
+- [x] Socket half-close is not treated as user disconnect or auto-deny.
+- [x] Stop remains turn-end; process liveness reconciles sessions that emit no
       terminal session event.
-- [ ] Runtime is single-instance; non-permission spool is bounded and replayed.
+- [x] Runtime is single-instance; non-permission spool is bounded and replayed.
 
 ### M2 - API and minimum UI
 
@@ -74,6 +74,8 @@ not weaken or replace the full plan.
       control loop, and pass-through.
 - [ ] `doctor` emits structured, repairability-aware issues and refuses to
       mutate malformed provider configuration.
+- [ ] `doctor` reports an overlong Unix Socket path before attempting Hook
+      installation or Runtime startup.
 - [ ] Unknown fields and events are visible and never panic.
 
 ### M4 - quota, settings, and P1

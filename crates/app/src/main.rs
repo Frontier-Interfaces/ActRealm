@@ -2,8 +2,12 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use flow_agent_bridge::{default_socket_path, BridgeClient, BridgeListener};
 use flow_agent_core::{
-    permission_deadline_ms, permission_directive, BridgeRequest, BridgeResponse, Decision,
-    Provider, MAX_HOOK_PAYLOAD_BYTES,
+    permission_deadline_ms, permission_directive, BridgeRequest, Decision, Provider,
+    MAX_HOOK_PAYLOAD_BYTES, PERMISSION_COMMIT_DELAY_MS,
+};
+use flow_agent_runtime::{
+    default_database_path, ApprovalAction, EventSpool, RuntimeInstanceGuard, RuntimeStore,
+    WaiterRegistry,
 };
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::io::AsRawFd;
@@ -11,7 +15,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -51,7 +56,10 @@ enum ApprovalMode {
 }
 
 enum RuntimeOutcome {
-    Decision(Decision),
+    Decision {
+        decision: Decision,
+        proposed_at: u64,
+    },
     PassThrough(&'static str),
 }
 
@@ -76,6 +84,16 @@ fn main() -> Result<()> {
 }
 
 fn serve(socket_path: PathBuf, approval: ApprovalMode) -> Result<()> {
+    let paths = runtime_paths(&socket_path);
+    let _instance = RuntimeInstanceGuard::acquire(&paths.lock)
+        .with_context(|| format!("failed to acquire {}", paths.lock.display()))?;
+    let store = RuntimeStore::open(&paths.database)
+        .with_context(|| format!("failed to open {}", paths.database.display()))?;
+    store
+        .reconcile_orphaned_approvals(Vec::new(), now_millis())
+        .context("failed to reconcile stale approvals")?;
+    let spool = EventSpool::new(paths.spool);
+    let _ = spool.drain(|request| store.ingest(request).is_ok());
     let listener = BridgeListener::bind(&socket_path)
         .with_context(|| format!("failed to bind {}", socket_path.display()))?;
     println!(
@@ -84,11 +102,24 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode) -> Result<()> {
     );
     let prompt_lock = Arc::new(Mutex::new(()));
     let prompt_input = (approval == ApprovalMode::Prompt).then(prompt_input_channel);
+    let waiters = WaiterRegistry::default();
+    let expiry_waiters = waiters.clone();
+    let expiry_store = store.clone();
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(2));
+        if let Ok(expired) = expiry_waiters.expire_request_ids_at(now_millis()) {
+            for request_id in expired {
+                let _ = expiry_store.expire_approval(request_id, "deadline", now_millis());
+            }
+        }
+    });
 
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
         let prompt_lock = Arc::clone(&prompt_lock);
         let prompt_input = prompt_input.clone();
+        let store = store.clone();
+        let waiters = waiters.clone();
         thread::spawn(move || {
             let Ok(request) = BridgeListener::read_request(&mut stream) else {
                 return;
@@ -99,20 +130,61 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode) -> Result<()> {
                 request.event_name().unwrap_or("unknown"),
                 request.session_id().unwrap_or("unknown")
             );
+            if store.ingest(request.clone()).is_err() {
+                return;
+            }
 
             if request.needs_reply {
+                let Ok(registration) = waiters.register_at(&request, now_millis()) else {
+                    return;
+                };
+                if let Some(replaced) = registration.replaced_request_id {
+                    let _ = store.expire_approval(replaced, "duplicate_replaced", now_millis());
+                }
                 let _prompt_guard = prompt_lock.lock().ok();
                 let outcome = choose_outcome(approval, prompt_input.as_deref());
                 let request_id = request.request_id.unwrap_or(request.id);
-                let response = match outcome {
-                    RuntimeOutcome::Decision(decision) => {
-                        BridgeResponse::decided(request_id, decision)
+                let command_id = Uuid::now_v7();
+                let resolved = match outcome {
+                    RuntimeOutcome::Decision {
+                        decision,
+                        proposed_at,
+                    } => {
+                        let action = if decision == Decision::Allow {
+                            ApprovalAction::Approve
+                        } else {
+                            ApprovalAction::Deny
+                        };
+                        store
+                            .claim_approval(command_id, request_id, action, proposed_at)
+                            .and_then(|_| {
+                                store.commit(
+                                    command_id,
+                                    proposed_at.saturating_add(PERMISSION_COMMIT_DELAY_MS),
+                                    true,
+                                )
+                            })
+                            .is_ok()
+                            && waiters.decide(request_id, decision).is_ok()
                     }
                     RuntimeOutcome::PassThrough(reason) => {
-                        BridgeResponse::pass_through(request_id, reason)
+                        store
+                            .claim_approval(
+                                command_id,
+                                request_id,
+                                ApprovalAction::PassThrough,
+                                now_millis(),
+                            )
+                            .is_ok()
+                            && waiters.pass_through(request_id, reason).is_ok()
                     }
                 };
-                let _ = BridgeListener::write_response(&mut stream, &response);
+                if !resolved {
+                    let _ = waiters.pass_through(request_id, "runtime_error");
+                }
+                if let Ok(response) = registration.ticket.recv_timeout(Duration::from_secs(1)) {
+                    let _ = BridgeListener::write_response(&mut stream, &response);
+                }
             }
         });
     }
@@ -169,20 +241,28 @@ fn choose_outcome(
                     _ => None,
                 };
                 let Some(decision) = decision else { continue };
+                let proposed_at = now_millis();
                 eprintln!("Decision pending for 3 seconds; type u then Enter to undo.");
                 if undo_requested(&receiver, commit_delay()) {
                     eprintln!("Decision undone.");
                     continue;
                 }
-                return RuntimeOutcome::Decision(decision);
+                return RuntimeOutcome::Decision {
+                    decision,
+                    proposed_at,
+                };
             }
         }
     }
 }
 
 fn delayed_decision(decision: Decision) -> RuntimeOutcome {
+    let proposed_at = now_millis();
     thread::sleep(commit_delay());
-    RuntimeOutcome::Decision(decision)
+    RuntimeOutcome::Decision {
+        decision,
+        proposed_at,
+    }
 }
 
 fn commit_delay() -> Duration {
@@ -230,7 +310,16 @@ fn run_hook(provider: Provider, socket_path: PathBuf) -> Result<()> {
         Duration::from_millis(200)
     };
 
-    let Some(response) = BridgeClient::new(socket_path).send(&request, timeout)? else {
+    let response = match BridgeClient::new(socket_path).send(&request, timeout) {
+        Ok(response) => response,
+        Err(_) => {
+            if !request.needs_reply {
+                let _ = EventSpool::default().append(&request);
+            }
+            return Ok(());
+        }
+    };
+    let Some(response) = response else {
         return Ok(());
     };
     let Some(decision) = response.decision() else {
@@ -316,6 +405,41 @@ fn default_reply_timeout(provider: Provider) -> Duration {
     permission_deadline_ms(provider)
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_millis(200))
+}
+
+struct RuntimePaths {
+    database: PathBuf,
+    spool: PathBuf,
+    lock: PathBuf,
+}
+
+fn runtime_paths(socket_path: &std::path::Path) -> RuntimePaths {
+    if socket_path == default_socket_path() {
+        let database = default_database_path();
+        let root = database
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        return RuntimePaths {
+            database,
+            spool: root.join("spool"),
+            lock: root.join("run/runtime.lock"),
+        };
+    }
+    RuntimePaths {
+        database: socket_path.with_extension("sqlite"),
+        spool: socket_path.with_extension("spool"),
+        lock: socket_path.with_extension("lock"),
+    }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

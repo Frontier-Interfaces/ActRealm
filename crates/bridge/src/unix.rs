@@ -1,8 +1,8 @@
 use flow_agent_core::{BridgeRequest, BridgeResponse, ReplyAction};
 use std::env;
-use std::fs;
+use std::fs::{self, DirBuilder};
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(test)]
@@ -137,7 +137,10 @@ impl BridgeListener {
         let socket_path = socket_path.into();
         if let Some(parent) = socket_path.parent() {
             let created_parent = !parent.exists();
-            fs::create_dir_all(parent)?;
+            if created_parent {
+                let mut builder = DirBuilder::new();
+                builder.recursive(true).mode(0o700).create(parent)?;
+            }
             // Never chmod an arbitrary existing directory supplied via --socket
             // (for example /private/tmp). Directories created by flow-agent are
             // private from their first usable moment.

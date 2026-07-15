@@ -6,6 +6,8 @@ BIN="$ROOT/target/release/flow-agent"
 TMP_ROOT="${TMPDIR:-/private/tmp}/flow-agent-m0-e2e-$$"
 SOCKET="$TMP_ROOT/bridge.sock"
 SERVER_LOG="$TMP_ROOT/server.log"
+DATABASE="$TMP_ROOT/bridge.sqlite"
+LOCK_FILE="$TMP_ROOT/bridge.lock"
 SERVER_PID=""
 
 cleanup() {
@@ -13,7 +15,7 @@ cleanup() {
         kill "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
     fi
-    rm -f "$SOCKET" "$SERVER_LOG"
+    rm -f "$SOCKET" "$SERVER_LOG" "$DATABASE" "$DATABASE-shm" "$DATABASE-wal" "$LOCK_FILE"
     rmdir "$TMP_ROOT" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM

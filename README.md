@@ -2,8 +2,8 @@
 
 Local-first attention surface for coding agents.
 
-The repository is under active v1 development. The first executable slice is
-the fail-open hook bridge:
+The repository is under active v1 development. M1 now provides the fail-open
+Hook bridge plus the persistent single-instance Runtime:
 
 ```bash
 cargo run -p flow-agent -- serve --approval prompt
@@ -19,6 +19,7 @@ with `FLOW_AGENT_HOME=/path/to/data`.
 - [Executable milestone acceptance](docs/V1_ACCEPTANCE.md)
 - [Open Vibe Island / CodeIsland reference decisions](docs/REFERENCE_REVIEW.md)
 - [M0 verification record](docs/M0_VERIFICATION.md)
+- [M1 verification record](docs/M1_VERIFICATION.md)
 
 ## Local quality gate
 
@@ -30,8 +31,10 @@ cargo build --workspace --release --offline
 ./scripts/m0-e2e.sh
 ```
 
-The E2E script verifies Claude approval, Codex denial, and silent fail-open
-behavior when the runtime is absent.
+The common suite covers the M0 provider path and M1 SQLite, waiter, spool,
+single-instance, restart, duplicate-request, and half-close contracts. The E2E
+script verifies Claude approval, Codex denial, and silent fail-open behavior
+when the runtime is absent.
 
 ## Privacy
 
