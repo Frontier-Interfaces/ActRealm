@@ -1,0 +1,21 @@
+[package]
+name = "flow-agent-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axum.workspace = true
+flow-agent-runtime = { path = "../runtime" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+flow-agent-core = { path = "../core" }
+futures-util = "0.3"
+tokio-tungstenite = "0.29.0"
+tower = { version = "0.5", features = ["util"] }

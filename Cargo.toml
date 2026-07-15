@@ -5,6 +5,7 @@ members = [
     "crates/core",
     "crates/providers",
     "crates/runtime",
+    "crates/server",
 ]
 resolver = "2"
 
@@ -16,10 +17,12 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 anyhow = "1.0"
+axum = { version = "0.8.9", features = ["ws"] }
 clap = { version = "4.5", features = ["derive"] }
 libc = "0.2"
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
+tokio = { version = "1.52.3", features = ["net", "rt", "sync", "time"] }
 uuid = { version = "1.18", features = ["v7", "serde"] }

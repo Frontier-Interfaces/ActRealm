@@ -146,6 +146,11 @@ impl WaiterRegistry {
         Ok(state.by_request.keys().copied().collect())
     }
 
+    pub fn is_active(&self, request_id: Uuid) -> Result<bool, WaiterError> {
+        let state = self.inner.state.lock().map_err(|_| WaiterError::Poisoned)?;
+        Ok(state.by_request.contains_key(&request_id))
+    }
+
     pub fn raw(&self, request_id: Uuid) -> Result<Option<Value>, WaiterError> {
         let state = self.inner.state.lock().map_err(|_| WaiterError::Poisoned)?;
         Ok(state

@@ -11,6 +11,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -40,6 +41,22 @@ pub enum ApprovalAction {
     Approve,
     Deny,
     PassThrough,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionAction {
+    Ack,
+    Snooze,
+}
+
+impl AttentionAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ack => "ack",
+            Self::Snooze => "snooze",
+        }
+    }
 }
 
 impl ApprovalAction {
@@ -108,11 +125,13 @@ pub struct IngestResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimResult {
+    pub created: bool,
     pub command_id: Uuid,
     pub attention_id: String,
     pub request_id: Uuid,
     pub action: ApprovalAction,
     pub state: CommandState,
+    pub commit_due_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +148,8 @@ pub struct SessionRecord {
     pub id: String,
     pub provider: String,
     pub provider_session_id: String,
+    pub project: Option<String>,
+    pub model: Option<String>,
     pub exec_state: String,
     pub approval_owner: Option<String>,
     pub activity: Option<String>,
@@ -140,11 +161,19 @@ pub struct SessionRecord {
 pub struct AttentionRecord {
     pub id: String,
     pub session_id: String,
+    pub provider: String,
+    pub project: Option<String>,
     pub request_id: Option<Uuid>,
+    pub kind: String,
+    pub title: String,
+    pub detail: Option<String>,
     pub state: String,
     pub risk: String,
+    pub risk_notes: Vec<String>,
     pub command_preview: Option<String>,
     pub expires_at: Option<u64>,
+    pub created_at: u64,
+    pub resolution: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +228,13 @@ enum StoreMessage {
         now: u64,
         waiter_active: bool,
         reply: mpsc::SyncSender<Result<CommitResult, StoreError>>,
+    },
+    ActAttention {
+        command_id: Uuid,
+        attention_id: String,
+        action: AttentionAction,
+        now: u64,
+        reply: mpsc::SyncSender<Result<CommandState, StoreError>>,
     },
     Reconcile {
         active_request_ids: Vec<Uuid>,
@@ -300,6 +336,24 @@ impl RuntimeStore {
             command_id,
             now,
             waiter_active,
+            reply,
+        })?;
+        receive(receiver)
+    }
+
+    pub fn act_on_attention(
+        &self,
+        command_id: Uuid,
+        attention_id: impl Into<String>,
+        action: AttentionAction,
+        now: u64,
+    ) -> Result<CommandState, StoreError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send(StoreMessage::ActAttention {
+            command_id,
+            attention_id: attention_id.into(),
+            action,
+            now,
             reply,
         })?;
         receive(receiver)
@@ -421,6 +475,21 @@ fn writer_loop(mut connection: Connection, receiver: mpsc::Receiver<StoreMessage
                     waiter_active,
                 ));
             }
+            StoreMessage::ActAttention {
+                command_id,
+                attention_id,
+                action,
+                now,
+                reply,
+            } => {
+                let _ = reply.send(act_attention_transaction(
+                    &mut connection,
+                    command_id,
+                    &attention_id,
+                    action,
+                    now,
+                ));
+            }
             StoreMessage::Reconcile {
                 active_request_ids,
                 now,
@@ -459,7 +528,9 @@ fn writer_loop(mut connection: Connection, receiver: mpsc::Receiver<StoreMessage
                 ));
             }
             StoreMessage::Snapshot { reply } => {
-                let _ = reply.send(read_snapshot(&connection));
+                let result = reopen_due_snoozed(&mut connection, now_millis())
+                    .and_then(|_| read_snapshot(&connection));
+                let _ = reply.send(result);
             }
             StoreMessage::Shutdown => break,
         }
@@ -698,16 +769,84 @@ fn ingest_transaction(
         )
         .map_err(storage_error)?;
 
-    let attention_id = if parsed.kind == EventKind::PermissionRequested {
-        Some(insert_approval_attention(
+    let stopped_after_write = if parsed.kind == EventKind::Stopped {
+        turn_id
+            .as_deref()
+            .map(|turn| turn_has_write_tool(&transaction, turn))
+            .transpose()?
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    let attention_id = match parsed.kind {
+        EventKind::PermissionRequested => Some(insert_approval_attention(
             &transaction,
             &session_id,
             turn_id.as_deref(),
             &request,
             parsed.tool_name.as_deref(),
-        )?)
-    } else {
-        None
+        )?),
+        EventKind::Failed => Some(insert_nonapproval_attention(
+            &transaction,
+            &session_id,
+            turn_id.as_deref(),
+            &request,
+            NonApprovalSpec {
+                kind: "error",
+                title: "Agent 运行失败",
+                detail: request.raw.get("error").and_then(Value::as_str),
+                dedupe_key: format!(
+                    "{}:{}:error:{}",
+                    session_id,
+                    turn_id.as_deref().unwrap_or("none"),
+                    request.id
+                ),
+            },
+        )?),
+        EventKind::Notification if is_structured_question(&request.raw) => {
+            Some(insert_nonapproval_attention(
+                &transaction,
+                &session_id,
+                turn_id.as_deref(),
+                &request,
+                NonApprovalSpec {
+                    kind: "question",
+                    title: "Agent 有问题",
+                    detail: request
+                        .raw
+                        .get("message")
+                        .or_else(|| request.raw.get("prompt"))
+                        .and_then(Value::as_str),
+                    dedupe_key: format!(
+                        "{}:question:{}",
+                        session_id,
+                        request
+                            .raw
+                            .get("notification_id")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_else(|| request.id.to_string())
+                    ),
+                },
+            )?)
+        }
+        EventKind::Stopped if stopped_after_write => Some(insert_nonapproval_attention(
+            &transaction,
+            &session_id,
+            turn_id.as_deref(),
+            &request,
+            NonApprovalSpec {
+                kind: "completion",
+                title: "任务已完成，等你确认",
+                detail: None,
+                dedupe_key: format!(
+                    "{}:{}:completion",
+                    session_id,
+                    turn_id.as_deref().unwrap_or("none")
+                ),
+            },
+        )?),
+        _ => None,
     };
 
     let may_update = occurred_at >= last_event_at
@@ -836,11 +975,15 @@ fn claim_transaction(
         .map_err(storage_error)?;
     transaction.commit().map_err(storage_error)?;
     Ok(ClaimResult {
+        created: true,
         command_id,
         attention_id: attention.0,
         request_id,
         action,
         state: CommandState::parse(command_state)?,
+        commit_due_at: action
+            .decision()
+            .map(|_| now.saturating_add(PERMISSION_COMMIT_DELAY_MS)),
     })
 }
 
@@ -972,6 +1115,87 @@ fn commit_transaction(
     })
 }
 
+fn act_attention_transaction(
+    connection: &mut Connection,
+    command_id: Uuid,
+    attention_id: &str,
+    action: AttentionAction,
+    now: u64,
+) -> Result<CommandState, StoreError> {
+    let transaction = connection.transaction().map_err(storage_error)?;
+    if let Some(state) = transaction
+        .query_row(
+            "SELECT state FROM commands WHERE id = ?1",
+            [command_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(storage_error)?
+    {
+        return CommandState::parse(&state);
+    }
+    let (kind, state) = transaction
+        .query_row(
+            "SELECT kind, state FROM attention_items WHERE id = ?1",
+            [attention_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(storage_error)?
+        .ok_or(StoreError::StaleApproval)?;
+    if kind == "approval" || !matches!(state.as_str(), "open" | "snoozed") {
+        return Err(StoreError::StaleApproval);
+    }
+    match action {
+        AttentionAction::Ack => {
+            transaction
+                .execute(
+                    "UPDATE attention_items SET state = 'resolved', resolved_at = ?2,
+                       resolution = 'ack', expires_at = NULL WHERE id = ?1",
+                    params![attention_id, to_i64(now)],
+                )
+                .map_err(storage_error)?;
+        }
+        AttentionAction::Snooze => {
+            transaction
+                .execute(
+                    "UPDATE attention_items SET state = 'snoozed', resolved_at = NULL,
+                       resolution = NULL, expires_at = ?2 WHERE id = ?1",
+                    params![attention_id, to_i64(now.saturating_add(10 * 60 * 1_000))],
+                )
+                .map_err(storage_error)?;
+        }
+    }
+    transaction
+        .execute(
+            "INSERT INTO commands (
+               id, attention_id, request_id, action, state, created_at, confirmed_at
+             ) VALUES (?1, ?2, NULL, ?3, 'confirmed', ?4, ?4)",
+            params![
+                command_id.to_string(),
+                attention_id,
+                action.as_str(),
+                to_i64(now)
+            ],
+        )
+        .map_err(storage_error)?;
+    transaction.commit().map_err(storage_error)?;
+    Ok(CommandState::Confirmed)
+}
+
+fn reopen_due_snoozed(connection: &mut Connection, now: u64) -> Result<(), StoreError> {
+    let transaction = connection.transaction().map_err(storage_error)?;
+    transaction
+        .execute(
+            "UPDATE attention_items SET state = 'open', expires_at = NULL
+             WHERE state = 'snoozed' AND expires_at <= ?1",
+            [to_i64(now)],
+        )
+        .map_err(storage_error)?;
+    transaction.commit().map_err(storage_error)?;
+    Ok(())
+}
+
 fn reconcile_transaction(
     connection: &mut Connection,
     active_request_ids: Vec<Uuid>,
@@ -1033,7 +1257,7 @@ fn expire_approval_transaction(
     let attention_id = transaction
         .query_row(
             "SELECT id FROM attention_items WHERE request_id = ?1
-             AND state IN ('open', 'committing')",
+             AND state IN ('open', 'committing', 'decision_sent')",
             [request_id.to_string()],
             |row| row.get::<_, String>(0),
         )
@@ -1052,7 +1276,7 @@ fn expire_approval_transaction(
     transaction
         .execute(
             "UPDATE commands SET state = 'failed', error_code = ?2
-             WHERE attention_id = ?1 AND state = 'pending_commit'",
+             WHERE attention_id = ?1 AND state IN ('pending_commit', 'decision_sent')",
             params![attention_id, reason],
         )
         .map_err(storage_error)?;
@@ -1128,8 +1352,8 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
     let sessions = {
         let mut statement = connection
             .prepare(
-                "SELECT id, provider, provider_session_id, exec_state,
-                        approval_owner, activity, last_event_at
+                "SELECT id, provider, provider_session_id, project, model,
+                        exec_state, approval_owner, activity, last_event_at
                  FROM sessions ORDER BY last_event_at DESC",
             )
             .map_err(storage_error)?;
@@ -1139,10 +1363,12 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
                     id: row.get(0)?,
                     provider: row.get(1)?,
                     provider_session_id: row.get(2)?,
-                    exec_state: row.get(3)?,
-                    approval_owner: row.get(4)?,
-                    activity: row.get(5)?,
-                    last_event_at: from_i64(row.get(6)?),
+                    project: row.get(3)?,
+                    model: row.get(4)?,
+                    exec_state: row.get(5)?,
+                    approval_owner: row.get(6)?,
+                    activity: row.get(7)?,
+                    last_event_at: from_i64(row.get(8)?),
                 })
             })
             .map_err(storage_error)?
@@ -1153,22 +1379,32 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
     let attention = {
         let mut statement = connection
             .prepare(
-                "SELECT id, session_id, request_id, state, risk,
-                        command_preview, expires_at
+                "SELECT id, session_id, provider, project, request_id, kind,
+                        title, detail, state, risk, risk_notes, command_preview,
+                        expires_at, created_at, resolution
                  FROM attention_items ORDER BY created_at DESC",
             )
             .map_err(storage_error)?;
         let rows = statement
             .query_map([], |row| {
-                let request: Option<String> = row.get(2)?;
+                let request: Option<String> = row.get(4)?;
                 Ok(AttentionRecord {
                     id: row.get(0)?,
                     session_id: row.get(1)?,
+                    provider: row.get(2)?,
+                    project: row.get(3)?,
                     request_id: request.and_then(|value| Uuid::parse_str(&value).ok()),
-                    state: row.get(3)?,
-                    risk: row.get(4)?,
-                    command_preview: row.get(5)?,
-                    expires_at: row.get::<_, Option<i64>>(6)?.map(from_i64),
+                    kind: row.get(5)?,
+                    title: row.get(6)?,
+                    detail: row.get(7)?,
+                    state: row.get(8)?,
+                    risk: row.get(9)?,
+                    risk_notes: serde_json::from_str(&row.get::<_, String>(10)?)
+                        .unwrap_or_default(),
+                    command_preview: row.get(11)?,
+                    expires_at: row.get::<_, Option<i64>>(12)?.map(from_i64),
+                    created_at: from_i64(row.get(13)?),
+                    resolution: row.get(14)?,
                 })
             })
             .map_err(storage_error)?
@@ -1339,6 +1575,85 @@ fn insert_approval_attention(
     Ok(id)
 }
 
+struct NonApprovalSpec<'a> {
+    kind: &'a str,
+    title: &'a str,
+    detail: Option<&'a str>,
+    dedupe_key: String,
+}
+
+fn insert_nonapproval_attention(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    turn_id: Option<&str>,
+    request: &BridgeRequest,
+    spec: NonApprovalSpec<'_>,
+) -> Result<String, StoreError> {
+    if let Some(existing) = transaction
+        .query_row(
+            "SELECT id FROM attention_items WHERE dedupe_key = ?1",
+            [&spec.dedupe_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(storage_error)?
+    {
+        return Ok(existing);
+    }
+    let id = Uuid::now_v7().to_string();
+    let project = request
+        .raw
+        .get("cwd")
+        .and_then(Value::as_str)
+        .and_then(project_name);
+    transaction
+        .execute(
+            "INSERT INTO attention_items (
+               id, session_id, provider, project, turn_id, request_id, kind,
+               title, detail, command_preview, risk, risk_notes, dedupe_key,
+               state, expires_at, created_at
+             ) VALUES (
+               ?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, NULL, 'unknown',
+               '[]', ?9, 'open', NULL, ?10
+             )",
+            params![
+                id,
+                session_id,
+                request.provider.to_string(),
+                project,
+                turn_id,
+                spec.kind,
+                spec.title,
+                spec.detail.map(redacted_preview),
+                spec.dedupe_key,
+                to_i64(request.received_at),
+            ],
+        )
+        .map_err(storage_error)?;
+    Ok(id)
+}
+
+fn is_structured_question(raw: &Value) -> bool {
+    ["notification_type", "type", "kind"]
+        .iter()
+        .filter_map(|field| raw.get(field).and_then(Value::as_str))
+        .any(|value| value.eq_ignore_ascii_case("question"))
+}
+
+fn turn_has_write_tool(transaction: &Transaction<'_>, turn_id: &str) -> Result<bool, StoreError> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM events WHERE turn_id = ?1
+               AND type IN ('tool.started', 'tool.finished')
+               AND tool_name IN ('Edit', 'Write', 'apply_patch', 'MultiEdit')
+             )",
+            [turn_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(storage_error)
+}
+
 fn attention_id_for_request(
     transaction: &Transaction<'_>,
     request_id: Uuid,
@@ -1359,7 +1674,8 @@ fn command_claim(
 ) -> Result<Option<ClaimResult>, StoreError> {
     let row = transaction
         .query_row(
-            "SELECT attention_id, request_id, action, state FROM commands WHERE id = ?1",
+            "SELECT attention_id, request_id, action, state, created_at
+             FROM commands WHERE id = ?1",
             [command_id.to_string()],
             |row| {
                 Ok((
@@ -1367,19 +1683,25 @@ fn command_claim(
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             },
         )
         .optional()
         .map_err(storage_error)?;
-    row.map(|(attention_id, request_id, action, state)| {
+    row.map(|(attention_id, request_id, action, state, created_at)| {
+        let action = ApprovalAction::parse(&action)?;
         Ok(ClaimResult {
+            created: false,
             command_id,
             attention_id,
             request_id: Uuid::parse_str(&request_id)
                 .map_err(|error| StoreError::Storage(error.to_string()))?,
-            action: ApprovalAction::parse(&action)?,
+            action,
             state: CommandState::parse(&state)?,
+            commit_due_at: action
+                .decision()
+                .map(|_| from_i64(created_at).saturating_add(PERMISSION_COMMIT_DELAY_MS)),
         })
     })
     .transpose()
@@ -1481,7 +1803,7 @@ fn classify_risk(
             vec!["⚠ 已识别到高影响操作", "提交后动作本身不可撤销"],
         );
     }
-    let has_shell_composition = ["|", ">", "<", "$(`", "&&", ";"]
+    let has_shell_composition = ["|", ">", "<", "$(", "`", "&&", ";"]
         .iter()
         .any(|needle| command.contains(needle));
     if has_shell_composition {
@@ -1607,4 +1929,13 @@ fn to_i64(value: u64) -> i64 {
 
 fn from_i64(value: i64) -> u64 {
     value.max(0) as u64
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }

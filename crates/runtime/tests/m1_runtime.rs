@@ -2,8 +2,8 @@
 
 use flow_agent_core::{BridgeRequest, Decision, Provider, ReplyAction};
 use flow_agent_runtime::{
-    ApprovalAction, CommandState, EventSpool, InstanceError, RuntimeInstanceGuard, RuntimeStore,
-    SpoolError, StoreError, WaiterRegistry,
+    ApprovalAction, AttentionAction, CommandState, EventSpool, InstanceError, RuntimeInstanceGuard,
+    RuntimeStore, SpoolError, StoreError, WaiterRegistry,
 };
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 fn temp_root(name: &str) -> PathBuf {
@@ -673,5 +674,117 @@ fn runtime_lock_allows_only_one_instance_and_is_reusable_after_drop() {
     );
     drop(first);
     RuntimeInstanceGuard::acquire(&lock).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn factual_error_question_and_completion_attention_support_local_actions() {
+    let root = temp_root("attention-kinds");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    let error = BridgeRequest::from_hook_at(
+        Provider::Claude,
+        json!({
+            "hook_event_name": "StopFailure",
+            "session_id": "attention-session",
+            "prompt_id": "turn-1",
+            "cwd": "/tmp/example-project",
+            "error": "request failed token=super-secret"
+        }),
+        now,
+    );
+    store.ingest(error).unwrap();
+    let question = BridgeRequest::from_hook_at(
+        Provider::Claude,
+        json!({
+            "hook_event_name": "Notification",
+            "session_id": "question-session",
+            "prompt_id": "turn-2",
+            "cwd": "/tmp/example-project",
+            "notification_type": "question",
+            "notification_id": "question-1",
+            "message": "Which database should I use?"
+        }),
+        now + 1,
+    );
+    store.ingest(question).unwrap();
+
+    for (offset, event, tool_name) in [
+        (2, "UserPromptSubmit", None),
+        (3, "PreToolUse", Some("Write")),
+        (4, "PostToolUse", Some("Write")),
+        (5, "Stop", None),
+    ] {
+        let mut raw = json!({
+            "hook_event_name": event,
+            "session_id": "completion-session",
+            "turn_id": "turn-3",
+            "cwd": "/tmp/example-project"
+        });
+        if let Some(tool_name) = tool_name {
+            raw["tool_name"] = Value::String(tool_name.to_owned());
+            raw["tool_input"] = json!({ "file_path": "/tmp/example-project/file.rs" });
+        }
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Codex,
+                raw,
+                now + offset,
+            ))
+            .unwrap();
+    }
+
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.attention.len(), 3);
+    let error = snapshot
+        .attention
+        .iter()
+        .find(|item| item.kind == "error")
+        .unwrap();
+    assert!(!error.detail.as_deref().unwrap().contains("super-secret"));
+    let error_id = error.id.clone();
+    let question_id = snapshot
+        .attention
+        .iter()
+        .find(|item| item.kind == "question")
+        .unwrap()
+        .id
+        .clone();
+    assert!(snapshot
+        .attention
+        .iter()
+        .any(|item| item.kind == "completion"));
+
+    assert_eq!(
+        store
+            .act_on_attention(Uuid::now_v7(), error_id, AttentionAction::Ack, now + 10)
+            .unwrap(),
+        CommandState::Confirmed
+    );
+    assert_eq!(
+        store
+            .act_on_attention(
+                Uuid::now_v7(),
+                question_id,
+                AttentionAction::Snooze,
+                now + 10,
+            )
+            .unwrap(),
+        CommandState::Confirmed
+    );
+    let snapshot = store.snapshot().unwrap();
+    assert!(snapshot
+        .attention
+        .iter()
+        .any(|item| item.kind == "error" && item.state == "resolved"));
+    assert!(snapshot
+        .attention
+        .iter()
+        .any(|item| item.kind == "question" && item.state == "snoozed"));
+    drop(store);
     fs::remove_dir_all(root).unwrap();
 }

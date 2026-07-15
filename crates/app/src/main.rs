@@ -9,6 +9,7 @@ use flow_agent_runtime::{
     default_database_path, ApprovalAction, EventSpool, RuntimeInstanceGuard, RuntimeStore,
     WaiterRegistry,
 };
+use flow_agent_server::{ApiServer, ApiServerConfig};
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -31,12 +32,15 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the local M0 bridge runtime.
+    /// Run the local runtime and control panel.
     Serve {
-        #[arg(long, value_enum, default_value_t = ApprovalMode::Prompt)]
+        #[arg(long, value_enum, default_value_t = ApprovalMode::Widget)]
         approval: ApprovalMode,
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Open the one-time authenticated control panel in the default browser.
+        #[arg(long)]
+        open: bool,
     },
     /// Receive one provider hook payload from stdin and forward it to the runtime.
     Hook {
@@ -49,6 +53,7 @@ enum Command {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ApprovalMode {
+    Widget,
     Prompt,
     Allow,
     Deny,
@@ -70,9 +75,11 @@ enum PromptInput {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Serve { approval, socket } => {
-            serve(socket.unwrap_or_else(default_socket_path), approval)
-        }
+        Command::Serve {
+            approval,
+            socket,
+            open,
+        } => serve(socket.unwrap_or_else(default_socket_path), approval, open),
         Command::Hook { provider, socket } => {
             // Hook failures must be silent and fail open. Parsing CLI arguments still
             // reports errors because malformed installation is an operator error.
@@ -83,7 +90,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn serve(socket_path: PathBuf, approval: ApprovalMode) -> Result<()> {
+fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()> {
     let paths = runtime_paths(&socket_path);
     let _instance = RuntimeInstanceGuard::acquire(&paths.lock)
         .with_context(|| format!("failed to acquire {}", paths.lock.display()))?;
@@ -96,13 +103,44 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode) -> Result<()> {
     let _ = spool.drain(|request| store.ingest(request).is_ok());
     let listener = BridgeListener::bind(&socket_path)
         .with_context(|| format!("failed to bind {}", socket_path.display()))?;
-    println!(
-        "flow-agent M0 bridge listening on {}",
+    let waiters = WaiterRegistry::default();
+    let api = if approval == ApprovalMode::Widget || open {
+        Some(
+            ApiServer::start(
+                store.clone(),
+                waiters.clone(),
+                ApiServerConfig {
+                    commit_delay: commit_delay(),
+                    ..ApiServerConfig::default()
+                },
+            )
+            .context("failed to start local control API")?,
+        )
+    } else {
+        None
+    };
+    let mut runtime_output = io::stdout().lock();
+    if let Some(api) = api.as_ref() {
+        let _ = writeln!(
+            runtime_output,
+            "Flow Agent control panel: {}",
+            api.bootstrap_url()
+        );
+        if open {
+            let _ = std::process::Command::new("open")
+                .arg(api.bootstrap_url())
+                .spawn();
+        }
+    }
+    let _ = writeln!(
+        runtime_output,
+        "flow-agent runtime listening on {}",
         socket_path.display()
     );
+    let _ = runtime_output.flush();
+    drop(runtime_output);
     let prompt_lock = Arc::new(Mutex::new(()));
     let prompt_input = (approval == ApprovalMode::Prompt).then(prompt_input_channel);
-    let waiters = WaiterRegistry::default();
     let expiry_waiters = waiters.clone();
     let expiry_store = store.clone();
     thread::spawn(move || loop {
@@ -124,22 +162,51 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode) -> Result<()> {
             let Ok(request) = BridgeListener::read_request(&mut stream) else {
                 return;
             };
-            println!(
+            let _ = writeln!(
+                io::stdout().lock(),
                 "provider={} event={} session={}",
                 request.provider,
                 request.event_name().unwrap_or("unknown"),
                 request.session_id().unwrap_or("unknown")
             );
-            if store.ingest(request.clone()).is_err() {
-                return;
-            }
-
-            if request.needs_reply {
+            let registration = if request.needs_reply {
                 let Ok(registration) = waiters.register_at(&request, now_millis()) else {
                     return;
                 };
                 if let Some(replaced) = registration.replaced_request_id {
                     let _ = store.expire_approval(replaced, "duplicate_replaced", now_millis());
+                }
+                Some(registration)
+            } else {
+                None
+            };
+            if store.ingest(request.clone()).is_err() {
+                if let Some(registration) = registration {
+                    let request_id = request.request_id.unwrap_or(request.id);
+                    let _ = waiters.pass_through(request_id, "runtime_error");
+                    if let Ok(response) = registration.ticket.recv_timeout(Duration::from_secs(1)) {
+                        let _ = BridgeListener::write_response(&mut stream, &response);
+                    }
+                }
+                return;
+            }
+
+            if let Some(registration) = registration {
+                if approval == ApprovalMode::Widget {
+                    let request_id = request.request_id.unwrap_or(request.id);
+                    let wait_for = request
+                        .deadline_at
+                        .map(|deadline| {
+                            Duration::from_millis(deadline.saturating_sub(now_millis()))
+                        })
+                        .unwrap_or(Duration::from_millis(200));
+                    if let Ok(response) = registration.ticket.recv_timeout(wait_for) {
+                        let _ = BridgeListener::write_response(&mut stream, &response);
+                    } else {
+                        let _ = waiters.pass_through(request_id, "deadline");
+                        let _ = store.expire_approval(request_id, "deadline", now_millis());
+                    }
+                    return;
                 }
                 let _prompt_guard = prompt_lock.lock().ok();
                 let outcome = choose_outcome(approval, prompt_input.as_deref());
@@ -218,6 +285,7 @@ fn choose_outcome(
     prompt_input: Option<&Mutex<mpsc::Receiver<PromptInput>>>,
 ) -> RuntimeOutcome {
     match mode {
+        ApprovalMode::Widget => RuntimeOutcome::PassThrough("invalid_widget_dispatch"),
         ApprovalMode::Allow => delayed_decision(Decision::Allow),
         ApprovalMode::Deny => delayed_decision(Decision::Deny),
         ApprovalMode::PassThrough => RuntimeOutcome::PassThrough("user"),

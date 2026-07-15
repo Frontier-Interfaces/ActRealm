@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>Flow Agent</title>
+    <link rel="stylesheet" href="/app.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand" aria-label="Flow Agent">
+        <span class="brand-mark" aria-hidden="true">F</span>
+        <span>Flow Agent</span>
+      </div>
+      <div class="runtime-state" id="runtime-state" role="status">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="runtime-label">正在连接本地 Runtime</span>
+      </div>
+    </header>
+
+    <div class="offline-banner" id="offline-banner" hidden>
+      与 Runtime 失去连接，正在重连
+    </div>
+
+    <main class="dashboard" aria-label="Agent 控制面板">
+      <section class="module attention-module" aria-labelledby="attention-heading">
+        <div class="module-heading">
+          <div>
+            <p class="eyebrow">ATTENTION</p>
+            <h1 id="attention-heading">待处理</h1>
+          </div>
+          <span class="count-badge" id="attention-count">0</span>
+        </div>
+        <div class="module-body" id="attention-list" aria-live="polite"></div>
+      </section>
+
+      <section class="module sessions-module" aria-labelledby="sessions-heading">
+        <div class="module-heading">
+          <div>
+            <p class="eyebrow">SESSIONS</p>
+            <h2 id="sessions-heading">Agent 任务</h2>
+          </div>
+          <span class="section-meta" id="session-count">0 个接入</span>
+        </div>
+        <div class="module-body list-body" id="session-list" aria-live="polite"></div>
+      </section>
+
+      <section class="module quota-module" aria-labelledby="quota-heading">
+        <div class="module-heading">
+          <div>
+            <p class="eyebrow">QUOTA</p>
+            <h2 id="quota-heading">额度</h2>
+          </div>
+        </div>
+        <div class="module-body list-body" id="quota-list" aria-live="polite"></div>
+        <footer class="activity-footer">
+          <span>本地事件</span>
+          <strong id="event-count">0</strong>
+        </footer>
+      </section>
+    </main>
+
+    <div class="undo-toast" id="undo-toast" role="status" hidden>
+      <span id="undo-message">决定将在 3 秒后提交</span>
+      <button type="button" id="undo-button">撤回</button>
+    </div>
+    <div class="toast" id="toast" role="status" hidden></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

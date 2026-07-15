@@ -55,11 +55,11 @@ not weaken or replace the full plan.
 
 ### M2 - API and minimum UI
 
-- [ ] Authenticated localhost API and WebSocket snapshot are implemented.
-- [ ] The fixed three-column 1600x600 UI has no fake data.
-- [ ] Attention supports approve, deny, undo, pass-through, ack, and snooze.
-- [ ] UI distinguishes pending, sent, confirmed, passed-through, and expired.
-- [ ] Real Claude and Codex approval paths pass end to end.
+- [x] Authenticated localhost API and WebSocket snapshot are implemented.
+- [x] The fixed three-column 1600x600 UI has no fake data.
+- [x] Attention supports approve, deny, undo, pass-through, ack, and snooze.
+- [x] UI distinguishes pending, sent, confirmed, passed-through, and expired.
+- [x] Real Claude and Codex approval paths pass end to end.
 
 ### M3 - installation and onboarding
 
