@@ -1,14 +1,17 @@
-use flow_agent_core::{BridgeRequest, BridgeResponse};
+use flow_agent_core::{BridgeRequest, BridgeResponse, ReplyAction};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
+use std::time::Instant;
 use thiserror::Error;
+use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum BridgeError {
@@ -18,6 +21,12 @@ pub enum BridgeError {
     Json(#[from] serde_json::Error),
     #[error("bridge closed without a response")]
     MissingResponse,
+    #[error("bridge response id mismatch: expected {expected}, received {received}")]
+    MismatchedRequestId { expected: Uuid, received: Uuid },
+    #[error("bridge runtime instance changed while waiting")]
+    RuntimeChanged,
+    #[error("bridge response deadline exceeded")]
+    DeadlineExceeded,
 }
 
 pub fn default_socket_path() -> PathBuf {
@@ -48,7 +57,6 @@ impl BridgeClient {
     ) -> Result<Option<BridgeResponse>, BridgeError> {
         let mut stream = UnixStream::connect(&self.socket_path)?;
         stream.set_write_timeout(Some(Duration::from_millis(200)))?;
-        stream.set_read_timeout(Some(timeout))?;
         serde_json::to_writer(&mut stream, request)?;
         stream.write_all(b"\n")?;
         stream.flush()?;
@@ -57,12 +65,65 @@ impl BridgeClient {
             return Ok(None);
         }
 
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line)?;
-        if line.trim().is_empty() {
-            return Err(BridgeError::MissingResponse);
+        let expected = request.request_id.ok_or(BridgeError::MissingResponse)?;
+        let deadline = Instant::now() + timeout;
+        let mut reader = BufReader::new(stream);
+        let mut runtime_instance_id = None;
+        loop {
+            if reader.buffer().is_empty() {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(BridgeError::DeadlineExceeded);
+                }
+                let wait = deadline
+                    .saturating_duration_since(now)
+                    .min(Duration::from_secs(2));
+                let timeout_ms = wait.as_millis().max(1).min(i32::MAX as u128) as i32;
+                let mut descriptor = libc::pollfd {
+                    fd: reader.get_ref().as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: poll receives one live UnixStream descriptor and does not
+                // retain the pointer after returning.
+                let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+                if ready == 0 {
+                    if Instant::now() >= deadline {
+                        return Err(BridgeError::DeadlineExceeded);
+                    }
+                    continue;
+                }
+                if ready < 0 {
+                    return Err(BridgeError::Io(io::Error::last_os_error()));
+                }
+            }
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => return Err(BridgeError::MissingResponse),
+                Ok(_) => {}
+                Err(error) => return Err(BridgeError::Io(error)),
+            }
+            if line.trim().is_empty() {
+                return Err(BridgeError::MissingResponse);
+            }
+            let response: BridgeResponse = serde_json::from_str(&line)?;
+            if response.request_id != expected {
+                return Err(BridgeError::MismatchedRequestId {
+                    expected,
+                    received: response.request_id,
+                });
+            }
+            if let Some(incoming_instance_id) = response.runtime_instance_id {
+                if runtime_instance_id.is_some_and(|known| known != incoming_instance_id) {
+                    return Err(BridgeError::RuntimeChanged);
+                }
+                runtime_instance_id = Some(incoming_instance_id);
+            }
+            if response.action == ReplyAction::Ping {
+                continue;
+            }
+            return Ok(Some(response));
         }
-        Ok(Some(serde_json::from_str(&line)?))
     }
 }
 
@@ -153,13 +214,13 @@ mod tests {
                 "session_id": "session-1"
             }),
         );
-        let expected_id = request.id;
+        let expected_id = request.request_id.unwrap();
         let server = thread::spawn(move || {
             let mut stream = listener.incoming().next().unwrap().unwrap();
             let request = BridgeListener::read_request(&mut stream).unwrap();
             BridgeListener::write_response(
                 &mut stream,
-                &BridgeResponse::decided(request.id, Decision::Allow),
+                &BridgeResponse::decided(request.request_id.unwrap(), Decision::Allow),
             )
             .unwrap();
         });
@@ -171,6 +232,6 @@ mod tests {
         server.join().unwrap();
 
         assert_eq!(response.request_id, expected_id);
-        assert_eq!(response.decision, Some(Decision::Allow));
+        assert_eq!(response.decision(), Some(Decision::Allow));
     }
 }

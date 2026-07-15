@@ -1,0 +1,13 @@
+{
+  "session_id": "fixture-claude-session",
+  "transcript_path": "/redacted/transcript.jsonl",
+  "cwd": "/redacted/example-project",
+  "prompt_id": "fixture-claude-prompt",
+  "permission_mode": "default",
+  "effort": { "level": "high" },
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "Probe complete",
+  "background_tasks": [],
+  "session_crons": []
+}

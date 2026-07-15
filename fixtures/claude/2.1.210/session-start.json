@@ -1,0 +1,8 @@
+{
+  "session_id": "fixture-claude-session",
+  "transcript_path": "/redacted/transcript.jsonl",
+  "cwd": "/redacted/example-project",
+  "hook_event_name": "SessionStart",
+  "source": "startup",
+  "model": "redacted-model"
+}

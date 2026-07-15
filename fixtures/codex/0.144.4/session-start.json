@@ -1,0 +1,9 @@
+{
+  "session_id": "fixture-codex-session",
+  "transcript_path": "/redacted/rollout.jsonl",
+  "cwd": "/redacted/example-project",
+  "permission_mode": "default",
+  "hook_event_name": "SessionStart",
+  "source": "startup",
+  "model": "redacted-model"
+}

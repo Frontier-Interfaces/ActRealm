@@ -10,5 +10,5 @@ anyhow.workspace = true
 clap.workspace = true
 flow-agent-bridge = { path = "../bridge" }
 flow-agent-core = { path = "../core" }
+libc.workspace = true
 serde_json.workspace = true
-

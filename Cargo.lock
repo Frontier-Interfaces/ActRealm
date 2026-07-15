@@ -124,6 +124,7 @@ dependencies = [
  "clap",
  "flow-agent-bridge",
  "flow-agent-core",
+ "libc",
  "serde_json",
 ]
 
@@ -132,8 +133,10 @@ name = "flow-agent-bridge"
 version = "0.1.0"
 dependencies = [
  "flow-agent-core",
+ "libc",
  "serde_json",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]
@@ -144,6 +147,16 @@ dependencies = [
  "serde_json",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "flow-agent-providers"
+version = "0.1.0"
+dependencies = [
+ "flow-agent-core",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

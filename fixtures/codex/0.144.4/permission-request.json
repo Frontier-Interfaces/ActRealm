@@ -1,0 +1,13 @@
+{
+  "session_id": "fixture-codex-session",
+  "transcript_path": "/redacted/rollout.jsonl",
+  "cwd": "/redacted/example-project",
+  "permission_mode": "default",
+  "hook_event_name": "PermissionRequest",
+  "turn_id": "fixture-codex-turn",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "printf flow-agent-probe"
+  },
+  "model": "redacted-model"
+}

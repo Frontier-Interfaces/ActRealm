@@ -33,7 +33,8 @@ wait_for_socket() {
 start_server() {
     mode=$1
     mkdir -p "$TMP_ROOT"
-    "$BIN" serve --approval "$mode" --socket "$SOCKET" >"$SERVER_LOG" 2>&1 &
+    FLOW_AGENT_COMMIT_DELAY_MS=0 \
+        "$BIN" serve --approval "$mode" --socket "$SOCKET" >"$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
     wait_for_socket
 }
@@ -47,28 +48,45 @@ stop_server() {
 
 start_server allow
 allow_output=$("$BIN" hook --provider claude --socket "$SOCKET" \
-    <"$ROOT/fixtures/claude/permission-request.json")
+    <"$ROOT/fixtures/claude/2.1.210/permission-request.json")
 case "$allow_output" in
     *'"behavior":"allow"'*) ;;
     *) echo "Claude allow directive mismatch: $allow_output" >&2; exit 1 ;;
+esac
+case "$allow_output" in
+    *'"continue"'*) echo "Claude directive was not minimal: $allow_output" >&2; exit 1 ;;
+    *) ;;
 esac
 stop_server
 
 start_server deny
 deny_output=$("$BIN" hook --provider codex --socket "$SOCKET" \
-    <"$ROOT/fixtures/codex/permission-request.json")
+    <"$ROOT/fixtures/codex/0.144.4/permission-request.json")
 case "$deny_output" in
     *'"behavior":"deny"'*) ;;
     *) echo "Codex deny directive mismatch: $deny_output" >&2; exit 1 ;;
 esac
+case "$deny_output" in
+    *'"continue"'*) echo "Codex directive contains unsupported continue: $deny_output" >&2; exit 1 ;;
+    *) ;;
+esac
+stop_server
+
+start_server pass-through
+pass_output=$("$BIN" hook --provider codex --socket "$SOCKET" \
+    <"$ROOT/fixtures/codex/0.144.4/permission-request.json")
+if [ -n "$pass_output" ]; then
+    echo "pass-through hook unexpectedly wrote to stdout: $pass_output" >&2
+    exit 1
+fi
 stop_server
 
 fail_open_output=$("$BIN" hook --provider codex \
     --socket "$TMP_ROOT/missing.sock" \
-    <"$ROOT/fixtures/codex/permission-request.json")
+    <"$ROOT/fixtures/codex/0.144.4/permission-request.json")
 if [ -n "$fail_open_output" ]; then
     echo "fail-open hook unexpectedly wrote to stdout: $fail_open_output" >&2
     exit 1
 fi
 
-echo "M0 E2E passed: Claude allow, Codex deny, missing-runtime fail-open"
+echo "M0 E2E passed: Claude allow, Codex deny, pass-through, missing-runtime fail-open"

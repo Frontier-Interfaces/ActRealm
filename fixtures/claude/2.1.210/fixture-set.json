@@ -1,0 +1,9 @@
+{
+  "provider": "claude",
+  "version": "2.1.210",
+  "capturedAt": "2026-07-15",
+  "captureStatus": "live_probe_confirmed",
+  "capturedFlows": ["allow", "deny", "pass_through"],
+  "events": ["SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "Stop"],
+  "note": "Sanitized from local Claude Code 2.1.210 hook probes. IDs, paths, model, prompt, command, and assistant text are replaced; field presence and JSON shapes are preserved."
+}
