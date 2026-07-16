@@ -2,17 +2,23 @@
 
 Local-first attention surface for coding agents.
 
-The repository is under active v1 development. M4 provides the fail-open Hook
+中文用户请从 [Flow Agent v1 中文使用教程](docs/USER_GUIDE_zh-CN.md) 开始。
+
+The repository is an M5 release candidate under strict v1 verification. It
+provides the fail-open Hook
 bridge, persistent single-instance Runtime, authenticated localhost control
 panel, fixed three-module web UI, safe Claude/Codex installer, first-run
 onboarding, structured diagnostics, honest quota adapters, notification
-settings, retention, export, and destructive local-data clearing:
+settings, retention, aggregate metrics, export, and destructive local-data
+clearing:
 
 ```bash
 cargo run -p flow-agent -- serve --open
 cargo run -p flow-agent -- install-hooks all
 cargo run -p flow-agent -- doctor
 cargo run -p flow-agent -- export
+cargo run -p flow-agent -- export-metrics
+cargo run -p flow-agent -- diagnostics status
 cargo run -p flow-agent -- hook --provider claude < fixture.json
 ```
 
@@ -49,6 +55,22 @@ percentage. Local export contains the sanitized SQLite tables; destructive
 clear requires the exact confirmation `DELETE` and preserves Hook integration
 and backups.
 
+Aggregate metrics never leave the machine automatically. `export-metrics`
+creates a separate metrics-only JSON file containing daily counters and their
+definitions, without sessions, events, attention items, commands, projects, or
+paths. The settings panel shows the same factual counters.
+
+Temporary diagnostic capture is disabled by default. It records only fixed
+event categories, provider, capture time, whether a reply was required, and
+payload size. It never records raw Hook bodies, session identifiers, paths,
+prompts, commands, arguments, URLs, or tokens:
+
+```bash
+flow-agent diagnostics enable --minutes 10
+flow-agent diagnostics status
+flow-agent diagnostics clear
+```
+
 ## v1 plan
 
 - [Full v1.1 implementation plan](docs/WIDGET_V1_PLAN.md)
@@ -59,6 +81,7 @@ and backups.
 - [M2 verification record](docs/M2_VERIFICATION.md)
 - [M3 verification record](docs/M3_VERIFICATION.md)
 - [M4 verification record](docs/M4_VERIFICATION.md)
+- [M5 verification record](docs/M5_VERIFICATION.md)
 
 ## Local quality gate
 
@@ -68,6 +91,7 @@ cargo clippy --workspace --all-targets --offline -- -D warnings
 cargo test --workspace --offline
 cargo build --workspace --release --offline
 ./scripts/m0-e2e.sh
+./scripts/m5-resource-check.sh target/release/flow-agent
 ```
 
 The common suite covers the provider path, SQLite Runtime, waiter, spool,
@@ -77,6 +101,10 @@ task progress, quota degradation, settings/data management, and half-close
 behavior. The E2E suites verify provider
 directives, widget control, pass-through, silent fail-open behavior when the
 Runtime is absent, and the post-install real-event verification boundary.
+
+M5 is not complete until the browser render/memory measurement and a continuous
+48-hour soak pass on the exact frozen release candidate. Until then this branch
+must not be represented as a finished v1 release.
 
 ## Privacy
 

@@ -4,7 +4,7 @@ use flow_agent_providers::parse_hook;
 use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Number, Value};
+use serde_json::{json, Map, Number, Value};
 use std::collections::HashSet;
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -198,6 +198,30 @@ pub struct StoreSnapshot {
     pub attention: Vec<AttentionRecord>,
     pub commands: Vec<CommandRecord>,
     pub event_count: u64,
+    pub metrics: MetricsSummary,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsSummary {
+    pub active_days: u64,
+    pub approval_requests: u64,
+    pub widget_approvals: u64,
+    pub widget_denials: u64,
+    pub pass_through_manual: u64,
+    pub pass_through_timeout: u64,
+    pub decision_response_ms_total: u64,
+    pub decision_response_count: u64,
+    pub banners_shown: u64,
+    pub sessions_observed: u64,
+    pub app_opened: u64,
+    pub today_widget_decisions: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricEvent {
+    AppOpened,
+    BannerShown,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -284,12 +308,21 @@ enum StoreMessage {
         entries: Vec<QuotaRecord>,
         reply: mpsc::SyncSender<Result<(), StoreError>>,
     },
+    RecordMetric {
+        event: MetricEvent,
+        now: u64,
+        reply: mpsc::SyncSender<Result<(), StoreError>>,
+    },
     PruneEvents {
         retention_days: u32,
         now: u64,
         reply: mpsc::SyncSender<Result<usize, StoreError>>,
     },
     Export {
+        now: u64,
+        reply: mpsc::SyncSender<Result<Value, StoreError>>,
+    },
+    ExportMetrics {
         now: u64,
         reply: mpsc::SyncSender<Result<Value, StoreError>>,
     },
@@ -480,6 +513,12 @@ impl RuntimeStore {
         receive(receiver)
     }
 
+    pub fn record_metric(&self, event: MetricEvent, now: u64) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send(StoreMessage::RecordMetric { event, now, reply })?;
+        receive(receiver)
+    }
+
     pub fn prune_events(&self, retention_days: u32, now: u64) -> Result<usize, StoreError> {
         let (reply, receiver) = mpsc::sync_channel(1);
         self.send(StoreMessage::PruneEvents {
@@ -493,6 +532,12 @@ impl RuntimeStore {
     pub fn export_json(&self, now: u64) -> Result<Value, StoreError> {
         let (reply, receiver) = mpsc::sync_channel(1);
         self.send(StoreMessage::Export { now, reply })?;
+        receive(receiver)
+    }
+
+    pub fn export_metrics_json(&self, now: u64) -> Result<Value, StoreError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send(StoreMessage::ExportMetrics { now, reply })?;
         receive(receiver)
     }
 
@@ -650,6 +695,9 @@ fn writer_loop(
             StoreMessage::ReplaceQuota { entries, reply } => {
                 let _ = reply.send(replace_quota_transaction(&mut connection, entries));
             }
+            StoreMessage::RecordMetric { event, now, reply } => {
+                let _ = reply.send(record_metric_transaction(&mut connection, event, now));
+            }
             StoreMessage::PruneEvents {
                 retention_days,
                 now,
@@ -663,6 +711,9 @@ fn writer_loop(
             }
             StoreMessage::Export { now, reply } => {
                 let _ = reply.send(export_database(&connection, now));
+            }
+            StoreMessage::ExportMetrics { now, reply } => {
+                let _ = reply.send(export_metrics_database(&connection, now));
             }
             StoreMessage::ClearData { reply } => {
                 let _ = reply.send(reset_database(&mut connection, &database_path));
@@ -703,6 +754,108 @@ fn replace_quota_transaction(
             .map_err(storage_error)?;
     }
     transaction.commit().map_err(storage_error)
+}
+
+fn record_metric_transaction(
+    connection: &mut Connection,
+    event: MetricEvent,
+    now: u64,
+) -> Result<(), StoreError> {
+    let transaction = connection.transaction().map_err(storage_error)?;
+    ensure_metric_day(&transaction, now)?;
+    let column = match event {
+        MetricEvent::AppOpened => "app_opened",
+        MetricEvent::BannerShown => "banners_shown",
+    };
+    transaction
+        .execute(
+            &format!("UPDATE metrics_daily SET {column} = {column} + 1 WHERE day = ?1"),
+            [metric_day(now)],
+        )
+        .map_err(storage_error)?;
+    transaction.commit().map_err(storage_error)
+}
+
+fn ensure_metric_day(transaction: &Transaction<'_>, now: u64) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "INSERT INTO metrics_daily(day) VALUES (?1)
+             ON CONFLICT(day) DO NOTHING",
+            [metric_day(now)],
+        )
+        .map(|_| ())
+        .map_err(storage_error)
+}
+
+fn increment_ingest_metrics(
+    transaction: &Transaction<'_>,
+    now: u64,
+    new_session: bool,
+    approval_request: bool,
+) -> Result<(), StoreError> {
+    if !new_session && !approval_request {
+        return Ok(());
+    }
+    ensure_metric_day(transaction, now)?;
+    transaction
+        .execute(
+            "UPDATE metrics_daily SET
+               approval_requests = approval_requests + ?2,
+               sessions_observed = sessions_observed + ?3
+             WHERE day = ?1",
+            params![
+                metric_day(now),
+                i64::from(approval_request),
+                i64::from(new_session)
+            ],
+        )
+        .map(|_| ())
+        .map_err(storage_error)
+}
+
+fn increment_decision_metrics(
+    transaction: &Transaction<'_>,
+    action: ApprovalAction,
+    response_ms: u64,
+    now: u64,
+) -> Result<(), StoreError> {
+    ensure_metric_day(transaction, now)?;
+    let column = match action {
+        ApprovalAction::Approve => "widget_approvals",
+        ApprovalAction::Deny => "widget_denials",
+        ApprovalAction::PassThrough => "pass_through_manual",
+    };
+    transaction
+        .execute(
+            &format!(
+                "UPDATE metrics_daily SET
+                   {column} = {column} + 1,
+                   decision_response_ms_total = decision_response_ms_total + ?2,
+                   decision_response_count = decision_response_count + 1
+                 WHERE day = ?1"
+            ),
+            params![metric_day(now), to_i64(response_ms)],
+        )
+        .map(|_| ())
+        .map_err(storage_error)
+}
+
+fn metric_day(now: u64) -> String {
+    let seconds: libc::time_t = (now / 1_000).try_into().unwrap_or(libc::time_t::MAX);
+    let mut local = std::mem::MaybeUninit::<libc::tm>::zeroed();
+    // SAFETY: local points to writable tm storage and seconds remains alive for the call.
+    let result = unsafe { libc::localtime_r(&seconds, local.as_mut_ptr()) };
+    if result.is_null() {
+        return "1970-01-01".to_owned();
+    }
+    // SAFETY: localtime_r returned non-null and initialized the tm value.
+    let local = unsafe { local.assume_init() };
+    format!(
+        "{:04}-{:02}-{:02}",
+        local.tm_year + 1900,
+        local.tm_mon + 1,
+        local.tm_mday
+    )
 }
 
 fn prune_events_transaction(
@@ -774,6 +927,49 @@ fn export_database(connection: &Connection, now: u64) -> Result<Value, StoreErro
         ("exportedAt".to_owned(), Value::Number(now.into())),
         ("tables".to_owned(), Value::Object(tables)),
     ])))
+}
+
+fn export_metrics_database(connection: &Connection, now: u64) -> Result<Value, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT day, approval_requests, widget_approvals, widget_denials,
+                    pass_through_manual, pass_through_timeout,
+                    decision_response_ms_total, decision_response_count,
+                    banners_shown, sessions_observed, app_opened
+             FROM metrics_daily ORDER BY day",
+        )
+        .map_err(storage_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(json!({
+                "day": row.get::<_, String>(0)?,
+                "approvalRequests": from_i64(row.get(1)?),
+                "widgetApprovals": from_i64(row.get(2)?),
+                "widgetDenials": from_i64(row.get(3)?),
+                "passThroughManual": from_i64(row.get(4)?),
+                "passThroughTimeout": from_i64(row.get(5)?),
+                "decisionResponseMsTotal": from_i64(row.get(6)?),
+                "decisionResponseCount": from_i64(row.get(7)?),
+                "bannersShown": from_i64(row.get(8)?),
+                "sessionsObserved": from_i64(row.get(9)?),
+                "appOpened": from_i64(row.get(10)?),
+            }))
+        })
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    Ok(json!({
+        "schemaVersion": 1,
+        "appVersion": env!("CARGO_PKG_VERSION"),
+        "exportedAt": now,
+        "scope": "metrics_only",
+        "definitions": {
+            "panelHandlingRate": "(widgetApprovals + widgetDenials) / approvalRequests",
+            "terminalReturnRate": "(passThroughManual + passThroughTimeout) / approvalRequests",
+            "averageResponseMs": "decisionResponseMsTotal / decisionResponseCount"
+        },
+        "metricsDaily": rows
+    }))
 }
 
 fn sqlite_value(value: ValueRef<'_>) -> Value {
@@ -1010,6 +1206,7 @@ fn ingest_transaction(
         )
         .optional()
         .map_err(storage_error)?;
+    let new_session = existing.is_none();
     let (session_id, current_state, last_event_at) = if let Some(existing) = existing {
         existing
     } else {
@@ -1077,7 +1274,7 @@ fn ingest_transaction(
                 turn_id,
                 provider,
                 event_type(parsed.kind),
-                parsed.tool_name,
+                parsed.tool_name.as_deref().map(sanitized_tool_name),
                 event_summary(&request.raw, parsed.kind),
                 occurred_at,
                 sequence,
@@ -1246,6 +1443,13 @@ fn ingest_transaction(
         }
     }
 
+    increment_ingest_metrics(
+        &transaction,
+        request.received_at,
+        new_session,
+        parsed.kind == EventKind::PermissionRequested,
+    )?;
+
     transaction.commit().map_err(storage_error)?;
     Ok(IngestResult {
         inserted: true,
@@ -1269,13 +1473,15 @@ fn claim_transaction(
     let request_id_string = request_id.to_string();
     let attention = transaction
         .query_row(
-            "SELECT id, state, expires_at FROM attention_items WHERE request_id = ?1",
+            "SELECT id, state, expires_at, created_at
+             FROM attention_items WHERE request_id = ?1",
             [&request_id_string],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             },
         )
@@ -1320,6 +1526,14 @@ fn claim_transaction(
             ],
         )
         .map_err(storage_error)?;
+    if action == ApprovalAction::PassThrough {
+        increment_decision_metrics(
+            &transaction,
+            action,
+            now.saturating_sub(from_i64(attention.3)),
+            now,
+        )?;
+    }
     transaction.commit().map_err(storage_error)?;
     Ok(ClaimResult {
         created: true,
@@ -1389,8 +1603,11 @@ fn commit_transaction(
     let transaction = connection.transaction().map_err(storage_error)?;
     let command = transaction
         .query_row(
-            "SELECT attention_id, request_id, action, state, created_at
-             FROM commands WHERE id = ?1",
+            "SELECT commands.attention_id, commands.request_id, commands.action,
+                    commands.state, commands.created_at, attention_items.created_at
+             FROM commands JOIN attention_items
+               ON attention_items.id = commands.attention_id
+             WHERE commands.id = ?1",
             [command_id.to_string()],
             |row| {
                 Ok((
@@ -1399,6 +1616,7 @@ fn commit_transaction(
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             },
         )
@@ -1453,6 +1671,12 @@ fn commit_transaction(
             params![command.0, action.as_str()],
         )
         .map_err(storage_error)?;
+    increment_decision_metrics(
+        &transaction,
+        action,
+        from_i64(command.4).saturating_sub(from_i64(command.5)),
+        from_i64(command.4),
+    )?;
     transaction.commit().map_err(storage_error)?;
     Ok(CommitResult {
         command_id,
@@ -1603,14 +1827,14 @@ fn expire_approval_transaction(
     let transaction = connection.transaction().map_err(storage_error)?;
     let attention_id = transaction
         .query_row(
-            "SELECT id FROM attention_items WHERE request_id = ?1
+            "SELECT id, created_at FROM attention_items WHERE request_id = ?1
              AND state IN ('open', 'committing', 'decision_sent')",
             [request_id.to_string()],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
         )
         .optional()
         .map_err(storage_error)?;
-    let Some(attention_id) = attention_id else {
+    let Some((attention_id, _created_at)) = attention_id else {
         return Ok(false);
     };
     transaction
@@ -1627,6 +1851,17 @@ fn expire_approval_transaction(
             params![attention_id, reason],
         )
         .map_err(storage_error)?;
+    if reason == "deadline" {
+        ensure_metric_day(&transaction, now)?;
+        transaction
+            .execute(
+                "UPDATE metrics_daily
+                 SET pass_through_timeout = pass_through_timeout + 1
+                 WHERE day = ?1",
+                [metric_day(now)],
+            )
+            .map_err(storage_error)?;
+    }
     transaction.commit().map_err(storage_error)?;
     Ok(true)
 }
@@ -1797,12 +2032,53 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
         })
         .map(from_i64)
         .map_err(storage_error)?;
+    let metrics = read_metrics(connection, now_millis())?;
     Ok(StoreSnapshot {
         sessions,
         attention,
         commands,
         event_count,
+        metrics,
     })
+}
+
+fn read_metrics(connection: &Connection, now: u64) -> Result<MetricsSummary, StoreError> {
+    connection
+        .query_row(
+            "SELECT
+               COUNT(*),
+               COALESCE(SUM(approval_requests), 0),
+               COALESCE(SUM(widget_approvals), 0),
+               COALESCE(SUM(widget_denials), 0),
+               COALESCE(SUM(pass_through_manual), 0),
+               COALESCE(SUM(pass_through_timeout), 0),
+               COALESCE(SUM(decision_response_ms_total), 0),
+               COALESCE(SUM(decision_response_count), 0),
+               COALESCE(SUM(banners_shown), 0),
+               COALESCE(SUM(sessions_observed), 0),
+               COALESCE(SUM(app_opened), 0),
+               COALESCE(SUM(CASE WHEN day = ?1
+                 THEN widget_approvals + widget_denials ELSE 0 END), 0)
+             FROM metrics_daily",
+            [metric_day(now)],
+            |row| {
+                Ok(MetricsSummary {
+                    active_days: from_i64(row.get(0)?),
+                    approval_requests: from_i64(row.get(1)?),
+                    widget_approvals: from_i64(row.get(2)?),
+                    widget_denials: from_i64(row.get(3)?),
+                    pass_through_manual: from_i64(row.get(4)?),
+                    pass_through_timeout: from_i64(row.get(5)?),
+                    decision_response_ms_total: from_i64(row.get(6)?),
+                    decision_response_count: from_i64(row.get(7)?),
+                    banners_shown: from_i64(row.get(8)?),
+                    sessions_observed: from_i64(row.get(9)?),
+                    app_opened: from_i64(row.get(10)?),
+                    today_widget_decisions: from_i64(row.get(11)?),
+                })
+            },
+        )
+        .map_err(storage_error)
 }
 
 fn select_or_create_turn(
@@ -1916,7 +2192,13 @@ fn insert_approval_attention(
                 project,
                 turn_id,
                 request_id.to_string(),
-                format!("允许 {}？", tool_name.unwrap_or("此操作")),
+                format!(
+                    "允许 {}？",
+                    tool_name
+                        .map(sanitized_tool_name)
+                        .as_deref()
+                        .unwrap_or("此操作")
+                ),
                 command.map(redacted_preview),
                 risk,
                 serde_json::to_string(&notes)
@@ -1978,7 +2260,9 @@ fn insert_nonapproval_attention(
                 turn_id,
                 spec.kind,
                 spec.title,
-                spec.detail.map(redacted_preview),
+                spec.detail
+                    .filter(|detail| !detail.trim().is_empty())
+                    .map(|_| "Provider 附加详情已脱敏".to_owned()),
                 spec.dedupe_key,
                 to_i64(request.received_at),
             ],
@@ -2330,31 +2614,66 @@ fn redacted_preview(command: &str) -> String {
             }
         })
         .collect();
-    let mut words = Vec::new();
-    let mut redact_next = false;
-    for word in one_line.split_whitespace() {
-        let lower = word.to_ascii_lowercase();
-        if redact_next {
-            words.push("<redacted>".to_owned());
-            redact_next = false;
+    let mut words = one_line.split_whitespace();
+    let executable = loop {
+        let Some(word) = words.next() else {
+            return "<redacted>".to_owned();
+        };
+        let before_equals = word.split_once('=').map(|(name, _)| name);
+        if before_equals.is_some_and(|name| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        }) {
             continue;
         }
-        if ["--token", "--password", "--secret", "-p"].contains(&lower.as_str()) {
-            words.push(word.to_owned());
-            redact_next = true;
-            continue;
+        break word;
+    };
+    let executable = Path::new(executable.trim_matches(['\'', '"']))
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let subcommand = words
+        .next()
+        .map(|word| word.trim_matches(['\'', '"']).to_ascii_lowercase());
+    let safe = match (executable.as_str(), subcommand.as_deref()) {
+        ("git", Some(value)) if matches!(value, "status" | "diff" | "log") => {
+            Some(format!("git {value}"))
         }
-        if ["token=", "password=", "secret=", "api_key="]
-            .iter()
-            .any(|prefix| lower.starts_with(prefix))
+        ("cargo", Some(value))
+            if matches!(value, "test" | "build" | "check" | "clippy" | "fmt") =>
         {
-            words.push("<redacted>".to_owned());
-        } else {
-            words.push(word.to_owned());
+            Some(format!("cargo {value}"))
         }
+        ("npm" | "pnpm" | "yarn", Some("test")) => Some(format!("{executable} test")),
+        ("rg" | "ls", _) => Some(executable.clone()),
+        _ => None,
+    };
+    if let Some(safe) = safe {
+        return safe;
     }
-    let joined = words.join(" ");
-    joined.chars().take(160).collect()
+    let label: String = executable
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '+' | '-')
+        })
+        .take(24)
+        .collect();
+    if label.is_empty() {
+        "<redacted>".to_owned()
+    } else {
+        format!("{label} <redacted>")
+    }
+}
+
+fn sanitized_tool_name(name: &str) -> String {
+    match name {
+        "Bash" | "Shell" | "Edit" | "Write" | "Read" | "Glob" | "Grep" | "Task" | "WebFetch"
+        | "WebSearch" | "apply_patch" | "MultiEdit" => name.to_owned(),
+        _ => "Unknown".to_owned(),
+    }
 }
 
 fn event_summary(raw: &Value, kind: EventKind) -> Option<String> {
@@ -2362,11 +2681,8 @@ fn event_summary(raw: &Value, kind: EventKind) -> Option<String> {
         EventKind::PermissionRequested => raw
             .get("tool_name")
             .and_then(Value::as_str)
-            .map(|tool| format!("请求运行 {tool}")),
-        EventKind::Unknown => raw
-            .get("hook_event_name")
-            .and_then(Value::as_str)
-            .map(|name| format!("未知事件 {name}")),
+            .map(|tool| format!("请求运行 {}", sanitized_tool_name(tool))),
+        EventKind::Unknown => Some("未知 Provider 事件".to_owned()),
         _ => None,
     }
 }

@@ -35,6 +35,8 @@ const ui = {
   claudeBridgeAction: document.querySelector("#claude-bridge-action"),
   exportData: document.querySelector("#export-data"),
   clearData: document.querySelector("#clear-data"),
+  metricsSummary: document.querySelector("#metrics-summary"),
+  exportMetrics: document.querySelector("#export-metrics"),
   notificationBanner: document.querySelector("#notification-banner"),
   notificationKind: document.querySelector("#notification-kind"),
   notificationTitle: document.querySelector("#notification-title"),
@@ -63,6 +65,8 @@ let settingsBusy = false;
 let notificationsPrimed = false;
 let knownAttentionIds = new Set();
 let notificationItemId;
+let renderedEventCount = 0;
+let eventUiLatencies = [];
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -214,6 +218,7 @@ async function changeSetup(provider, action) {
 
 function openSettings() {
   ui.settingsOverlay.hidden = false;
+  renderMetrics();
   ui.settingsClose.focus();
   loadSettings();
 }
@@ -346,6 +351,25 @@ async function exportLocalData() {
   }
 }
 
+async function exportLocalMetrics() {
+  try {
+    const response = await fetch("/api/v1/metrics/export", { credentials: "same-origin" });
+    if (!response.ok) throw new Error(`HTTP_${response.status}`);
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "flow-agent-metrics.json";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    showToast("仅统计数据已导出，不含会话和事件明细");
+  } catch (error) {
+    showToast(`统计导出失败：${error.message}`);
+  }
+}
+
 async function clearLocalData() {
   const confirmation = window.prompt("这会删除本地事件、会话、额度缓存和设置。请输入 DELETE 确认：");
   if (confirmation !== "DELETE") {
@@ -380,6 +404,33 @@ function stateLabel(state) {
   }[state] || state;
 }
 
+function renderMetrics() {
+  const metrics = snapshot.stats?.metrics || {};
+  const requests = Number(metrics.approvalRequests || 0);
+  const decisions = Number(metrics.widgetApprovals || 0) + Number(metrics.widgetDenials || 0);
+  const responses = Number(metrics.decisionResponseCount || 0);
+  const panelRate = requests > 0 ? `${Math.round(decisions / requests * 100)}%` : "—";
+  const timeoutRate = requests > 0 ? `${Math.round(Number(metrics.passThroughTimeout || 0) / requests * 100)}%` : "—";
+  const average = responses > 0 ? `${Math.round(Number(metrics.decisionResponseMsTotal || 0) / responses / 100) / 10}s` : "—";
+  const uiP95 = document.body.dataset.eventUiP95Ms
+    ? `${document.body.dataset.eventUiP95Ms}ms`
+    : "—";
+  const values = [
+    [Number(metrics.activeDays || 0), "活跃天数"],
+    [decisions, "面板批准 / 拒绝"],
+    [panelRate, "面板处理率"],
+    [timeoutRate, "超时交还率"],
+    [average, "平均响应"],
+    [uiP95, "页面渲染 p95"],
+  ];
+  ui.metricsSummary.replaceChildren();
+  for (const [value, label] of values) {
+    const item = element("div", "metric-pill");
+    item.append(element("strong", "", value), element("span", "", label));
+    ui.metricsSummary.append(item);
+  }
+}
+
 function attentionTitle(item) {
   if (item.kind === "approval") return `想运行 ${item.commandPreview || "一项工具操作"}，等你点头`;
   if (item.kind === "error") return item.title || "任务出错停下来了";
@@ -405,7 +456,11 @@ function renderAttention() {
   ui.attentionCount.textContent = String(items.length);
   ui.attentionList.replaceChildren();
   if (!items.length) {
-    ui.attentionList.append(emptyState("✓", "现在没有需要你处理的任务", "新的授权、问题、完成或错误会实时出现在这里。"));
+    const handled = Number(snapshot.stats?.metrics?.todayWidgetDecisions || 0);
+    const detail = handled > 0
+      ? `今天你已通过面板处理 ${handled} 件；新的授权、问题、完成或错误会实时出现。`
+      : "新的授权、问题、完成或错误会实时出现在这里。";
+    ui.attentionList.append(emptyState("✓", "现在没有需要你处理的任务", detail));
     const outcome = outcomeSummary();
     if (outcome) ui.attentionList.append(outcome);
     return;
@@ -612,6 +667,7 @@ function showNotification(item) {
   ui.notificationTitle.textContent = attentionTitle(item);
   ui.notificationBanner.hidden = false;
   playNotificationSound();
+  void recordUiMetric("banner_shown");
 }
 
 function processNotifications(nextSnapshot) {
@@ -630,6 +686,19 @@ function render(nextSnapshot) {
   renderSessions();
   renderQuota();
   ui.eventCount.textContent = String(snapshot.stats?.eventCount || 0);
+  const eventCount = Number(snapshot.stats?.eventCount || 0);
+  if (eventCount > renderedEventCount) {
+    const latest = Math.max(0, ...(snapshot.sessions || []).map((session) => Number(session.lastEventAt || 0)));
+    const latency = Date.now() - latest;
+    if (latest > 0 && latency >= 0 && latency <= 10000) {
+      eventUiLatencies.push(latency);
+      eventUiLatencies = eventUiLatencies.slice(-100);
+      const sorted = [...eventUiLatencies].sort((a, b) => a - b);
+      document.body.dataset.eventUiP95Ms = String(sorted[Math.max(0, Math.ceil(sorted.length * 0.95) - 1)]);
+    }
+    renderedEventCount = eventCount;
+  }
+  renderMetrics();
 }
 
 async function api(path, options = {}) {
@@ -644,6 +713,17 @@ async function api(path, options = {}) {
     throw error;
   }
   return data;
+}
+
+async function recordUiMetric(event) {
+  try {
+    await api("/api/v1/metrics", {
+      method: "POST",
+      body: JSON.stringify({ event }),
+    });
+  } catch (_) {
+    // Metrics are local evidence only and never interfere with Agent control.
+  }
 }
 
 async function bootstrap() {
@@ -774,6 +854,7 @@ for (const control of [
 }
 ui.claudeBridgeAction.addEventListener("click", changeClaudeBridge);
 ui.exportData.addEventListener("click", exportLocalData);
+ui.exportMetrics.addEventListener("click", exportLocalMetrics);
 ui.clearData.addEventListener("click", clearLocalData);
 ui.notificationClose.addEventListener("click", () => { ui.notificationBanner.hidden = true; });
 ui.notificationView.addEventListener("click", () => {
@@ -796,6 +877,8 @@ document.addEventListener("keydown", (event) => {
     await loadSnapshot();
     await loadSetup();
     await loadSettings();
+    await recordUiMetric("app_opened");
+    await loadSnapshot();
     knownAttentionIds = new Set(openItems().map((item) => item.id));
     notificationsPrimed = true;
     connectSocket();

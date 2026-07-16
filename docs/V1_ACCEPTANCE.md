@@ -90,15 +90,15 @@ not weaken or replace the full plan.
 
 ### M5 - release evidence
 
-- [ ] Local metrics and JSON export match the plan definitions.
-- [ ] Oversize/deep JSON, host/origin/CSRF, socket permissions, and redaction
+- [x] Local metrics and JSON export match the plan definitions.
+- [x] Oversize/deep JSON, host/origin/CSRF, socket permissions, and redaction
       tests pass.
-- [ ] Default logs contain no raw hook payload; diagnostic capture is explicit,
+- [x] Default logs contain no raw hook payload; diagnostic capture is explicit,
       redacted, bounded, and expires.
-- [ ] Hook non-blocking p95 is below 50ms; event-to-UI p95 below 300ms.
-- [ ] Idle runtime CPU is below 0.5%; browser tab memory below 150MB.
+- [x] Hook non-blocking p95 is below 50ms; event-to-UI p95 below 300ms.
+- [x] Idle runtime CPU is below 0.5%; browser tab memory below 150MB.
 - [ ] Runtime RSS remains below 80MB throughout a continuous 48-hour soak.
-- [ ] Every pass-through path leaves the provider terminal usable.
+- [x] Every pass-through path leaves the provider terminal usable.
 
 ## Publishing rule
 

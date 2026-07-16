@@ -1,5 +1,5 @@
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE, HOST, ORIGIN, SET_COOKIE,
 };
@@ -13,8 +13,8 @@ use flow_agent_installer::{
 };
 use flow_agent_quota::{QuotaCollector, QuotaEntry, QuotaPaths};
 use flow_agent_runtime::{
-    ApprovalAction, AttentionAction, CommandState, QuotaRecord, RuntimeStore, StoreError,
-    WaiterRegistry,
+    ApprovalAction, AttentionAction, CommandState, MetricEvent, QuotaRecord, RuntimeStore,
+    StoreError, WaiterRegistry,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -50,7 +50,7 @@ impl Default for ApiServerConfig {
         Self {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             commit_delay: Duration::from_secs(3),
-            snapshot_interval: Duration::from_millis(250),
+            snapshot_interval: Duration::from_millis(100),
             quota_poll_interval: Duration::from_secs(5 * 60),
             install_paths: None,
         }
@@ -108,6 +108,7 @@ impl ApiServer {
         let data_paths = DataPaths {
             cache: install_paths.flow_home.join("cache"),
             spool: install_paths.flow_home.join("spool"),
+            diagnostics: install_paths.flow_home.join("diagnostics"),
         };
         let state = AppState {
             store,
@@ -212,6 +213,7 @@ struct QuotaState {
 struct DataPaths {
     cache: PathBuf,
     spool: PathBuf,
+    diagnostics: PathBuf,
 }
 
 struct AuthState {
@@ -232,10 +234,13 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/settings", get(settings).put(update_settings))
         .route("/api/v1/quota/claude-bridge", post(change_claude_bridge))
         .route("/api/v1/export", get(export_data))
+        .route("/api/v1/metrics", post(record_metric))
+        .route("/api/v1/metrics/export", get(export_metrics))
         .route("/api/v1/data/clear", post(clear_data))
         .route("/api/v1/commands", post(command))
         .route("/api/v1/commands/{id}/undo", post(undo))
         .route("/api/v1/ws", get(websocket))
+        .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(state)
 }
 
@@ -749,6 +754,63 @@ async fn export_data(State(state): State<AppState>, headers: HeaderMap) -> Respo
         .into_response()
 }
 
+async fn export_metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&state, &headers) {
+        return api_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED");
+    }
+    let export = match state.store.export_metrics_json(now_millis()) {
+        Ok(export) => export,
+        Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "EXPORT_FAILED"),
+    };
+    let body = match serde_json::to_vec_pretty(&export) {
+        Ok(body) => body,
+        Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "EXPORT_FAILED"),
+    };
+    (
+        [
+            (CONTENT_TYPE, HeaderValue::from_static("application/json")),
+            (
+                CONTENT_DISPOSITION,
+                HeaderValue::from_static("attachment; filename=flow-agent-metrics.json"),
+            ),
+            (CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum UiMetricEvent {
+    AppOpened,
+    BannerShown,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetricRequest {
+    event: UiMetricEvent,
+}
+
+async fn record_metric(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<MetricRequest>,
+) -> Response {
+    if !authorized_mutation(&state, &headers) {
+        return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_MUTATION");
+    }
+    let event = match request.event {
+        UiMetricEvent::AppOpened => MetricEvent::AppOpened,
+        UiMetricEvent::BannerShown => MetricEvent::BannerShown,
+    };
+    match state.store.record_metric(event, now_millis()) {
+        Ok(()) => Json(json!({"recorded": true})).into_response(),
+        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "METRIC_RECORD_FAILED"),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ClearDataRequest {
     confirmation: String,
@@ -765,7 +827,11 @@ async fn clear_data(
     if request.confirmation != "DELETE" {
         return api_error(StatusCode::BAD_REQUEST, "DELETE_CONFIRMATION_REQUIRED");
     }
-    for path in [&state.data_paths.cache, &state.data_paths.spool] {
+    for path in [
+        &state.data_paths.cache,
+        &state.data_paths.spool,
+        &state.data_paths.diagnostics,
+    ] {
         if let Err(error) = removable_owned_tree(path) {
             return api_error_detail(StatusCode::CONFLICT, "UNSAFE_DATA_PATH", &error);
         }
@@ -773,7 +839,11 @@ async fn clear_data(
     if state.store.clear_data().is_err() {
         return api_error(StatusCode::INTERNAL_SERVER_ERROR, "CLEAR_FAILED");
     }
-    for path in [&state.data_paths.cache, &state.data_paths.spool] {
+    for path in [
+        &state.data_paths.cache,
+        &state.data_paths.spool,
+        &state.data_paths.diagnostics,
+    ] {
         if path.exists() && fs::remove_dir_all(path).is_err() {
             return api_error(StatusCode::INTERNAL_SERVER_ERROR, "CLEAR_FAILED");
         }
@@ -1017,7 +1087,10 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
         "attention": snapshot.attention,
         "commands": snapshot.commands,
         "quota": quota,
-        "stats": { "eventCount": snapshot.event_count }
+        "stats": {
+            "eventCount": snapshot.event_count,
+            "metrics": snapshot.metrics
+        }
     }))
 }
 
@@ -1204,6 +1277,7 @@ mod tests {
             data_paths: DataPaths {
                 cache: root.join("flow-home/cache"),
                 spool: root.join("flow-home/spool"),
+                diagnostics: root.join("flow-home/diagnostics"),
             },
         }
     }
@@ -1369,6 +1443,12 @@ mod tests {
         .unwrap();
         fs::create_dir_all(&state.data_paths.spool).unwrap();
         fs::write(state.data_paths.spool.join("offline.json"), b"sanitized").unwrap();
+        fs::create_dir_all(&state.data_paths.diagnostics).unwrap();
+        fs::write(
+            state.data_paths.diagnostics.join("events.jsonl"),
+            b"sanitized diagnostics",
+        )
+        .unwrap();
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1471,6 +1551,7 @@ mod tests {
         assert_eq!(store.read_setting(SETTINGS_KEY).unwrap(), None);
         assert!(!state.data_paths.cache.exists());
         assert!(!state.data_paths.spool.exists());
+        assert!(!state.data_paths.diagnostics.exists());
         assert!(claude_settings.exists());
         fs::remove_dir_all(root).unwrap();
     }
@@ -1525,6 +1606,113 @@ mod tests {
             fs::read(&hooks).unwrap(),
             b"provider file must stay unchanged"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn m5_ui_metrics_are_authenticated_local_and_visible_in_snapshot_and_export() {
+        let root = std::env::temp_dir().join(format!(
+            "flow-agent-server-m5-metrics-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        {
+            let mut auth = state.auth.lock().unwrap();
+            auth.bootstrap_token = None;
+            auth.session_token = Some("test-session".to_owned());
+            auth.csrf_token = Some("test-csrf".to_owned());
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let app = router(state);
+            for event in ["app_opened", "banner_shown", "banner_shown"] {
+                let response = app
+                    .clone()
+                    .oneshot(authorized_request(
+                        "POST",
+                        "/api/v1/metrics",
+                        json!({"event":event}),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            let snapshot = app
+                .clone()
+                .oneshot(authorized_request("GET", "/api/v1/snapshot", Value::Null))
+                .await
+                .unwrap();
+            let snapshot = json_body(snapshot).await;
+            assert_eq!(snapshot["stats"]["metrics"]["appOpened"], 1);
+            assert_eq!(snapshot["stats"]["metrics"]["bannersShown"], 2);
+
+            let export = app
+                .clone()
+                .oneshot(authorized_request("GET", "/api/v1/export", Value::Null))
+                .await
+                .unwrap();
+            let export = json_body(export).await;
+            assert_eq!(export["tables"]["metrics_daily"][0]["app_opened"], 1);
+
+            let metrics_export = app
+                .oneshot(authorized_request(
+                    "GET",
+                    "/api/v1/metrics/export",
+                    Value::Null,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(metrics_export.status(), StatusCode::OK);
+            assert_eq!(
+                metrics_export.headers()[CONTENT_DISPOSITION],
+                "attachment; filename=flow-agent-metrics.json"
+            );
+            let metrics_export = json_body(metrics_export).await;
+            assert_eq!(metrics_export["scope"], "metrics_only");
+            assert!(metrics_export.get("tables").is_none());
+        });
+        assert!(INDEX_HTML.contains("我的使用统计"));
+        assert!(INDEX_HTML.contains("导出统计"));
+        assert!(APP_JS.contains("todayWidgetDecisions"));
+        assert!(APP_JS.contains("banner_shown"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn m5_api_rejects_bodies_over_64_kib_before_deserialization() {
+        let root = std::env::temp_dir().join(format!(
+            "flow-agent-server-m5-body-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store, &root);
+        {
+            let mut auth = state.auth.lock().unwrap();
+            auth.bootstrap_token = None;
+            auth.session_token = Some("test-session".to_owned());
+            auth.csrf_token = Some("test-csrf".to_owned());
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let response = router(state)
+                .oneshot(authorized_request(
+                    "PUT",
+                    "/api/v1/settings",
+                    json!({"padding":"x".repeat(65 * 1024)}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        });
         fs::remove_dir_all(root).unwrap();
     }
 }

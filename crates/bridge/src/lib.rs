@@ -4,7 +4,7 @@ mod unix;
 #[cfg(unix)]
 pub use unix::{
     default_socket_path, unix_socket_path_limit, validate_socket_path, BridgeClient, BridgeError,
-    BridgeListener,
+    BridgeListener, MAX_BRIDGE_FRAME_BYTES,
 };
 
 #[cfg(not(unix))]

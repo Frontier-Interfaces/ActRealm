@@ -1,4 +1,4 @@
-use flow_agent_core::{BridgeRequest, BridgeResponse, ReplyAction};
+use flow_agent_core::{BridgeRequest, BridgeResponse, ReplyAction, MAX_HOOK_PAYLOAD_BYTES};
 use std::env;
 use std::fs::{self, DirBuilder};
 use std::io::{self, BufRead, BufReader, Write};
@@ -12,12 +12,16 @@ use std::time::Instant;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub const MAX_BRIDGE_FRAME_BYTES: usize = MAX_HOOK_PAYLOAD_BYTES + 64 * 1024;
+
 #[derive(Debug, Error)]
 pub enum BridgeError {
     #[error("bridge I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error("bridge protocol failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("bridge frame exceeds {maximum} bytes")]
+    FrameTooLarge { maximum: usize },
     #[error("bridge closed without a response")]
     MissingResponse,
     #[error("bridge response id mismatch: expected {expected}, received {received}")]
@@ -191,12 +195,32 @@ impl BridgeListener {
     }
 
     pub fn read_request(stream: &mut UnixStream) -> Result<BridgeRequest, BridgeError> {
-        let mut line = String::new();
-        BufReader::new(stream.try_clone()?).read_line(&mut line)?;
-        if line.trim().is_empty() {
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut frame = Vec::new();
+        loop {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                break;
+            }
+            let take = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |position| position + 1);
+            if frame.len().saturating_add(take) > MAX_BRIDGE_FRAME_BYTES {
+                return Err(BridgeError::FrameTooLarge {
+                    maximum: MAX_BRIDGE_FRAME_BYTES,
+                });
+            }
+            frame.extend_from_slice(&available[..take]);
+            reader.consume(take);
+            if frame.last() == Some(&b'\n') {
+                break;
+            }
+        }
+        if frame.iter().all(u8::is_ascii_whitespace) {
             return Err(BridgeError::MissingResponse);
         }
-        Ok(serde_json::from_str(&line)?)
+        Ok(serde_json::from_slice(&frame)?)
     }
 
     pub fn write_response(

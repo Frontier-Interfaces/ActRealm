@@ -11,8 +11,8 @@ use flow_agent_installer::{
 };
 use flow_agent_quota::{capture_claude_statusline, statusline_text, QuotaPaths};
 use flow_agent_runtime::{
-    default_database_path, ApprovalAction, EventSpool, RuntimeInstanceGuard, RuntimeStore,
-    WaiterRegistry,
+    default_database_path, ApprovalAction, DiagnosticCapture, EventSpool, RuntimeInstanceGuard,
+    RuntimeStore, WaiterRegistry,
 };
 use flow_agent_server::{ApiServer, ApiServerConfig};
 use serde::Serialize;
@@ -82,6 +82,13 @@ enum Command {
     },
     /// Export all locally persisted, sanitized Flow Agent data as JSON.
     Export,
+    /// Export only aggregate daily metrics, with no session or event records.
+    ExportMetrics,
+    /// Manage explicit, sanitized, time-limited local diagnostic capture.
+    Diagnostics {
+        #[command(subcommand)]
+        action: DiagnosticsCommand,
+    },
     /// Claude Code status line bridge. Installed and invoked by Flow Agent.
     #[command(hide = true)]
     Statusline,
@@ -101,6 +108,19 @@ enum HookTarget {
     Claude,
     Codex,
     All,
+}
+
+#[derive(Debug, Subcommand)]
+enum DiagnosticsCommand {
+    /// Enable sanitized capture for 1-60 minutes.
+    Enable {
+        #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..=60))]
+        minutes: u64,
+    },
+    /// Show whether sanitized capture is active.
+    Status,
+    /// Disable capture and delete captured diagnostic metadata.
+    Clear,
 }
 
 impl HookTarget {
@@ -148,8 +168,34 @@ fn main() -> Result<()> {
         Command::UninstallHooks { provider } => uninstall_hooks(provider),
         Command::Doctor { json } => doctor(json),
         Command::Export => export_local_data(),
+        Command::ExportMetrics => export_metrics(),
+        Command::Diagnostics { action } => manage_diagnostics(action),
         Command::Statusline => run_statusline(),
     }
+}
+
+fn manage_diagnostics(action: DiagnosticsCommand) -> Result<()> {
+    let database = default_database_path();
+    let root = database
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("diagnostics");
+    let capture = DiagnosticCapture::new(root);
+    match action {
+        DiagnosticsCommand::Enable { minutes } => {
+            let status = capture.enable(minutes, now_millis())?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        DiagnosticsCommand::Status => {
+            let status = capture.status(now_millis())?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        DiagnosticsCommand::Clear => {
+            capture.clear()?;
+            println!("diagnostic capture cleared");
+        }
+    }
+    Ok(())
 }
 
 fn export_local_data() -> Result<()> {
@@ -157,6 +203,15 @@ fn export_local_data() -> Result<()> {
     let export = store
         .export_json(now_millis())
         .context("failed to export local data")?;
+    println!("{}", serde_json::to_string_pretty(&export)?);
+    Ok(())
+}
+
+fn export_metrics() -> Result<()> {
+    let store = RuntimeStore::open(default_database_path()).context("failed to open local data")?;
+    let export = store
+        .export_metrics_json(now_millis())
+        .context("failed to export local metrics")?;
     println!("{}", serde_json::to_string_pretty(&export)?);
     Ok(())
 }
@@ -1009,6 +1064,8 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()>
     store
         .reconcile_orphaned_approvals(Vec::new(), now_millis())
         .context("failed to reconcile stale approvals")?;
+    let diagnostics = DiagnosticCapture::new(paths.diagnostics);
+    let _ = diagnostics.status(now_millis());
     let spool = EventSpool::new(paths.spool);
     let _ = spool.drain(|request| store.ingest(request).is_ok());
     let listener = BridgeListener::bind(&socket_path)
@@ -1053,9 +1110,12 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()>
     let prompt_input = (approval == ApprovalMode::Prompt).then(prompt_input_channel);
     let expiry_waiters = waiters.clone();
     let expiry_store = store.clone();
+    let expiry_diagnostics = diagnostics.clone();
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(2));
-        if let Ok(expired) = expiry_waiters.expire_request_ids_at(now_millis()) {
+        let now = now_millis();
+        let _ = expiry_diagnostics.status(now);
+        if let Ok(expired) = expiry_waiters.expire_request_ids_at(now) {
             for request_id in expired {
                 let _ = expiry_store.expire_approval(request_id, "deadline", now_millis());
             }
@@ -1068,6 +1128,7 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()>
         let prompt_input = prompt_input.clone();
         let store = store.clone();
         let waiters = waiters.clone();
+        let diagnostics = diagnostics.clone();
         thread::spawn(move || {
             let Ok(request) = BridgeListener::read_request(&mut stream) else {
                 return;
@@ -1106,13 +1167,7 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()>
                 }
                 return;
             }
-            let _ = writeln!(
-                io::stdout().lock(),
-                "provider={} event={} session={}",
-                request.provider,
-                request.event_name().unwrap_or("unknown"),
-                request.session_id().unwrap_or("unknown")
-            );
+            let _ = diagnostics.capture(&request, now_millis());
             let registration = if request.needs_reply {
                 let Ok(registration) = waiters.register_at(&request, now_millis()) else {
                     return;
@@ -1423,6 +1478,7 @@ struct RuntimePaths {
     database: PathBuf,
     spool: PathBuf,
     lock: PathBuf,
+    diagnostics: PathBuf,
 }
 
 fn runtime_paths(socket_path: &std::path::Path) -> RuntimePaths {
@@ -1436,12 +1492,14 @@ fn runtime_paths(socket_path: &std::path::Path) -> RuntimePaths {
             database,
             spool: root.join("spool"),
             lock: root.join("run/runtime.lock"),
+            diagnostics: root.join("diagnostics"),
         };
     }
     RuntimePaths {
         database: socket_path.with_extension("sqlite"),
         spool: socket_path.with_extension("spool"),
         lock: socket_path.with_extension("lock"),
+        diagnostics: socket_path.with_extension("diagnostics"),
     }
 }
 
