@@ -1,0 +1,2 @@
+{"type":"session_meta","payload":{"cli_version":"0.144.2"}}
+{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":49.0,"window_minutes":10080,"resets_at":1784780297},"secondary":null,"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"individual_limit":null,"plan_type":"plus","rate_limit_reached_type":null}}}

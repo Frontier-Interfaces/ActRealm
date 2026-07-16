@@ -57,7 +57,7 @@ let settingsState = {
   notificationRules: { approval: "banner", question: "banner", error: "banner", completion: "list" },
   soundEnabled: true,
   providerMuted: { claude: false, codex: false },
-  codexEnhancedActivity: false,
+  codexEnhancedActivity: true,
   retentionDays: 90,
 };
 let claudeBridge = { status: "not_installed" };
@@ -67,12 +67,30 @@ let knownAttentionIds = new Set();
 let notificationItemId;
 let renderedEventCount = 0;
 let eventUiLatencies = [];
+let selectedSessionId;
+let sessionActivityRefs = new Map();
+const SESSION_VISIBLE_FOR_MS = 30 * 60 * 1000;
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
   if (text !== undefined) node.textContent = String(text);
   return node;
+}
+
+function providerIcon(provider) {
+  const normalized = String(provider || "").toLowerCase();
+  const source = {
+    claude: "/assets/claude.png",
+    codex: "/assets/codex.png",
+  }[normalized];
+  if (!source) return element("span", "provider-glyph provider-fallback", "?");
+  const icon = element("img", `provider-glyph provider-${normalized}`);
+  icon.src = source;
+  icon.alt = `${providerName(normalized)} 图标`;
+  icon.width = 28;
+  icon.height = 28;
+  return icon;
 }
 
 function emptyState(icon, title, detail) {
@@ -141,7 +159,7 @@ function renderSetup() {
     const card = element("article", "setup-provider");
     const heading = element("div", "setup-provider-heading");
     const identity = element("div", "setup-identity");
-    identity.append(element("span", "provider-glyph", providerName(provider.provider).slice(0, 2)));
+    identity.append(providerIcon(provider.provider));
     identity.append(element("strong", "", providerName(provider.provider)));
     heading.append(identity, element("span", `setup-status ${status.className}`, status.label));
     card.append(heading, element("p", "setup-detail", status.detail));
@@ -204,7 +222,11 @@ async function changeSetup(provider, action) {
   try {
     setupState = await api("/api/v1/setup", {
       method: "POST",
-      body: JSON.stringify({ provider, action, enhancedCodexActivity: false }),
+      body: JSON.stringify({
+        provider,
+        action,
+        enhancedCodexActivity: Boolean(settingsState.codexEnhancedActivity),
+      }),
     });
     renderSetup();
     showToast(action === "uninstall" ? `${providerName(provider)} 接入已移除` : `${providerName(provider)} 配置已安全写入`);
@@ -233,7 +255,7 @@ function bridgeStatusCopy(status) {
     installed: "已开启 · 等待 Claude 下一次响应更新",
     not_installed: "未开启",
     helper_missing: "桥接文件缺失，可安全修复",
-    custom_conflict: "检测到你的自定义 status line，不会覆盖",
+    custom_conflict: "检测到自定义状态栏；可以保留原显示并串联额度采集",
     config_malformed: "Claude 配置无法解析，已停止修改",
   }[status] || "状态暂时不可用";
 }
@@ -251,9 +273,19 @@ function renderSettings() {
   ui.retentionDays.value = String(settingsState.retentionDays || 90);
   ui.claudeBridgeStatus.textContent = bridgeStatusCopy(claudeBridge.status);
   const removable = claudeBridge.status === "installed";
-  const blocked = ["custom_conflict", "config_malformed"].includes(claudeBridge.status);
-  ui.claudeBridgeAction.textContent = removable ? "关闭" : claudeBridge.status === "helper_missing" ? "修复" : "开启";
-  ui.claudeBridgeAction.dataset.action = removable ? "uninstall" : "install";
+  const blocked = claudeBridge.status === "config_malformed";
+  ui.claudeBridgeAction.textContent = removable
+    ? "关闭"
+    : claudeBridge.status === "custom_conflict"
+      ? "保留现有并开启"
+      : claudeBridge.status === "helper_missing"
+        ? "修复"
+        : "开启";
+  ui.claudeBridgeAction.dataset.action = removable
+    ? "uninstall"
+    : claudeBridge.status === "custom_conflict"
+      ? "wrap"
+      : "install";
   ui.claudeBridgeAction.disabled = settingsBusy || blocked;
 }
 
@@ -323,7 +355,7 @@ async function changeClaudeBridge() {
     settingsState = response.settings;
     claudeBridge = response.claudeQuotaBridge;
     await loadSnapshot();
-    showToast(action === "install" ? "Claude 额度桥已开启，完成一次对话后会显示额度" : "Claude 额度桥已关闭");
+    showToast(action === "uninstall" ? "Claude 额度桥已关闭，原状态栏已恢复" : "Claude 额度桥已开启，完成一次对话后会显示额度");
   } catch (error) {
     showToast(`额度桥操作失败：${error.detail || error.message}`);
   } finally {
@@ -474,10 +506,15 @@ function renderAttention() {
   card.append(kicker, element("h3", "", attentionTitle(item)));
 
   const agentLine = element("div", "agent-line");
-  agentLine.append(element("span", "provider-glyph", providerName(item.provider).slice(0, 2)));
+  agentLine.append(providerIcon(item.provider));
   agentLine.append(element("strong", "", providerName(item.provider)));
   if (item.project) agentLine.append(element("span", "", `· ${item.project}`));
   card.append(agentLine);
+
+  const taskJump = element("button", "task-jump", "在 Agent 任务中查看 →");
+  taskJump.type = "button";
+  taskJump.addEventListener("click", () => selectSession(item.sessionId));
+  card.append(taskJump);
 
   const fact = item.detail || item.commandPreview;
   if (fact) card.append(element("div", "fact-block", fact));
@@ -544,23 +581,122 @@ function sessionStatus(session) {
   return { label: "在跑", className: "" };
 }
 
+function elapsedText(since) {
+  const seconds = Math.max(0, Math.floor((Date.now() - Number(since || Date.now())) / 1000));
+  if (seconds < 60) return `${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分 ${seconds % 60} 秒`;
+  return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
+}
+
+function visibleSessions() {
+  const attentionSessions = new Set(
+    snapshot.attention
+      .filter((item) => ["open", "committing", "decision_sent", "snoozed"].includes(item.state))
+      .map((item) => item.sessionId),
+  );
+  const cutoff = Date.now() - SESSION_VISIBLE_FOR_MS;
+  return snapshot.sessions
+    .filter((session) => Number(session.lastEventAt || 0) >= cutoff || attentionSessions.has(session.id))
+    .sort((a, b) => {
+      if (a.id === selectedSessionId) return -1;
+      if (b.id === selectedSessionId) return 1;
+      return Number(b.lastEventAt || 0) - Number(a.lastEventAt || 0);
+    });
+}
+
+function activityDisplay(session) {
+  const waiting = snapshot.attention
+    .filter((item) => item.sessionId === session.id && ["open", "committing", "decision_sent"].includes(item.state))
+    .sort((a, b) => a.createdAt - b.createdAt)[0];
+  if (waiting) {
+    return {
+      className: "waiting",
+      marker: "!",
+      text: `等待你处理 · 已等 ${elapsedText(waiting.createdAt)}`,
+    };
+  }
+  const elapsed = elapsedText(session.activitySince || session.lastEventAt);
+  if (session.execState === "thinking") {
+    return { className: "thinking", marker: "•••", text: `${session.activity || "正在思考"} · ${elapsed}` };
+  }
+  if (session.execState === "tool_running") {
+    return { className: "tool", marker: "▌", text: `${session.activity || "正在运行工具"} · ${elapsed}` };
+  }
+  if (session.execState === "compacting") {
+    return { className: "compacting", marker: "◌", text: `${session.activity || "正在压缩记忆"} · ${elapsed}` };
+  }
+  if (session.execState === "failed") {
+    return { className: "failed", marker: "×", text: session.activity || "运行失败" };
+  }
+  if (session.execState === "response_finished") {
+    return { className: "idle", marker: "✓", text: `${session.activity || "本轮已完成"} · ${elapsed}前` };
+  }
+  return { className: "idle", marker: "·", text: `${session.activity || "空闲"} · ${elapsed}前` };
+}
+
+function updateSessionActivity() {
+  for (const [sessionId, ref] of sessionActivityRefs) {
+    const session = snapshot.sessions.find((candidate) => candidate.id === sessionId);
+    if (!session || !ref.marker.isConnected) continue;
+    const display = activityDisplay(session);
+    ref.root.className = `row-subtitle session-activity ${display.className}`;
+    ref.marker.textContent = display.marker;
+    ref.text.textContent = display.text;
+  }
+}
+
+function selectSession(sessionId) {
+  if (!sessionId) return;
+  selectedSessionId = sessionId;
+  renderSessions();
+  window.requestAnimationFrame(() => {
+    const row = [...ui.sessionList.querySelectorAll(".session-row")]
+      .find((candidate) => candidate.dataset.sessionId === sessionId);
+    row?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    row?.focus({ preventScroll: true });
+  });
+}
+
 function renderSessions() {
   ui.sessionList.replaceChildren();
-  ui.sessionCount.textContent = `${snapshot.sessions.length} 个接入`;
-  if (!snapshot.sessions.length) {
-    ui.sessionList.append(emptyState("↗", "还没有 Agent 接入", "安装 Hook 后，真实会话会出现在这里。"));
+  sessionActivityRefs = new Map();
+  const sessions = visibleSessions();
+  ui.sessionCount.textContent = `${sessions.length} 个任务`;
+  if (!sessions.length) {
+    selectedSessionId = undefined;
+    ui.sessionList.append(emptyState("✓", "当前没有活跃任务", "这里只保留运行中、待处理或最近 30 分钟内的任务。"));
     return;
   }
-  for (const session of snapshot.sessions) {
+  if (selectedSessionId && !sessions.some((session) => session.id === selectedSessionId)) {
+    selectedSessionId = undefined;
+  }
+  for (const session of sessions) {
     const status = sessionStatus(session);
-    const row = element("article", "session-row");
+    const row = element("article", `session-row${session.id === selectedSessionId ? " selected" : ""}`);
+    row.dataset.sessionId = session.id;
+    row.tabIndex = 0;
+    row.addEventListener("click", () => selectSession(session.id));
+    row.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectSession(session.id);
+      }
+    });
     const top = element("div", "row-top");
-    top.append(element("span", "provider-glyph", providerName(session.provider).slice(0, 2)));
+    top.append(providerIcon(session.provider));
     const copy = element("div", "row-copy");
     const title = element("div", "row-title");
-    title.append(element("strong", "", session.project || providerName(session.provider)));
+    title.append(element("strong", "", session.title || "等待下一条任务"));
     title.append(element("span", `state-pill ${status.className}`.trim(), status.label));
-    copy.append(title, element("div", "row-subtitle", session.activity || stateLabel(session.execState)));
+    const meta = element("div", "session-meta", providerName(session.provider));
+    if (session.project) meta.append(element("span", "", ` · ${session.project}`));
+    const activity = element("div", "row-subtitle session-activity");
+    const marker = element("span", "activity-marker");
+    const activityText = element("span", "activity-copy");
+    activity.append(marker, activityText);
+    sessionActivityRefs.set(session.id, { root: activity, marker, text: activityText });
+    copy.append(title, meta, activity);
     if (Number.isInteger(session.planDone) && Number.isInteger(session.planTotal) && session.planTotal > 0) {
       const progress = element("div", "plan-progress");
       const label = element("span", "", `计划 ${session.planDone}/${session.planTotal}`);
@@ -579,22 +715,43 @@ function renderSessions() {
     row.append(top);
     ui.sessionList.append(row);
   }
+  updateSessionActivity();
+}
+
+function quotaWindowLabel(provider, windowName) {
+  if (provider === "claude" && windowName === "5h") return "Claude · 5 小时";
+  if (provider === "claude" && windowName === "7d") return "Claude · 7 天";
+  if (provider === "codex") return "Codex · 本周";
+  return `${providerName(provider)} · ${windowName || "额度"}`;
+}
+
+function quotaSlots() {
+  const expected = [
+    { provider: "claude", window: "5h" },
+    { provider: "claude", window: "7d" },
+    { provider: "codex", window: "week" },
+  ];
+  return expected.map((slot) => {
+    const match = snapshot.quota.find((quota) => {
+      if (quota.provider !== slot.provider) return false;
+      if (slot.provider === "codex") return ["week", "7d", "10080m"].includes(quota.window);
+      return quota.window === slot.window;
+    });
+    return match || {
+      ...slot,
+      status: "unavailable",
+      reason: "这个额度窗口暂时没有返回可验证数据",
+    };
+  });
 }
 
 function renderQuota() {
   ui.quotaList.replaceChildren();
-  if (!snapshot.quota.length) {
-    const unavailable = element("div", "quota-unavailable");
-    unavailable.append(element("strong", "", "暂无可靠额度数据"));
-    unavailable.append(element("p", "", "额度来源尚未检查；Flow Agent 不会用估算值冒充真实额度。"));
-    unavailable.append(element("div", "quota-track"));
-    ui.quotaList.append(unavailable);
-    return;
-  }
-  for (const quota of snapshot.quota) {
+  for (const quota of quotaSlots()) {
+    const label = quotaWindowLabel(quota.provider, quota.window);
     if (quota.status !== "available" || typeof quota.usedPct !== "number" || typeof quota.remainingPct !== "number") {
       const unavailable = element("article", "quota-unavailable");
-      unavailable.append(element("strong", "", `${providerName(quota.provider)} · 暂无数据`));
+      unavailable.append(element("strong", "", label));
       unavailable.append(element("p", "", quota.reason || "额度来源没有返回可验证数据"));
       unavailable.append(element("div", "quota-track"));
       if (quota.provider === "claude") {
@@ -608,7 +765,7 @@ function renderQuota() {
     }
     const row = element("article", "quota-row");
     const title = element("div", "row-title");
-    title.append(element("strong", "", `${providerName(quota.provider)} · ${quota.window || "额度"}`));
+    title.append(element("strong", "", label));
     title.append(element("span", "section-meta", `剩余 ${Math.round(quota.remainingPct)}%`));
     row.append(title);
     const track = element("div", "quota-track");
@@ -620,7 +777,7 @@ function renderQuota() {
     const meta = element("div", "quota-meta");
     if (quota.resetsAt) {
       const reset = new Date(Number(quota.resetsAt) * 1000);
-      meta.append(element("span", "", `${reset.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} 重置`));
+      meta.append(element("span", "", `${reset.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })} 重置`));
     }
     if (quota.capturedAt) {
       const minutes = Math.floor((Date.now() - Number(quota.capturedAt)) / 60000);
@@ -782,6 +939,7 @@ function connectSocket() {
 
 async function sendAction(item, action) {
   const id = crypto.randomUUID();
+  if (action === "pass_through") selectSession(item.sessionId);
   try {
     const command = await api("/api/v1/commands", {
       method: "POST",
@@ -870,6 +1028,7 @@ document.addEventListener("keydown", (event) => {
   if (!ui.setupOverlay.hidden) closeSetup();
   if (!ui.settingsOverlay.hidden) closeSettings();
 });
+window.setInterval(updateSessionActivity, 1000);
 
 (async () => {
   setConnected(false);

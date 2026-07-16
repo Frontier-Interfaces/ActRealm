@@ -1,3 +1,4 @@
+use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::header::{
@@ -18,6 +19,7 @@ use flow_agent_runtime::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
@@ -32,9 +34,13 @@ use uuid::Uuid;
 const SESSION_COOKIE: &str = "flow_agent_session";
 const CSRF_HEADER: &str = "x-flow-agent-csrf";
 const SETTINGS_KEY: &str = "ui_settings";
+const SESSION_LIST_RETENTION_MS: u64 = 30 * 60 * 1_000;
+const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 const INDEX_HTML: &str = include_str!("../../../web/index.html");
 const APP_CSS: &str = include_str!("../../../web/app.css");
 const APP_JS: &str = include_str!("../../../web/app.js");
+const CLAUDE_ICON: &[u8] = include_bytes!("../../../web/assets/claude.png");
+const CODEX_ICON: &[u8] = include_bytes!("../../../web/assets/codex.png");
 
 #[derive(Debug, Clone)]
 pub struct ApiServerConfig {
@@ -128,7 +134,9 @@ impl ApiServer {
                 collector: QuotaCollector::new(quota_paths),
                 entries: Vec::new(),
                 refreshed_at: None,
+                claude_cache_modified_at: None,
             })),
+            session_sweep: Arc::new(Mutex::new(None)),
             data_paths,
         };
         let router = router(state);
@@ -200,6 +208,7 @@ struct AppState {
     quota_poll_interval: Duration,
     installer: Arc<Installer>,
     quota: Arc<Mutex<QuotaState>>,
+    session_sweep: Arc<Mutex<Option<Instant>>>,
     data_paths: DataPaths,
 }
 
@@ -207,6 +216,7 @@ struct QuotaState {
     collector: QuotaCollector,
     entries: Vec<QuotaEntry>,
     refreshed_at: Option<Instant>,
+    claude_cache_modified_at: Option<SystemTime>,
 }
 
 #[derive(Clone)]
@@ -227,6 +237,8 @@ fn router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/app.css", get(styles))
         .route("/app.js", get(script))
+        .route("/assets/claude.png", get(claude_icon))
+        .route("/assets/codex.png", get(codex_icon))
         .route("/api/v1/health", get(health))
         .route("/api/v1/bootstrap", post(bootstrap))
         .route("/api/v1/snapshot", get(snapshot))
@@ -256,6 +268,14 @@ async fn script() -> Response {
     static_response("text/javascript; charset=utf-8", APP_JS)
 }
 
+async fn claude_icon() -> Response {
+    static_binary_response("image/png", CLAUDE_ICON)
+}
+
+async fn codex_icon() -> Response {
+    static_binary_response("image/png", CODEX_ICON)
+}
+
 fn static_response(content_type: &'static str, body: &'static str) -> Response {
     (
         [
@@ -263,6 +283,17 @@ fn static_response(content_type: &'static str, body: &'static str) -> Response {
             (CACHE_CONTROL, HeaderValue::from_static("no-store")),
         ],
         body,
+    )
+        .into_response()
+}
+
+fn static_binary_response(content_type: &'static str, body: &'static [u8]) -> Response {
+    (
+        [
+            (CONTENT_TYPE, HeaderValue::from_static(content_type)),
+            (CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        Body::from(body),
     )
         .into_response()
 }
@@ -545,7 +576,7 @@ impl Default for UiSettings {
                 claude: false,
                 codex: false,
             },
-            codex_enhanced_activity: false,
+            codex_enhanced_activity: true,
             retention_days: 90,
         }
     }
@@ -700,11 +731,17 @@ async fn change_claude_bridge(
     if !authorized_mutation(&state, &headers) {
         return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_MUTATION");
     }
-    if request.action == "install" && !provider_cli_available(HookProvider::Claude) {
+    if matches!(request.action.as_str(), "install" | "wrap")
+        && !provider_cli_available(HookProvider::Claude)
+    {
         return api_error(StatusCode::CONFLICT, "PROVIDER_CLI_MISSING");
     }
     let result = match request.action.as_str() {
         "install" => state.installer.install_claude_statusline().map(|_| ()),
+        "wrap" => state
+            .installer
+            .install_claude_statusline_wrapper()
+            .map(|_| ()),
         "uninstall" => state.installer.uninstall_claude_statusline().map(|_| ()),
         _ => return api_error(StatusCode::BAD_REQUEST, "UNKNOWN_BRIDGE_ACTION"),
     };
@@ -868,6 +905,7 @@ fn invalidate_quota(state: &AppState) {
     if let Ok(mut quota) = state.quota.lock() {
         quota.entries.clear();
         quota.refreshed_at = None;
+        quota.claude_cache_modified_at = None;
     }
 }
 
@@ -1080,7 +1118,24 @@ async fn websocket_loop(mut socket: WebSocket, state: AppState) {
 }
 
 fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
-    let snapshot = state.store.snapshot()?;
+    let now = now_millis();
+    reconcile_sessions_if_due(state, now)?;
+    let mut snapshot = state.store.snapshot()?;
+    let visible_attention_sessions = snapshot
+        .attention
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.state.as_str(),
+                "open" | "committing" | "decision_sent" | "snoozed"
+            )
+        })
+        .map(|item| item.session_id.as_str())
+        .collect::<HashSet<_>>();
+    let cutoff = now.saturating_sub(SESSION_LIST_RETENTION_MS);
+    snapshot.sessions.retain(|session| {
+        session.last_event_at >= cutoff || visible_attention_sessions.contains(session.id.as_str())
+    });
     let quota = quota_entries(state)?;
     Ok(json!({
         "sessions": snapshot.sessions,
@@ -1094,17 +1149,44 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
     }))
 }
 
+fn reconcile_sessions_if_due(state: &AppState, now: u64) -> Result<(), StoreError> {
+    let should_sweep = {
+        let mut last = state
+            .session_sweep
+            .lock()
+            .map_err(|_| StoreError::Storage("session sweep lock is poisoned".to_owned()))?;
+        if last.is_some_and(|instant| instant.elapsed() < SESSION_SWEEP_INTERVAL) {
+            false
+        } else {
+            *last = Some(Instant::now());
+            true
+        }
+    };
+    if should_sweep {
+        state
+            .store
+            .reconcile_session_liveness(Vec::new(), now, SESSION_LIST_RETENTION_MS)?;
+    }
+    Ok(())
+}
+
 fn quota_entries(state: &AppState) -> Result<Vec<QuotaEntry>, StoreError> {
     let mut quota = state
         .quota
         .lock()
         .map_err(|_| StoreError::Storage("quota collector lock is poisoned".to_owned()))?;
-    let refresh = quota
-        .refreshed_at
-        .is_none_or(|instant| instant.elapsed() >= state.quota_poll_interval);
+    let claude_cache_modified_at = fs::metadata(quota.collector.paths().claude_cache())
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    let claude_cache_changed = claude_cache_modified_at != quota.claude_cache_modified_at;
+    let refresh = claude_cache_changed
+        || quota
+            .refreshed_at
+            .is_none_or(|instant| instant.elapsed() >= state.quota_poll_interval);
     if refresh {
         quota.entries = quota.collector.collect(now_millis());
         quota.refreshed_at = Some(Instant::now());
+        quota.claude_cache_modified_at = claude_cache_modified_at;
         let persisted = quota
             .entries
             .iter()
@@ -1273,7 +1355,9 @@ mod tests {
                 collector: QuotaCollector::new(quota_paths),
                 entries: Vec::new(),
                 refreshed_at: None,
+                claude_cache_modified_at: None,
             })),
+            session_sweep: Arc::new(Mutex::new(None)),
             data_paths: DataPaths {
                 cache: root.join("flow-home/cache"),
                 spool: root.join("flow-home/spool"),
@@ -1413,6 +1497,105 @@ mod tests {
     }
 
     #[test]
+    fn agent_list_keeps_recent_and_attention_sessions_but_hides_older_idle_history() {
+        let root = std::env::temp_dir().join(format!(
+            "flow-agent-server-visible-sessions-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        let now = now_millis();
+        for (session, event, at) in [
+            (
+                "old-idle",
+                json!({"hook_event_name":"SessionStart","session_id":"old-idle"}),
+                now.saturating_sub(31 * 60 * 1_000),
+            ),
+            (
+                "recent-idle",
+                json!({"hook_event_name":"SessionStart","session_id":"recent-idle"}),
+                now.saturating_sub(29 * 60 * 1_000),
+            ),
+            (
+                "old-attention",
+                json!({
+                    "hook_event_name":"PermissionRequest",
+                    "session_id":"old-attention",
+                    "tool_name":"Bash",
+                    "tool_input":{"command":"cargo test"}
+                }),
+                now.saturating_sub(31 * 60 * 1_000),
+            ),
+        ] {
+            let request = flow_agent_core::BridgeRequest::from_hook_at(
+                flow_agent_core::Provider::Claude,
+                event,
+                at,
+            );
+            store
+                .ingest(request)
+                .unwrap_or_else(|error| panic!("failed to ingest {session}: {error}"));
+        }
+
+        let value = snapshot_value(&state).unwrap();
+        let sessions = value["sessions"].as_array().unwrap();
+        let provider_ids = sessions
+            .iter()
+            .filter_map(|session| session["providerSessionId"].as_str())
+            .collect::<HashSet<_>>();
+        assert!(!provider_ids.contains("old-idle"));
+        assert!(provider_ids.contains("recent-idle"));
+        assert!(provider_ids.contains("old-attention"));
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn new_claude_cache_refreshes_immediately_after_an_unavailable_snapshot() {
+        let root = std::env::temp_dir().join(format!(
+            "flow-agent-server-quota-cache-refresh-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+
+        let before = snapshot_value(&state).unwrap();
+        assert!(before["quota"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["provider"] == "claude")
+            .all(|entry| entry["status"] == "unavailable"));
+
+        let cache = state.quota.lock().unwrap().collector.paths().claude_cache();
+        flow_agent_quota::capture_claude_statusline(
+            br#"{"rate_limits":{"five_hour":{"used_percentage":2,"resets_at":1784193000},"seven_day":{"used_percentage":0,"resets_at":1784563200}}}"#,
+            &cache,
+            now_millis(),
+        )
+        .unwrap();
+
+        let after = snapshot_value(&state).unwrap();
+        let claude = after["quota"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["provider"] == "claude")
+            .collect::<Vec<_>>();
+        assert_eq!(claude.len(), 2);
+        assert!(claude.iter().all(|entry| entry["status"] == "available"));
+        assert_eq!(claude[0]["usedPct"], 2.0);
+        assert_eq!(claude[1]["usedPct"], 0.0);
+
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn m4_settings_quota_export_and_clear_follow_the_authenticated_ui_path() {
         let root = std::env::temp_dir().join(format!(
             "flow-agent-server-m4-{}-{}",
@@ -1510,6 +1693,26 @@ mod tests {
                 serde_json::from_slice::<Value>(&fs::read(&claude_settings).unwrap()).unwrap()
                     ["keep"],
                 true
+            );
+
+            let wrapped = app
+                .clone()
+                .oneshot(authorized_request(
+                    "POST",
+                    "/api/v1/quota/claude-bridge",
+                    json!({"action":"wrap"}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(wrapped.status(), StatusCode::OK);
+            let wrapped = json_body(wrapped).await;
+            assert_eq!(wrapped["claudeQuotaBridge"]["status"], "installed");
+            let wrapped_settings =
+                serde_json::from_slice::<Value>(&fs::read(&claude_settings).unwrap()).unwrap();
+            assert_eq!(wrapped_settings["keep"], true);
+            assert_eq!(
+                wrapped_settings["_flowAgentOriginalStatusLine"]["command"],
+                "~/.claude/custom.sh"
             );
 
             let exported = app

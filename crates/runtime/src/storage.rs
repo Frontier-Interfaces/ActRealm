@@ -17,7 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+const MAX_TASK_TITLE_CHARS: usize = 64;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum StoreError {
@@ -151,10 +152,12 @@ pub struct SessionRecord {
     pub provider: String,
     pub provider_session_id: String,
     pub project: Option<String>,
+    pub title: Option<String>,
     pub model: Option<String>,
     pub exec_state: String,
     pub approval_owner: Option<String>,
     pub activity: Option<String>,
+    pub activity_since: Option<u64>,
     pub plan_done: Option<u32>,
     pub plan_total: Option<u32>,
     pub last_event_at: u64,
@@ -1062,7 +1065,7 @@ fn initialize(connection: &Connection) -> Result<(), StoreError> {
               id TEXT PRIMARY KEY,
               provider TEXT NOT NULL,
               provider_session_id TEXT NOT NULL,
-              cwd TEXT, project TEXT, model TEXT, permission_mode TEXT,
+              cwd TEXT, project TEXT, title TEXT, model TEXT, permission_mode TEXT,
               term_app TEXT, term_session_id TEXT, term_tty TEXT, term_title TEXT,
               exec_state TEXT NOT NULL DEFAULT 'idle',
               approval_owner TEXT, activity TEXT, activity_since INTEGER,
@@ -1157,9 +1160,27 @@ fn initialize(connection: &Connection) -> Result<(), StoreError> {
             "#,
         )
         .map_err(storage_error)?;
+    ensure_session_title_column(connection)?;
     connection
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(storage_error)?;
+    Ok(())
+}
+
+fn ensure_session_title_column(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(sessions)")
+        .map_err(storage_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    if !columns.iter().any(|column| column == "title") {
+        connection
+            .execute("ALTER TABLE sessions ADD COLUMN title TEXT", [])
+            .map_err(storage_error)?;
+    }
     Ok(())
 }
 
@@ -1190,6 +1211,7 @@ fn ingest_transaction(
     }
 
     let occurred_at = to_i64(request.received_at);
+    let task_title = task_title(&request.raw, parsed.kind);
     let provider = request.provider.to_string();
     let existing = transaction
         .query_row(
@@ -1216,16 +1238,17 @@ fn ingest_transaction(
         transaction
             .execute(
                 "INSERT INTO sessions (
-                   id, provider, provider_session_id, cwd, project, model,
+                   id, provider, provider_session_id, cwd, project, title, model,
                    permission_mode, term_app, term_session_id, term_tty, term_title,
                    exec_state, started_at, last_event_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'idle', ?12, ?12)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'idle', ?13, ?13)",
                 params![
                     session_id,
                     provider,
                     parsed.provider_session_id,
                     cwd,
                     project,
+                    task_title.as_deref(),
                     parsed.model,
                     parsed.permission_mode,
                     request.term.as_ref().and_then(|value| value.app.as_deref()),
@@ -1405,6 +1428,7 @@ fn ingest_transaction(
                    activity_since = ?5, last_event_at = ?5,
                    plan_done = COALESCE(?7, plan_done),
                    plan_total = COALESCE(?8, plan_total),
+                   title = COALESCE(?9, title),
                    ended_at = CASE WHEN ?6 = 1 THEN ?5 ELSE ended_at END
                  WHERE id = ?1",
                 params![
@@ -1416,6 +1440,7 @@ fn ingest_transaction(
                     i64::from(parsed.kind == EventKind::SessionEnded),
                     plan_progress.map(|(done, _)| i64::from(done)),
                     plan_progress.map(|(_, total)| i64::from(total)),
+                    task_title.as_deref(),
                 ],
             )
             .map_err(storage_error)?;
@@ -1934,9 +1959,9 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
     let sessions = {
         let mut statement = connection
             .prepare(
-                "SELECT id, provider, provider_session_id, project, model,
-                        exec_state, approval_owner, activity, plan_done,
-                        plan_total, last_event_at
+                "SELECT id, provider, provider_session_id, project, title, model,
+                        exec_state, approval_owner, activity, activity_since,
+                        plan_done, plan_total, last_event_at
                  FROM sessions ORDER BY last_event_at DESC",
             )
             .map_err(storage_error)?;
@@ -1947,17 +1972,19 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
                     provider: row.get(1)?,
                     provider_session_id: row.get(2)?,
                     project: row.get(3)?,
-                    model: row.get(4)?,
-                    exec_state: row.get(5)?,
-                    approval_owner: row.get(6)?,
-                    activity: row.get(7)?,
+                    title: row.get(4)?,
+                    model: row.get(5)?,
+                    exec_state: row.get(6)?,
+                    approval_owner: row.get(7)?,
+                    activity: row.get(8)?,
+                    activity_since: row.get::<_, Option<i64>>(9)?.map(from_i64),
                     plan_done: row
-                        .get::<_, Option<i64>>(8)?
+                        .get::<_, Option<i64>>(10)?
                         .and_then(|value| u32::try_from(value).ok()),
                     plan_total: row
-                        .get::<_, Option<i64>>(9)?
+                        .get::<_, Option<i64>>(11)?
                         .and_then(|value| u32::try_from(value).ok()),
-                    last_event_at: from_i64(row.get(10)?),
+                    last_event_at: from_i64(row.get(12)?),
                 })
             })
             .map_err(storage_error)?
@@ -2496,6 +2523,33 @@ fn has_background_work(raw: &Value) -> bool {
             .and_then(Value::as_array)
             .is_some_and(|items| !items.is_empty())
     })
+}
+
+fn task_title(raw: &Value, kind: EventKind) -> Option<String> {
+    if kind != EventKind::PromptSubmitted {
+        return None;
+    }
+    let prompt = raw
+        .get("prompt")
+        .or_else(|| raw.get("user_prompt"))
+        .and_then(Value::as_str)?;
+    let normalized = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    let sentence = normalized
+        .split_inclusive(['。', '！', '？', '.', '!', '?'])
+        .next()
+        .unwrap_or(&normalized)
+        .trim();
+    let mut title = sentence
+        .chars()
+        .take(MAX_TASK_TITLE_CHARS)
+        .collect::<String>();
+    if sentence.chars().count() > MAX_TASK_TITLE_CHARS {
+        title.push('…');
+    }
+    (!title.is_empty()).then_some(title)
 }
 
 fn project_event<'a>(

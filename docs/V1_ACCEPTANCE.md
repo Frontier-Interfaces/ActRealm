@@ -80,13 +80,32 @@ not weaken or replace the full plan.
 
 ### M4 - quota, settings, and P1
 
-- [x] Claude quota bridge never replaces an existing custom status line.
+- [x] Claude quota bridge never silently replaces an existing custom status
+      line; explicit wrapper mode preserves its visible output and restores
+      the complete original object on uninstall.
 - [x] Codex rollout parsing is isolated, version-gated, and read-only.
 - [x] Missing, stale, or incompatible quota data renders an honest unavailable
       state without percentages.
 - [x] Notification, retention, export, and destructive-clear settings work.
 - [x] Gemini round-level observation is intentionally not shipped in v1; it
       remains optional P1 and did not block either P0 provider.
+
+### v1.1 user-functional corrections
+
+- [x] Quota renders exactly Claude 5h, Claude 7d, and Codex week.
+- [x] Codex desktop 0.144.2, CLI 0.144.4, and CLI 0.144.5 quota schemas are
+      separately fixture-gated.
+- [x] A Claude cache created after an unavailable snapshot refreshes
+      immediately instead of waiting for the normal five-minute poll.
+- [x] Current-task titles are bounded, migrated safely, and never replaced by
+      a username or project placeholder.
+- [x] Agent rows expose factual live elapsed/tool/waiting state.
+- [x] The main list keeps active, attention-bearing, and last-30-minute
+      sessions only.
+- [x] Selecting an attention item selects, pins, highlights, and reveals its
+      corresponding Agent session.
+- [x] Claude and Codex use locally served image marks in onboarding, attention,
+      and session rows; third-party asset attribution is included.
 
 ### M5 - release evidence
 

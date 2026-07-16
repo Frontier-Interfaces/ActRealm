@@ -4,6 +4,9 @@ Local-first attention surface for coding agents.
 
 中文用户请从 [Flow Agent v1 中文使用教程](docs/USER_GUIDE_zh-CN.md) 开始。
 
+Third-party asset attribution is recorded in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 The repository is an M5 release candidate under strict v1 verification. It
 provides the fail-open Hook
 bridge, persistent single-instance Runtime, authenticated localhost control
@@ -47,13 +50,24 @@ The onboarding UI uses the same installer implementation. It does not show
 "connected" until a real provider event arrives after installation. Doctor and
 automated tests do not modify the user's real Claude or Codex configuration.
 
-The settings panel can opt into the Claude status-line quota bridge. Flow Agent
-refuses to replace any existing custom `statusLine`. Codex quota parsing is
-read-only, accepts only the fixture-verified 0.144.4 rollout schema, and renders
-unknown, missing, or data older than 30 minutes as unavailable without a
-percentage. Local export contains the sanitized SQLite tables; destructive
-clear requires the exact confirmation `DELETE` and preserves Hook integration
-and backups.
+The settings panel can opt into the Claude status-line quota bridge. A custom
+`statusLine` is never silently replaced: the explicit **keep existing and
+enable** action stores the complete original object, delegates visible output
+to it, captures only the bounded quota fields, and restores it verbatim on
+uninstall. A newly created Claude cache invalidates an earlier unavailable
+snapshot immediately. Codex quota parsing is read-only and currently accepts
+only the fixture-verified 0.144.2 desktop, 0.144.4, and 0.144.5 rollout
+families. The UI always renders
+the three factual slots Claude 5h, Claude 7d, and Codex week; unknown, missing,
+or data older than 30 minutes remains unavailable without an invented
+percentage.
+
+Agent sessions are titled from a privacy-bounded current-task summary, show a
+live activity timer/tool state, and stay in the main list only while active,
+waiting for attention, or seen in the last 30 minutes. Selecting an attention
+item pins and highlights its corresponding session. Local export contains the
+sanitized SQLite tables; destructive clear requires the exact confirmation
+`DELETE` and preserves Hook integration and backups.
 
 Aggregate metrics never leave the machine automatically. `export-metrics`
 creates a separate metrics-only JSON file containing daily counters and their
@@ -82,6 +96,7 @@ flow-agent diagnostics clear
 - [M3 verification record](docs/M3_VERIFICATION.md)
 - [M4 verification record](docs/M4_VERIFICATION.md)
 - [M5 verification record](docs/M5_VERIFICATION.md)
+- [v1.1 functional-correction record](docs/V1_1_FUNCTIONAL_CORRECTIONS.md)
 
 ## Local quality gate
 

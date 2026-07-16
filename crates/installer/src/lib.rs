@@ -14,6 +14,7 @@ use toml_edit::DocumentMut;
 
 const CONFIG_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
 const STATE_SCHEMA_VERSION: u32 = 1;
+const CLAUDE_ORIGINAL_STATUSLINE_KEY: &str = "_flowAgentOriginalStatusLine";
 static UNIQUE_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 const CLAUDE_EVENTS: &[&str] = &[
@@ -111,6 +112,10 @@ impl InstallPaths {
 
     pub fn statusline_helper(&self) -> PathBuf {
         self.flow_home.join("bin/statusline")
+    }
+
+    pub fn statusline_delegate(&self) -> PathBuf {
+        self.flow_home.join("bin/statusline-delegate")
     }
 
     pub fn state_file(&self) -> PathBuf {
@@ -245,6 +250,8 @@ pub enum InstallerError {
     CodexInlineHooksConflict { events: Vec<String> },
     #[error("Claude already has a custom statusLine; Flow Agent will not replace it")]
     ClaudeStatuslineConflict,
+    #[error("Claude custom statusLine has no command that Flow Agent can preserve")]
+    ClaudeStatuslineNotWrappable,
     #[error("installer lock failed: {0}")]
     Lock(io::Error),
     #[error("I/O failed for {path}: {source}")]
@@ -394,8 +401,14 @@ impl Installer {
                 if configured.is_none() {
                     ClaudeStatuslineStatus::NotInstalled
                 } else if configured == Some(&self.managed_statusline_value()) {
+                    let wrapper_mode = config
+                        .as_ref()
+                        .is_some_and(|value| value.get(CLAUDE_ORIGINAL_STATUSLINE_KEY).is_some());
                     if inspect_binary(&helper_path)? == BinaryHealth::Executable
                         && inspect_binary(&self.paths.stable_binary())? == BinaryHealth::Executable
+                        && (!wrapper_mode
+                            || inspect_binary(&self.paths.statusline_delegate())?
+                                == BinaryHealth::Executable)
                     {
                         ClaudeStatuslineStatus::Installed
                     } else {
@@ -457,6 +470,68 @@ impl Installer {
         })
     }
 
+    pub fn install_claude_statusline_wrapper(&self) -> Result<InstallReport, InstallerError> {
+        let _lock = InstallLock::acquire(&self.paths.flow_home)?;
+        self.validate_source_binary()?;
+        let config_path = self.paths.claude_settings.clone();
+        let (original, existed) = self.load_provider_json(&config_path)?;
+        let original_statusline = original
+            .get("statusLine")
+            .filter(|value| *value != &self.managed_statusline_value())
+            .cloned()
+            .ok_or(InstallerError::ClaudeStatuslineNotWrappable)?;
+        let original_command = original_statusline
+            .get("command")
+            .and_then(Value::as_str)
+            .filter(|command| !command.trim().is_empty())
+            .ok_or(InstallerError::ClaudeStatuslineNotWrappable)?
+            .to_owned();
+
+        let mut updated = original.clone();
+        let object = updated
+            .as_object_mut()
+            .expect("validated provider configuration");
+        object.insert(
+            CLAUDE_ORIGINAL_STATUSLINE_KEY.to_owned(),
+            original_statusline,
+        );
+        object.insert("statusLine".to_owned(), self.managed_statusline_value());
+        let config_changed = updated != original;
+        let backup_path = if config_changed && existed {
+            Some(self.backup_file(&config_path)?)
+        } else {
+            None
+        };
+        let binary_changed = self.install_stable_binary()?;
+        let delegate = format!(
+            "#!/bin/sh\n# Original Claude statusLine preserved by Flow Agent.\n{original_command}\n"
+        );
+        atomic_write(
+            &self.paths.statusline_delegate(),
+            delegate.as_bytes(),
+            0o700,
+        )?;
+        let wrapper = format!(
+            "#!/bin/sh\ninput=$(cat)\nprintf '%s' \"$input\" | {} statusline >/dev/null 2>&1\nprintf '%s' \"$input\" | {}\n",
+            shell_quote(&self.paths.stable_binary()),
+            shell_quote(&self.paths.statusline_delegate()),
+        );
+        atomic_write(&self.paths.statusline_helper(), wrapper.as_bytes(), 0o700)?;
+        if config_changed {
+            atomic_write_json(&config_path, &updated, 0o600)?;
+        }
+        Ok(InstallReport {
+            provider: HookProvider::Claude,
+            intent: InstallIntent::Installed,
+            config_path,
+            stable_binary: self.paths.statusline_helper(),
+            config_changed,
+            binary_changed,
+            backup_path,
+            definition_hash: None,
+        })
+    }
+
     pub fn uninstall_claude_statusline(&self) -> Result<InstallReport, InstallerError> {
         let _lock = InstallLock::acquire(&self.paths.flow_home)?;
         let config_path = self.paths.claude_settings.clone();
@@ -464,10 +539,14 @@ impl Installer {
         let mut updated = original.clone();
         let owns_entry = original.get("statusLine") == Some(&self.managed_statusline_value());
         if owns_entry {
-            updated
+            let object = updated
                 .as_object_mut()
-                .expect("validated provider configuration")
-                .remove("statusLine");
+                .expect("validated provider configuration");
+            if let Some(saved) = object.remove(CLAUDE_ORIGINAL_STATUSLINE_KEY) {
+                object.insert("statusLine".to_owned(), saved);
+            } else {
+                object.remove("statusLine");
+            }
         }
         let config_changed = existed && updated != original;
         let backup_path = if config_changed {
@@ -481,6 +560,7 @@ impl Installer {
         let mut binary_changed = false;
         if owns_entry {
             binary_changed |= remove_regular_file(&self.paths.statusline_helper())?;
+            binary_changed |= remove_regular_file(&self.paths.statusline_delegate())?;
             let state = self.load_state()?;
             let hooks_installed = state
                 .providers

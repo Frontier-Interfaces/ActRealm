@@ -16,7 +16,7 @@ intentionally not shipped in v1; it did not delay either P0 provider.
   confirms `rate_limits.five_hour` and `rate_limits.seven_day`, their
   `used_percentage` and `resets_at` fields, optional presence, and stdin/stdout
   execution model. The live development CLI remains Claude Code `2.1.210`.
-- The current local Codex CLI is `0.144.4`. A keys-only inspection of sanitized
+- At the original M4 gate the local Codex CLI was `0.144.4`. A keys-only inspection of sanitized
   rollout records confirmed `session_meta.payload.cli_version` and
   `event_msg.payload.type=token_count` with `rate_limits.primary/secondary`.
   The adapter only parses those records, scans a bounded tail, and never
@@ -27,9 +27,8 @@ intentionally not shipped in v1; it did not delay either P0 provider.
 - Open Vibe Island revision `6e5e7a6a5b5097ee627a7d4dea6226c128747a71`
   and CodeIsland revision `3e2aec7fa87c56b0f5129d7ba11d0dc3699dd500`
   remain architecture and failure-mode references only. No GPL source was
-  copied. The accepted lesson is preserved: an existing custom status line is
-  never overwritten, and a missing bridge/cache is a visible unavailable
-  state.
+  copied. The original accepted lesson was that an existing custom status line
+  must never be overwritten and a missing bridge/cache must be visible.
 
 ## Quota truth boundary
 
@@ -41,7 +40,7 @@ intentionally not shipped in v1; it did not delay either P0 provider.
   semantic JSON merge, same-directory temporary file, fsync, atomic rename,
   symlink refusal, stable binary, and mode preservation. A custom `statusLine`
   returns a conflict before any binary, backup, or config mutation.
-- Codex accepts only the fixture-gated `0.144.4` rollout family. It reads at
+- At the original gate Codex accepted only the fixture-gated `0.144.4` rollout family. It reads at
   most 128 KiB for session metadata and a 2 MiB file tail for token-count
   records. Unknown versions, changed schema, missing/null limits, missing
   files, parse errors, and data older than 30 minutes render without a
@@ -90,6 +89,31 @@ M3. Per the browser skill, no standalone automation was substituted. An
 isolated Runtime under `/tmp/fa-m4-visual-*` opened the exact page in the
 default browser for human review. The user accepted both the quota view and the
 settings overlay at 1600x600 on 2026-07-16.
+
+## 2026-07-16 user-functional amendment
+
+The original M4 record above remains historical evidence. A later user review
+identified two real compatibility gaps and required a stricter display
+contract:
+
+- Open Vibe Island's later custom-status-line wrapper pattern was adopted
+  without copying GPL source. Explicit wrapper mode stores the original
+  `statusLine` object under a private managed key, preserves its stdout through
+  a delegate, captures quota through the stable binary, and restores the
+  original object verbatim on uninstall. The normal install path still refuses
+  custom configuration unless the user explicitly chooses wrapper mode.
+- Separately sanitized `0.144.2` desktop and `0.144.5` CLI Codex fixtures were
+  added. The adapter now accepts only `0.144.2`, `0.144.4`, and `0.144.5`, and
+  projects only the 10080-minute weekly window.
+- A Claude cache appearing after the bridge is enabled now invalidates the
+  earlier unavailable snapshot immediately while preserving the normal
+  five-minute periodic poll.
+- The quota UI now has exactly three independent slots: Claude 5h, Claude 7d,
+  and Codex week. Missing one slot cannot make another slot stand in for it.
+
+The new wrapper, restore, version, privacy, and unavailable-slot cases are
+covered by the post-candidate correction gate in
+`V1_1_FUNCTIONAL_CORRECTIONS.md`.
 
 ## Remaining gate
 

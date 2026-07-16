@@ -49,6 +49,99 @@ fn request_at(
 }
 
 #[test]
+fn existing_v1_database_adds_task_titles_without_losing_sessions() {
+    let root = temp_root("schema-v2-title");
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("data.sqlite");
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE sessions (
+               id TEXT PRIMARY KEY, provider TEXT NOT NULL,
+               provider_session_id TEXT NOT NULL,
+               cwd TEXT, project TEXT, model TEXT, permission_mode TEXT,
+               term_app TEXT, term_session_id TEXT, term_tty TEXT, term_title TEXT,
+               exec_state TEXT NOT NULL DEFAULT 'idle',
+               approval_owner TEXT, activity TEXT, activity_since INTEGER,
+               plan_done INTEGER, plan_total INTEGER,
+               started_at INTEGER NOT NULL, last_event_at INTEGER NOT NULL,
+               ended_at INTEGER,
+               UNIQUE(provider, provider_session_id)
+             );
+             INSERT INTO sessions(
+               id, provider, provider_session_id, exec_state, started_at, last_event_at
+             ) VALUES ('old-id', 'claude', 'old-session', 'idle', 1, 1);
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = RuntimeStore::open(&database).unwrap();
+    let before = store.snapshot().unwrap();
+    assert_eq!(before.sessions.len(), 1);
+    assert_eq!(before.sessions[0].title, None);
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"UserPromptSubmit",
+                "session_id":"old-session",
+                "prompt":"迁移后显示当前任务标题"
+            }),
+            2,
+        ))
+        .unwrap();
+    assert_eq!(
+        store.snapshot().unwrap().sessions[0].title.as_deref(),
+        Some("迁移后显示当前任务标题")
+    );
+    drop(store);
+    let connection = Connection::open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    drop(connection);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn current_task_title_is_a_bounded_prompt_summary_with_live_activity_time() {
+    let root = temp_root("task-title");
+    let database = root.join("data.sqlite");
+    let store = RuntimeStore::open(&database).unwrap();
+    let private_tail = "PRIVATE_TAIL_MUST_NOT_BE_PERSISTED";
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"UserPromptSubmit",
+                "session_id":"title-session",
+                "cwd":"/tmp/example-project",
+                "prompt":format!(
+                    "修复额度、实时进程和任务列表，并保证标题来自当前任务而不是用户名，继续补充足够长的说明 {private_tail}"
+                )
+            }),
+            9_000,
+        ))
+        .unwrap();
+
+    let snapshot = store.snapshot().unwrap();
+    assert!(!serde_json::to_string(&snapshot)
+        .unwrap()
+        .contains(private_tail));
+    let session = snapshot.sessions[0].clone();
+    let title = session.title.unwrap();
+    assert!(title.starts_with("修复额度、实时进程和任务列表"));
+    assert!(title.chars().count() <= 65);
+    assert_eq!(session.activity_since, Some(9_000));
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn versioned_fixtures_replay_idempotently_into_wal() {
     let root = temp_root("fixtures");
     let database = root.join("data.sqlite");

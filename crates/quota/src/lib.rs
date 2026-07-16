@@ -14,7 +14,7 @@ use thiserror::Error;
 const CACHE_SCHEMA_VERSION: u32 = 1;
 const CLAUDE_SOURCE: &str = "statusline";
 const CODEX_SOURCE: &str = "rollout_experimental";
-const SUPPORTED_CODEX_VERSIONS: &[&str] = &["0.144.4"];
+const SUPPORTED_CODEX_VERSIONS: &[&str] = &["0.144.2", "0.144.4", "0.144.5"];
 const FRESH_FOR_MS: u64 = 30 * 60 * 1_000;
 const MAX_CLOCK_SKEW_MS: u64 = 5 * 60 * 1_000;
 const MAX_STATUSLINE_BYTES: u64 = 256 * 1_024;
@@ -77,10 +77,10 @@ impl QuotaEntry {
         }
     }
 
-    fn unavailable(provider: &str, source: &str, reason: impl Into<String>) -> Self {
+    fn unavailable(provider: &str, window: &str, source: &str, reason: impl Into<String>) -> Self {
         Self {
             provider: provider.to_owned(),
-            window: "额度".to_owned(),
+            window: window.to_owned(),
             status: "unavailable".to_owned(),
             used_pct: None,
             remaining_pct: None,
@@ -91,11 +91,11 @@ impl QuotaEntry {
         }
     }
 
-    fn stale(provider: &str, source: &str, captured_at: u64, now_ms: u64) -> Self {
+    fn stale(provider: &str, window: &str, source: &str, captured_at: u64, now_ms: u64) -> Self {
         let minutes = now_ms.saturating_sub(captured_at) / 60_000;
         Self {
             provider: provider.to_owned(),
-            window: "额度".to_owned(),
+            window: window.to_owned(),
             status: "stale".to_owned(),
             used_pct: None,
             remaining_pct: None,
@@ -160,18 +160,20 @@ impl QuotaCollector {
         let bytes = match read_bounded(&path, MAX_STATUSLINE_BYTES) {
             Ok(bytes) => bytes,
             Err(QuotaError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-                return vec![QuotaEntry::unavailable(
+                return unavailable_windows(
                     "claude",
                     CLAUDE_SOURCE,
+                    &["5h", "7d"],
                     "额度缓存不存在；请开启 Claude 额度桥并完成一次对话",
-                )]
+                )
             }
             Err(error) => {
-                return vec![QuotaEntry::unavailable(
+                return unavailable_windows(
                     "claude",
                     CLAUDE_SOURCE,
+                    &["5h", "7d"],
                     format!("额度缓存不可读：{error}"),
-                )]
+                )
             }
         };
         let cache = match serde_json::from_slice::<CacheDocument>(&bytes) {
@@ -183,64 +185,70 @@ impl QuotaCollector {
                 cache
             }
             Ok(_) => {
-                return vec![QuotaEntry::unavailable(
+                return unavailable_windows(
                     "claude",
                     CLAUDE_SOURCE,
+                    &["5h", "7d"],
                     "额度缓存版本不兼容",
-                )]
+                )
             }
             Err(_) => {
-                return vec![QuotaEntry::unavailable(
+                return unavailable_windows(
                     "claude",
                     CLAUDE_SOURCE,
+                    &["5h", "7d"],
                     "额度缓存解析失败",
-                )]
+                )
             }
         };
         if cache.captured_at > now_ms.saturating_add(MAX_CLOCK_SKEW_MS) {
-            return vec![QuotaEntry::unavailable(
+            return unavailable_windows(
                 "claude",
                 CLAUDE_SOURCE,
+                &["5h", "7d"],
                 "额度缓存时间晚于本机时间",
-            )];
+            );
         }
         if now_ms.saturating_sub(cache.captured_at) > FRESH_FOR_MS {
-            return vec![QuotaEntry::stale(
-                "claude",
-                CLAUDE_SOURCE,
-                cache.captured_at,
-                now_ms,
-            )];
+            return ["5h", "7d"]
+                .into_iter()
+                .map(|window| {
+                    QuotaEntry::stale("claude", window, CLAUDE_SOURCE, cache.captured_at, now_ms)
+                })
+                .collect();
         }
-        let entries = cache
-            .windows
+        ["5h", "7d"]
             .into_iter()
-            .filter(|window| {
-                matches!(window.window.as_str(), "5h" | "7d")
-                    && window.used_pct.is_finite()
-                    && (0.0..=100.0).contains(&window.used_pct)
-                    && window.resets_at > 0
+            .map(|expected| {
+                cache
+                    .windows
+                    .iter()
+                    .find(|window| {
+                        window.window == expected
+                            && window.used_pct.is_finite()
+                            && (0.0..=100.0).contains(&window.used_pct)
+                            && window.resets_at > 0
+                    })
+                    .map(|window| {
+                        QuotaEntry::available(
+                            "claude",
+                            expected,
+                            window.used_pct,
+                            window.resets_at,
+                            CLAUDE_SOURCE,
+                            cache.captured_at,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        QuotaEntry::unavailable(
+                            "claude",
+                            expected,
+                            CLAUDE_SOURCE,
+                            "额度缓存没有这个窗口",
+                        )
+                    })
             })
-            .map(|window| {
-                QuotaEntry::available(
-                    "claude",
-                    window.window,
-                    window.used_pct,
-                    window.resets_at,
-                    CLAUDE_SOURCE,
-                    cache.captured_at,
-                )
-            })
-            .collect::<Vec<_>>();
-        if entries.is_empty() {
-            vec![QuotaEntry::unavailable(
-                "claude",
-                CLAUDE_SOURCE,
-                "额度缓存没有可识别窗口",
-            )]
-        } else {
-            entries
-        }
+            .collect()
     }
 
     pub fn collect_codex(&self, now_ms: u64) -> Vec<QuotaEntry> {
@@ -250,6 +258,7 @@ impl QuotaCollector {
         let Some((path, modified_at)) = files.into_iter().next() else {
             return vec![QuotaEntry::unavailable(
                 "codex",
+                "week",
                 CODEX_SOURCE,
                 "未找到 Codex rollout 文件",
             )];
@@ -259,6 +268,7 @@ impl QuotaCollector {
             Ok(None) => {
                 return vec![QuotaEntry::unavailable(
                     "codex",
+                    "week",
                     CODEX_SOURCE,
                     "rollout 缺少版本信息",
                 )]
@@ -266,6 +276,7 @@ impl QuotaCollector {
             Err(_) => {
                 return vec![QuotaEntry::unavailable(
                     "codex",
+                    "week",
                     CODEX_SOURCE,
                     "rollout 无法读取",
                 )]
@@ -274,6 +285,7 @@ impl QuotaCollector {
         if !SUPPORTED_CODEX_VERSIONS.contains(&version.as_str()) {
             return vec![QuotaEntry::unavailable(
                 "codex",
+                "week",
                 CODEX_SOURCE,
                 format!("Codex {version} 的额度结构尚未验证"),
             )];
@@ -281,6 +293,7 @@ impl QuotaCollector {
         if modified_at > now_ms.saturating_add(MAX_CLOCK_SKEW_MS) {
             return vec![QuotaEntry::unavailable(
                 "codex",
+                "week",
                 CODEX_SOURCE,
                 "rollout 时间晚于本机时间",
             )];
@@ -288,6 +301,7 @@ impl QuotaCollector {
         if now_ms.saturating_sub(modified_at) > FRESH_FOR_MS {
             return vec![QuotaEntry::stale(
                 "codex",
+                "week",
                 CODEX_SOURCE,
                 modified_at,
                 now_ms,
@@ -297,16 +311,31 @@ impl QuotaCollector {
             Ok(entries) if !entries.is_empty() => entries,
             Ok(_) => vec![QuotaEntry::unavailable(
                 "codex",
+                "week",
                 CODEX_SOURCE,
                 "最新 rollout 没有可用的 rate_limits",
             )],
             Err(_) => vec![QuotaEntry::unavailable(
                 "codex",
+                "week",
                 CODEX_SOURCE,
                 "rollout 额度结构解析失败",
             )],
         }
     }
+}
+
+fn unavailable_windows(
+    provider: &str,
+    source: &str,
+    windows: &[&str],
+    reason: impl Into<String>,
+) -> Vec<QuotaEntry> {
+    let reason = reason.into();
+    windows
+        .iter()
+        .map(|window| QuotaEntry::unavailable(provider, window, source, reason.clone()))
+        .collect()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -526,14 +555,12 @@ fn read_codex_limits(path: &Path, captured_at: u64) -> Result<Vec<QuotaEntry>, Q
             {
                 continue;
             }
-            let name = match window.window_minutes {
-                300 => "5h".to_owned(),
-                10_080 => "7d".to_owned(),
-                minutes => format!("{minutes}m"),
-            };
+            if window.window_minutes != 10_080 {
+                continue;
+            }
             entries.push(QuotaEntry::available(
                 "codex",
-                name,
+                "week",
                 window.used_percent,
                 window.resets_at,
                 CODEX_SOURCE,
@@ -814,9 +841,9 @@ mod tests {
             codex_sessions: root.clone(),
         });
         let entries = collector.collect_codex(now);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].window, "5h");
-        assert_eq!(entries[1].remaining_pct, Some(56.0));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].window, "week");
+        assert_eq!(entries[0].remaining_pct, Some(56.0));
 
         write_rollout(&root, "0.145.0", "null");
         let incompatible = collector.collect_codex(now + 1);
@@ -851,9 +878,9 @@ mod tests {
             codex_sessions: root.clone(),
         })
         .collect_codex(captured_at);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].used_pct, Some(12.0));
-        assert_eq!(entries[1].window, "7d");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].used_pct, Some(44.0));
+        assert_eq!(entries[0].window, "week");
 
         let future = QuotaCollector::new(QuotaPaths {
             flow_home: root.join("future-flow"),
@@ -869,6 +896,64 @@ mod tests {
         .collect_codex(captured_at.saturating_sub(MAX_CLOCK_SKEW_MS + 1));
         assert_eq!(future[0].status, "unavailable");
         assert_eq!(future[0].remaining_pct, None);
+    }
+
+    #[test]
+    fn codex_0_144_5_weekly_fixture_matches_the_local_rollout_schema() {
+        let root = root("codex-0-144-5");
+        let directory = root.join("2026/07/16");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("rollout-fixture.jsonl");
+        fs::write(
+            &path,
+            include_bytes!("../../../fixtures/codex/0.144.5/rate-limits-rollout.jsonl"),
+        )
+        .unwrap();
+        let captured_at = fs::metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let entries = QuotaCollector::new(QuotaPaths {
+            flow_home: root.join("flow"),
+            codex_sessions: root.clone(),
+        })
+        .collect_codex(captured_at);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].window, "week");
+        assert_eq!(entries[0].used_pct, Some(8.0));
+        assert_eq!(entries[0].remaining_pct, Some(92.0));
+    }
+
+    #[test]
+    fn codex_0_144_2_desktop_fixture_matches_the_local_rollout_schema() {
+        let root = root("codex-0-144-2-desktop");
+        let directory = root.join("2026/07/16");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("rollout-fixture.jsonl");
+        fs::write(
+            &path,
+            include_bytes!("../../../fixtures/codex/0.144.2/rate-limits-rollout.jsonl"),
+        )
+        .unwrap();
+        let captured_at = fs::metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let entries = QuotaCollector::new(QuotaPaths {
+            flow_home: root.join("flow"),
+            codex_sessions: root.clone(),
+        })
+        .collect_codex(captured_at);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].window, "week");
+        assert_eq!(entries[0].used_pct, Some(49.0));
+        assert_eq!(entries[0].remaining_pct, Some(51.0));
     }
 
     #[test]

@@ -36,7 +36,8 @@ authority when a third-party example conflicts with them.
 | Codex compatibility | Feature keys and trust rules changed across releases | Write canonical `[features].hooks`, recognize legacy `codex_hooks`, report exact-command trust separately, and version-gate compatibility behavior. | M3 |
 | Diagnostics | “Connected/not connected” is not actionable | `doctor` returns structured issues: missing/not executable binary, malformed config, stale path, missing manifest, conflicting hooks, untrusted Codex hook, runtime/probe failure, and whether repair is safe. | M3 |
 | Terminal return | Jump-back needs more than `TERM_PROGRAM` | Capture only non-secret terminal identifiers needed for iTerm, Terminal, VS Code, tmux, kitty, WezTerm/Kaku, cmux, and zellij return paths. | M3/M4 |
-| Quota bridge | Replacing an existing status line breaks user setup | Never overwrite a custom status line; show quota as unavailable when a safe bridge cannot be installed. | M4 |
+| Quota bridge | Replacing an existing status line breaks user setup; later Open Vibe Island revisions safely delegate to it | Never silently overwrite. Default install refuses a conflict; explicit wrapper mode preserves visible output, stores the original object, and restores it verbatim on uninstall. | M4/v1.1 correction |
+| Provider identity | Letter monograms make concurrent Agent rows harder to scan | Use local Claude/Codex image marks in onboarding, attention, and session rows. The two optimized PNGs derive from CodeIsland's MIT assets and retain attribution; no Open Vibe Island GPL asset is copied. | v1.1 correction |
 | Diagnostics privacy | Raw hook logging can expose prompts, commands, paths, and tokens | No raw payload logging by default. Use redacted bounded diagnostics and an explicit short-lived diagnostic mode only. | M5 |
 
 ## Explicitly rejected patterns

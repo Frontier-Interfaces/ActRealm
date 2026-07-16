@@ -214,9 +214,18 @@ fn embedded_ui_contract_is_small_honest_and_complete() {
     }
     assert!(!APP_JS.contains("innerHTML"));
     assert!(!INDEX_HTML.contains('$'));
-    assert!(APP_JS.contains("暂无可靠额度数据"));
-    assert!(APP_JS.contains("不会用估算值冒充真实额度"));
+    assert!(APP_JS.contains("Claude · 5 小时"));
+    assert!(APP_JS.contains("Claude · 7 天"));
+    assert!(APP_JS.contains("Codex · 本周"));
+    assert!(APP_JS.contains("这个额度窗口暂时没有返回可验证数据"));
     assert!(APP_JS.contains("quota.status !== \"available\""));
+    assert!(APP_JS.contains("SESSION_VISIBLE_FOR_MS"));
+    assert!(APP_JS.contains("selectSession(item.sessionId)"));
+    assert!(APP_JS.contains("providerIcon(provider.provider)"));
+    assert!(APP_JS.contains("/assets/claude.png"));
+    assert!(APP_JS.contains("/assets/codex.png"));
+    assert!(!include_bytes!("../../../web/assets/claude.png").is_empty());
+    assert!(!include_bytes!("../../../web/assets/codex.png").is_empty());
     assert!(INDEX_HTML.contains("Claude 额度桥"));
     assert!(INDEX_HTML.contains("彻底清除"));
     assert!(APP_JS.contains("confirmation !== \"DELETE\""));
@@ -458,7 +467,10 @@ fn pass_through_ack_snooze_and_websocket_snapshot_are_real() {
         assert_eq!(payload["type"], "snapshot");
         assert!(payload["snapshot"]["sessions"].as_array().unwrap().len() >= 3);
         let quota = payload["snapshot"]["quota"].as_array().unwrap();
-        assert_eq!(quota.len(), 2);
+        assert_eq!(quota.len(), 3);
+        assert_eq!(quota[0]["window"], "5h");
+        assert_eq!(quota[1]["window"], "7d");
+        assert_eq!(quota[2]["window"], "week");
         assert!(quota
             .iter()
             .all(|entry| entry["status"] == "unavailable" && entry.get("usedPct").is_none()));

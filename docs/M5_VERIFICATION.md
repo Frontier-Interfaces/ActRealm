@@ -149,3 +149,33 @@ while it ran and received the final documentation/static checks. This candidate
 is eligible for the requested user-test branch commit and push. The final
 48-hour gate remains unchecked and must pass before M5 or v1 can be represented
 as complete.
+
+## Post-candidate functional correction
+
+After the frozen candidate, the user required current-task titles, factual live
+activity, a 30-minute main-list window, attention-to-session selection, exactly
+three quota slots, custom Claude status-line preservation, and Codex 0.144.5
+quota compatibility. These are bounded product corrections rather than a
+claim that the final 48-hour release gate passed.
+
+A subsequent local check found the active Codex desktop rollout reports
+`0.144.2` even though the installed CLI reports `0.144.5`, and found that a
+Claude cache created just after bridge setup could remain behind the normal
+five-minute poll. A sanitized desktop fixture and an immediate cache-mtime
+invalidation regression close both gaps without widening the schema parser.
+
+The correction implementation passed 113 workspace tests before the final
+documentation/static rerun. Its exact implementation and gate evidence is
+recorded in `V1_1_FUNCTIONAL_CORRECTIONS.md`. Because Runtime, installer,
+quota, server, and web code changed after the prior 30-minute candidate soak,
+a new pre-local-test resource gate had to run on the rebuilt binary before this
+correction could be committed and pushed. The user amended this correction
+gate to 2 minutes on 2026-07-16; it passed with 118 samples, CPU average
+0.000%, and Runtime RSS maximum 5,504 KiB. After the live quota compatibility
+fix, the exact 115-test tree repeated that gate and passed with 118 samples,
+CPU average 0.000%, and Runtime RSS maximum 5,440 KiB. Local replacement and
+real Provider/quota checks then passed: all 14 doctor checks were green and the
+three fixed quota slots were persisted from real local sources. The user
+accepted the current functionality and visuals on 2026-07-16, making this
+correction eligible for the requested user-test branch push. The 48-hour final
+release soak remains pending afterward.

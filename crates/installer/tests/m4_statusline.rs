@@ -81,6 +81,50 @@ fn existing_custom_statusline_is_never_replaced_or_backed_up_as_if_managed() {
 }
 
 #[test]
+fn explicit_wrapper_mode_preserves_runs_and_restores_the_custom_statusline() {
+    let fixture = Fixture::new("custom-wrapper");
+    let original_statusline = json!({
+        "type":"command",
+        "command":"node /Users/example/custom-statusline.js --compact",
+        "padding":4
+    });
+    let original = json!({
+        "statusLine": original_statusline,
+        "keep": {"nested": true}
+    });
+    write_json(&fixture.paths.claude_settings, &original);
+    let installer = fixture.installer();
+
+    let report = installer.install_claude_statusline_wrapper().unwrap();
+    assert!(report.config_changed);
+    assert!(report.backup_path.unwrap().is_file());
+    let installed = read_json(&fixture.paths.claude_settings);
+    assert_eq!(installed["keep"], original["keep"]);
+    assert_eq!(
+        installed["_flowAgentOriginalStatusLine"],
+        original["statusLine"]
+    );
+    assert!(installed["statusLine"]["command"]
+        .as_str()
+        .unwrap()
+        .contains("bin/statusline"));
+    let helper = fs::read_to_string(fixture.paths.statusline_helper()).unwrap();
+    let delegate = fs::read_to_string(fixture.paths.statusline_delegate()).unwrap();
+    assert!(helper.contains(" statusline >/dev/null"));
+    assert!(helper.contains("statusline-delegate"));
+    assert!(delegate.contains("node /Users/example/custom-statusline.js --compact"));
+    assert_eq!(
+        installer.inspect_claude_statusline().unwrap().status,
+        ClaudeStatuslineStatus::Installed
+    );
+
+    installer.uninstall_claude_statusline().unwrap();
+    assert_eq!(read_json(&fixture.paths.claude_settings), original);
+    assert!(!fixture.paths.statusline_helper().exists());
+    assert!(!fixture.paths.statusline_delegate().exists());
+}
+
+#[test]
 fn managed_statusline_round_trip_preserves_user_json_and_file_modes() {
     let fixture = Fixture::new("roundtrip");
     let original = json!({"keep": {"nested": [1,2,3]}});
