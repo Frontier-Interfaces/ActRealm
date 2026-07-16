@@ -4,6 +4,12 @@ Local-first attention surface for coding agents.
 
 中文用户请从 [Flow Agent v1 中文使用教程](docs/USER_GUIDE_zh-CN.md) 开始。
 
+> **安装硬性前提：** 只克隆仓库或写入 Claude/Codex Hook 不算安装完成。
+> `flow-agent serve --open` 必须持续运行，Hook 才能连接本机 Runtime；浏览器必须由
+> 本次 `serve --open` 打开，不能复用上一次随机端口的旧页面。请按中文教程中的
+> [安装完成判定与 Agent 交接指令](docs/USER_GUIDE_zh-CN.md#21-安装完成判定硬性要求)
+> 执行并验收。
+
 Third-party asset attribution is recorded in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
