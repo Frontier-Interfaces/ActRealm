@@ -63,6 +63,16 @@ fn normalize_event(provider: Provider, event_name: &str, raw: &Value) -> EventKi
         {
             EventKind::QuestionRequested
         }
+        "PreToolUse"
+            if provider == Provider::Codex
+                && raw.get("tool_name").and_then(Value::as_str) == Some("request_permissions") =>
+        {
+            // Codex Desktop 0.144.x exposes its native permission sheet as a
+            // non-blocking tool lifecycle, not as a replyable PermissionRequest
+            // hook. Treat it as observed provider UI; BridgeRequest still keeps
+            // `needs_reply = false` because the hook event is PreToolUse.
+            EventKind::PermissionRequested
+        }
         "PreToolUse" => EventKind::ToolStarted,
         "PostToolUse" | "AfterAgent" => EventKind::ToolFinished,
         "PostToolUseFailure" => EventKind::ToolFailed,

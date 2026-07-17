@@ -131,6 +131,13 @@ pub struct IngestResult {
     pub session_id: String,
     pub attention_id: Option<String>,
     pub kind: EventKind,
+    pub resolved_request_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeApprovalSyncResult {
+    pub session_found: bool,
+    pub resolved_request_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -327,6 +334,14 @@ enum StoreMessage {
         idle_after_ms: u64,
         reply: mpsc::SyncSender<Result<usize, StoreError>>,
     },
+    SyncNativeApproval {
+        provider: Provider,
+        provider_session_id: String,
+        waiting: bool,
+        active: bool,
+        now: u64,
+        reply: mpsc::SyncSender<Result<NativeApprovalSyncResult, StoreError>>,
+    },
     Snapshot {
         reply: mpsc::SyncSender<Result<StoreSnapshot, StoreError>>,
     },
@@ -508,6 +523,26 @@ impl RuntimeStore {
             active_sessions,
             now,
             idle_after_ms,
+            reply,
+        })?;
+        receive(receiver)
+    }
+
+    pub fn sync_native_approval(
+        &self,
+        provider: Provider,
+        provider_session_id: impl Into<String>,
+        waiting: bool,
+        active: bool,
+        now: u64,
+    ) -> Result<NativeApprovalSyncResult, StoreError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send(StoreMessage::SyncNativeApproval {
+            provider,
+            provider_session_id: provider_session_id.into(),
+            waiting,
+            active,
+            now,
             reply,
         })?;
         receive(receiver)
@@ -701,6 +736,23 @@ fn writer_loop(
                     active_sessions,
                     now,
                     idle_after_ms,
+                ));
+            }
+            StoreMessage::SyncNativeApproval {
+                provider,
+                provider_session_id,
+                waiting,
+                active,
+                now,
+                reply,
+            } => {
+                let _ = reply.send(sync_native_approval_transaction(
+                    &mut connection,
+                    provider,
+                    &provider_session_id,
+                    waiting,
+                    active,
+                    now,
                 ));
             }
             StoreMessage::Snapshot { reply } => {
@@ -1328,6 +1380,7 @@ fn ingest_transaction(
                 .request_id
                 .and_then(|id| attention_id_for_request(&transaction, id).ok().flatten()),
             kind: parsed.kind,
+            resolved_request_ids: Vec::new(),
         });
     }
 
@@ -1343,21 +1396,27 @@ fn ingest_transaction(
     let provider = request.provider.to_string();
     let existing = transaction
         .query_row(
-            "SELECT id, exec_state, last_event_at FROM sessions
+            "SELECT id, exec_state, approval_owner, activity, last_event_at FROM sessions
              WHERE provider = ?1 AND provider_session_id = ?2",
             params![provider, parsed.provider_session_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             },
         )
         .optional()
         .map_err(storage_error)?;
     let new_session = existing.is_none();
-    let (session_id, current_state, last_event_at) = if let Some(existing) = existing {
+    let (session_id, current_state, current_owner, current_activity, last_event_at) = if let Some(
+        existing,
+    ) =
+        existing
+    {
         existing
     } else {
         let session_id = Uuid::now_v7().to_string();
@@ -1410,7 +1469,7 @@ fn ingest_transaction(
                 ],
             )
             .map_err(storage_error)?;
-        (session_id, "idle".to_owned(), occurred_at)
+        (session_id, "idle".to_owned(), None, None, occurred_at)
     };
 
     let terminal = matches!(current_state.as_str(), "response_finished" | "failed");
@@ -1474,14 +1533,25 @@ fn ingest_transaction(
         &request.raw,
         occurred_at,
     )?;
+    let observed_native_permission = is_observed_codex_permission_start(&request);
     let attention_id = match parsed.kind {
-        EventKind::PermissionRequested => Some(insert_approval_attention(
-            &transaction,
-            &session_id,
-            turn_id.as_deref(),
-            &request,
-            parsed.tool_name.as_deref(),
-        )?),
+        EventKind::PermissionRequested if observed_native_permission => {
+            Some(insert_native_permission_attention(
+                &transaction,
+                &session_id,
+                turn_id.as_deref(),
+                &request,
+            )?)
+        }
+        EventKind::PermissionRequested if !request.provider_handles_approval => {
+            Some(insert_approval_attention(
+                &transaction,
+                &session_id,
+                turn_id.as_deref(),
+                &request,
+                parsed.tool_name.as_deref(),
+            )?)
+        }
         EventKind::QuestionRequested | EventKind::ElicitationRequested => {
             Some(insert_nonapproval_attention(
                 &transaction,
@@ -1568,7 +1638,16 @@ fn ingest_transaction(
         _ => None,
     };
 
-    reconcile_provider_handled_approval(
+    let native_permission_resolved = reconcile_observed_native_permission(
+        &transaction,
+        &session_id,
+        turn_id.as_deref(),
+        &request,
+        parsed.kind,
+        occurred_at,
+    )?;
+
+    let resolved_request_ids = reconcile_provider_handled_approval(
         &transaction,
         &session_id,
         turn_id.as_deref(),
@@ -1584,20 +1663,63 @@ fn ingest_transaction(
                 EventKind::PromptSubmitted | EventKind::SessionStarted | EventKind::SessionEnded
             ));
     if may_update {
-        let (next_state, owner, default_activity) =
-            project_event(parsed.kind, &request.raw, &current_state);
-        let activity = plan_progress
-            .map(|(done, total)| format!("计划进度 {done}/{total}"))
-            .or_else(|| {
-                active_subagents.map(|active| {
-                    if active == 0 {
-                        "子 Agent 已结束".to_owned()
-                    } else {
-                        format!("派了 {active} 个子 Agent")
-                    }
+        let preserves_native_request = current_state == "awaiting_approval"
+            && current_owner.as_deref() == Some("terminal")
+            && !native_permission_resolved
+            && !matches!(
+                parsed.kind,
+                EventKind::PromptSubmitted
+                    | EventKind::Stopped
+                    | EventKind::Failed
+                    | EventKind::SessionEnded
+            );
+        let (next_state, owner, default_activity) = if observed_native_permission {
+            (
+                "awaiting_approval",
+                Some("terminal"),
+                "Codex 正在请求批准，请在原界面处理".to_owned(),
+            )
+        } else if preserves_native_request {
+            (
+                current_state.as_str(),
+                current_owner.as_deref(),
+                current_activity
+                    .clone()
+                    .unwrap_or_else(|| "Codex 正在请求批准，请在原界面处理".to_owned()),
+            )
+        } else if request.provider_handles_approval && parsed.kind == EventKind::PermissionRequested
+        {
+            (
+                "thinking",
+                Some("provider"),
+                "Codex 正在自动审批".to_owned(),
+            )
+        } else {
+            let (state, owner, activity) = project_event(parsed.kind, &request.raw, &current_state);
+            if native_permission_resolved
+                && matches!(parsed.kind, EventKind::ToolFinished | EventKind::ToolFailed)
+            {
+                (state, owner, "权限请求已在 Codex 原界面处理".to_owned())
+            } else {
+                (state, owner, activity)
+            }
+        };
+        let activity = if preserves_native_request {
+            default_activity
+        } else {
+            plan_progress
+                .map(|(done, total)| format!("计划进度 {done}/{total}"))
+                .or_else(|| {
+                    active_subagents.map(|active| {
+                        if active == 0 {
+                            "子 Agent 已结束".to_owned()
+                        } else {
+                            format!("派了 {active} 个子 Agent")
+                        }
+                    })
                 })
-            })
-            .unwrap_or(default_activity);
+                .unwrap_or(default_activity)
+        };
         transaction
             .execute(
                 "UPDATE sessions SET
@@ -1687,7 +1809,7 @@ fn ingest_transaction(
         &transaction,
         request.received_at,
         new_session,
-        parsed.kind == EventKind::PermissionRequested,
+        parsed.kind == EventKind::PermissionRequested && request.needs_reply,
     )?;
 
     transaction.commit().map_err(storage_error)?;
@@ -1696,6 +1818,7 @@ fn ingest_transaction(
         session_id,
         attention_id,
         kind: parsed.kind,
+        resolved_request_ids,
     })
 }
 
@@ -2186,6 +2309,240 @@ fn reconcile_sessions_transaction(
     Ok(idled)
 }
 
+fn sync_native_approval_transaction(
+    connection: &mut Connection,
+    provider: Provider,
+    provider_session_id: &str,
+    waiting: bool,
+    active: bool,
+    now: u64,
+) -> Result<NativeApprovalSyncResult, StoreError> {
+    let transaction = connection.transaction().map_err(storage_error)?;
+    let provider_name = provider.to_string();
+    let session = transaction
+        .query_row(
+            "SELECT id, project, approval_owner FROM sessions
+             WHERE provider = ?1 AND provider_session_id = ?2
+             ORDER BY last_event_at DESC LIMIT 1",
+            params![provider_name, provider_session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(storage_error)?;
+    let Some((session_id, project, approval_owner)) = session else {
+        return Ok(NativeApprovalSyncResult {
+            session_found: false,
+            resolved_request_ids: Vec::new(),
+        });
+    };
+
+    let mut resolved_request_ids = Vec::new();
+
+    if waiting {
+        let hook_owned: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM attention_items
+                 WHERE session_id = ?1 AND kind = 'approval'
+                   AND state IN ('open', 'committing', 'decision_sent')",
+                [&session_id],
+                |row| row.get(0),
+            )
+            .map_err(storage_error)?;
+        if hook_owned != 0 || approval_owner.as_deref() == Some("provider") {
+            transaction.commit().map_err(storage_error)?;
+            return Ok(NativeApprovalSyncResult {
+                session_found: true,
+                resolved_request_ids,
+            });
+        }
+
+        let native_open: Option<String> = transaction
+            .query_row(
+                "SELECT id FROM attention_items
+                 WHERE session_id = ?1 AND kind = 'native_approval'
+                   AND state IN ('open', 'snoozed')
+                 ORDER BY created_at DESC LIMIT 1",
+                [&session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        if native_open.is_none() {
+            let attention_id = Uuid::now_v7().to_string();
+            let title = match provider {
+                Provider::Codex => "Codex 需要你在原界面批准",
+                Provider::Claude => "Claude 需要你在原界面批准",
+                Provider::Gemini => "Agent 需要你在原界面批准",
+            };
+            let detail = match provider {
+                Provider::Codex => {
+                    "Codex 客户端或终端正在等待原生权限决定；请在对应对话中批准或拒绝。"
+                }
+                Provider::Claude => {
+                    "Claude 客户端或终端正在等待原生权限决定；请在对应对话中批准或拒绝。"
+                }
+                Provider::Gemini => "Agent 正在等待原生权限决定；请在对应对话中处理。",
+            };
+            transaction
+                .execute(
+                    "INSERT INTO attention_items (
+                       id, session_id, provider, project, turn_id, request_id,
+                       kind, title, detail, command_preview, risk, risk_notes,
+                       dedupe_key, state, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, 'native_approval',
+                               ?5, ?6, NULL, 'unknown', '[]', ?7, 'open', ?8)",
+                    params![
+                        attention_id,
+                        session_id,
+                        provider_name,
+                        project,
+                        title,
+                        detail,
+                        format!("native-approval:{provider_session_id}:{now}"),
+                        to_i64(now),
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
+        transaction
+            .execute(
+                "UPDATE sessions SET exec_state = 'awaiting_approval',
+                   approval_owner = 'terminal', activity = ?2,
+                   activity_since = ?3, last_event_at = MAX(last_event_at, ?3)
+                 WHERE id = ?1",
+                params![
+                    session_id,
+                    format!("等待你在 {} 中处理权限", provider_display_name(provider)),
+                    to_i64(now),
+                ],
+            )
+            .map_err(storage_error)?;
+    } else {
+        let hook_approvals = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id, request_id, state, resolution FROM attention_items
+                     WHERE session_id = ?1 AND kind = 'approval'
+                       AND state IN ('open', 'committing', 'decision_sent')",
+                )
+                .map_err(storage_error)?;
+            let rows = statement
+                .query_map([&session_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })
+                .map_err(storage_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(storage_error)?;
+            rows
+        };
+        for (attention_id, request_id, state, resolution) in &hook_approvals {
+            transaction
+                .execute(
+                    "UPDATE attention_items SET state = 'resolved', resolved_at = ?2,
+                       resolution = COALESCE(resolution, 'provider_handled'), expires_at = NULL
+                     WHERE id = ?1",
+                    params![attention_id, to_i64(now)],
+                )
+                .map_err(storage_error)?;
+            let confirmed_action = (state == "decision_sent")
+                .then_some(resolution.as_deref())
+                .flatten()
+                .filter(|action| matches!(*action, "approve" | "deny"));
+            if let Some(action) = confirmed_action {
+                transaction
+                    .execute(
+                        "UPDATE commands SET state = 'confirmed', confirmed_at = ?2
+                         WHERE attention_id = ?1 AND action = ?3
+                           AND state = 'decision_sent'",
+                        params![attention_id, to_i64(now), action],
+                    )
+                    .map_err(storage_error)?;
+            } else {
+                transaction
+                    .execute(
+                        "UPDATE commands SET state = 'failed', confirmed_at = ?2,
+                           error_code = 'PROVIDER_HANDLED'
+                         WHERE attention_id = ?1
+                           AND state IN ('pending_commit', 'decision_sent')",
+                        params![attention_id, to_i64(now)],
+                    )
+                    .map_err(storage_error)?;
+            }
+            if let Some(request_id) = request_id
+                .as_deref()
+                .and_then(|value| Uuid::parse_str(value).ok())
+            {
+                resolved_request_ids.push(request_id);
+            }
+        }
+        transaction
+            .execute(
+                "UPDATE attention_items SET state = 'resolved', resolved_at = ?2,
+                   resolution = 'provider_handled', expires_at = NULL
+                 WHERE session_id = ?1 AND kind = 'native_approval'
+                   AND state IN ('open', 'snoozed')",
+                params![session_id, to_i64(now)],
+            )
+            .map_err(storage_error)?;
+        let coordinated = !hook_approvals.is_empty()
+            || matches!(
+                approval_owner.as_deref(),
+                Some("terminal" | "provider" | "widget")
+            );
+        if coordinated {
+            transaction
+                .execute(
+                    "UPDATE sessions SET exec_state = ?2, approval_owner = NULL,
+                       activity = ?3, activity_since = ?4,
+                       last_event_at = MAX(last_event_at, ?4)
+                     WHERE id = ?1",
+                    params![
+                        session_id,
+                        if active {
+                            "thinking"
+                        } else {
+                            "response_finished"
+                        },
+                        if active {
+                            format!("{} 原界面权限请求已处理", provider_display_name(provider))
+                        } else {
+                            format!(
+                                "{} 原界面权限请求已处理，本轮结束",
+                                provider_display_name(provider)
+                            )
+                        },
+                        to_i64(now),
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
+    }
+    transaction.commit().map_err(storage_error)?;
+    Ok(NativeApprovalSyncResult {
+        session_found: true,
+        resolved_request_ids,
+    })
+}
+
+fn provider_display_name(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Claude => "Claude",
+        Provider::Codex => "Codex",
+        Provider::Gemini => "Agent",
+    }
+}
+
 fn refresh_provider_titles(connection: &mut Connection, now: u64) -> Result<(), StoreError> {
     let cutoff = to_i64(now.saturating_sub(PROVIDER_TITLE_ACTIVE_WINDOW_MS));
     let candidates = {
@@ -2648,6 +3005,74 @@ fn insert_approval_attention(
     Ok(id)
 }
 
+fn insert_native_permission_attention(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    turn_id: Option<&str>,
+    request: &BridgeRequest,
+) -> Result<String, StoreError> {
+    let tool_use_id = request
+        .raw
+        .get("tool_use_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 256);
+    let identity = tool_use_id
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| request.id.to_string());
+    let dedupe_key = format!("native-request:{session_id}:{identity}");
+    if let Some(existing) = transaction
+        .query_row(
+            "SELECT id FROM attention_items WHERE dedupe_key = ?1",
+            [&dedupe_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(storage_error)?
+    {
+        return Ok(existing);
+    }
+
+    let id = Uuid::now_v7().to_string();
+    let project = request
+        .raw
+        .get("cwd")
+        .and_then(Value::as_str)
+        .and_then(project_name);
+    let detail = request
+        .raw
+        .pointer("/tool_input/reason")
+        .or_else(|| request.raw.get("reason"))
+        .and_then(Value::as_str)
+        .and_then(sanitized_attention_text)
+        .unwrap_or_else(|| {
+            "Codex 客户端或终端正在显示原生权限请求；请回到对应对话查看并处理。".to_owned()
+        });
+    transaction
+        .execute(
+            "INSERT INTO attention_items (
+               id, session_id, provider, project, turn_id, request_id, kind,
+               title, detail, command_preview, risk, risk_notes, dedupe_key,
+               state, expires_at, created_at
+             ) VALUES (
+               ?1, ?2, ?3, ?4, ?5, NULL, 'native_approval',
+               'Codex 正在请求批准', ?6, NULL, 'unknown', '[]', ?7,
+               'open', NULL, ?8
+             )",
+            params![
+                id,
+                session_id,
+                request.provider.to_string(),
+                project,
+                turn_id,
+                detail,
+                dedupe_key,
+                to_i64(request.received_at),
+            ],
+        )
+        .map_err(storage_error)?;
+    Ok(id)
+}
+
 struct NonApprovalSpec<'a> {
     kind: &'a str,
     title: &'a str,
@@ -2784,6 +3209,66 @@ fn command_claim(
     .transpose()
 }
 
+fn is_observed_codex_permission_start(request: &BridgeRequest) -> bool {
+    request.provider == Provider::Codex
+        && request.event_name() == Some("PreToolUse")
+        && request.raw.get("tool_name").and_then(Value::as_str) == Some("request_permissions")
+        && !request.needs_reply
+}
+
+fn reconcile_observed_native_permission(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    turn_id: Option<&str>,
+    request: &BridgeRequest,
+    kind: EventKind,
+    occurred_at: i64,
+) -> Result<bool, StoreError> {
+    if request.provider != Provider::Codex {
+        return Ok(false);
+    }
+    let exact_tool_end = matches!(
+        request.event_name(),
+        Some("PostToolUse" | "PostToolUseFailure")
+    ) && request.raw.get("tool_name").and_then(Value::as_str)
+        == Some("request_permissions");
+    let closes_actionable_state = exact_tool_end
+        || matches!(
+            kind,
+            EventKind::PromptSubmitted
+                | EventKind::Stopped
+                | EventKind::Failed
+                | EventKind::SessionEnded
+        );
+    if !closes_actionable_state {
+        return Ok(false);
+    }
+
+    let tool_use_id = request
+        .raw
+        .get("tool_use_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 256);
+    transaction
+        .execute(
+            "UPDATE attention_items SET state = 'resolved', resolved_at = ?2,
+               resolution = 'provider_handled', expires_at = NULL
+             WHERE session_id = ?1 AND kind = 'native_approval'
+               AND state IN ('open', 'snoozed')
+               AND (?3 = 0 OR ?4 IS NULL OR turn_id = ?4)
+               AND (?5 IS NULL OR dedupe_key = 'native-request:' || ?1 || ':' || ?5)",
+            params![
+                session_id,
+                occurred_at,
+                i64::from(exact_tool_end),
+                turn_id,
+                tool_use_id,
+            ],
+        )
+        .map_err(storage_error)?;
+    Ok(true)
+}
+
 fn reconcile_provider_handled_approval(
     transaction: &Transaction<'_>,
     session_id: &str,
@@ -2791,7 +3276,7 @@ fn reconcile_provider_handled_approval(
     kind: EventKind,
     tool_name: Option<&str>,
     occurred_at: i64,
-) -> Result<(), StoreError> {
+) -> Result<Vec<Uuid>, StoreError> {
     let outcome = match kind {
         EventKind::ToolStarted | EventKind::ToolFinished => "provider_approved",
         EventKind::ToolFailed | EventKind::PermissionDenied => "provider_denied",
@@ -2799,7 +3284,7 @@ fn reconcile_provider_handled_approval(
         | EventKind::Failed
         | EventKind::SessionEnded
         | EventKind::PromptSubmitted => "provider_closed",
-        _ => return Ok(()),
+        _ => return Ok(Vec::new()),
     };
     let terminal_event = matches!(
         kind,
@@ -2820,7 +3305,7 @@ fn reconcile_provider_handled_approval(
     let candidates = {
         let mut statement = transaction
             .prepare(
-                "SELECT id, title, resolution FROM attention_items
+                "SELECT id, request_id, title, resolution FROM attention_items
                  WHERE session_id = ?1 AND kind = 'approval'
                    AND state IN ('open', 'committing', 'decision_sent')
                    AND (?2 IS NULL OR turn_id = ?2)
@@ -2831,8 +3316,9 @@ fn reconcile_provider_handled_approval(
             .query_map(params![session_id, scoped_turn], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             })
             .map_err(storage_error)?
@@ -2841,9 +3327,10 @@ fn reconcile_provider_handled_approval(
         rows
     };
     if candidates.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    for (attention_id, title, resolution) in candidates {
+    let mut resolved_request_ids = Vec::new();
+    for (attention_id, request_id, title, resolution) in candidates {
         if !terminal_event && resolution.is_none() {
             let Some(tool_name) = tool_name else { continue };
             let safe_tool = sanitized_tool_name(tool_name);
@@ -2884,11 +3371,14 @@ fn reconcile_provider_handled_approval(
                 )
                 .map_err(storage_error)?;
         }
+        if let Some(request_id) = request_id.and_then(|value| Uuid::parse_str(&value).ok()) {
+            resolved_request_ids.push(request_id);
+        }
         if !terminal_event {
             break;
         }
     }
-    Ok(())
+    Ok(resolved_request_ids)
 }
 
 fn approval_detail(raw: &Value, tool_name: Option<&str>) -> Option<String> {
@@ -3330,18 +3820,34 @@ fn redacted_preview(command: &str) -> String {
 
 fn sanitized_tool_name(name: &str) -> String {
     match name {
-        "Bash" | "Shell" | "Edit" | "Write" | "Read" | "Glob" | "Grep" | "Task" | "WebFetch"
-        | "WebSearch" | "apply_patch" | "MultiEdit" => name.to_owned(),
+        "Bash"
+        | "Shell"
+        | "Edit"
+        | "Write"
+        | "Read"
+        | "Glob"
+        | "Grep"
+        | "Task"
+        | "WebFetch"
+        | "WebSearch"
+        | "apply_patch"
+        | "MultiEdit"
+        | "request_permissions" => name.to_owned(),
         _ => "Unknown".to_owned(),
     }
 }
 
 fn event_summary(raw: &Value, kind: EventKind) -> Option<String> {
     match kind {
-        EventKind::PermissionRequested => raw
-            .get("tool_name")
-            .and_then(Value::as_str)
-            .map(|tool| format!("请求运行 {}", sanitized_tool_name(tool))),
+        EventKind::PermissionRequested => {
+            raw.get("tool_name").and_then(Value::as_str).map(|tool| {
+                if tool == "request_permissions" {
+                    "Codex 原界面请求批准".to_owned()
+                } else {
+                    format!("请求运行 {}", sanitized_tool_name(tool))
+                }
+            })
+        }
         EventKind::QuestionRequested => Some("Claude AskUserQuestion".to_owned()),
         EventKind::ElicitationRequested => Some("Claude Elicitation".to_owned()),
         EventKind::Unknown => Some("未知 Provider 事件".to_owned()),

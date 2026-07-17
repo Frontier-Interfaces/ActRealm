@@ -526,9 +526,39 @@ function renderMetrics() {
 
 function attentionTitle(item) {
   if (item.kind === "approval") return `想运行 ${item.commandPreview || "一项工具操作"}，等你点头`;
+  if (item.kind === "native_approval") return item.title || `${providerName(item.provider)} 需要你在原界面批准`;
   if (item.kind === "error") return item.title || "任务出错停下来了";
   if (item.kind === "completion") return item.title || "这一轮已经完成";
   return item.title || "Agent 有一件事需要你处理";
+}
+
+function attentionContext(item) {
+  if (item.kind === "native_approval") {
+    return {
+      kicker: `${providerName(item.provider)} 原界面请求 · Flow Agent 仅同步状态`,
+      state: "等待原界面处理",
+      notification: "原界面请求批准",
+    };
+  }
+  if (item.kind === "approval") {
+    return {
+      kicker: "可在 Flow Agent 审批 · 任务等待决定",
+      state: stateLabel(item.state),
+      notification: "可在 Flow Agent 审批",
+    };
+  }
+  if (item.kind === "question") {
+    return {
+      kicker: "可在 Flow Agent 回答 · 任务等待输入",
+      state: stateLabel(item.state),
+      notification: "等待回答",
+    };
+  }
+  return {
+    kicker: item.kind === "completion" ? "任务已完成 · 不着急" : "需要你处理 · 任务已暂停",
+    state: stateLabel(item.state),
+    notification: stateLabel(item.kind),
+  };
 }
 
 function latestCommand(item) {
@@ -694,10 +724,11 @@ function renderAttention() {
   }
   currentAttention = Math.min(currentAttention, items.length - 1);
   const item = items[currentAttention];
+  const context = attentionContext(item);
   const card = element("article", "attention-card");
   const kicker = element("div", "attention-kicker");
-  kicker.append(element("span", "attention-kind", `${items.length} 件等你 · ${item.kind === "completion" ? "不着急" : "任务停着"}`));
-  kicker.append(element("span", "attention-state", stateLabel(item.state)));
+  kicker.append(element("span", "attention-kind", `${items.length} 件待处理 · ${context.kicker}`));
+  kicker.append(element("span", "attention-state", context.state));
   card.append(kicker, element("h3", "", attentionTitle(item)));
 
   const agentLine = element("div", "agent-line");
@@ -725,6 +756,17 @@ function renderAttention() {
   const actions = element("div", "actions");
   if (interactive) {
     // The interactive form owns its submit, decline, cancel, and handoff actions.
+  } else if (item.state === "open" && item.kind === "native_approval") {
+    const openProvider = element("button", "action-button", "去 Agent 处理");
+    openProvider.type = "button";
+    openProvider.addEventListener("click", () => {
+      const session = snapshot.sessions.find((candidate) => candidate.id === item.sessionId);
+      if (session) activateSession(session);
+      else selectSession(item.sessionId);
+    });
+    actions.append(openProvider);
+    actions.append(actionButton("待会提醒", "ghost", "snooze", item));
+    actions.append(actionButton("忽略", "ghost", "dismiss", item));
   } else if (item.state === "open" && item.kind === "approval") {
     if (item.risk === "high") {
       actions.append(actionButton("去终端核对", "", "pass_through", item));
@@ -772,13 +814,21 @@ function renderAttention() {
     card.append(pager);
   }
   ui.attentionList.append(card);
-  const outcome = outcomeSummary();
-  if (outcome) ui.attentionList.append(outcome);
 }
 
 function sessionStatus(session) {
-  const waiting = snapshot.attention.filter((item) => item.sessionId === session.id && ["open", "committing", "decision_sent"].includes(item.state)).length;
-  if (waiting) return { label: `等你${waiting > 1 ? ` ×${waiting}` : ""}`, className: "waiting" };
+  const waiting = snapshot.attention
+    .filter((item) => item.sessionId === session.id && ["open", "committing", "decision_sent"].includes(item.state))
+    .sort((left, right) => left.createdAt - right.createdAt);
+  if (waiting.length) {
+    const first = waiting[0];
+    const suffix = waiting.length > 1 ? ` ×${waiting.length}` : "";
+    if (first.kind === "native_approval") return { label: `原界面请求${suffix}`, className: "waiting" };
+    if (first.kind === "approval") return { label: `面板可审批${suffix}`, className: "waiting" };
+    if (first.kind === "question") return { label: `等你回答${suffix}`, className: "waiting" };
+    if (first.kind === "completion") return { label: `待确认${suffix}`, className: "waiting" };
+    return { label: `待处理${suffix}`, className: "waiting" };
+  }
   if (session.execState === "failed") return { label: "出错", className: "failed" };
   if (["idle", "response_finished"].includes(session.execState)) return { label: "空闲", className: "idle" };
   return { label: "在跑", className: "" };
@@ -910,10 +960,17 @@ function activityDisplay(session) {
     .filter((item) => item.sessionId === session.id && ["open", "committing", "decision_sent"].includes(item.state))
     .sort((a, b) => a.createdAt - b.createdAt)[0];
   if (waiting) {
+    const text = waiting.kind === "native_approval"
+      ? `${providerName(waiting.provider)} 正在请求批准，请回原界面处理`
+      : waiting.kind === "approval"
+        ? "等待你在 Flow Agent 审批"
+        : waiting.kind === "question"
+          ? "等待你在 Flow Agent 回答"
+          : "等待你处理";
     return {
       className: "waiting",
       marker: "!",
-      text: `等待你处理 · ${turnTiming(session)} · 已等 ${elapsedText(waiting.createdAt)}`,
+      text: `${text} · ${turnTiming(session)} · 已等 ${elapsedText(waiting.createdAt)}`,
     };
   }
   const timing = turnTiming(session);
@@ -1186,7 +1243,8 @@ function renderQuota() {
 }
 
 function notificationRule(item) {
-  return settingsState.notificationRules?.[item.kind] || "list";
+  const kind = item.kind === "native_approval" ? "approval" : item.kind;
+  return settingsState.notificationRules?.[kind] || "list";
 }
 
 function isProviderMuted(provider) {
@@ -1217,7 +1275,7 @@ function playNotificationSound() {
 
 function showNotification(item) {
   notificationItemId = item.id;
-  ui.notificationKind.textContent = `${providerName(item.provider)} · ${item.kind === "approval" ? "等待批准" : stateLabel(item.kind)}`;
+  ui.notificationKind.textContent = `${providerName(item.provider)} · ${attentionContext(item).notification}`;
   ui.notificationTitle.textContent = attentionTitle(item);
   ui.notificationBanner.hidden = false;
   playNotificationSound();
@@ -1226,6 +1284,10 @@ function showNotification(item) {
 
 function processNotifications(nextSnapshot) {
   const nextItems = (nextSnapshot.attention || []).filter((item) => ["open", "committing", "decision_sent"].includes(item.state));
+  if (notificationItemId && !nextItems.some((item) => item.id === notificationItemId)) {
+    ui.notificationBanner.hidden = true;
+    notificationItemId = undefined;
+  }
   if (notificationsPrimed) {
     const item = nextItems.find((candidate) => !knownAttentionIds.has(candidate.id));
     if (item && notificationRule(item) === "banner" && !isProviderMuted(item.provider)) showNotification(item);

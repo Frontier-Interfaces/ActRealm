@@ -6,8 +6,9 @@ use flow_agent_core::{
     DOCTOR_PROBE_EVENT, MAX_HOOK_PAYLOAD_BYTES, PERMISSION_COMMIT_DELAY_MS,
 };
 use flow_agent_installer::{
-    discover_provider_availability, BinaryHealth, CodexFeatureStatus, CodexTrustStatus,
-    ConfigHealth, HookProvider, InstallIntent, InstallOptions, InstallPaths, Installer,
+    codex_config_enables_auto_review, discover_provider_availability, BinaryHealth,
+    CodexFeatureStatus, CodexTrustStatus, ConfigHealth, HookProvider, InstallIntent,
+    InstallOptions, InstallPaths, Installer,
 };
 use flow_agent_quota::{capture_claude_statusline, statusline_text, QuotaPaths};
 use flow_agent_runtime::{
@@ -1191,15 +1192,23 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()>
             } else {
                 None
             };
-            if store.ingest(request.clone()).is_err() {
-                if let Some(registration) = registration {
-                    let request_id = request.request_id.unwrap_or(request.id);
-                    let _ = waiters.pass_through(request_id, "runtime_error");
-                    if let Ok(response) = registration.ticket.recv_timeout(Duration::from_secs(1)) {
-                        let _ = BridgeListener::write_response(&mut stream, &response);
+            let ingest_result = match store.ingest(request.clone()) {
+                Ok(result) => result,
+                Err(_) => {
+                    if let Some(registration) = registration {
+                        let request_id = request.request_id.unwrap_or(request.id);
+                        let _ = waiters.pass_through(request_id, "runtime_error");
+                        if let Ok(response) =
+                            registration.ticket.recv_timeout(Duration::from_secs(1))
+                        {
+                            let _ = BridgeListener::write_response(&mut stream, &response);
+                        }
                     }
+                    return;
                 }
-                return;
+            };
+            for resolved_request_id in ingest_result.resolved_request_ids {
+                let _ = waiters.pass_through(resolved_request_id, "provider_handled");
             }
 
             if let Some(registration) = registration {
@@ -1390,7 +1399,8 @@ fn run_hook(provider: Provider, socket_path: PathBuf) -> Result<()> {
         return Ok(());
     }
     let input = read_hook_input()?;
-    let raw = serde_json::from_slice(&input)?;
+    let mut raw: Value = serde_json::from_slice(&input)?;
+    apply_codex_auto_review_fallback(provider, &mut raw);
     let request = BridgeRequest::from_hook(provider, raw);
     let timeout = if request.needs_reply {
         reply_timeout(provider)
@@ -1415,6 +1425,32 @@ fn run_hook(provider: Provider, socket_path: PathBuf) -> Result<()> {
         println!();
     }
     Ok(())
+}
+
+fn apply_codex_auto_review_fallback(provider: Provider, raw: &mut Value) {
+    if provider != Provider::Codex
+        || raw.get("hook_event_name").and_then(Value::as_str) != Some("PermissionRequest")
+        || [
+            "approvals_reviewer",
+            "approvalsReviewer",
+            "_approvals_reviewer",
+        ]
+        .iter()
+        .any(|key| raw.get(*key).and_then(Value::as_str).is_some())
+    {
+        return;
+    }
+    let enabled = InstallPaths::discover()
+        .ok()
+        .is_some_and(|paths| codex_config_enables_auto_review(&paths.codex_config));
+    if enabled {
+        if let Some(object) = raw.as_object_mut() {
+            object.insert(
+                "_approvals_reviewer".to_owned(),
+                Value::String("auto_review".to_owned()),
+            );
+        }
+    }
 }
 
 fn read_hook_input() -> Result<Vec<u8>> {

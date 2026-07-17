@@ -9,9 +9,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use flow_agent_codex_connector::{
-    CodexConnector, CodexThread, ConnectorChannels, ServerNotification, ServerRequest,
+    parse_thread, CodexConnector, CodexThread, ConnectorChannels, ServerNotification, ServerRequest,
 };
-use flow_agent_core::{BridgeRequest, ReplyAction, ReplyPayload};
+use flow_agent_core::{BridgeRequest, Provider, ReplyAction, ReplyPayload};
 use flow_agent_installer::{
     discover_provider_availability, BinaryHealth, ClaudeStatuslineStatus, CodexTrustStatus,
     ConfigHealth, HookProvider, InstallIntent, InstallOptions, InstallPaths, Installer,
@@ -252,6 +252,7 @@ struct CodexManager {
     connector: Option<CodexConnector>,
     state: Arc<Mutex<CodexManagerState>>,
     store: RuntimeStore,
+    waiters: WaiterRegistry,
 }
 
 #[derive(Default)]
@@ -261,6 +262,8 @@ struct CodexManagerState {
     threads: HashMap<String, CodexThread>,
     managed: HashSet<String>,
     resume_failed: HashSet<String>,
+    native_waiting: HashMap<String, bool>,
+    native_synced: HashSet<String>,
 }
 
 struct QuotaState {
@@ -292,6 +295,7 @@ impl CodexManager {
                 ..CodexManagerState::default()
             })),
             store,
+            waiters: WaiterRegistry::default(),
         }
     }
 
@@ -311,6 +315,7 @@ impl CodexManager {
                 connector: None,
                 state,
                 store,
+                waiters,
             };
         };
         let (connector, channels) = match CodexConnector::connect(&executable, socket_path) {
@@ -323,6 +328,7 @@ impl CodexManager {
                     connector: None,
                     state,
                     store,
+                    waiters,
                 };
             }
         };
@@ -337,6 +343,7 @@ impl CodexManager {
             .take(MAX_MANAGED_CODEX_THREADS)
             .collect::<HashSet<_>>();
         let listed = connector.list_threads().unwrap_or_default();
+        let listed_for_sync = listed.clone();
         if let Ok(mut current) = state.lock() {
             current.status = "connected".to_owned();
             current.error = None;
@@ -346,12 +353,39 @@ impl CodexManager {
                 .map(|thread| (thread.id.clone(), thread))
                 .collect();
         }
+        for thread in &listed_for_sync {
+            let waiting = thread_waiting_on_approval(thread);
+            if let Ok(mut current) = state.lock() {
+                current.native_waiting.insert(thread.id.clone(), waiting);
+            }
+            sync_codex_native_attention(
+                &state,
+                &store,
+                &waiters,
+                &thread.id,
+                waiting,
+                thread.status == "active",
+            );
+        }
         for thread_id in &managed {
             if let Ok(thread) = connector.resume_thread(thread_id) {
+                let waiting = thread_waiting_on_approval(&thread);
                 if let Ok(mut current) = state.lock() {
                     current.resume_failed.remove(thread_id);
+                    current.native_waiting.insert(thread.id.clone(), waiting);
                     current.threads.insert(thread.id.clone(), thread);
                 }
+                let active = state
+                    .lock()
+                    .ok()
+                    .and_then(|current| {
+                        current
+                            .threads
+                            .get(thread_id)
+                            .map(|thread| thread.status == "active")
+                    })
+                    .unwrap_or(false);
+                sync_codex_native_attention(&state, &store, &waiters, thread_id, waiting, active);
             } else if let Ok(mut current) = state.lock() {
                 current.resume_failed.insert(thread_id.clone());
             }
@@ -361,12 +395,13 @@ impl CodexManager {
             channels,
             Arc::clone(&state),
             store.clone(),
-            waiters,
+            waiters.clone(),
         );
         Self {
             connector: Some(connector),
             state,
             store,
+            waiters,
         }
     }
 
@@ -378,6 +413,8 @@ impl CodexManager {
         let thread = connector
             .resume_thread(thread_id)
             .map_err(|error| error.to_string())?;
+        let waiting = thread_waiting_on_approval(&thread);
+        let active = thread.status == "active";
         let managed = {
             let mut state = self
                 .state
@@ -385,6 +422,7 @@ impl CodexManager {
                 .map_err(|_| "Connector 状态不可用".to_owned())?;
             state.managed.insert(thread_id.to_owned());
             state.resume_failed.remove(thread_id);
+            state.native_waiting.insert(thread.id.clone(), waiting);
             state.threads.insert(thread.id.clone(), thread.clone());
             let mut managed = state.managed.iter().cloned().collect::<Vec<_>>();
             managed.sort();
@@ -396,6 +434,14 @@ impl CodexManager {
                 serde_json::to_string(&managed).map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?;
+        sync_codex_native_attention(
+            &self.state,
+            &self.store,
+            &self.waiters,
+            thread_id,
+            waiting,
+            active,
+        );
         Ok(thread)
     }
 
@@ -410,6 +456,33 @@ impl CodexManager {
             "protocol": "app-server",
             "experimentalUserInput": true
         })
+    }
+
+    fn retry_unsynced_native_approvals(&self) {
+        let pending = self
+            .state
+            .lock()
+            .map(|state| {
+                state
+                    .native_waiting
+                    .iter()
+                    .filter_map(|(thread_id, waiting)| {
+                        (*waiting && !state.native_synced.contains(thread_id))
+                            .then_some(thread_id.clone())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for thread_id in pending {
+            sync_codex_native_attention(
+                &self.state,
+                &self.store,
+                &self.waiters,
+                &thread_id,
+                true,
+                true,
+            );
+        }
     }
 
     fn recovery_for(
@@ -468,13 +541,14 @@ fn spawn_codex_handlers(
     let request_connector = connector.clone();
     let request_state = Arc::clone(&state);
     let request_store = store.clone();
+    let request_waiters = waiters.clone();
     thread::spawn(move || {
         for request in channels.requests {
             handle_codex_server_request(
                 request_connector.clone(),
                 Arc::clone(&request_state),
                 request_store.clone(),
-                waiters.clone(),
+                request_waiters.clone(),
                 request,
             );
         }
@@ -483,9 +557,10 @@ fn spawn_codex_handlers(
             current.error = Some("Codex app-server 请求通道已断开".to_owned());
         }
     });
+    let notification_store = store.clone();
     thread::spawn(move || {
         for notification in channels.notifications {
-            update_codex_notification(&state, notification);
+            update_codex_notification(&state, &notification_store, &waiters, notification);
         }
         if let Ok(mut current) = state.lock() {
             current.status = "unavailable".to_owned();
@@ -586,31 +661,41 @@ fn handle_codex_server_request(
 
 fn update_codex_notification(
     state: &Arc<Mutex<CodexManagerState>>,
+    store: &RuntimeStore,
+    waiters: &WaiterRegistry,
     notification: ServerNotification,
 ) {
-    let Some(thread_id) = notification
-        .params
-        .get("threadId")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-    else {
-        return;
-    };
-    let Ok(mut current) = state.lock() else {
-        return;
-    };
-    current.resume_failed.remove(&thread_id);
-    if notification.method == "thread/status/changed" {
-        let Some(status) = notification
-            .params
-            .pointer("/status/type")
-            .and_then(Value::as_str)
-        else {
+    let started_thread = (notification.method == "thread/started")
+        .then(|| notification.params.get("thread").and_then(parse_thread))
+        .flatten();
+    let thread_id = started_thread
+        .as_ref()
+        .map(|thread| thread.id.clone())
+        .or_else(|| {
+            notification
+                .params
+                .get("threadId")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        });
+    let Some(thread_id) = thread_id else { return };
+
+    let (waiting, active) = {
+        let Ok(mut current) = state.lock() else {
             return;
         };
-        if let Some(thread) = current.threads.get_mut(&thread_id) {
-            thread.status = status.to_owned();
-            thread.active_flags = notification
+        current.resume_failed.remove(&thread_id);
+        if let Some(thread) = started_thread {
+            current.threads.insert(thread_id.clone(), thread);
+        } else if notification.method == "thread/status/changed" {
+            let Some(status) = notification
+                .params
+                .pointer("/status/type")
+                .and_then(Value::as_str)
+            else {
+                return;
+            };
+            let flags = notification
                 .params
                 .pointer("/status/activeFlags")
                 .and_then(Value::as_array)
@@ -619,15 +704,92 @@ fn update_codex_notification(
                         .iter()
                         .filter_map(Value::as_str)
                         .map(ToOwned::to_owned)
-                        .collect()
+                        .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
+            current
+                .threads
+                .entry(thread_id.clone())
+                .and_modify(|thread| {
+                    thread.status = status.to_owned();
+                    thread.active_flags.clone_from(&flags);
+                })
+                .or_insert_with(|| CodexThread {
+                    id: thread_id.clone(),
+                    name: None,
+                    cwd: None,
+                    status: status.to_owned(),
+                    active_flags: flags,
+                    updated_at: None,
+                });
+        } else if matches!(
+            notification.method.as_str(),
+            "turn/completed" | "thread/closed"
+        ) {
+            if let Some(thread) = current.threads.get_mut(&thread_id) {
+                thread.status = "idle".to_owned();
+                thread.active_flags.clear();
+            }
+        } else if notification.method == "turn/started" {
+            if let Some(thread) = current.threads.get_mut(&thread_id) {
+                thread.status = "active".to_owned();
+                thread.active_flags.clear();
+            }
+        } else {
+            return;
         }
-    } else if notification.method == "turn/completed" {
-        if let Some(thread) = current.threads.get_mut(&thread_id) {
-            thread.status = "idle".to_owned();
-            thread.active_flags.clear();
+        let waiting = current
+            .threads
+            .get(&thread_id)
+            .is_some_and(thread_waiting_on_approval);
+        let changed = current.native_waiting.insert(thread_id.clone(), waiting) != Some(waiting);
+        if !changed && (!waiting || current.native_synced.contains(&thread_id)) {
+            return;
         }
+        let active = current
+            .threads
+            .get(&thread_id)
+            .is_some_and(|thread| thread.status == "active");
+        (waiting, active)
+    };
+    sync_codex_native_attention(state, store, waiters, &thread_id, waiting, active);
+}
+
+fn thread_waiting_on_approval(thread: &CodexThread) -> bool {
+    thread.status == "active"
+        && thread
+            .active_flags
+            .iter()
+            .any(|flag| flag == "waitingOnApproval")
+}
+
+fn sync_codex_native_attention(
+    state: &Arc<Mutex<CodexManagerState>>,
+    store: &RuntimeStore,
+    waiters: &WaiterRegistry,
+    thread_id: &str,
+    waiting: bool,
+    active: bool,
+) {
+    let Ok(result) = store.sync_native_approval(
+        Provider::Codex,
+        thread_id.to_owned(),
+        waiting,
+        active,
+        now_millis(),
+    ) else {
+        return;
+    };
+    for request_id in result.resolved_request_ids {
+        let _ = waiters.pass_through(request_id, "provider_handled");
+    }
+    let Ok(mut current) = state.lock() else {
+        return;
+    };
+    if waiting && result.session_found {
+        current.native_synced.insert(thread_id.to_owned());
+    } else if !waiting {
+        current.native_synced.remove(thread_id);
     }
 }
 
@@ -1862,6 +2024,7 @@ async fn websocket_loop(mut socket: WebSocket, state: AppState) {
 
 fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
     let now = now_millis();
+    state.codex.retry_unsynced_native_approvals();
     let mut snapshot = state.store.snapshot()?;
     let visible_attention_sessions = snapshot
         .attention
@@ -2979,6 +3142,7 @@ mod tests {
             )]),
             error: None,
             resume_failed: HashSet::new(),
+            ..CodexManagerState::default()
         }));
         let value = snapshot_value(&state).unwrap();
         let sessions = value["sessions"].as_array().unwrap();
@@ -2999,6 +3163,170 @@ mod tests {
             .unwrap();
         assert_eq!(managed_session["controlCapability"], "managed");
         drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_native_waiting_flag_opens_and_resolves_attention() {
+        let root = std::env::temp_dir().join(format!(
+            "flow-agent-server-native-approval-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        store
+            .ingest(flow_agent_core::BridgeRequest::from_hook_at(
+                flow_agent_core::Provider::Codex,
+                json!({
+                    "hook_event_name":"UserPromptSubmit",
+                    "session_id":"thread-native",
+                    "turn_id":"turn-1",
+                    "prompt":"在桌面建立空白文件夹"
+                }),
+                1_000,
+            ))
+            .unwrap();
+        let state = Arc::new(Mutex::new(CodexManagerState::default()));
+        let waiters = WaiterRegistry::default();
+
+        update_codex_notification(
+            &state,
+            &store,
+            &waiters,
+            ServerNotification {
+                method: "thread/started".to_owned(),
+                params: json!({
+                    "thread": {
+                        "id":"thread-native",
+                        "status": {
+                            "type":"active",
+                            "activeFlags":["waitingOnApproval"]
+                        }
+                    }
+                }),
+            },
+        );
+        let waiting = store.snapshot().unwrap();
+        assert_eq!(waiting.attention.len(), 1);
+        assert_eq!(waiting.attention[0].kind, "native_approval");
+        assert_eq!(waiting.attention[0].state, "open");
+        assert_eq!(waiting.sessions[0].exec_state, "awaiting_approval");
+        assert_eq!(
+            waiting.sessions[0].approval_owner.as_deref(),
+            Some("terminal")
+        );
+        assert!(state
+            .lock()
+            .unwrap()
+            .native_synced
+            .contains("thread-native"));
+
+        update_codex_notification(
+            &state,
+            &store,
+            &waiters,
+            ServerNotification {
+                method: "thread/status/changed".to_owned(),
+                params: json!({
+                    "threadId":"thread-native",
+                    "status": {"type":"active", "activeFlags":[]}
+                }),
+            },
+        );
+        let resumed = store.snapshot().unwrap();
+        assert_eq!(resumed.attention[0].state, "resolved");
+        assert_eq!(
+            resumed.attention[0].resolution.as_deref(),
+            Some("provider_handled")
+        );
+        assert_eq!(resumed.sessions[0].exec_state, "thinking");
+        assert_eq!(resumed.sessions[0].approval_owner, None);
+        assert!(!state
+            .lock()
+            .unwrap()
+            .native_synced
+            .contains("thread-native"));
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_native_resolution_releases_a_competing_hook_waiter() {
+        let root = std::env::temp_dir().join(format!(
+            "flow-agent-server-hook-release-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let request = flow_agent_core::BridgeRequest::from_hook_at(
+            flow_agent_core::Provider::Codex,
+            json!({
+                "hook_event_name":"PermissionRequest",
+                "session_id":"thread-hook-release",
+                "turn_id":"turn-1",
+                "tool_name":"Bash",
+                "tool_input":{"command":"mkdir Desktop/example"}
+            }),
+            now_millis(),
+        );
+        let request_id = request.request_id.unwrap();
+        let waiters = WaiterRegistry::default();
+        let registration = waiters.register_at(&request, now_millis()).unwrap();
+        store.ingest(request).unwrap();
+        let state = Arc::new(Mutex::new(CodexManagerState::default()));
+
+        update_codex_notification(
+            &state,
+            &store,
+            &waiters,
+            ServerNotification {
+                method: "thread/started".to_owned(),
+                params: json!({
+                    "thread": {
+                        "id":"thread-hook-release",
+                        "status": {
+                            "type":"active",
+                            "activeFlags":["waitingOnApproval"]
+                        }
+                    }
+                }),
+            },
+        );
+        let waiting = store.snapshot().unwrap();
+        assert_eq!(waiting.attention.len(), 1);
+        assert_eq!(waiting.attention[0].kind, "approval");
+        assert!(waiters.is_active(request_id).unwrap());
+
+        update_codex_notification(
+            &state,
+            &store,
+            &waiters,
+            ServerNotification {
+                method: "thread/status/changed".to_owned(),
+                params: json!({
+                    "threadId":"thread-hook-release",
+                    "status":{"type":"active", "activeFlags":[]}
+                }),
+            },
+        );
+        let response = registration
+            .ticket
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(response.action, ReplyAction::PassThrough);
+        assert_eq!(response.reason.as_deref(), Some("provider_handled"));
+        assert!(!waiters.is_active(request_id).unwrap());
+        let resolved = store.snapshot().unwrap();
+        assert_eq!(resolved.attention[0].state, "resolved");
+        assert_eq!(
+            resolved.attention[0].resolution.as_deref(),
+            Some("provider_handled")
+        );
+        assert_eq!(resolved.sessions[0].exec_state, "thinking");
+        assert_eq!(resolved.sessions[0].approval_owner, None);
+
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }

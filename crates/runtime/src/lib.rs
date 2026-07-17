@@ -17,7 +17,7 @@ pub use spool::{default_spool_path, EventSpool, SpoolError};
 pub use storage::{
     default_database_path, ApprovalAction, AttentionAction, AttentionRecord, ClaimResult,
     CommandRecord, CommandState, CommitResult, IngestResult, MetricEvent, MetricsSummary,
-    QuotaRecord, RuntimeStore, SessionRecord, StoreError, StoreSnapshot,
+    NativeApprovalSyncResult, QuotaRecord, RuntimeStore, SessionRecord, StoreError, StoreSnapshot,
 };
 pub use waiter::{
     InteractiveOption, InteractivePrompt, InteractiveQuestion, RegisterResult, WaiterError,

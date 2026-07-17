@@ -342,7 +342,7 @@ fn id_key(id: &Value) -> String {
         .unwrap_or_else(|| id.to_string())
 }
 
-fn parse_thread(value: &Value) -> Option<CodexThread> {
+pub fn parse_thread(value: &Value) -> Option<CodexThread> {
     let status = value.get("status")?;
     Some(CodexThread {
         id: value.get("id")?.as_str()?.to_owned(),

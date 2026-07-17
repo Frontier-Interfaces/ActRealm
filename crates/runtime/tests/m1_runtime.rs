@@ -568,7 +568,7 @@ fn tool_completion_before_stop_confirms_only_an_allow() {
         .claim_approval(command_id, request_id, ApprovalAction::Approve, 2_000)
         .unwrap();
     store.commit(command_id, 5_000, true).unwrap();
-    store
+    let confirmation = store
         .ingest(request_at(
             Provider::Codex,
             "PostToolUse",
@@ -578,9 +578,238 @@ fn tool_completion_before_stop_confirms_only_an_allow() {
             5_001,
         ))
         .unwrap();
+    assert_eq!(confirmation.resolved_request_ids, vec![request_id]);
     let snapshot = store.snapshot().unwrap();
     assert_eq!(snapshot.commands[0].state, "confirmed");
     assert_eq!(snapshot.attention[0].state, "resolved");
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn codex_auto_review_is_observed_without_creating_a_competing_waiter() {
+    let root = temp_root("codex-auto-review");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let request = BridgeRequest::from_hook_at(
+        Provider::Codex,
+        json!({
+            "hook_event_name":"PermissionRequest",
+            "session_id":"auto-review-session",
+            "turn_id":"turn-1",
+            "tool_name":"Bash",
+            "approvals_reviewer":"auto_review",
+            "permission_mode":"default"
+        }),
+        1_000,
+    );
+    assert!(!request.needs_reply);
+    let result = store.ingest(request).unwrap();
+    assert_eq!(result.attention_id, None);
+    let snapshot = store.snapshot().unwrap();
+    assert!(snapshot.attention.is_empty());
+    assert_eq!(snapshot.sessions[0].exec_state, "thinking");
+    assert_eq!(
+        snapshot.sessions[0].approval_owner.as_deref(),
+        Some("provider")
+    );
+    assert_eq!(
+        snapshot.sessions[0].activity.as_deref(),
+        Some("Codex 正在自动审批")
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn native_provider_approval_is_visible_and_resolves_with_the_provider_state() {
+    let root = temp_root("native-provider-approval");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(request_at(
+            Provider::Codex,
+            "UserPromptSubmit",
+            "native-session",
+            Some("turn-1"),
+            None,
+            1_000,
+        ))
+        .unwrap();
+
+    assert!(
+        store
+            .sync_native_approval(Provider::Codex, "native-session", true, true, 1_100)
+            .unwrap()
+            .session_found
+    );
+    let waiting = store.snapshot().unwrap();
+    assert_eq!(waiting.attention.len(), 1);
+    assert_eq!(waiting.attention[0].kind, "native_approval");
+    assert_eq!(waiting.attention[0].state, "open");
+    assert_eq!(waiting.sessions[0].exec_state, "awaiting_approval");
+    assert_eq!(
+        waiting.sessions[0].approval_owner.as_deref(),
+        Some("terminal")
+    );
+
+    assert!(
+        store
+            .sync_native_approval(Provider::Codex, "native-session", false, true, 1_200)
+            .unwrap()
+            .session_found
+    );
+    let resolved = store.snapshot().unwrap();
+    assert_eq!(resolved.attention[0].state, "resolved");
+    assert_eq!(
+        resolved.attention[0].resolution.as_deref(),
+        Some("provider_handled")
+    );
+    assert_eq!(resolved.sessions[0].exec_state, "thinking");
+    assert_eq!(resolved.sessions[0].approval_owner, None);
+
+    store
+        .sync_native_approval(Provider::Codex, "native-session", true, true, 1_300)
+        .unwrap();
+    store
+        .sync_native_approval(Provider::Codex, "native-session", false, false, 1_400)
+        .unwrap();
+    let ended = store.snapshot().unwrap();
+    assert_eq!(ended.sessions[0].exec_state, "response_finished");
+    assert_eq!(ended.sessions[0].approval_owner, None);
+    assert_eq!(ended.attention[1].state, "resolved");
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn codex_request_permissions_hook_tracks_native_request_without_claiming_a_decision() {
+    let root = temp_root("codex-request-permissions-native");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let start = BridgeRequest::from_hook_at(
+        Provider::Codex,
+        json!({
+            "hook_event_name":"PreToolUse",
+            "session_id":"codex-desktop-native",
+            "turn_id":"turn-native",
+            "transcript_path":"/tmp/rollout-native.jsonl",
+            "cwd":"/tmp/example-project",
+            "permission_mode":"default",
+            "tool_name":"request_permissions",
+            "tool_use_id":"call-native",
+            "tool_input":{
+                "permissions":{"network":{"enabled":true}},
+                "reason":"允许本任务后续运行的终端命令访问互联网。"
+            }
+        }),
+        100_000,
+    );
+    assert!(!start.needs_reply);
+    let ingested = store.ingest(start).unwrap();
+    assert_eq!(
+        ingested.kind,
+        flow_agent_core::EventKind::PermissionRequested
+    );
+
+    let waiting = store.snapshot().unwrap();
+    assert_eq!(waiting.attention.len(), 1);
+    assert_eq!(waiting.attention[0].kind, "native_approval");
+    assert_eq!(waiting.attention[0].title, "Codex 正在请求批准");
+    assert_eq!(
+        waiting.attention[0].detail.as_deref(),
+        Some("允许本任务后续运行的终端命令访问互联网。")
+    );
+    assert_eq!(waiting.attention[0].request_id, None);
+    assert_eq!(waiting.sessions[0].exec_state, "awaiting_approval");
+    assert_eq!(
+        waiting.sessions[0].approval_owner.as_deref(),
+        Some("terminal")
+    );
+
+    // Open Island's reducer deliberately protects actionable state from an
+    // incidental running update. Flow Agent must do the same.
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"Notification",
+                "session_id":"codex-desktop-native",
+                "turn_id":"turn-native",
+                "message":"still waiting"
+            }),
+            100_001,
+        ))
+        .unwrap();
+    let preserved = store.snapshot().unwrap();
+    assert_eq!(preserved.sessions[0].exec_state, "awaiting_approval");
+    assert_eq!(
+        preserved.sessions[0].approval_owner.as_deref(),
+        Some("terminal")
+    );
+    assert_eq!(preserved.attention[0].state, "open");
+
+    // PostToolUse means only that Codex finished handling the request. It does
+    // not reveal whether the user approved or denied it.
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"PostToolUse",
+                "session_id":"codex-desktop-native",
+                "turn_id":"turn-native",
+                "tool_name":"request_permissions",
+                "tool_use_id":"call-native",
+                "tool_response":{"status":"handled"}
+            }),
+            100_002,
+        ))
+        .unwrap();
+    let handled = store.snapshot().unwrap();
+    assert_eq!(handled.attention[0].state, "resolved");
+    assert_eq!(
+        handled.attention[0].resolution.as_deref(),
+        Some("provider_handled")
+    );
+    assert_eq!(handled.sessions[0].exec_state, "thinking");
+    assert_eq!(handled.sessions[0].approval_owner, None);
+    assert!(handled.sessions[0]
+        .activity
+        .as_deref()
+        .is_some_and(|activity| activity.contains("Codex 原界面处理")));
+    assert!(!handled.sessions[0]
+        .activity
+        .as_deref()
+        .is_some_and(|activity| activity.contains("批准") || activity.contains("拒绝")));
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn native_provider_signal_does_not_duplicate_a_live_hook_approval() {
+    let root = temp_root("native-hook-dedupe");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(request_at(
+            Provider::Codex,
+            "PermissionRequest",
+            "dedupe-session",
+            Some("turn-1"),
+            Some("cargo test"),
+            1_000,
+        ))
+        .unwrap();
+    assert!(
+        store
+            .sync_native_approval(Provider::Codex, "dedupe-session", true, true, 1_100)
+            .unwrap()
+            .session_found
+    );
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.attention.len(), 1);
+    assert_eq!(snapshot.attention[0].kind, "approval");
+    assert_eq!(
+        snapshot.sessions[0].approval_owner.as_deref(),
+        Some("widget")
+    );
     drop(store);
     fs::remove_dir_all(root).unwrap();
 }

@@ -59,6 +59,39 @@ fn seeded_m10_m12_control_panel_preview() {
             now.saturating_sub(42_000),
         ))
         .unwrap();
+
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"UserPromptSubmit",
+                "session_id":"preview-native-approval",
+                "turn_id":"preview-native-turn",
+                "cwd":"/Users/example/Desktop",
+                "prompt":"在桌面建立一个空白文件夹",
+                "model":"gpt-5.6-codex",
+                "thread_name":"在桌面建立空白文件夹"
+            }),
+            now.saturating_sub(10_000),
+        ))
+        .unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"PreToolUse",
+                "session_id":"preview-native-approval",
+                "turn_id":"preview-native-turn",
+                "cwd":"/Users/example/Desktop",
+                "tool_name":"request_permissions",
+                "tool_use_id":"preview-request-permissions",
+                "tool_input":{
+                    "reason":"允许 Codex 在桌面创建文件夹。"
+                }
+            }),
+            now.saturating_sub(2_000),
+        ))
+        .unwrap();
     store
         .ingest(BridgeRequest::from_hook_at(
             Provider::Codex,
@@ -99,6 +132,7 @@ fn seeded_m10_m12_control_panel_preview() {
     let _question_ticket = waiters.register_at(&question, now).unwrap();
     store.ingest(question).unwrap();
 
+    let resolver = store.clone();
     let api = ApiServer::start(
         store,
         waiters,
@@ -109,6 +143,22 @@ fn seeded_m10_m12_control_panel_preview() {
         },
     )
     .unwrap();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(90));
+        let _ = resolver.ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"PostToolUse",
+                "session_id":"preview-native-approval",
+                "turn_id":"preview-native-turn",
+                "cwd":"/Users/example/Desktop",
+                "tool_name":"request_permissions",
+                "tool_use_id":"preview-request-permissions",
+                "tool_response":{"status":"handled"}
+            }),
+            now_millis(),
+        ));
+    });
     println!("FLOW_AGENT_PREVIEW_URL={}", api.bootstrap_url());
     let seconds = env::var("FLOW_AGENT_PREVIEW_SECONDS")
         .ok()

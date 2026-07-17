@@ -47,6 +47,29 @@ fn codex_permission_request_preserves_turn_id() {
 }
 
 #[test]
+fn codex_request_permissions_tool_is_an_observed_native_request() {
+    let event = parse_hook(
+        Provider::Codex,
+        json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "codex-desktop-session",
+            "turn_id": "turn-native",
+            "tool_name": "request_permissions",
+            "tool_use_id": "call-native",
+            "tool_input": {
+                "permissions": {"network": {"enabled": true}},
+                "reason": "Allow terminal commands to access the network."
+            }
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(event.kind, EventKind::PermissionRequested);
+    assert_eq!(event.tool_name.as_deref(), Some("request_permissions"));
+    assert_eq!(event.provider_turn_id.as_deref(), Some("turn-native"));
+}
+
+#[test]
 fn supported_lifecycle_events_map_to_normalized_kinds() {
     let cases = [
         ("SessionStart", EventKind::SessionStarted),

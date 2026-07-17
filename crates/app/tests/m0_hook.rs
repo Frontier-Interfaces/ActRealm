@@ -16,7 +16,18 @@ fn temp_socket(name: &str) -> PathBuf {
 }
 
 fn run_hook(path: &Path, provider: &str, payload: serde_json::Value, timeout_ms: u64) -> Vec<u8> {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_flow-agent"))
+    run_hook_with_env(path, provider, payload, timeout_ms, &[])
+}
+
+fn run_hook_with_env(
+    path: &Path,
+    provider: &str,
+    payload: serde_json::Value,
+    timeout_ms: u64,
+    environment: &[(&str, &str)],
+) -> Vec<u8> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_flow-agent"));
+    command
         .args([
             "hook",
             "--provider",
@@ -27,9 +38,11 @@ fn run_hook(path: &Path, provider: &str, payload: serde_json::Value, timeout_ms:
         .env("FLOW_AGENT_HOOK_REPLY_TIMEOUT_MS", timeout_ms.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    for (key, value) in environment {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().unwrap();
     serde_json::to_writer(child.stdin.as_mut().unwrap(), &payload).unwrap();
     drop(child.stdin.take());
     let output = child.wait_with_output().unwrap();
@@ -121,6 +134,82 @@ fn explicit_pass_through_keeps_stdout_empty() {
     server.join().unwrap();
     assert!(stdout.is_empty());
     let _ = fs::remove_file(path);
+}
+
+#[test]
+fn codex_auto_review_is_forwarded_as_observation_without_blocking_or_directive() {
+    let path = temp_socket("auto-review");
+    let listener = UnixListener::bind(&path).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_request(&mut stream);
+        assert!(request.provider_handles_approval);
+        assert!(!request.needs_reply);
+        assert_eq!(request.request_id, None);
+    });
+
+    let started = Instant::now();
+    let stdout = run_hook(
+        &path,
+        "codex",
+        json!({
+            "hook_event_name":"PermissionRequest",
+            "session_id":"auto-review-session",
+            "turn_id":"turn-1",
+            "tool_name":"Bash",
+            "approvals_reviewer":"auto_review",
+            "permission_mode":"default"
+        }),
+        1_000,
+    );
+    server.join().unwrap();
+    assert!(stdout.is_empty());
+    // This is a process-level integration test, so retain enough startup
+    // budget for a loaded CI host. The dedicated Hook performance gate owns
+    // the sub-50 ms latency contract.
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn codex_auto_review_profile_config_is_used_when_the_hook_omits_the_reviewer() {
+    let path = temp_socket("auto-review-profile");
+    let listener = UnixListener::bind(&path).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_request(&mut stream);
+        assert!(request.provider_handles_approval);
+        assert!(!request.needs_reply);
+        assert_eq!(request.request_id, None);
+    });
+    let codex_home = std::env::temp_dir().join(format!(
+        "flow-agent-auto-review-config-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&codex_home).unwrap();
+    fs::write(
+        codex_home.join("config.toml"),
+        "profile = \"work\"\napprovals_reviewer = \"user\"\n\n[profiles.work]\napprovals_reviewer = \"auto_review\"\n",
+    )
+    .unwrap();
+
+    let stdout = run_hook_with_env(
+        &path,
+        "codex",
+        json!({
+            "hook_event_name":"PermissionRequest",
+            "session_id":"auto-review-profile-session",
+            "turn_id":"turn-1",
+            "tool_name":"Bash",
+            "permission_mode":"default"
+        }),
+        1_000,
+        &[("CODEX_HOME", codex_home.to_str().unwrap())],
+    );
+    server.join().unwrap();
+    assert!(stdout.is_empty());
+    let _ = fs::remove_file(path);
+    fs::remove_dir_all(codex_home).unwrap();
 }
 
 #[test]

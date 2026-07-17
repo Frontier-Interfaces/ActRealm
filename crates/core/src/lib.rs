@@ -361,6 +361,8 @@ pub struct BridgeRequest {
     pub received_at: u64,
     pub deadline_at: Option<u64>,
     pub needs_reply: bool,
+    #[serde(default)]
+    pub provider_handles_approval: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocking_kind: Option<BlockingRequestKind>,
     pub term: Option<TermContext>,
@@ -389,16 +391,22 @@ impl BridgeRequest {
 
     pub fn from_hook_at(provider: Provider, raw: Value, received_at: u64) -> Self {
         let event_name = raw.get("hook_event_name").and_then(Value::as_str);
-        let blocking_kind = match (provider, event_name) {
-            (Provider::Claude | Provider::Codex, Some("PermissionRequest")) => {
+        let provider_handles_approval = provider == Provider::Codex
+            && event_name == Some("PermissionRequest")
+            && codex_provider_handles_approval(&raw);
+        let blocking_kind = match (provider, event_name, provider_handles_approval) {
+            (Provider::Codex, Some("PermissionRequest"), true) => None,
+            (Provider::Claude | Provider::Codex, Some("PermissionRequest"), false) => {
                 Some(BlockingRequestKind::Permission)
             }
-            (Provider::Claude, Some("PreToolUse"))
+            (Provider::Claude, Some("PreToolUse"), _)
                 if raw.get("tool_name").and_then(Value::as_str) == Some("AskUserQuestion") =>
             {
                 Some(BlockingRequestKind::ClaudeQuestion)
             }
-            (Provider::Claude, Some("Elicitation")) => Some(BlockingRequestKind::ClaudeElicitation),
+            (Provider::Claude, Some("Elicitation"), _) => {
+                Some(BlockingRequestKind::ClaudeElicitation)
+            }
             _ => None,
         };
         let needs_reply = blocking_kind.is_some();
@@ -418,6 +426,7 @@ impl BridgeRequest {
                 received_at.saturating_add(permission_deadline_ms(provider).unwrap_or_default())
             }),
             needs_reply,
+            provider_handles_approval,
             blocking_kind,
             term: terminal_context(),
             raw,
@@ -438,6 +447,7 @@ impl BridgeRequest {
             received_at,
             deadline_at: Some(received_at.saturating_add(1_000)),
             needs_reply: true,
+            provider_handles_approval: false,
             blocking_kind: Some(BlockingRequestKind::Permission),
             term: None,
             raw: serde_json::json!({
@@ -478,6 +488,7 @@ impl BridgeRequest {
             received_at,
             deadline_at: Some(deadline_at),
             needs_reply: true,
+            provider_handles_approval: false,
             blocking_kind: Some(BlockingRequestKind::CodexUserInput),
             term: None,
             raw,
@@ -593,6 +604,28 @@ impl BridgeResponse {
 
 fn owned_raw_string(raw: &Value, key: &str) -> Option<String> {
     raw.get(key).and_then(Value::as_str).map(ToOwned::to_owned)
+}
+
+pub fn codex_provider_handles_approval(raw: &Value) -> bool {
+    let reviewer = [
+        "approvals_reviewer",
+        "approvalsReviewer",
+        "_approvals_reviewer",
+    ]
+    .iter()
+    .find_map(|key| raw.get(*key).and_then(Value::as_str))
+    .map(|value| value.trim().trim_matches(['\"', '\'']).to_ascii_lowercase());
+    if matches!(
+        reviewer.as_deref(),
+        Some("auto_review" | "guardian_subagent")
+    ) {
+        return true;
+    }
+
+    matches!(
+        raw.get("permission_mode").and_then(Value::as_str),
+        Some("dontAsk" | "bypassPermissions")
+    )
 }
 
 fn terminal_context() -> Option<TermContext> {
@@ -759,6 +792,66 @@ mod tests {
         );
         assert!(!codex_question.needs_reply);
         assert!(!stop.needs_reply);
+    }
+
+    #[test]
+    fn codex_auto_review_and_noninteractive_modes_remain_provider_owned() {
+        for raw in [
+            serde_json::json!({
+                "hook_event_name":"PermissionRequest",
+                "session_id":"auto-review",
+                "approvals_reviewer":"auto_review"
+            }),
+            serde_json::json!({
+                "hook_event_name":"PermissionRequest",
+                "session_id":"guardian",
+                "_approvals_reviewer":"guardian_subagent"
+            }),
+            serde_json::json!({
+                "hook_event_name":"PermissionRequest",
+                "session_id":"never-ask",
+                "permission_mode":"dontAsk"
+            }),
+        ] {
+            let request = BridgeRequest::from_hook_at(Provider::Codex, raw, 1_000);
+            assert!(request.provider_handles_approval);
+            assert!(!request.needs_reply);
+            assert_eq!(request.request_id, None);
+            assert_eq!(request.blocking_kind, None);
+        }
+
+        let user = BridgeRequest::from_hook_at(
+            Provider::Codex,
+            serde_json::json!({
+                "hook_event_name":"PermissionRequest",
+                "session_id":"user",
+                "approvals_reviewer":"user",
+                "permission_mode":"default"
+            }),
+            1_000,
+        );
+        assert!(!user.provider_handles_approval);
+        assert!(user.needs_reply);
+        assert_eq!(user.blocking_kind, Some(BlockingRequestKind::Permission));
+    }
+
+    #[test]
+    fn codex_request_permissions_pre_tool_is_observed_but_never_replyable() {
+        let request = BridgeRequest::from_hook_at(
+            Provider::Codex,
+            serde_json::json!({
+                "hook_event_name":"PreToolUse",
+                "session_id":"desktop-native-request",
+                "turn_id":"turn-native",
+                "tool_name":"request_permissions"
+            }),
+            1_000,
+        );
+
+        assert!(!request.needs_reply);
+        assert_eq!(request.blocking_kind, None);
+        assert_eq!(request.request_id, None);
+        assert!(!request.provider_handles_approval);
     }
 
     #[test]

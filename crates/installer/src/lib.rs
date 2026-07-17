@@ -126,6 +126,44 @@ pub fn discover_provider_availability(provider: HookProvider) -> ProviderAvailab
     }
 }
 
+/// Returns whether the effective Codex profile delegates approvals to Codex's
+/// automatic reviewer. Hook payload fields still take precedence; this is only
+/// a compatibility fallback for Codex builds that omit the reviewer field.
+pub fn codex_config_enables_auto_review(path: &Path) -> bool {
+    if refuse_symlink(path).is_err() || !path.exists() {
+        return false;
+    }
+    let Ok(bytes) = read_bounded(path, CONFIG_LIMIT_BYTES) else {
+        return false;
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    let Ok(document) = text.parse::<DocumentMut>() else {
+        return false;
+    };
+    let selected_profile = document.get("profile").and_then(|item| item.as_str());
+    let reviewer = selected_profile
+        .and_then(|profile| {
+            document
+                .get("profiles")
+                .and_then(|profiles| profiles.get(profile))
+                .and_then(|profile| profile.get("approvals_reviewer"))
+                .and_then(|item| item.as_str())
+        })
+        .or_else(|| {
+            document
+                .get("approvals_reviewer")
+                .and_then(|item| item.as_str())
+        });
+    reviewer.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "auto_review" | "guardian_subagent"
+        )
+    })
+}
+
 fn find_executable_in_path(executable: &str) -> Option<PathBuf> {
     env::var_os("PATH").and_then(|paths| {
         env::split_paths(&paths).find_map(|directory| {
