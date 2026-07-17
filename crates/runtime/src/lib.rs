@@ -19,4 +19,7 @@ pub use storage::{
     CommandRecord, CommandState, CommitResult, IngestResult, MetricEvent, MetricsSummary,
     QuotaRecord, RuntimeStore, SessionRecord, StoreError, StoreSnapshot,
 };
-pub use waiter::{RegisterResult, WaiterError, WaiterRegistry, WaiterTicket};
+pub use waiter::{
+    InteractiveOption, InteractivePrompt, InteractiveQuestion, RegisterResult, WaiterError,
+    WaiterRegistry, WaiterTicket,
+};

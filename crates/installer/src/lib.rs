@@ -26,6 +26,7 @@ const CLAUDE_EVENTS: &[&str] = &[
     "PostToolUseFailure",
     "PermissionRequest",
     "PermissionDenied",
+    "Elicitation",
     "Notification",
     "Stop",
     "StopFailure",
@@ -1081,7 +1082,7 @@ fn merge_provider_hooks(
 
 fn hook_group(provider: HookProvider, event: &str, command: &str) -> Value {
     let timeout = match (provider, event) {
-        (HookProvider::Claude, "PermissionRequest") => 86_400,
+        (HookProvider::Claude, "PermissionRequest" | "PreToolUse" | "Elicitation") => 86_400,
         (HookProvider::Codex, "PermissionRequest") => 3_600,
         _ => 5,
     };

@@ -103,7 +103,7 @@ fn existing_v1_database_adds_task_titles_without_losing_sessions() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        5
+        6
     );
     drop(connection);
     fs::remove_dir_all(root).unwrap();
@@ -303,6 +303,7 @@ fn restart_restores_running_session_and_keeps_private_jump_locator_out_of_json()
             title: Some("private title".to_owned()),
             bundle_id: Some("com.openai.codex".to_owned()),
             surface: Some("codex_app".to_owned()),
+            provider_pid: None,
         });
         store.ingest(request).unwrap();
         let before = store.snapshot().unwrap();
@@ -596,16 +597,33 @@ fn restart_expires_every_approval_without_a_live_waiter() {
         Some("git status"),
         10_000,
     );
+    let question = BridgeRequest::from_hook_at(
+        Provider::Claude,
+        json!({
+            "hook_event_name":"PreToolUse",
+            "session_id":"restart-question-session",
+            "prompt_id":"prompt-2",
+            "tool_name":"AskUserQuestion",
+            "tool_input":{"questions":[{"question":"Continue?","header":"Confirm","options":[],"multiSelect":false}]}
+        }),
+        10_001,
+    );
     {
         let store = RuntimeStore::open(&database).unwrap();
         store.ingest(permission).unwrap();
+        store.ingest(question).unwrap();
     }
     let reopened = RuntimeStore::open(&database).unwrap();
     assert_eq!(
         reopened.reconcile_orphaned_approvals(Vec::new(), 20_000),
-        Ok(1)
+        Ok(2)
     );
-    assert_eq!(reopened.snapshot().unwrap().attention[0].state, "expired");
+    assert!(reopened
+        .snapshot()
+        .unwrap()
+        .attention
+        .iter()
+        .all(|item| item.state == "expired"));
     drop(reopened);
     fs::remove_dir_all(root).unwrap();
 }

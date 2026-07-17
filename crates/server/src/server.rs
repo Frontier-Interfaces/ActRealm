@@ -8,6 +8,10 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use flow_agent_codex_connector::{
+    CodexConnector, CodexThread, ConnectorChannels, ServerNotification, ServerRequest,
+};
+use flow_agent_core::{BridgeRequest, ReplyAction, ReplyPayload};
 use flow_agent_installer::{
     discover_provider_availability, BinaryHealth, ClaudeStatuslineStatus, CodexTrustStatus,
     ConfigHealth, HookProvider, InstallIntent, InstallOptions, InstallPaths, Installer,
@@ -15,11 +19,11 @@ use flow_agent_installer::{
 use flow_agent_quota::{QuotaCollector, QuotaEntry, QuotaPaths};
 use flow_agent_runtime::{
     ApprovalAction, AttentionAction, CommandState, MetricEvent, QuotaRecord, RuntimeStore,
-    SessionRecord, StoreError, WaiterRegistry,
+    SessionRecord, StoreError, WaiterError, WaiterRegistry,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
@@ -35,6 +39,29 @@ use uuid::Uuid;
 const SESSION_COOKIE: &str = "flow_agent_session";
 const CSRF_HEADER: &str = "x-flow-agent-csrf";
 const SETTINGS_KEY: &str = "ui_settings";
+const MANAGED_CODEX_THREADS_KEY: &str = "managed_codex_threads";
+const MAX_MANAGED_CODEX_THREADS: usize = 32;
+const TASK_CARD_DISPLAY_FIELDS: &[&str] = &[
+    "project",
+    "task",
+    "model",
+    "activity",
+    "plan",
+    "tokens",
+    "context",
+    "tool",
+    "permissionMode",
+    "subagents",
+    "environment",
+    "recovery",
+    "control",
+    "jump",
+    "titleSource",
+    "sessionId",
+    "providerSessionId",
+    "providerTurnId",
+    "lastEventAt",
+];
 const SESSION_LIST_RETENTION_MS: u64 = 30 * 60 * 1_000;
 const INDEX_HTML: &str = include_str!("../../../web/index.html");
 const APP_CSS: &str = include_str!("../../../web/app.css");
@@ -49,6 +76,7 @@ pub struct ApiServerConfig {
     pub snapshot_interval: Duration,
     pub quota_poll_interval: Duration,
     pub install_paths: Option<InstallPaths>,
+    pub enable_codex_connector: bool,
 }
 
 impl Default for ApiServerConfig {
@@ -59,6 +87,7 @@ impl Default for ApiServerConfig {
             snapshot_interval: Duration::from_millis(100),
             quota_poll_interval: Duration::from_secs(5 * 60),
             install_paths: None,
+            enable_codex_connector: false,
         }
     }
 }
@@ -116,6 +145,12 @@ impl ApiServer {
             spool: install_paths.flow_home.join("spool"),
             diagnostics: install_paths.flow_home.join("diagnostics"),
         };
+        let codex_socket = install_paths.flow_home.join("run/codex-app-server.sock");
+        let codex = if config.enable_codex_connector {
+            CodexManager::start(store.clone(), waiters.clone(), &codex_socket)
+        } else {
+            CodexManager::disabled(store.clone())
+        };
         let state = AppState {
             store,
             waiters,
@@ -137,6 +172,7 @@ impl ApiServer {
                 claude_cache_modified_at: None,
             })),
             data_paths,
+            codex,
         };
         let router = router(state);
         let (shutdown, shutdown_receiver) = oneshot::channel();
@@ -208,6 +244,23 @@ struct AppState {
     installer: Arc<Installer>,
     quota: Arc<Mutex<QuotaState>>,
     data_paths: DataPaths,
+    codex: CodexManager,
+}
+
+#[derive(Clone)]
+struct CodexManager {
+    connector: Option<CodexConnector>,
+    state: Arc<Mutex<CodexManagerState>>,
+    store: RuntimeStore,
+}
+
+#[derive(Default)]
+struct CodexManagerState {
+    status: String,
+    error: Option<String>,
+    threads: HashMap<String, CodexThread>,
+    managed: HashSet<String>,
+    resume_failed: HashSet<String>,
 }
 
 struct QuotaState {
@@ -230,6 +283,354 @@ struct AuthState {
     csrf_token: Option<String>,
 }
 
+impl CodexManager {
+    fn disabled(store: RuntimeStore) -> Self {
+        Self {
+            connector: None,
+            state: Arc::new(Mutex::new(CodexManagerState {
+                status: "disabled".to_owned(),
+                ..CodexManagerState::default()
+            })),
+            store,
+        }
+    }
+
+    fn start(store: RuntimeStore, waiters: WaiterRegistry, socket_path: &FilePath) -> Self {
+        let state = Arc::new(Mutex::new(CodexManagerState {
+            status: "unavailable".to_owned(),
+            ..CodexManagerState::default()
+        }));
+        let executable = discover_provider_availability(HookProvider::Codex)
+            .version_executable()
+            .map(ToOwned::to_owned);
+        let Some(executable) = executable else {
+            if let Ok(mut current) = state.lock() {
+                current.error = Some("未找到支持 app-server 的 Codex 客户端".to_owned());
+            }
+            return Self {
+                connector: None,
+                state,
+                store,
+            };
+        };
+        let (connector, channels) = match CodexConnector::connect(&executable, socket_path) {
+            Ok(connection) => connection,
+            Err(error) => {
+                if let Ok(mut current) = state.lock() {
+                    current.error = Some(error.to_string());
+                }
+                return Self {
+                    connector: None,
+                    state,
+                    store,
+                };
+            }
+        };
+        let managed = store
+            .read_setting(MANAGED_CODEX_THREADS_KEY)
+            .ok()
+            .flatten()
+            .and_then(|value| serde_json::from_str::<Vec<String>>(&value).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|id| !id.is_empty() && id.len() <= 256)
+            .take(MAX_MANAGED_CODEX_THREADS)
+            .collect::<HashSet<_>>();
+        let listed = connector.list_threads().unwrap_or_default();
+        if let Ok(mut current) = state.lock() {
+            current.status = "connected".to_owned();
+            current.error = None;
+            current.managed = managed.clone();
+            current.threads = listed
+                .into_iter()
+                .map(|thread| (thread.id.clone(), thread))
+                .collect();
+        }
+        for thread_id in &managed {
+            if let Ok(thread) = connector.resume_thread(thread_id) {
+                if let Ok(mut current) = state.lock() {
+                    current.resume_failed.remove(thread_id);
+                    current.threads.insert(thread.id.clone(), thread);
+                }
+            } else if let Ok(mut current) = state.lock() {
+                current.resume_failed.insert(thread_id.clone());
+            }
+        }
+        spawn_codex_handlers(
+            connector.clone(),
+            channels,
+            Arc::clone(&state),
+            store.clone(),
+            waiters,
+        );
+        Self {
+            connector: Some(connector),
+            state,
+            store,
+        }
+    }
+
+    fn attach(&self, thread_id: &str) -> Result<CodexThread, String> {
+        let connector = self
+            .connector
+            .as_ref()
+            .ok_or_else(|| "Codex app-server Connector 当前不可用".to_owned())?;
+        let thread = connector
+            .resume_thread(thread_id)
+            .map_err(|error| error.to_string())?;
+        let managed = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "Connector 状态不可用".to_owned())?;
+            state.managed.insert(thread_id.to_owned());
+            state.resume_failed.remove(thread_id);
+            state.threads.insert(thread.id.clone(), thread.clone());
+            let mut managed = state.managed.iter().cloned().collect::<Vec<_>>();
+            managed.sort();
+            managed
+        };
+        self.store
+            .write_setting(
+                MANAGED_CODEX_THREADS_KEY,
+                serde_json::to_string(&managed).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(thread)
+    }
+
+    fn capability_value(&self) -> Value {
+        let Ok(state) = self.state.lock() else {
+            return json!({"status":"unavailable","error":"Connector 状态不可用"});
+        };
+        json!({
+            "status": state.status,
+            "error": state.error,
+            "managedThreads": state.managed.len(),
+            "protocol": "app-server",
+            "experimentalUserInput": true
+        })
+    }
+
+    fn recovery_for(
+        &self,
+        thread_id: &str,
+        exec_state: &str,
+    ) -> (String, String, bool, Option<String>) {
+        let Ok(state) = self.state.lock() else {
+            return (
+                "external_hook".to_owned(),
+                "waiting_for_event".to_owned(),
+                false,
+                None,
+            );
+        };
+        let managed = state.managed.contains(thread_id);
+        let status = state
+            .threads
+            .get(thread_id)
+            .map(|thread| thread.status.clone());
+        if managed {
+            if state.status != "connected" || state.resume_failed.contains(thread_id) {
+                return (
+                    "managed".to_owned(),
+                    "lost_control".to_owned(),
+                    false,
+                    status,
+                );
+            }
+            let recovery = match status.as_deref() {
+                Some("active") => "controllable",
+                Some("idle") => "ended",
+                Some("systemError") => "lost_control",
+                Some("notLoaded") | None => "waiting_for_event",
+                Some(_) => "waiting_for_event",
+            };
+            return ("managed".to_owned(), recovery.to_owned(), false, status);
+        }
+        let ended = matches!(exec_state, "idle" | "response_finished" | "failed");
+        (
+            "external_hook".to_owned(),
+            if ended { "ended" } else { "observing" }.to_owned(),
+            state.status == "connected",
+            status,
+        )
+    }
+}
+
+fn spawn_codex_handlers(
+    connector: CodexConnector,
+    channels: ConnectorChannels,
+    state: Arc<Mutex<CodexManagerState>>,
+    store: RuntimeStore,
+    waiters: WaiterRegistry,
+) {
+    let request_connector = connector.clone();
+    let request_state = Arc::clone(&state);
+    let request_store = store.clone();
+    thread::spawn(move || {
+        for request in channels.requests {
+            handle_codex_server_request(
+                request_connector.clone(),
+                Arc::clone(&request_state),
+                request_store.clone(),
+                waiters.clone(),
+                request,
+            );
+        }
+        if let Ok(mut current) = request_state.lock() {
+            current.status = "unavailable".to_owned();
+            current.error = Some("Codex app-server 请求通道已断开".to_owned());
+        }
+    });
+    thread::spawn(move || {
+        for notification in channels.notifications {
+            update_codex_notification(&state, notification);
+        }
+        if let Ok(mut current) = state.lock() {
+            current.status = "unavailable".to_owned();
+            current.error = Some("Codex app-server 通知通道已断开".to_owned());
+        }
+    });
+}
+
+fn handle_codex_server_request(
+    connector: CodexConnector,
+    state: Arc<Mutex<CodexManagerState>>,
+    store: RuntimeStore,
+    waiters: WaiterRegistry,
+    request: ServerRequest,
+) {
+    if request.method != "item/tool/requestUserInput" {
+        let _ = connector.respond_error(
+            request.id,
+            -32601,
+            "Unsupported Flow Agent connector request",
+        );
+        return;
+    }
+    let Some(bridge_request) = BridgeRequest::codex_user_input_at(request.params, now_millis())
+    else {
+        let _ = connector.respond_error(request.id, -32602, "Invalid requestUserInput params");
+        return;
+    };
+    let Some(thread_id) = bridge_request.provider_session_id.clone() else {
+        let _ = connector.respond_error(request.id, -32602, "Missing threadId");
+        return;
+    };
+    let request_id = bridge_request.request_id.unwrap_or(bridge_request.id);
+    let registration = match waiters.register_at(&bridge_request, now_millis()) {
+        Ok(registration) => registration,
+        Err(_) => {
+            let _ = connector.respond_error(request.id, -32000, "Question waiter unavailable");
+            return;
+        }
+    };
+    if store.ingest(bridge_request.clone()).is_err() {
+        let _ = waiters.pass_through(request_id, "runtime_error");
+        let _ = connector.respond_error(request.id, -32000, "Flow Agent storage unavailable");
+        return;
+    }
+    let managed = if let Ok(mut current) = state.lock() {
+        current.managed.insert(thread_id.clone());
+        current.resume_failed.remove(&thread_id);
+        current
+            .threads
+            .entry(thread_id.clone())
+            .and_modify(|thread| {
+                thread.status = "active".to_owned();
+                if !thread
+                    .active_flags
+                    .iter()
+                    .any(|flag| flag == "waitingOnUserInput")
+                {
+                    thread.active_flags.push("waitingOnUserInput".to_owned());
+                }
+            });
+        let mut managed = current.managed.iter().cloned().collect::<Vec<_>>();
+        managed.sort();
+        Some(managed)
+    } else {
+        None
+    };
+    if let Some(managed) = managed.and_then(|value| serde_json::to_string(&value).ok()) {
+        let _ = store.write_setting(MANAGED_CODEX_THREADS_KEY, managed);
+    }
+    thread::spawn(move || {
+        let wait_for = bridge_request
+            .deadline_at
+            .map(|deadline| Duration::from_millis(deadline.saturating_sub(now_millis())))
+            .unwrap_or(Duration::from_secs(60));
+        match registration.ticket.recv_timeout(wait_for) {
+            Ok(response) => match (response.action, response.payload) {
+                (ReplyAction::Answer, Some(ReplyPayload::CodexUserInput { answers })) => {
+                    let answers = answers
+                        .into_iter()
+                        .map(|(id, answers)| (id, json!({"answers": answers})))
+                        .collect::<serde_json::Map<_, _>>();
+                    let _ = connector.respond(request.id, json!({"answers": answers}));
+                }
+                _ => {
+                    let _ =
+                        connector.respond_error(request.id, -32001, "Question was not answered");
+                }
+            },
+            Err(_) => {
+                let _ = waiters.pass_through(request_id, "deadline");
+                let _ = store.expire_approval(request_id, "deadline", now_millis());
+                let _ = connector.respond_error(request.id, -32001, "Question expired");
+            }
+        }
+    });
+}
+
+fn update_codex_notification(
+    state: &Arc<Mutex<CodexManagerState>>,
+    notification: ServerNotification,
+) {
+    let Some(thread_id) = notification
+        .params
+        .get("threadId")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+    else {
+        return;
+    };
+    let Ok(mut current) = state.lock() else {
+        return;
+    };
+    current.resume_failed.remove(&thread_id);
+    if notification.method == "thread/status/changed" {
+        let Some(status) = notification
+            .params
+            .pointer("/status/type")
+            .and_then(Value::as_str)
+        else {
+            return;
+        };
+        if let Some(thread) = current.threads.get_mut(&thread_id) {
+            thread.status = status.to_owned();
+            thread.active_flags = notification
+                .params
+                .pointer("/status/activeFlags")
+                .and_then(Value::as_array)
+                .map(|flags| {
+                    flags
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+    } else if notification.method == "turn/completed" {
+        if let Some(thread) = current.threads.get_mut(&thread_id) {
+            thread.status = "idle".to_owned();
+            thread.active_flags.clear();
+        }
+    }
+}
+
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
@@ -248,8 +649,10 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/metrics/export", get(export_metrics))
         .route("/api/v1/data/clear", post(clear_data))
         .route("/api/v1/commands", post(command))
+        .route("/api/v1/questions/{id}/answer", post(answer_question))
         .route("/api/v1/commands/{id}/undo", post(undo))
         .route("/api/v1/sessions/{id}/jump", post(jump_session))
+        .route("/api/v1/sessions/{id}/manage", post(manage_session))
         .route("/api/v1/ws", get(websocket))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(state)
@@ -531,13 +934,15 @@ fn setup_value(state: &AppState) -> Result<Value, String> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 struct UiSettings {
     notification_rules: NotificationRules,
     sound_enabled: bool,
     provider_muted: ProviderMuted,
     codex_enhanced_activity: bool,
     retention_days: u32,
+    display_profile: String,
+    task_card_fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -572,6 +977,21 @@ impl Default for UiSettings {
             },
             codex_enhanced_activity: true,
             retention_days: 90,
+            display_profile: "detailed".to_owned(),
+            task_card_fields: vec![
+                "project".to_owned(),
+                "task".to_owned(),
+                "model".to_owned(),
+                "activity".to_owned(),
+                "plan".to_owned(),
+                "tokens".to_owned(),
+                "tool".to_owned(),
+                "subagents".to_owned(),
+                "environment".to_owned(),
+                "recovery".to_owned(),
+                "control".to_owned(),
+                "jump".to_owned(),
+            ],
         }
     }
 }
@@ -590,6 +1010,24 @@ impl UiSettings {
         }
         if !matches!(self.retention_days, 30 | 90 | 365) {
             return Err("retentionDays must be 30, 90, or 365");
+        }
+        if !matches!(
+            self.display_profile.as_str(),
+            "concise" | "detailed" | "developer"
+        ) {
+            return Err("displayProfile must be concise, detailed, or developer");
+        }
+        if self.task_card_fields.len() > TASK_CARD_DISPLAY_FIELDS.len() {
+            return Err("taskCardFields contains too many fields");
+        }
+        let mut unique = HashSet::new();
+        for field in &self.task_card_fields {
+            if !TASK_CARD_DISPLAY_FIELDS.contains(&field.as_str()) {
+                return Err("taskCardFields contains an unsupported field");
+            }
+            if !unique.insert(field.as_str()) {
+                return Err("taskCardFields contains duplicate fields");
+            }
         }
         Ok(())
     }
@@ -703,6 +1141,27 @@ fn settings_value(state: &AppState) -> Result<Value, String> {
         .map_err(|error| error.to_string())?;
     Ok(json!({
         "settings": settings,
+        "displayCatalog": [
+            { "id": "project", "label": "项目名", "level": "detailed" },
+            { "id": "task", "label": "任务内容", "level": "concise" },
+            { "id": "model", "label": "模型", "level": "detailed" },
+            { "id": "activity", "label": "实时状态与本轮时间", "level": "concise" },
+            { "id": "plan", "label": "计划进度", "level": "detailed" },
+            { "id": "tokens", "label": "本轮 Token", "level": "detailed" },
+            { "id": "context", "label": "上下文占用", "level": "detailed" },
+            { "id": "tool", "label": "当前工具", "level": "detailed" },
+            { "id": "permissionMode", "label": "权限模式", "level": "detailed" },
+            { "id": "subagents", "label": "运行中的子 Agent", "level": "detailed" },
+            { "id": "environment", "label": "运行环境", "level": "detailed" },
+            { "id": "recovery", "label": "恢复状态", "level": "detailed" },
+            { "id": "control", "label": "控制能力", "level": "detailed" },
+            { "id": "jump", "label": "跳转能力", "level": "detailed" },
+            { "id": "titleSource", "label": "标题来源", "level": "developer" },
+            { "id": "sessionId", "label": "Flow Agent Session ID", "level": "developer" },
+            { "id": "providerSessionId", "label": "Provider Session ID", "level": "developer" },
+            { "id": "providerTurnId", "label": "Provider Turn ID", "level": "developer" },
+            { "id": "lastEventAt", "label": "最后事件时间", "level": "developer" }
+        ],
         "claudeQuotaBridge": {
             "status": bridge.status,
             "configPath": bridge.config_path,
@@ -1033,6 +1492,68 @@ async fn command(
     }
 }
 
+async fn answer_question(
+    State(state): State<AppState>,
+    Path(request_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(submission): Json<Value>,
+) -> Response {
+    if !authorized_mutation(&state, &headers) {
+        return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_MUTATION");
+    }
+    if !submission.is_object() {
+        return api_error(StatusCode::BAD_REQUEST, "INVALID_ANSWER");
+    }
+    let snapshot = match state.store.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "STORAGE_ERROR"),
+    };
+    let Some(attention) = snapshot.attention.iter().find(|item| {
+        item.request_id == Some(request_id) && item.kind == "question" && item.state == "open"
+    }) else {
+        return api_error(StatusCode::CONFLICT, "QUESTION_EXPIRED");
+    };
+    let native_provider_ui = submission.get("action").and_then(Value::as_str) == Some("native");
+    let result = if native_provider_ui {
+        state.waiters.pass_through(request_id, "native_provider_ui")
+    } else {
+        state.waiters.answer(request_id, &submission)
+    };
+    match result {
+        Ok(()) => {}
+        Err(WaiterError::InvalidAnswer | WaiterError::NotInteractive) => {
+            return api_error(StatusCode::BAD_REQUEST, "INVALID_ANSWER")
+        }
+        Err(WaiterError::NotActive) => {
+            let _ = state
+                .store
+                .expire_approval(request_id, "stale_waiter", now_millis());
+            return api_error(StatusCode::CONFLICT, "QUESTION_EXPIRED");
+        }
+        Err(WaiterError::Poisoned | WaiterError::NotBlocking) => {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "ANSWER_FAILED")
+        }
+    }
+    let command_id = Uuid::now_v7();
+    if state
+        .store
+        .act_on_attention(
+            command_id,
+            &attention.id,
+            AttentionAction::Ack,
+            now_millis(),
+        )
+        .is_err()
+    {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "STORAGE_ERROR");
+    }
+    Json(json!({
+        "requestId": request_id,
+        "state": if native_provider_ui { "passed_through" } else { "answered" }
+    }))
+    .into_response()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum JumpTarget {
     CodexThread(String),
@@ -1076,6 +1597,49 @@ async fn jump_session(
             "JUMP_FAILED",
             "系统没有找到目标窗口，或尚未授予应用控制权限",
         ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ManageSessionRequest {
+    action: String,
+}
+
+async fn manage_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<ManageSessionRequest>,
+) -> Response {
+    if !authorized_mutation(&state, &headers) {
+        return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_MUTATION");
+    }
+    if request.action != "attach" {
+        return api_error(StatusCode::BAD_REQUEST, "UNKNOWN_MANAGE_ACTION");
+    }
+    let snapshot = match state.store.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "STORAGE_ERROR"),
+    };
+    let Some(session) = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.id == session_id)
+    else {
+        return api_error(StatusCode::NOT_FOUND, "SESSION_NOT_FOUND");
+    };
+    if session.provider != "codex" {
+        return api_error(StatusCode::CONFLICT, "MANAGED_CONNECTOR_UNSUPPORTED");
+    }
+    match state.codex.attach(&session.provider_session_id) {
+        Ok(thread) => Json(json!({
+            "attached": true,
+            "threadId": thread.id,
+            "status": thread.status,
+            "controlCapability": "managed"
+        }))
+        .into_response(),
+        Err(error) => api_error_detail(StatusCode::CONFLICT, "CONNECTOR_ATTACH_FAILED", &error),
     }
 }
 
@@ -1320,17 +1884,93 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
             || session.last_event_at >= cutoff
             || visible_attention_sessions.contains(session.id.as_str())
     });
+    let mut sessions = serde_json::to_value(&snapshot.sessions)
+        .map_err(|error| StoreError::Storage(error.to_string()))?;
+    if let Some(items) = sessions.as_array_mut() {
+        for (index, session) in snapshot.sessions.iter().enumerate() {
+            let (control, mut recovery, can_manage, connector_status) =
+                if session.provider == "codex" {
+                    state
+                        .codex
+                        .recovery_for(&session.provider_session_id, &session.exec_state)
+                } else {
+                    let ended = matches!(
+                        session.exec_state.as_str(),
+                        "idle" | "response_finished" | "failed"
+                    );
+                    (
+                        "external_hook".to_owned(),
+                        if ended { "ended" } else { "observing" }.to_owned(),
+                        false,
+                        None,
+                    )
+                };
+            if control == "external_hook"
+                && !matches!(
+                    session.exec_state.as_str(),
+                    "idle" | "response_finished" | "failed"
+                )
+            {
+                recovery = match session.provider_pid {
+                    Some(pid) if process_alive(pid) => "observing".to_owned(),
+                    Some(_) => "lost_control".to_owned(),
+                    None => "waiting_for_event".to_owned(),
+                };
+            }
+            if let Some(object) = items.get_mut(index).and_then(Value::as_object_mut) {
+                object.insert("controlCapability".to_owned(), Value::String(control));
+                object.insert("recoveryState".to_owned(), Value::String(recovery));
+                object.insert("canManage".to_owned(), Value::Bool(can_manage));
+                if let Some(status) = connector_status {
+                    object.insert("connectorThreadStatus".to_owned(), Value::String(status));
+                }
+            }
+        }
+    }
+    let mut attention = serde_json::to_value(&snapshot.attention)
+        .map_err(|error| StoreError::Storage(error.to_string()))?;
+    if let Some(items) = attention.as_array_mut() {
+        for (index, item) in snapshot.attention.iter().enumerate() {
+            let Some(request_id) = item.request_id else {
+                continue;
+            };
+            let Ok(Some(interaction)) = state.waiters.interactive_prompt(request_id) else {
+                continue;
+            };
+            if let Some(object) = items.get_mut(index).and_then(Value::as_object_mut) {
+                object.insert(
+                    "interaction".to_owned(),
+                    serde_json::to_value(interaction)
+                        .map_err(|error| StoreError::Storage(error.to_string()))?,
+                );
+            }
+        }
+    }
     let quota = quota_entries(state)?;
     Ok(json!({
-        "sessions": snapshot.sessions,
-        "attention": snapshot.attention,
+        "sessions": sessions,
+        "attention": attention,
         "commands": snapshot.commands,
         "quota": quota,
         "stats": {
             "eventCount": snapshot.event_count,
             "metrics": snapshot.metrics
+        },
+        "capabilities": {
+            "codexConnector": state.codex.capability_value()
         }
     }))
+}
+
+fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 1 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 fn quota_entries(state: &AppState) -> Result<Vec<QuotaEntry>, StoreError> {
@@ -1500,6 +2140,7 @@ mod tests {
             flow_home: paths.flow_home.clone(),
             codex_sessions: root.join("codex/sessions"),
         };
+        let codex = CodexManager::disabled(store.clone());
         AppState {
             store,
             waiters: WaiterRegistry::default(),
@@ -1525,6 +2166,7 @@ mod tests {
                 spool: root.join("flow-home/spool"),
                 diagnostics: root.join("flow-home/diagnostics"),
             },
+            codex,
         }
     }
 
@@ -1548,6 +2190,7 @@ mod tests {
                     title: None,
                     bundle_id: Some("com.openai.codex".to_owned()),
                     surface: Some("codex_app".to_owned()),
+                    provider_pid: None,
                 },
             ),
             (
@@ -1560,6 +2203,7 @@ mod tests {
                     title: None,
                     bundle_id: Some("com.googlecode.iterm2".to_owned()),
                     surface: Some("terminal".to_owned()),
+                    provider_pid: None,
                 },
             ),
             (
@@ -1572,6 +2216,7 @@ mod tests {
                     title: None,
                     bundle_id: Some("com.anthropic.claudefordesktop".to_owned()),
                     surface: Some("claude_app".to_owned()),
+                    provider_pid: None,
                 },
             ),
         ];
@@ -2168,6 +2813,193 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         });
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn m10_display_settings_migrate_and_reject_fields_outside_the_safe_catalog() {
+        let legacy = serde_json::from_value::<UiSettings>(json!({
+            "notificationRules": {
+                "approval": "banner",
+                "question": "list",
+                "error": "banner",
+                "completion": "list"
+            },
+            "soundEnabled": false,
+            "providerMuted": { "claude": false, "codex": true },
+            "codexEnhancedActivity": true,
+            "retentionDays": 90
+        }))
+        .unwrap();
+        assert_eq!(legacy.display_profile, "detailed");
+        assert!(legacy.task_card_fields.contains(&"activity".to_owned()));
+        legacy.validate().unwrap();
+
+        for unsafe_field in ["raw", "payload", "fullCommand", "transcript"] {
+            let unsafe_settings = UiSettings {
+                task_card_fields: vec![unsafe_field.to_owned()],
+                ..UiSettings::default()
+            };
+            assert_eq!(
+                unsafe_settings.validate(),
+                Err("taskCardFields contains an unsupported field")
+            );
+        }
+
+        let encoded = serde_json::to_string(&UiSettings::default()).unwrap();
+        assert!(!encoded.contains("raw"));
+        assert!(!encoded.contains("payload"));
+        assert!(!encoded.contains("command"));
+    }
+
+    #[test]
+    fn interactive_question_is_ephemeral_answerable_and_removed_from_snapshot() {
+        let root = std::env::temp_dir().join(format!(
+            "flow-agent-server-question-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        {
+            let mut auth = state.auth.lock().unwrap();
+            auth.bootstrap_token = None;
+            auth.session_token = Some("test-session".to_owned());
+            auth.csrf_token = Some("test-csrf".to_owned());
+        }
+        let request = flow_agent_core::BridgeRequest::from_hook_at(
+            flow_agent_core::Provider::Claude,
+            json!({
+                "hook_event_name":"Elicitation",
+                "session_id":"question-session",
+                "message":"enter private key",
+                "requested_schema":{
+                    "type":"object",
+                    "required":["key"],
+                    "properties":{"key":{"type":"string","format":"password"}}
+                }
+            }),
+            now_millis(),
+        );
+        let registration = state.waiters.register_at(&request, now_millis()).unwrap();
+        let request_id = request.request_id.unwrap();
+        store.ingest(request).unwrap();
+        let before = snapshot_value(&state).unwrap();
+        let interactive = before["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|item| item.get("interaction"))
+            .unwrap();
+        assert_eq!(interactive["questions"][0]["isSecret"], true);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let response = router(state.clone())
+                .oneshot(authorized_request(
+                    "POST",
+                    &format!("/api/v1/questions/{request_id}/answer"),
+                    json!({"action":"accept","answers":{"key":"secret-48291"}}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+        let response = registration
+            .ticket
+            .recv_timeout(Duration::from_millis(50))
+            .unwrap();
+        assert_eq!(response.action, flow_agent_core::ReplyAction::Answer);
+        let after = snapshot_value(&state).unwrap();
+        assert!(after["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item.get("interaction").is_none()));
+        let exported = serde_json::to_string(&store.export_json(now_millis()).unwrap()).unwrap();
+        assert!(!exported.contains("secret-48291"));
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_snapshot_distinguishes_observing_lost_and_managed_sessions() {
+        let root = std::env::temp_dir().join(format!(
+            "flow-agent-server-recovery-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        for (session, pid) in [
+            ("live-external", std::process::id()),
+            ("dead-external", u32::MAX - 1),
+        ] {
+            let mut request = flow_agent_core::BridgeRequest::from_hook_at(
+                flow_agent_core::Provider::Claude,
+                json!({
+                    "hook_event_name":"UserPromptSubmit",
+                    "session_id":session,
+                    "prompt":"recovery test"
+                }),
+                now_millis(),
+            );
+            request.term.as_mut().unwrap().provider_pid = Some(pid);
+            store.ingest(request).unwrap();
+        }
+        let mut managed = flow_agent_core::BridgeRequest::from_hook_at(
+            flow_agent_core::Provider::Codex,
+            json!({
+                "hook_event_name":"UserPromptSubmit",
+                "session_id":"managed-thread",
+                "turn_id":"turn-1",
+                "prompt":"managed recovery"
+            }),
+            now_millis(),
+        );
+        managed.term = None;
+        store.ingest(managed).unwrap();
+        let mut state = test_state(store.clone(), &root);
+        state.codex.state = Arc::new(Mutex::new(CodexManagerState {
+            status: "connected".to_owned(),
+            managed: HashSet::from(["managed-thread".to_owned()]),
+            threads: HashMap::from([(
+                "managed-thread".to_owned(),
+                CodexThread {
+                    id: "managed-thread".to_owned(),
+                    name: Some("Managed".to_owned()),
+                    cwd: None,
+                    status: "active".to_owned(),
+                    active_flags: vec![],
+                    updated_at: None,
+                },
+            )]),
+            error: None,
+            resume_failed: HashSet::new(),
+        }));
+        let value = snapshot_value(&state).unwrap();
+        let sessions = value["sessions"].as_array().unwrap();
+        let recovery = |id: &str| {
+            sessions
+                .iter()
+                .find(|session| session["providerSessionId"] == id)
+                .unwrap()["recoveryState"]
+                .as_str()
+                .unwrap()
+        };
+        assert_eq!(recovery("live-external"), "observing");
+        assert_eq!(recovery("dead-external"), "lost_control");
+        assert_eq!(recovery("managed-thread"), "controllable");
+        let managed_session = sessions
+            .iter()
+            .find(|session| session["providerSessionId"] == "managed-thread")
+            .unwrap();
+        assert_eq!(managed_session["controlCapability"], "managed");
+        drop(state);
+        drop(store);
         fs::remove_dir_all(root).unwrap();
     }
 }

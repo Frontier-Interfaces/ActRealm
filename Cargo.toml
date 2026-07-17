@@ -2,6 +2,7 @@
 members = [
     "crates/app",
     "crates/bridge",
+    "crates/codex-connector",
     "crates/core",
     "crates/installer",
     "crates/providers",

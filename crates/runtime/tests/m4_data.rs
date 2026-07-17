@@ -124,3 +124,31 @@ fn retention_and_quota_validation_reject_ambiguous_values() {
         }])
         .is_err());
 }
+
+#[test]
+fn interactive_question_schema_and_secret_answers_never_enter_persistent_export() {
+    let database = Database::new("interactive-privacy");
+    let store = RuntimeStore::open(&database.path).unwrap();
+    let request = BridgeRequest::from_hook_at(
+        Provider::Claude,
+        json!({
+            "hook_event_name":"Elicitation",
+            "session_id":"private-question",
+            "message":"private form prompt 347819",
+            "requested_schema":{
+                "type":"object",
+                "required":["password"],
+                "properties":{
+                    "password":{"type":"string","format":"password","description":"secret field description 347819"}
+                }
+            }
+        }),
+        100,
+    );
+    store.ingest(request).unwrap();
+    let encoded = serde_json::to_string(&store.export_json(101).unwrap()).unwrap();
+    assert!(!encoded.contains("private form prompt 347819"));
+    assert!(!encoded.contains("secret field description 347819"));
+    assert!(!encoded.contains("requested_schema"));
+    assert!(encoded.contains("Claude 需要补充信息"));
+}

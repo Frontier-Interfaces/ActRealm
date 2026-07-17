@@ -39,7 +39,7 @@ pub fn parse_hook(provider: Provider, raw: Value) -> Result<ParsedHookEvent, Pro
 
     Ok(ParsedHookEvent {
         provider,
-        kind: normalize_event(provider, &event_name),
+        kind: normalize_event(provider, &event_name, &raw),
         event_name,
         provider_session_id,
         provider_turn_id: owned_string_field(&raw, "turn_id"),
@@ -52,16 +52,24 @@ pub fn parse_hook(provider: Provider, raw: Value) -> Result<ParsedHookEvent, Pro
     })
 }
 
-fn normalize_event(provider: Provider, event_name: &str) -> EventKind {
+fn normalize_event(provider: Provider, event_name: &str, raw: &Value) -> EventKind {
     match event_name {
         "SessionStart" => EventKind::SessionStarted,
         "SessionEnd" => EventKind::SessionEnded,
         "UserPromptSubmit" | "BeforeAgent" => EventKind::PromptSubmitted,
+        "PreToolUse"
+            if provider == Provider::Claude
+                && raw.get("tool_name").and_then(Value::as_str) == Some("AskUserQuestion") =>
+        {
+            EventKind::QuestionRequested
+        }
         "PreToolUse" => EventKind::ToolStarted,
         "PostToolUse" | "AfterAgent" => EventKind::ToolFinished,
         "PostToolUseFailure" => EventKind::ToolFailed,
         "PermissionRequest" if provider != Provider::Gemini => EventKind::PermissionRequested,
         "PermissionDenied" if provider != Provider::Gemini => EventKind::PermissionDenied,
+        "Elicitation" if provider == Provider::Claude => EventKind::ElicitationRequested,
+        "CodexRequestUserInput" if provider == Provider::Codex => EventKind::QuestionRequested,
         "Notification" => EventKind::Notification,
         "SubagentStart" => EventKind::SubagentStarted,
         "SubagentStop" => EventKind::SubagentStopped,

@@ -303,9 +303,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "flow-agent-codex-connector"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "flow-agent-core"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "thiserror",
@@ -361,11 +371,13 @@ name = "flow-agent-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "flow-agent-codex-connector",
  "flow-agent-core",
  "flow-agent-installer",
  "flow-agent-quota",
  "flow-agent-runtime",
  "futures-util",
+ "libc",
  "serde",
  "serde_json",
  "thiserror",

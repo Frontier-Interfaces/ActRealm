@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use flow_agent_bridge::{default_socket_path, validate_socket_path, BridgeClient, BridgeListener};
 use flow_agent_core::{
-    permission_deadline_ms, permission_directive, BridgeRequest, Decision, Provider,
+    hook_directive, permission_deadline_ms, BlockingRequestKind, BridgeRequest, Decision, Provider,
     DOCTOR_PROBE_EVENT, MAX_HOOK_PAYLOAD_BYTES, PERMISSION_COMMIT_DELAY_MS,
 };
 use flow_agent_installer::{
@@ -1089,6 +1089,7 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()>
                 waiters.clone(),
                 ApiServerConfig {
                     commit_delay: commit_delay(),
+                    enable_codex_connector: true,
                     ..ApiServerConfig::default()
                 },
             )
@@ -1215,6 +1216,15 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()>
                     } else {
                         let _ = waiters.pass_through(request_id, "deadline");
                         let _ = store.expire_approval(request_id, "deadline", now_millis());
+                    }
+                    return;
+                }
+                if request.blocking_kind != Some(BlockingRequestKind::Permission) {
+                    let request_id = request.request_id.unwrap_or(request.id);
+                    let _ = waiters.pass_through(request_id, "native_provider_ui");
+                    let _ = store.expire_approval(request_id, "native_provider_ui", now_millis());
+                    if let Ok(response) = registration.ticket.recv_timeout(Duration::from_secs(1)) {
+                        let _ = BridgeListener::write_response(&mut stream, &response);
                     }
                     return;
                 }
@@ -1400,10 +1410,7 @@ fn run_hook(provider: Provider, socket_path: PathBuf) -> Result<()> {
     let Some(response) = response else {
         return Ok(());
     };
-    let Some(decision) = response.decision() else {
-        return Ok(());
-    };
-    if let Some(directive) = permission_directive(provider, decision) {
+    if let Some(directive) = hook_directive(&request, &response) {
         serde_json::to_writer(io::stdout(), &directive)?;
         println!();
     }

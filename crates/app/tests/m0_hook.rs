@@ -1,7 +1,8 @@
 #![cfg(unix)]
 
-use flow_agent_core::{BridgeRequest, BridgeResponse, Decision};
+use flow_agent_core::{BridgeRequest, BridgeResponse, Decision, ReplyPayload};
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
@@ -119,6 +120,92 @@ fn explicit_pass_through_keeps_stdout_empty() {
     );
     server.join().unwrap();
     assert!(stdout.is_empty());
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn claude_ask_user_question_writes_updated_input_with_answers() {
+    let path = temp_socket("claude-question");
+    let listener = UnixListener::bind(&path).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_request(&mut stream);
+        let response = BridgeResponse::answered(
+            request.request_id.unwrap(),
+            ReplyPayload::ClaudeQuestion {
+                answers: BTreeMap::from([("继续部署？".to_owned(), "继续".to_owned())]),
+            },
+        );
+        serde_json::to_writer(&mut stream, &response).unwrap();
+        stream.write_all(b"\n").unwrap();
+    });
+
+    let stdout = run_hook(
+        &path,
+        "claude",
+        json!({
+            "hook_event_name":"PreToolUse",
+            "session_id":"question-session",
+            "tool_name":"AskUserQuestion",
+            "tool_input":{
+                "questions":[{"question":"继续部署？","header":"确认","options":[],"multiSelect":false}],
+                "keep":"original"
+            }
+        }),
+        1_000,
+    );
+    server.join().unwrap();
+    let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(
+        output.pointer("/hookSpecificOutput/updatedInput/answers/继续部署？"),
+        Some(&json!("继续"))
+    );
+    assert_eq!(
+        output.pointer("/hookSpecificOutput/updatedInput/keep"),
+        Some(&json!("original"))
+    );
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn claude_elicitation_writes_the_official_accept_shape() {
+    let path = temp_socket("claude-elicitation");
+    let listener = UnixListener::bind(&path).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_request(&mut stream);
+        let response = BridgeResponse::answered(
+            request.request_id.unwrap(),
+            ReplyPayload::ClaudeElicitation {
+                action: "accept".to_owned(),
+                content: Some(json!({"name":"Ada"})),
+            },
+        );
+        serde_json::to_writer(&mut stream, &response).unwrap();
+        stream.write_all(b"\n").unwrap();
+    });
+    let stdout = run_hook(
+        &path,
+        "claude",
+        json!({
+            "hook_event_name":"Elicitation",
+            "session_id":"elicitation-session",
+            "message":"Name",
+            "requested_schema":{"type":"object","properties":{"name":{"type":"string"}}}
+        }),
+        1_000,
+    );
+    server.join().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&stdout).unwrap(),
+        json!({
+            "hookSpecificOutput":{
+                "hookEventName":"Elicitation",
+                "action":"accept",
+                "content":{"name":"Ada"}
+            }
+        })
+    );
     let _ = fs::remove_file(path);
 }
 

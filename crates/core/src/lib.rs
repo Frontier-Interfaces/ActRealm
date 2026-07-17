@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -74,6 +75,8 @@ pub enum EventKind {
     ToolFailed,
     PermissionRequested,
     PermissionDenied,
+    QuestionRequested,
+    ElicitationRequested,
     Notification,
     SubagentStarted,
     SubagentStopped,
@@ -103,6 +106,15 @@ pub enum ExecState {
 pub enum ApprovalOwner {
     Widget,
     Terminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockingRequestKind {
+    Permission,
+    ClaudeQuestion,
+    ClaudeElicitation,
+    CodexUserInput,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,6 +191,10 @@ impl SessionProjection {
                 self.decision_sent_at = None;
                 self.decision_sent = None;
                 self.decision_confirmed = false;
+            }
+            EventKind::QuestionRequested | EventKind::ElicitationRequested => {
+                self.exec_state = ExecState::AwaitingApproval;
+                self.approval_owner = Some(ApprovalOwner::Widget);
             }
             EventKind::PermissionDenied => {
                 self.exec_state = ExecState::Thinking;
@@ -345,6 +361,8 @@ pub struct BridgeRequest {
     pub received_at: u64,
     pub deadline_at: Option<u64>,
     pub needs_reply: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking_kind: Option<BlockingRequestKind>,
     pub term: Option<TermContext>,
     pub raw: Value,
 }
@@ -360,6 +378,8 @@ pub struct TermContext {
     pub bundle_id: Option<String>,
     #[serde(default)]
     pub surface: Option<String>,
+    #[serde(default)]
+    pub provider_pid: Option<u32>,
 }
 
 impl BridgeRequest {
@@ -368,11 +388,20 @@ impl BridgeRequest {
     }
 
     pub fn from_hook_at(provider: Provider, raw: Value, received_at: u64) -> Self {
-        let needs_reply = raw
-            .get("hook_event_name")
-            .and_then(Value::as_str)
-            .is_some_and(|name| name == "PermissionRequest")
-            && provider != Provider::Gemini;
+        let event_name = raw.get("hook_event_name").and_then(Value::as_str);
+        let blocking_kind = match (provider, event_name) {
+            (Provider::Claude | Provider::Codex, Some("PermissionRequest")) => {
+                Some(BlockingRequestKind::Permission)
+            }
+            (Provider::Claude, Some("PreToolUse"))
+                if raw.get("tool_name").and_then(Value::as_str) == Some("AskUserQuestion") =>
+            {
+                Some(BlockingRequestKind::ClaudeQuestion)
+            }
+            (Provider::Claude, Some("Elicitation")) => Some(BlockingRequestKind::ClaudeElicitation),
+            _ => None,
+        };
+        let needs_reply = blocking_kind.is_some();
         let request_id = needs_reply.then(Uuid::now_v7);
 
         Self {
@@ -389,6 +418,7 @@ impl BridgeRequest {
                 received_at.saturating_add(permission_deadline_ms(provider).unwrap_or_default())
             }),
             needs_reply,
+            blocking_kind,
             term: terminal_context(),
             raw,
         }
@@ -408,12 +438,50 @@ impl BridgeRequest {
             received_at,
             deadline_at: Some(received_at.saturating_add(1_000)),
             needs_reply: true,
+            blocking_kind: Some(BlockingRequestKind::Permission),
             term: None,
             raw: serde_json::json!({
                 "hook_event_name": DOCTOR_PROBE_EVENT,
                 "session_id": "flow-agent-doctor"
             }),
         }
+    }
+
+    pub fn codex_user_input_at(raw_params: Value, received_at: u64) -> Option<Self> {
+        let provider_session_id = owned_raw_string(&raw_params, "threadId")?;
+        let provider_turn_id = owned_raw_string(&raw_params, "turnId");
+        let auto_resolution_ms = raw_params
+            .get("autoResolutionMs")
+            .and_then(Value::as_u64)
+            .filter(|value| *value >= 1_000);
+        let deadline_at = received_at.saturating_add(
+            auto_resolution_ms
+                .unwrap_or(CODEX_PERMISSION_DEADLINE_MS)
+                .min(CLAUDE_PERMISSION_DEADLINE_MS),
+        );
+        let request_id = Uuid::now_v7();
+        let mut raw = raw_params;
+        raw["hook_event_name"] = Value::String("CodexRequestUserInput".to_owned());
+        raw["session_id"] = Value::String(provider_session_id.clone());
+        if let Some(turn_id) = provider_turn_id.as_ref() {
+            raw["turn_id"] = Value::String(turn_id.clone());
+        }
+        Some(Self {
+            v: PROTOCOL_VERSION,
+            id: Uuid::now_v7(),
+            request_id: Some(request_id),
+            provider: Provider::Codex,
+            provider_session_id: Some(provider_session_id),
+            provider_turn_id,
+            prompt_id: None,
+            role: "managed".to_owned(),
+            received_at,
+            deadline_at: Some(deadline_at),
+            needs_reply: true,
+            blocking_kind: Some(BlockingRequestKind::CodexUserInput),
+            term: None,
+            raw,
+        })
     }
 
     pub fn event_name(&self) -> Option<&str> {
@@ -436,6 +504,8 @@ pub struct BridgeResponse {
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_instance_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<ReplyPayload>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -445,6 +515,23 @@ pub enum ReplyAction {
     Deny,
     PassThrough,
     Ping,
+    Answer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReplyPayload {
+    ClaudeQuestion {
+        answers: BTreeMap<String, String>,
+    },
+    ClaudeElicitation {
+        action: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<Value>,
+    },
+    CodexUserInput {
+        answers: BTreeMap<String, Vec<String>>,
+    },
 }
 
 impl BridgeResponse {
@@ -458,6 +545,7 @@ impl BridgeResponse {
             message: (decision == Decision::Deny).then(|| "User denied via Flow Agent".to_owned()),
             reason: None,
             runtime_instance_id: None,
+            payload: None,
         }
     }
 
@@ -468,6 +556,7 @@ impl BridgeResponse {
             message: None,
             reason: Some(reason.into()),
             runtime_instance_id: None,
+            payload: None,
         }
     }
 
@@ -478,6 +567,18 @@ impl BridgeResponse {
             message: None,
             reason: None,
             runtime_instance_id: Some(runtime_instance_id),
+            payload: None,
+        }
+    }
+
+    pub fn answered(request_id: Uuid, payload: ReplyPayload) -> Self {
+        Self {
+            request_id,
+            action: ReplyAction::Answer,
+            message: None,
+            reason: None,
+            runtime_instance_id: None,
+            payload: Some(payload),
         }
     }
 
@@ -485,7 +586,7 @@ impl BridgeResponse {
         match self.action {
             ReplyAction::Allow => Some(Decision::Allow),
             ReplyAction::Deny => Some(Decision::Deny),
-            ReplyAction::PassThrough | ReplyAction::Ping => None,
+            ReplyAction::PassThrough | ReplyAction::Ping | ReplyAction::Answer => None,
         }
     }
 }
@@ -510,13 +611,15 @@ fn terminal_context() -> Option<TermContext> {
         title: std::env::var("FLOW_AGENT_TERM_TITLE").ok(),
         bundle_id,
         surface,
+        provider_pid: u32::try_from(unsafe { libc::getppid() }).ok(),
     };
     (context.app.is_some()
         || context.session_id.is_some()
         || context.tty.is_some()
         || context.title.is_some()
         || context.bundle_id.is_some()
-        || context.surface.is_some())
+        || context.surface.is_some()
+        || context.provider_pid.is_some())
     .then_some(context)
 }
 
@@ -559,6 +662,49 @@ pub fn permission_directive(provider: Provider, decision: Decision) -> Option<Va
     }))
 }
 
+pub fn hook_directive(request: &BridgeRequest, response: &BridgeResponse) -> Option<Value> {
+    match (
+        request.blocking_kind,
+        response.action,
+        response.payload.as_ref(),
+    ) {
+        (Some(BlockingRequestKind::Permission), _, _) => {
+            permission_directive(request.provider, response.decision()?)
+        }
+        (
+            Some(BlockingRequestKind::ClaudeQuestion),
+            ReplyAction::Answer,
+            Some(ReplyPayload::ClaudeQuestion { answers }),
+        ) => {
+            let mut updated_input = request.raw.get("tool_input")?.as_object()?.clone();
+            updated_input.insert("answers".to_owned(), serde_json::to_value(answers).ok()?);
+            Some(serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "permissionDecisionReason": "Answered by Flow Agent",
+                    "updatedInput": Value::Object(updated_input)
+                }
+            }))
+        }
+        (
+            Some(BlockingRequestKind::ClaudeElicitation),
+            ReplyAction::Answer,
+            Some(ReplyPayload::ClaudeElicitation { action, content }),
+        ) if matches!(action.as_str(), "accept" | "decline" | "cancel") => {
+            let mut output = serde_json::json!({
+                "hookEventName": "Elicitation",
+                "action": action
+            });
+            if action == "accept" {
+                output["content"] = content.clone().unwrap_or_else(|| serde_json::json!({}));
+            }
+            Some(serde_json::json!({ "hookSpecificOutput": output }))
+        }
+        _ => None,
+    }
+}
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -573,7 +719,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_only_permission_requests_as_blocking() {
+    fn detects_supported_hook_reply_requests_as_blocking() {
         let permission = BridgeRequest::from_hook(
             Provider::Claude,
             serde_json::json!({"hook_event_name": "PermissionRequest"}),
@@ -582,8 +728,36 @@ mod tests {
             Provider::Claude,
             serde_json::json!({"hook_event_name": "Stop"}),
         );
+        let question = BridgeRequest::from_hook(
+            Provider::Claude,
+            serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "AskUserQuestion",
+                "tool_input": {"questions": []}
+            }),
+        );
+        let elicitation = BridgeRequest::from_hook(
+            Provider::Claude,
+            serde_json::json!({"hook_event_name": "Elicitation"}),
+        );
+        let codex_question = BridgeRequest::from_hook(
+            Provider::Codex,
+            serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "AskUserQuestion"
+            }),
+        );
 
         assert!(permission.needs_reply);
+        assert_eq!(
+            question.blocking_kind,
+            Some(BlockingRequestKind::ClaudeQuestion)
+        );
+        assert_eq!(
+            elicitation.blocking_kind,
+            Some(BlockingRequestKind::ClaudeElicitation)
+        );
+        assert!(!codex_question.needs_reply);
         assert!(!stop.needs_reply);
     }
 
@@ -602,5 +776,65 @@ mod tests {
             permission_directive(Provider::Gemini, Decision::Allow),
             None
         );
+    }
+
+    #[test]
+    fn claude_question_answer_preserves_original_input_and_adds_answers() {
+        let request = BridgeRequest::from_hook(
+            Provider::Claude,
+            serde_json::json!({
+                "hook_event_name":"PreToolUse",
+                "tool_name":"AskUserQuestion",
+                "tool_input": {
+                    "questions":[{"question":"选择环境？","header":"环境","options":[],"multiSelect":false}],
+                    "metadata":"keep"
+                }
+            }),
+        );
+        let response = BridgeResponse::answered(
+            request.request_id.unwrap(),
+            ReplyPayload::ClaudeQuestion {
+                answers: BTreeMap::from([("选择环境？".to_owned(), "本地".to_owned())]),
+            },
+        );
+        let output = hook_directive(&request, &response).unwrap();
+        assert_eq!(
+            output.pointer("/hookSpecificOutput/permissionDecision"),
+            Some(&Value::String("allow".to_owned()))
+        );
+        assert_eq!(
+            output.pointer("/hookSpecificOutput/updatedInput/metadata"),
+            Some(&Value::String("keep".to_owned()))
+        );
+        assert_eq!(
+            output.pointer("/hookSpecificOutput/updatedInput/answers/选择环境？"),
+            Some(&Value::String("本地".to_owned()))
+        );
+    }
+
+    #[test]
+    fn claude_elicitation_directive_supports_accept_decline_and_cancel() {
+        let request = BridgeRequest::from_hook(
+            Provider::Claude,
+            serde_json::json!({"hook_event_name":"Elicitation"}),
+        );
+        for action in ["accept", "decline", "cancel"] {
+            let response = BridgeResponse::answered(
+                request.request_id.unwrap(),
+                ReplyPayload::ClaudeElicitation {
+                    action: action.to_owned(),
+                    content: (action == "accept").then(|| serde_json::json!({"name":"Ada"})),
+                },
+            );
+            let output = hook_directive(&request, &response).unwrap();
+            assert_eq!(
+                output.pointer("/hookSpecificOutput/action"),
+                Some(&Value::String(action.to_owned()))
+            );
+            assert_eq!(
+                output.pointer("/hookSpecificOutput/hookEventName"),
+                Some(&Value::String("Elicitation".to_owned()))
+            );
+        }
     }
 }

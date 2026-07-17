@@ -9,8 +9,12 @@ Product invariants:
 
 - Claude Code and Codex CLI are P0 providers.
 - External Hook Control controls each request-keyed `PermissionRequest`; it
-  does not own the provider session and must never imply reply, interrupt, or
-  steer support.
+  does not own the provider session and must never imply interrupt or steer
+  support. Claude `AskUserQuestion` and `Elicitation` may use their official
+  blocking Hook reply channels, but answers remain memory-only.
+- Codex direct question answers require an explicitly attached, version-gated
+  app-server Connector. Hook-only Codex sessions remain observe/approval-only
+  and must never be shown as managed or directly answerable.
 - Allow, deny, and pass-through are the only v1 approval outcomes.
 - Permission hooks use provider-aligned hard deadlines owned by the hook
   process: Claude 24 hours and Codex 1 hour. Tests inject short budgets.
@@ -21,6 +25,9 @@ Product invariants:
 - A written directive is `decision_sent`, never `confirmed`; only a later
   provider event may confirm progress.
 - Permission requests are never spooled or replayed.
+- Interactive question waiters are never persisted or restored. Runtime
+  restart expires the old request; a managed Provider may issue a fresh one
+  after Thread/Turn reconnection.
 - Raw prompts, full commands, tool input/output, transcripts, and file contents
   are not persisted by default.
 - The runtime is local-only. Do not add telemetry, cloud SDKs, CDNs, or outbound

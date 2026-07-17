@@ -16,9 +16,11 @@ not weaken or replace the full plan.
   cannot block v1 release.
 - External Hook Control handles each official permission request through
   approve, deny, or pass-through. Multiple sessions may wait concurrently, but
-  every waiter is request-keyed and receives exactly one outcome. Managed
-  sessions, reply, cancel, interrupt, steer, Coach, cloud accounts, and
-  telemetry are outside v1.
+  every waiter is request-keyed and receives exactly one outcome. v1.1 adds
+  Claude's official AskUserQuestion/Elicitation Hook replies and an explicit,
+  version-gated Codex app-server Connector for requestUserInput and Thread
+  recovery. Interrupt, steer, Coach, cloud accounts, and telemetry remain out
+  of scope.
 
 ## Milestone gates
 
@@ -135,9 +137,54 @@ not weaken or replace the full plan.
       five-round Claude/Codex control replay, and 120-second resource gate pass.
 - [x] Exact release installed locally; Runtime/control loop, real Provider
       events, live title rendering, and browser console checks pass.
-- [ ] User completes Codex's official `/hooks` re-trust and accepts the build.
+- [x] User completes Codex's official `/hooks` re-trust and accepts the build.
 - [x] Local commit authorized by the user on 2026-07-17.
-- [ ] GitHub push authorized separately by the user after final local acceptance.
+- [x] GitHub push authorized separately by the user after final local acceptance.
+
+### M10 - configurable safe display
+
+- [x] Settings provide concise, detailed, and developer profiles.
+- [x] Task-card fields are selected from a server-owned allowlist and persist
+      across Runtime/UI restart.
+- [x] The safe catalog covers project/task/model/activity/plan/usage, sanitized
+      current tool, permission mode, child-Agent count, environment, recovery,
+      control and developer IDs when those facts exist.
+- [x] A detail drawer uses only the same safe field catalog.
+- [x] Unknown fields and raw/payload/full-command/transcript requests are
+      rejected; raw Hook payload is never directly rendered.
+
+### M11 - Agent questions in Attention
+
+- [x] Claude AskUserQuestion supports one-to-four questions, choice,
+      multi-select, and free input using official updatedInput.answers output.
+- [x] Claude Elicitation supports accept, decline, cancel, typed fields, and
+      official hookSpecificOutput.
+- [x] Secret fields use password inputs and answers exist only in the DOM,
+      authenticated request body, in-memory waiter, and one Provider response.
+- [x] Answers never enter SQLite, logs, diagnostics, snapshots, or exports.
+- [x] Expired questions cannot be submitted; handing a Claude question back to
+      native Provider UI emits no directive.
+- [x] Hook-only Codex sessions never display a fake direct-answer input.
+
+### M12 - managed Codex and restart recovery
+
+- [x] The Connector initializes with experimental API capability through a
+      private persistent official app-server Unix Socket and proxy transport;
+      it does not require Codex's standalone-only daemon command.
+- [x] Explicit attach uses thread/list and thread/resume; managed Thread IDs
+      persist and are rejoined after Flow Agent restarts.
+- [x] item/tool/requestUserInput maps to the same memory-only question model
+      and writes ToolRequestUserInputResponse keyed by official question IDs.
+- [x] External Hook sessions use captured parent-process liveness and expose
+      observing, waiting-for-event, lost-control, or ended truthfully.
+- [x] Managed sessions expose controllable only after a real app-server resume;
+      other Codex sessions remain external_hook.
+- [x] Runtime restart restores session display but expires every old approval
+      and question waiter; no disconnected stdout/RPC continuation is revived.
+- [x] Full workspace/release gates and the two-minute resource gate pass on the
+      exact candidate.
+- [x] Exact candidate is installed locally and accepted by the user on
+      2026-07-17 before any commit or GitHub push.
 
 ### M5 - release evidence
 

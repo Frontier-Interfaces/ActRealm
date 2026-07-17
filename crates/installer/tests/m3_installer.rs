@@ -149,9 +149,13 @@ fn claude_install_backs_up_and_preserves_user_semantics() {
         original["hooks"]["PreToolUse"][0]
     );
     let handlers = flow_handlers(&installed, "hook --provider claude");
-    assert_eq!(handlers.len(), 16);
+    assert_eq!(handlers.len(), 17);
     assert_eq!(
         installed["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"],
+        86_400
+    );
+    assert_eq!(
+        installed["hooks"]["Elicitation"][0]["hooks"][0]["timeout"],
         86_400
     );
     assert_eq!(
@@ -444,7 +448,7 @@ fn concurrent_installs_are_serialized_and_leave_one_valid_definition_set() {
     let installed = read_json(&fixture.paths.claude_settings);
     assert_eq!(
         flow_handlers(&installed, "hook --provider claude").len(),
-        16
+        17
     );
     assert_eq!(
         fixture.installer().intent(HookProvider::Claude).unwrap(),

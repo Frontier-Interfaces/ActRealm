@@ -30,7 +30,10 @@ const ui = {
   muteClaude: document.querySelector("#mute-claude"),
   muteCodex: document.querySelector("#mute-codex"),
   codexEnhanced: document.querySelector("#codex-enhanced"),
+  codexConnectorStatus: document.querySelector("#codex-connector-status"),
   retentionDays: document.querySelector("#retention-days"),
+  displayProfile: document.querySelector("#display-profile"),
+  taskCardFields: document.querySelector("#task-card-fields"),
   claudeBridgeStatus: document.querySelector("#claude-bridge-status"),
   claudeBridgeAction: document.querySelector("#claude-bridge-action"),
   exportData: document.querySelector("#export-data"),
@@ -42,6 +45,11 @@ const ui = {
   notificationTitle: document.querySelector("#notification-title"),
   notificationView: document.querySelector("#notification-view"),
   notificationClose: document.querySelector("#notification-close"),
+  sessionDetailOverlay: document.querySelector("#session-detail-overlay"),
+  sessionDetailClose: document.querySelector("#session-detail-close"),
+  sessionDetailTitle: document.querySelector("#session-detail-title"),
+  sessionDetailBody: document.querySelector("#session-detail-body"),
+  sessionDetailJump: document.querySelector("#session-detail-jump"),
 };
 
 let csrfToken = sessionStorage.getItem("flowAgentCsrf");
@@ -59,7 +67,10 @@ let settingsState = {
   providerMuted: { claude: false, codex: false },
   codexEnhancedActivity: true,
   retentionDays: 90,
+  displayProfile: "detailed",
+  taskCardFields: ["project", "task", "model", "activity", "plan", "tokens", "tool", "subagents", "environment", "recovery", "control", "jump"],
 };
+let displayCatalog = [];
 let claudeBridge = { status: "not_installed" };
 let settingsBusy = false;
 let notificationsPrimed = false;
@@ -68,9 +79,15 @@ let notificationItemId;
 let renderedEventCount = 0;
 let eventUiLatencies = [];
 let selectedSessionId;
+let detailSessionId;
 let sessionActivityRefs = new Map();
 let attentionExitTimer;
 const SESSION_VISIBLE_FOR_MS = 30 * 60 * 1000;
+const DISPLAY_PRESETS = {
+  concise: ["task", "activity"],
+  detailed: ["project", "task", "model", "activity", "plan", "tokens", "tool", "subagents", "environment", "recovery", "control", "jump"],
+  developer: ["project", "task", "model", "activity", "plan", "tokens", "context", "tool", "permissionMode", "subagents", "environment", "recovery", "control", "jump", "titleSource", "sessionId", "providerSessionId", "providerTurnId", "lastEventAt"],
+};
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -283,7 +300,15 @@ function renderSettings() {
   ui.muteClaude.checked = Boolean(settingsState.providerMuted?.claude);
   ui.muteCodex.checked = Boolean(settingsState.providerMuted?.codex);
   ui.codexEnhanced.checked = Boolean(settingsState.codexEnhancedActivity);
+  const connector = snapshot.capabilities?.codexConnector;
+  ui.codexConnectorStatus.textContent = connector?.status === "connected"
+    ? `已连接 · ${connector.managedThreads || 0} 个托管对话`
+    : connector?.status === "disabled"
+      ? "当前 Runtime 未启用"
+      : connector?.error || "当前版本不可用";
   ui.retentionDays.value = String(settingsState.retentionDays || 90);
+  ui.displayProfile.value = settingsState.displayProfile || "detailed";
+  renderFieldSelector();
   ui.claudeBridgeStatus.textContent = bridgeStatusCopy(claudeBridge.status);
   const removable = claudeBridge.status === "installed";
   const blocked = claudeBridge.status === "config_malformed";
@@ -302,12 +327,30 @@ function renderSettings() {
   ui.claudeBridgeAction.disabled = settingsBusy || blocked;
 }
 
+function renderFieldSelector() {
+  ui.taskCardFields.replaceChildren();
+  const selected = new Set(settingsState.taskCardFields || []);
+  const profile = settingsState.displayProfile || "detailed";
+  for (const field of displayCatalog) {
+    const label = element("label", `field-option field-${field.level || "detailed"}`);
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.value = field.id;
+    input.checked = selected.has(field.id);
+    input.disabled = field.level === "developer" && profile !== "developer";
+    label.append(input, element("span", "", field.label));
+    ui.taskCardFields.append(label);
+  }
+}
+
 async function loadSettings() {
   try {
     const response = await api("/api/v1/settings");
     settingsState = response.settings;
+    displayCatalog = response.displayCatalog || [];
     claudeBridge = response.claudeQuotaBridge;
     renderSettings();
+    renderSessions();
   } catch (error) {
     showToast(`设置读取失败：${error.message}`);
   }
@@ -325,6 +368,8 @@ function settingsFromForm() {
     providerMuted: { claude: ui.muteClaude.checked, codex: ui.muteCodex.checked },
     codexEnhancedActivity: ui.codexEnhanced.checked,
     retentionDays: Number(ui.retentionDays.value),
+    displayProfile: ui.displayProfile.value,
+    taskCardFields: [...ui.taskCardFields.querySelectorAll("input:checked")].map((input) => input.value),
   };
 }
 
@@ -338,8 +383,10 @@ async function saveSettings() {
       body: JSON.stringify(settingsFromForm()),
     });
     settingsState = response.settings;
+    displayCatalog = response.displayCatalog || displayCatalog;
     claudeBridge = response.claudeQuotaBridge;
     renderSettings();
+    renderSessions();
     if (previousCodexMode !== settingsState.codexEnhancedActivity) {
       showToast("Codex Hook 已更新，请在 Codex 中运行 /hooks 重新检查信任");
       loadSetup();
@@ -497,6 +544,140 @@ function actionButton(label, className, action, item) {
   return button;
 }
 
+async function submitQuestion(item, submission, controls) {
+  for (const control of controls) control.disabled = true;
+  try {
+    await api(`/api/v1/questions/${encodeURIComponent(item.requestId)}/answer`, {
+      method: "POST",
+      body: JSON.stringify(submission),
+    });
+    showToast(submission.action === "native" ? "已交回 Agent 原界面回答" : "回答已安全发送给 Agent");
+    await loadSnapshot();
+  } catch (error) {
+    for (const control of controls) control.disabled = false;
+    showToast(error.message === "QUESTION_EXPIRED" ? "这个问题已经过期，不能再提交" : `回答失败：${error.message}`);
+  }
+}
+
+function renderInteractiveForm(item, card) {
+  const interaction = item.interaction;
+  if (!interaction || item.state !== "open" || !item.requestId) return false;
+  if (interaction.message) card.append(element("div", "fact-block question-message", interaction.message));
+  const form = element("form", "question-form");
+  const bindings = [];
+  const allControls = [];
+  for (const question of interaction.questions || []) {
+    const fieldset = element("fieldset", "question-field");
+    const legend = element("legend", "", question.label || "问题");
+    fieldset.append(legend);
+    if (question.prompt) fieldset.append(element("p", "question-prompt", question.prompt));
+    const binding = { question, values: [], other: undefined, input: undefined };
+    if (question.inputType === "choice") {
+      const choices = element("div", "question-choices");
+      for (const [index, option] of (question.options || []).entries()) {
+        const label = element("label", "question-choice");
+        const input = document.createElement("input");
+        input.type = question.multiSelect ? "checkbox" : "radio";
+        input.name = `answer-${item.requestId}-${question.id}`;
+        input.value = option.label;
+        input.id = `answer-${item.requestId}-${question.id}-${index}`;
+        allControls.push(input);
+        binding.values.push(input);
+        const copy = element("span", "");
+        copy.append(element("strong", "", option.label));
+        if (option.description) copy.append(element("small", "", option.description));
+        label.append(input, copy);
+        choices.append(label);
+      }
+      if (question.allowsOther) {
+        const other = document.createElement("input");
+        other.type = "text";
+        other.className = "question-other";
+        other.placeholder = "其他答案（可直接输入）";
+        other.maxLength = 2000;
+        allControls.push(other);
+        binding.other = other;
+        choices.append(other);
+      }
+      fieldset.append(choices);
+    } else if (question.inputType === "boolean") {
+      const input = document.createElement("select");
+      input.append(new Option("请选择", ""), new Option("是", "true"), new Option("否", "false"));
+      allControls.push(input);
+      binding.input = input;
+      fieldset.append(input);
+    } else {
+      const input = document.createElement("input");
+      input.type = question.isSecret ? "password" : question.inputType === "number" ? "number" : "text";
+      input.autocomplete = question.isSecret ? "new-password" : "off";
+      input.maxLength = 8192;
+      allControls.push(input);
+      binding.input = input;
+      fieldset.append(input);
+      if (question.isSecret) fieldset.append(element("p", "secret-note", "仅在内存中提交，不写入数据库、日志或导出。"));
+    }
+    bindings.push(binding);
+    form.append(fieldset);
+  }
+  const actions = element("div", "actions question-actions");
+  const submit = element("button", "action-button", "发送回答");
+  submit.type = "submit";
+  allControls.push(submit);
+  actions.append(submit);
+  if (interaction.kind === "claude_elicitation") {
+    for (const [label, action] of [["拒绝提供", "decline"], ["取消请求", "cancel"]]) {
+      const button = element("button", "action-button ghost", label);
+      button.type = "button";
+      button.addEventListener("click", () => submitQuestion(item, { action }, allControls));
+      allControls.push(button);
+      actions.append(button);
+    }
+  }
+  if (interaction.supportsNative) {
+    const native = element("button", "action-button ghost", "去 Agent 回答");
+    native.type = "button";
+    native.addEventListener("click", () => submitQuestion(item, { action: "native" }, allControls));
+    allControls.push(native);
+    actions.append(native);
+  }
+  form.append(actions);
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const answers = {};
+    for (const binding of bindings) {
+      const { question } = binding;
+      if (question.inputType === "choice") {
+        const values = binding.values.filter((input) => input.checked).map((input) => input.value);
+        if (binding.other?.value.trim()) values.push(binding.other.value.trim());
+        if (!values.length && question.required) {
+          showToast(`请回答“${question.label}”`);
+          return;
+        }
+        answers[question.id] = ["claude_question", "codex_user_input"].includes(interaction.kind) ? values : values[0];
+      } else if (question.inputType === "boolean") {
+        if (!binding.input.value && question.required) {
+          showToast(`请回答“${question.label}”`);
+          return;
+        }
+        if (binding.input.value) answers[question.id] = interaction.kind === "codex_user_input" ? [binding.input.value] : binding.input.value === "true";
+      } else {
+        const value = binding.input.value.trim();
+        if (!value && question.required) {
+          showToast(`请填写“${question.label}”`);
+          return;
+        }
+        if (value) {
+          const normalized = question.inputType === "number" ? Number(value) : value;
+          answers[question.id] = interaction.kind === "codex_user_input" ? [String(normalized)] : normalized;
+        }
+      }
+    }
+    submitQuestion(item, { action: "accept", answers }, allControls);
+  });
+  card.append(form);
+  return true;
+}
+
 function renderAttention() {
   const items = openItems();
   ui.attentionCount.textContent = String(items.length);
@@ -530,16 +711,21 @@ function renderAttention() {
   taskJump.addEventListener("click", () => selectSession(item.sessionId));
   card.append(taskJump);
 
-  const fact = item.detail || item.commandPreview;
-  if (fact) card.append(element("div", "fact-block", fact));
-  const risk = element("div", "risk-row");
-  risk.append(element("span", "risk-chip", `风险标记：${item.risk || "未知"}`));
-  for (const note of item.riskNotes || []) risk.append(element("span", "risk-chip", note));
-  if (item.expiresAt) risk.append(element("span", "risk-chip", `截止 ${new Date(item.expiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`));
-  card.append(risk);
+  const interactive = renderInteractiveForm(item, card);
+  if (!interactive) {
+    const fact = item.detail || item.commandPreview;
+    if (fact) card.append(element("div", "fact-block", fact));
+    const risk = element("div", "risk-row");
+    risk.append(element("span", "risk-chip", `风险标记：${item.risk || "未知"}`));
+    for (const note of item.riskNotes || []) risk.append(element("span", "risk-chip", note));
+    if (item.expiresAt) risk.append(element("span", "risk-chip", `截止 ${new Date(item.expiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`));
+    card.append(risk);
+  }
 
   const actions = element("div", "actions");
-  if (item.state === "open" && item.kind === "approval") {
+  if (interactive) {
+    // The interactive form owns its submit, decline, cancel, and handoff actions.
+  } else if (item.state === "open" && item.kind === "approval") {
     if (item.risk === "high") {
       actions.append(actionButton("去终端核对", "", "pass_through", item));
       actions.append(actionButton("不行", "deny", "deny", item));
@@ -570,7 +756,7 @@ function renderAttention() {
       actions.append(undo);
     }
   }
-  card.append(actions);
+  if (!interactive) card.append(actions);
 
   if (items.length > 1) {
     const pager = element("div", "pager");
@@ -598,6 +784,16 @@ function sessionStatus(session) {
   return { label: "在跑", className: "" };
 }
 
+function recoveryDisplay(session) {
+  return {
+    controllable: { label: "已重新连接，可控制", className: "controllable" },
+    observing: { label: "仍在运行，仅可观察", className: "observing" },
+    waiting_for_event: { label: "历史已恢复，等待新事件", className: "waiting" },
+    lost_control: { label: "已失去控制", className: "lost" },
+    ended: { label: "已结束", className: "ended" },
+  }[session.recoveryState] || { label: "等待确认状态", className: "waiting" };
+}
+
 function elapsedText(since, until = Date.now()) {
   const seconds = Math.max(0, Math.floor((Number(until) - Number(since || until)) / 1000));
   if (seconds < 60) return `${seconds} 秒`;
@@ -622,6 +818,72 @@ function compactCount(value) {
   if (count >= 1_000_000) return `${Math.round(count / 100_000) / 10}m`;
   if (count >= 1_000) return `${Math.round(count / 100) / 10}k`;
   return String(count);
+}
+
+function cardFieldVisible(field) {
+  return (settingsState.taskCardFields || []).includes(field);
+}
+
+function detailPair(label, value, className = "") {
+  if (value === undefined || value === null || value === "") return undefined;
+  const row = element("div", `detail-pair ${className}`.trim());
+  row.append(element("span", "", label), element("strong", "", value));
+  return row;
+}
+
+function closeSessionDetail() {
+  ui.sessionDetailOverlay.hidden = true;
+  const sessionId = detailSessionId;
+  detailSessionId = undefined;
+  if (sessionId) {
+    ui.sessionList.querySelector(`[data-session-id="${CSS.escape(sessionId)}"] .session-details`)?.focus();
+  }
+}
+
+function openSessionDetail(session) {
+  detailSessionId = session.id;
+  ui.sessionDetailTitle.textContent = session.providerTitle || session.title || "任务详情";
+  ui.sessionDetailBody.replaceChildren();
+  const fields = new Set(settingsState.taskCardFields || []);
+  const status = sessionStatus(session);
+  const recovery = recoveryDisplay(session);
+  const rows = [
+    detailPair("Provider", providerName(session.provider)),
+    detailPair("状态", status.label),
+    fields.has("recovery") ? detailPair("恢复状态", recovery.label) : undefined,
+    fields.has("control") ? detailPair("控制能力", session.controlCapability === "managed" ? "Codex app-server 托管，可回答提问" : "外部 Hook，仅观察/授权") : undefined,
+    fields.has("project") ? detailPair("项目", session.project) : undefined,
+    fields.has("task") ? detailPair("任务", session.title) : undefined,
+    fields.has("model") ? detailPair("模型", session.model) : undefined,
+    fields.has("activity") ? detailPair("实时活动", activityDisplay(session).text) : undefined,
+    fields.has("plan") && Number.isInteger(session.planTotal) && session.planTotal > 0
+      ? detailPair("计划", `${session.planDone || 0}/${session.planTotal}`)
+      : undefined,
+    fields.has("tokens") && session.tokenTotal !== undefined && session.tokenTotal !== null
+      ? detailPair("本轮 Token", compactCount(session.tokenTotal))
+      : undefined,
+    fields.has("context") && Number(session.contextWindowTokens) > 0
+      ? detailPair("上下文", `${compactCount(session.tokenTotal || 0)} / ${compactCount(session.contextWindowTokens)}`)
+      : undefined,
+    fields.has("tool") ? detailPair("当前工具", session.currentTool) : undefined,
+    fields.has("permissionMode") ? detailPair("权限模式", session.permissionMode) : undefined,
+    fields.has("subagents") ? detailPair("运行中的子 Agent", String(session.activeSubagents || 0)) : undefined,
+    fields.has("environment") ? detailPair("运行环境", session.environment) : undefined,
+    fields.has("jump") ? detailPair("跳转能力", session.jumpLabel) : undefined,
+    fields.has("titleSource") ? detailPair("标题来源", session.providerTitleSource) : undefined,
+    fields.has("sessionId") ? detailPair("Flow Agent Session ID", session.id, "developer-value") : undefined,
+    fields.has("providerSessionId") ? detailPair("Provider Session ID", session.providerSessionId, "developer-value") : undefined,
+    fields.has("providerTurnId") ? detailPair("Provider Turn ID", session.providerTurnId, "developer-value") : undefined,
+    fields.has("lastEventAt") ? detailPair("最后事件", new Date(session.lastEventAt).toLocaleString()) : undefined,
+  ].filter(Boolean);
+  const grid = element("div", "session-detail-grid");
+  for (const row of rows) grid.append(row);
+  ui.sessionDetailBody.append(grid);
+  ui.sessionDetailJump.textContent = session.jumpLabel || "当前环境不支持跳转";
+  ui.sessionDetailJump.disabled = session.jumpCapability === "unsupported";
+  ui.sessionDetailJump.onclick = () => jumpSession(session);
+  ui.sessionDetailOverlay.hidden = false;
+  ui.sessionDetailClose.focus();
 }
 
 function visibleSessions() {
@@ -715,6 +977,20 @@ async function jumpSession(session) {
   }
 }
 
+async function manageSession(session) {
+  if (!session?.canManage) return;
+  try {
+    await api(`/api/v1/sessions/${encodeURIComponent(session.id)}/manage`, {
+      method: "POST",
+      body: JSON.stringify({ action: "attach" }),
+    });
+    showToast("Codex 对话已由 Flow Agent app-server Connector 接管");
+    await loadSnapshot();
+  } catch (error) {
+    showToast(`托管连接失败：${error.detail || error.message}`);
+  }
+}
+
 function activateSession(session) {
   selectSession(session.id);
   void jumpSession(session);
@@ -735,6 +1011,7 @@ function renderSessions() {
   }
   for (const session of sessions) {
     const status = sessionStatus(session);
+    const recovery = recoveryDisplay(session);
     const row = element("article", `session-row${session.id === selectedSessionId ? " selected" : ""}`);
     row.dataset.sessionId = session.id;
     row.tabIndex = 0;
@@ -752,16 +1029,23 @@ function renderSessions() {
     const clientTitle = session.providerTitle || session.title || "等待下一条任务";
     title.append(element("strong", "", clientTitle));
     title.append(element("span", `state-pill ${status.className}`.trim(), status.label));
-    const taskContent = session.providerTitle && session.title && session.providerTitle !== session.title
+    const taskContent = cardFieldVisible("task") && session.providerTitle && session.title && session.providerTitle !== session.title
       ? element("div", "session-question", session.title)
       : undefined;
-    const model = session.model ? element("div", "session-meta", session.model) : undefined;
+    const project = cardFieldVisible("project") && session.project ? element("div", "session-meta", session.project) : undefined;
+    const model = cardFieldVisible("model") && session.model ? element("div", "session-meta", session.model) : undefined;
     const jump = element("button", `session-jump ${session.jumpCapability || "unsupported"}`, session.jumpLabel || "当前环境不支持跳转");
     jump.type = "button";
     jump.disabled = session.jumpCapability === "unsupported";
     jump.addEventListener("click", (event) => {
       event.stopPropagation();
       activateSession(session);
+    });
+    const details = element("button", "session-details", "详情");
+    details.type = "button";
+    details.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openSessionDetail(session);
     });
     const activity = element("div", "row-subtitle session-activity");
     const marker = element("span", "activity-marker");
@@ -770,9 +1054,35 @@ function renderSessions() {
     sessionActivityRefs.set(session.id, { root: activity, marker, text: activityText });
     copy.append(title);
     if (taskContent) copy.append(taskContent);
+    if (project) copy.append(project);
     if (model) copy.append(model);
-    copy.append(jump, activity);
-    if (Number.isInteger(session.planDone) && Number.isInteger(session.planTotal) && session.planTotal > 0) {
+    const quickActions = element("div", "session-quick-actions");
+    if (cardFieldVisible("jump")) quickActions.append(jump);
+    quickActions.append(details);
+    if (session.canManage) {
+      const manage = element("button", "session-manage", "启用可控制连接");
+      manage.type = "button";
+      manage.addEventListener("click", (event) => {
+        event.stopPropagation();
+        manageSession(session);
+      });
+      quickActions.append(manage);
+    }
+    copy.append(quickActions);
+    if (cardFieldVisible("recovery")) copy.append(element("div", `session-recovery ${recovery.className}`, recovery.label));
+    if (cardFieldVisible("control")) copy.append(element("div", "session-meta", session.controlCapability === "managed" ? "可控制 · app-server" : "外部 Hook"));
+    if (cardFieldVisible("activity")) copy.append(activity);
+    if (cardFieldVisible("tokens") && session.tokenTotal !== undefined && session.tokenTotal !== null) {
+      copy.append(element("div", "session-meta", `本轮 ${compactCount(session.tokenTotal)} tokens`));
+    }
+    if (cardFieldVisible("context") && Number(session.contextWindowTokens) > 0) {
+      copy.append(element("div", "session-meta", `上下文 ${compactCount(session.tokenTotal || 0)} / ${compactCount(session.contextWindowTokens)}`));
+    }
+    if (cardFieldVisible("tool") && session.currentTool) copy.append(element("div", "session-meta", `工具 · ${session.currentTool}`));
+    if (cardFieldVisible("permissionMode") && session.permissionMode) copy.append(element("div", "session-meta", `权限 · ${session.permissionMode}`));
+    if (cardFieldVisible("subagents")) copy.append(element("div", "session-meta", `子 Agent · ${session.activeSubagents || 0}`));
+    if (cardFieldVisible("environment") && session.environment) copy.append(element("div", "session-meta", session.environment));
+    if (cardFieldVisible("plan") && Number.isInteger(session.planDone) && Number.isInteger(session.planTotal) && session.planTotal > 0) {
       const progress = element("div", "plan-progress");
       const label = element("span", "", `计划 ${session.planDone}/${session.planTotal}`);
       const track = element("div", "plan-track");
@@ -786,6 +1096,11 @@ function renderSessions() {
       progress.append(label, track);
       copy.append(progress);
     }
+    if (cardFieldVisible("titleSource") && session.providerTitleSource) copy.append(element("div", "session-developer", `标题来源 · ${session.providerTitleSource}`));
+    if (cardFieldVisible("sessionId")) copy.append(element("div", "session-developer", `Session · ${session.id}`));
+    if (cardFieldVisible("providerSessionId")) copy.append(element("div", "session-developer", `Provider · ${session.providerSessionId}`));
+    if (cardFieldVisible("providerTurnId") && session.providerTurnId) copy.append(element("div", "session-developer", `Turn · ${session.providerTurnId}`));
+    if (cardFieldVisible("lastEventAt")) copy.append(element("div", "session-developer", `事件 · ${new Date(session.lastEventAt).toLocaleString()}`));
     top.append(copy);
     row.append(top);
     ui.sessionList.append(row);
@@ -1094,6 +1409,20 @@ ui.settingsClose.addEventListener("click", closeSettings);
 ui.settingsOverlay.addEventListener("click", (event) => {
   if (event.target === ui.settingsOverlay) closeSettings();
 });
+ui.displayProfile.addEventListener("change", () => {
+  settingsState.displayProfile = ui.displayProfile.value;
+  settingsState.taskCardFields = [...(DISPLAY_PRESETS[ui.displayProfile.value] || DISPLAY_PRESETS.detailed)];
+  renderFieldSelector();
+  saveSettings();
+});
+ui.taskCardFields.addEventListener("change", () => {
+  settingsState.taskCardFields = [...ui.taskCardFields.querySelectorAll("input:checked")].map((input) => input.value);
+  saveSettings();
+});
+ui.sessionDetailClose.addEventListener("click", closeSessionDetail);
+ui.sessionDetailOverlay.addEventListener("click", (event) => {
+  if (event.target === ui.sessionDetailOverlay) closeSessionDetail();
+});
 for (const control of [
   ui.notifyApproval,
   ui.notifyQuestion,
@@ -1122,6 +1451,10 @@ ui.notificationView.addEventListener("click", () => {
 });
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
+  if (!ui.sessionDetailOverlay.hidden) {
+    closeSessionDetail();
+    return;
+  }
   if (!ui.setupOverlay.hidden) closeSetup();
   if (!ui.settingsOverlay.hidden) closeSettings();
 });

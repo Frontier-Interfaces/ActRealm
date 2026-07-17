@@ -61,7 +61,7 @@
 
 ### 1.4 明确不做（v1 拒绝清单）
 
-Coach、Managed Mode（stream-json / app-server）、多 Agent 接力、决策记忆的语义匹配（仅做同类命令计数）、自动授权规则、灵动岛/三分栏视图、云端/账号/遥测、移动端、历史回放页、Gemini 批准应答、任务内输入回答、取消/steer/任意消息注入。
+Coach、多 Agent 接力、决策记忆的语义匹配（仅做同类命令计数）、自动授权规则、灵动岛/三分栏视图、云端/账号/遥测、移动端、历史回放页、Gemini 批准应答、interrupt/steer/任意消息注入。v1.1 已把 Claude 官方问题 Hook、显式 Codex app-server Connector、Thread 恢复和 requestUserInput 纳入 M10-M12；它们不扩大 Hook-only 会话的能力。
 
 ### 1.5 能力边界（必须在 UI 中诚实呈现）
 
@@ -243,8 +243,8 @@ hook 进程发给 Runtime 的每条消息：
 - 环境变量 `FLOW_AGENT_SKIP_HOOKS=1` 时 hook 进程立即退出（对齐 Open Island 的 SKIP 机制）；
 - 单条消息上限 256KB，超限截断 `tool_input`/`tool_response` 并打标记；
 - `requestId` 由 hook 进程生成；同一 envelope 重放必须复用，不能重新生成；
-- `needsReply=true`（仅 PermissionRequest）时进程保持连接等待 Runtime 的回复帧，其余发完即走；
-- Runtime → Hook 回复帧仅允许 `{allow}`、`{deny,message}`、`{pass_through,reason}`、`{ping}`；未知帧按 pass-through 处理；
+- `needsReply=true` 用于 PermissionRequest，以及 Claude AskUserQuestion / Elicitation；Codex requestUserInput 只来自显式 app-server Connector，不伪装成 Hook 能力；
+- Runtime → Hook 回复帧允许批准决定、Claude 问题答案、Elicitation 响应、pass-through 与 ping；事件类型和回复类型不匹配时 stdout 为空并交回 Provider；
 - 活动 waiter 只存在于 Runtime 内存中，不把 socket 句柄伪装成可恢复数据库字段。
 
 ---

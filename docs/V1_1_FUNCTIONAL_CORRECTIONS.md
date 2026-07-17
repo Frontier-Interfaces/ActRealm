@@ -1,9 +1,8 @@
 # v1.1 functional-correction verification
 
-Status: M6-M9 implementation and automated gates complete; the exact release is
-installed locally and the user authorized a local commit on 2026-07-17. GitHub
-push remains forbidden until the user separately authorizes upload after final
-local acceptance.
+Status: M6-M9 were previously completed and pushed. M10-M12 implementation,
+full gates, exact-candidate installation, and local user acceptance are now
+complete. The user authorized commit and GitHub push on 2026-07-17.
 
 ## User contract
 
@@ -33,6 +32,12 @@ The main product surface must obey these visible rules:
 11. Provider conversation title and current task are separate: the verified
     local Claude/Codex conversation title is the visible main title, while the
     bounded current prompt remains visible without a synthetic label.
+12. Users choose a concise, detailed, or developer task-card profile from a
+    safe field allowlist; raw Hook payload is never directly rendered.
+13. Claude AskUserQuestion/Elicitation and managed Codex requestUserInput can be
+    answered in Attention; secrets remain memory-only.
+14. Restart recovery distinguishes managed/controllable, external/observing,
+    waiting-for-event, lost-control, and ended without restoring old waiters.
 
 ## Reference decisions
 
@@ -65,7 +70,8 @@ Adopted lessons:
 
 ### Runtime and session list
 
-- SQLite schema version 5 adds bounded task usage, private jump locators, and
+- SQLite schema version 6 adds bounded task usage, private jump locators,
+  Provider process liveness, and
   separate Provider title/source fields.
   Existing databases migrate in place without losing sessions.
 - `UserPromptSubmit` stores only a normalized, single-line, maximum-64-character
@@ -80,6 +86,21 @@ Adopted lessons:
   limited to a 2 MiB tail. Raw transcript text and its path are never exposed
   in the snapshot. Recent titles refresh at most once every two seconds, and an
   official Claude session title cannot be downgraded by an older AI title.
+
+### M10-M12 capability boundary
+
+- M10 persists only display profile and allowlisted field identifiers. The
+  snapshot already contains sanitized structured facts; there is no raw Hook
+  payload display or export path.
+- Claude direct answers use official blocking Hook output. Secret content is
+  validated and forwarded from memory, then released with the waiter.
+- Codex direct answers exist only after explicit app-server attach. The
+  Connector initializes an official persistent private Unix-Socket app-server
+  plus proxy transport with experimental API capability, resumes saved Thread IDs, and handles
+  `item/tool/requestUserInput`. Hook-only Codex stays observe/approval-only.
+- Runtime restart restores SQLite session presentation and reconnects saved
+  managed Threads, but every old permission/question waiter expires first.
+  A fresh Provider request is required before the UI becomes actionable again.
 
 ### UI linkage and activity
 
@@ -134,30 +155,25 @@ Adopted lessons:
 | `cargo test -p flow-agent-runtime --test m1_runtime --offline` | PASS, 25 tests including title provenance, migration, restart, usage, and jump privacy |
 | `cargo test -p flow-agent-quota --lib --offline` | PASS, 7 tests including dynamic windows and stale-value retention |
 | `cargo test -p flow-agent-installer --test m4_statusline --offline` | PASS, 4 tests including wrapper/restore |
-| `cargo test -p flow-agent-server --lib --offline` | PASS, 8 tests including jump target truthfulness and immediate Claude cache refresh |
+| `cargo test -p flow-agent-server --lib --offline` | PASS, 11 tests including safe display fields, interactive questions, recovery truthfulness, jump targets, and immediate Claude cache refresh |
 | `cargo test -p flow-agent-server --test m2_api --offline` | PASS, 3 authenticated API cases |
 | `cargo test -p flow-agent --test m2_widget_e2e --offline` | PASS, 5 Claude + 5 Codex control flows |
 | `cargo clippy --workspace --all-targets --offline -- -D warnings` | PASS, zero warnings |
-| `cargo test --workspace --offline` | PASS, 127 tests, one explicit resource test ignored by default, and all doc-tests |
+| `cargo test --workspace --offline` | PASS, 140 tests, two explicit resource/manual-preview tests ignored by default, and all doc-tests |
 | `cargo build --workspace --release --offline` | PASS |
 | `node --check web/app.js` | PASS |
 | event-to-WebSocket performance | PASS, below 300 ms budget |
 | five-round Claude + Codex widget control replay | PASS after isolating its Runtime/home from the user's live instance |
-| explicit 120-second release resource gate | PASS, 118 samples, CPU 0.000%, RSS max 5,616 KiB |
-| install exact release + Doctor on user home | INSTALLED; Runtime/control loop and real Claude/Codex event checks PASS; Codex requires the official `/hooks` re-trust after reinstall |
-| user release decision | Local commit authorized on 2026-07-17; Codex re-trust and explicit GitHub upload approval remain pending |
+| explicit 120-second release resource gate | PASS, 117 samples, CPU 0.000%, RSS max 5,792 KiB |
+| install exact release + Doctor on user home | PASS; M10-M12 candidate installed with matching SHA-256; Doctor overall PASS; Claude/Codex app and Terminal sources all emitted post-install events; user accepted the candidate |
+| user release decision | Commit and GitHub push authorized on 2026-07-17 |
 
 The resource report from this exact candidate tree is:
 
 ```json
-{"schemaVersion":1,"durationSeconds":120,"sampleCount":118,"idleCpuAveragePct":0.000,"runtimeRssMaxKiB":5616,"cpuBudgetPct":0.5,"rssBudgetKiB":81920}
+{"schemaVersion":1,"durationSeconds":120,"sampleCount":117,"idleCpuAveragePct":0.000,"runtimeRssMaxKiB":5792,"cpuBudgetPct":0.5,"rssBudgetKiB":81920}
 ```
 
-## Remaining release gate
+## Remaining long-run release evidence
 
-- exact current release is installed and running; the live page renders the
-  Codex client title separately from the current prompt with no console errors;
-- complete the official Codex `/hooks` re-trust and obtain explicit user
-  acceptance;
-- do not commit or push until the user authorizes upload after local testing;
 - keep the final 48-hour release soak unchecked until it actually passes.

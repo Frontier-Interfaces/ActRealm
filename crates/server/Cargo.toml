@@ -8,8 +8,11 @@ rust-version.workspace = true
 [dependencies]
 axum.workspace = true
 flow-agent-installer = { path = "../installer" }
+flow-agent-codex-connector = { path = "../codex-connector" }
+flow-agent-core = { path = "../core" }
 flow-agent-quota = { path = "../quota" }
 flow-agent-runtime = { path = "../runtime" }
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -17,7 +20,6 @@ tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-flow-agent-core = { path = "../core" }
 futures-util = "0.3"
 tokio-tungstenite = "0.29.0"
 tower = { version = "0.5", features = ["util"] }

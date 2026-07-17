@@ -113,10 +113,17 @@
             <label class="toggle-row"><span>Codex 静音</span><input id="mute-codex" type="checkbox"></label>
             <label class="toggle-row"><span>Codex 工具级事件</span><input id="codex-enhanced" type="checkbox"></label>
             <p class="settings-note">切换 Codex 工具级事件会重装 Hook，并需要重新运行 /hooks 检查信任。</p>
+            <div class="connector-status"><strong>Codex app-server Connector</strong><span id="codex-connector-status">正在检查</span></div>
             <div class="bridge-setting">
               <div><strong>Claude 额度桥</strong><span id="claude-bridge-status">正在检查</span></div>
               <button id="claude-bridge-action" type="button">开启</button>
             </div>
+          </section>
+          <section class="settings-card display-settings">
+            <h3>任务卡展示</h3>
+            <label>信息密度<select id="display-profile"><option value="concise">简洁</option><option value="detailed">详细</option><option value="developer">开发者</option></select></label>
+            <div class="field-selector" id="task-card-fields" aria-label="选择任务卡字段"></div>
+            <p class="settings-note">只提供经过清理的结构化字段；原始 Hook Payload、完整命令和对话内容永不直接展示。</p>
           </section>
           <section class="settings-card data-settings">
             <h3>本地数据</h3>
@@ -135,6 +142,23 @@
             <div class="metrics-summary" id="metrics-summary" aria-live="polite"></div>
           </section>
         </div>
+      </section>
+    </div>
+
+    <div class="setup-overlay" id="session-detail-overlay" hidden>
+      <section class="session-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="session-detail-title">
+        <header class="session-detail-header">
+          <div>
+            <p class="eyebrow">SESSION DETAILS</p>
+            <h2 id="session-detail-title">任务详情</h2>
+          </div>
+          <button class="setup-close" id="session-detail-close" type="button" aria-label="关闭任务详情">×</button>
+        </header>
+        <div class="session-detail-body" id="session-detail-body"></div>
+        <footer class="session-detail-footer">
+          <span>详情只来自安全字段目录，不包含原始 Hook Payload。</span>
+          <button id="session-detail-jump" type="button">当前环境不支持跳转</button>
+        </footer>
       </section>
     </div>
 

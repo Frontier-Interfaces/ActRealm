@@ -16,7 +16,9 @@ Third-party asset attribution is recorded in
 The repository is an M5 release candidate under strict v1 verification. It
 provides the fail-open Hook
 bridge, persistent single-instance Runtime, authenticated localhost control
-panel, fixed three-module web UI, safe Claude/Codex installer, first-run
+panel, fixed three-module web UI, configurable safe task fields and detail
+drawer, direct Claude question forms, an explicit version-gated Codex
+app-server Connector with Thread recovery, safe Claude/Codex installer, first-run
 onboarding, structured diagnostics, honest quota adapters, notification
 settings, retention, aggregate metrics, export, and destructive local-data
 clearing:

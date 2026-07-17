@@ -1,5 +1,5 @@
 [package]
-name = "flow-agent-core"
+name = "flow-agent-codex-connector"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +8,4 @@ rust-version.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-libc.workspace = true
 thiserror.workspace = true
-uuid.workspace = true

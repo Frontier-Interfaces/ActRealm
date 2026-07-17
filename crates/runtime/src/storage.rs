@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const MAX_TASK_TITLE_CHARS: usize = 64;
 const PROVIDER_TITLE_REFRESH_INTERVAL_MS: u64 = 2_000;
 const PROVIDER_TITLE_ACTIVE_WINDOW_MS: u64 = 30 * 60 * 1_000;
@@ -173,6 +173,11 @@ pub struct SessionRecord {
     pub turn_ended_at: Option<u64>,
     pub token_total: Option<u64>,
     pub context_window_tokens: Option<u64>,
+    pub permission_mode: Option<String>,
+    pub current_tool: Option<String>,
+    pub active_subagents: u32,
+    pub provider_turn_id: Option<String>,
+    pub environment: Option<String>,
     pub jump_capability: String,
     pub jump_label: String,
     #[serde(skip)]
@@ -185,6 +190,8 @@ pub struct SessionRecord {
     pub term_bundle_id: Option<String>,
     #[serde(skip)]
     pub term_surface: Option<String>,
+    #[serde(skip)]
+    pub provider_pid: Option<u32>,
     pub last_event_at: u64,
 }
 
@@ -1103,7 +1110,7 @@ fn initialize(connection: &Connection) -> Result<(), StoreError> {
               provider_title TEXT, provider_title_source TEXT,
               model TEXT, permission_mode TEXT,
               term_app TEXT, term_session_id TEXT, term_tty TEXT, term_title TEXT,
-              term_bundle_id TEXT, term_surface TEXT,
+              term_bundle_id TEXT, term_surface TEXT, provider_pid INTEGER,
               exec_state TEXT NOT NULL DEFAULT 'idle',
               approval_owner TEXT, activity TEXT, activity_since INTEGER,
               plan_done INTEGER, plan_total INTEGER,
@@ -1278,11 +1285,18 @@ fn ensure_session_locator_columns(connection: &Connection) -> Result<(), StoreEr
         .map_err(storage_error)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(storage_error)?;
-    for column in ["term_bundle_id", "term_surface"] {
+    for column in ["term_bundle_id", "term_surface", "provider_pid"] {
         if !columns.iter().any(|existing| existing == column) {
             connection
                 .execute(
-                    &format!("ALTER TABLE sessions ADD COLUMN {column} TEXT"),
+                    &format!(
+                        "ALTER TABLE sessions ADD COLUMN {column} {}",
+                        if column == "provider_pid" {
+                            "INTEGER"
+                        } else {
+                            "TEXT"
+                        }
+                    ),
                     [],
                 )
                 .map_err(storage_error)?;
@@ -1355,9 +1369,9 @@ fn ingest_transaction(
                    id, provider, provider_session_id, cwd, project, title,
                    provider_title, provider_title_source, model,
                    permission_mode, term_app, term_session_id, term_tty, term_title,
-                   term_bundle_id, term_surface,
+                   term_bundle_id, term_surface, provider_pid,
                    exec_state, started_at, last_event_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'idle', ?17, ?17)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 'idle', ?18, ?18)",
                 params![
                     session_id,
                     provider,
@@ -1387,6 +1401,11 @@ fn ingest_transaction(
                         .term
                         .as_ref()
                         .and_then(|value| value.surface.as_deref()),
+                    request
+                        .term
+                        .as_ref()
+                        .and_then(|value| value.provider_pid)
+                        .map(i64::from),
                     occurred_at,
                 ],
             )
@@ -1463,6 +1482,29 @@ fn ingest_transaction(
             &request,
             parsed.tool_name.as_deref(),
         )?),
+        EventKind::QuestionRequested | EventKind::ElicitationRequested => {
+            Some(insert_nonapproval_attention(
+                &transaction,
+                &session_id,
+                turn_id.as_deref(),
+                &request,
+                NonApprovalSpec {
+                    kind: "question",
+                    title: if request.provider == Provider::Codex {
+                        "Codex 正在询问"
+                    } else if parsed.kind == EventKind::ElicitationRequested {
+                        "Claude 需要补充信息"
+                    } else {
+                        "Claude 正在询问"
+                    },
+                    detail: Some("可直接在 Flow Agent 回答；答案不会写入本地历史。"),
+                    dedupe_key: request
+                        .request_id
+                        .map(|id| format!("interactive:{id}"))
+                        .unwrap_or_else(|| format!("interactive:{}", request.id)),
+                },
+            )?)
+        }
         EventKind::Failed => Some(insert_nonapproval_attention(
             &transaction,
             &session_id,
@@ -1574,6 +1616,7 @@ fn ingest_transaction(
                    term_title = COALESCE(?17, term_title),
                    term_bundle_id = COALESCE(?18, term_bundle_id),
                    term_surface = COALESCE(?19, term_surface),
+                   provider_pid = COALESCE(?20, provider_pid),
                    ended_at = CASE WHEN ?6 = 1 THEN ?5 ELSE ended_at END
                  WHERE id = ?1",
                 params![
@@ -1608,6 +1651,11 @@ fn ingest_transaction(
                         .term
                         .as_ref()
                         .and_then(|value| value.surface.as_deref()),
+                    request
+                        .term
+                        .as_ref()
+                        .and_then(|value| value.provider_pid)
+                        .map(i64::from),
                 ],
             )
             .map_err(storage_error)?;
@@ -1982,7 +2030,8 @@ fn reconcile_transaction(
         let mut statement = transaction
             .prepare(
                 "SELECT id, request_id FROM attention_items
-                 WHERE kind = 'approval' AND state IN ('open', 'committing', 'decision_sent')",
+                 WHERE kind IN ('approval', 'question') AND request_id IS NOT NULL
+                 AND state IN ('open', 'committing', 'decision_sent')",
             )
             .map_err(storage_error)?;
         let rows = statement
@@ -2028,14 +2077,20 @@ fn expire_approval_transaction(
     let transaction = connection.transaction().map_err(storage_error)?;
     let attention_id = transaction
         .query_row(
-            "SELECT id, created_at FROM attention_items WHERE request_id = ?1
+            "SELECT id, created_at, kind FROM attention_items WHERE request_id = ?1
              AND state IN ('open', 'committing', 'decision_sent')",
             [request_id.to_string()],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .optional()
         .map_err(storage_error)?;
-    let Some((attention_id, _created_at)) = attention_id else {
+    let Some((attention_id, _created_at, kind)) = attention_id else {
         return Ok(false);
     };
     transaction
@@ -2052,7 +2107,7 @@ fn expire_approval_transaction(
             params![attention_id, reason],
         )
         .map_err(storage_error)?;
-    if reason == "deadline" {
+    if reason == "deadline" && kind == "approval" {
         ensure_metric_day(&transaction, now)?;
         transaction
             .execute(
@@ -2242,7 +2297,16 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
                          ORDER BY ordinal DESC LIMIT 1),
                         token_total, context_window_tokens,
                         term_app, term_session_id, term_tty,
-                        term_bundle_id, term_surface, last_event_at
+                        term_bundle_id, term_surface, provider_pid, last_event_at,
+                        permission_mode,
+                        (SELECT tool_name FROM events
+                         WHERE events.session_id = sessions.id AND tool_name IS NOT NULL
+                         ORDER BY ingest_seq DESC LIMIT 1),
+                        (SELECT COUNT(*) FROM session_subagents
+                         WHERE session_subagents.session_id = sessions.id AND active = 1),
+                        (SELECT provider_turn_id FROM turns
+                         WHERE turns.session_id = sessions.id
+                         ORDER BY ordinal DESC LIMIT 1)
                  FROM sessions ORDER BY last_event_at DESC",
             )
             .map_err(storage_error)?;
@@ -2255,6 +2319,15 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
                 let term_tty = row.get::<_, Option<String>>(20)?;
                 let term_bundle_id = row.get::<_, Option<String>>(21)?;
                 let term_surface = row.get::<_, Option<String>>(22)?;
+                let provider_pid = row
+                    .get::<_, Option<i64>>(23)?
+                    .and_then(|value| u32::try_from(value).ok());
+                let exec_state = row.get::<_, String>(8)?;
+                let current_tool = if exec_state == "tool_running" {
+                    row.get(26)?
+                } else {
+                    None
+                };
                 let (jump_capability, jump_label) = jump_descriptor(
                     &provider,
                     &provider_session_id,
@@ -2264,6 +2337,7 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
                     term_bundle_id.as_deref(),
                     term_surface.as_deref(),
                 );
+                let environment = environment_label(term_surface.as_deref(), term_app.as_deref());
                 Ok(SessionRecord {
                     id: row.get(0)?,
                     provider,
@@ -2273,7 +2347,7 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
                     provider_title: row.get(5)?,
                     provider_title_source: row.get(6)?,
                     model: row.get(7)?,
-                    exec_state: row.get(8)?,
+                    exec_state,
                     approval_owner: row.get(9)?,
                     activity: row.get(10)?,
                     activity_since: row.get::<_, Option<i64>>(11)?.map(from_i64),
@@ -2287,6 +2361,15 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
                     turn_ended_at: row.get::<_, Option<i64>>(15)?.map(from_i64),
                     token_total: row.get::<_, Option<i64>>(16)?.map(from_i64),
                     context_window_tokens: row.get::<_, Option<i64>>(17)?.map(from_i64),
+                    permission_mode: row.get(25)?,
+                    current_tool,
+                    active_subagents: row
+                        .get::<_, i64>(27)
+                        .ok()
+                        .and_then(|value| u32::try_from(value).ok())
+                        .unwrap_or_default(),
+                    provider_turn_id: row.get(28)?,
+                    environment,
                     jump_capability,
                     jump_label,
                     term_app,
@@ -2294,7 +2377,8 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
                     term_tty,
                     term_bundle_id,
                     term_surface,
-                    last_event_at: from_i64(row.get(23)?),
+                    provider_pid,
+                    last_event_at: from_i64(row.get(24)?),
                 })
             })
             .map_err(storage_error)?
@@ -2377,6 +2461,21 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
         event_count,
         metrics,
     })
+}
+
+fn environment_label(surface: Option<&str>, app: Option<&str>) -> Option<String> {
+    match surface {
+        Some("codex_app") => Some("Codex 客户端".to_owned()),
+        Some("claude_app") => Some("Claude 客户端".to_owned()),
+        Some("terminal") => Some(
+            app.filter(|value| !value.trim().is_empty())
+                .unwrap_or("终端")
+                .chars()
+                .take(64)
+                .collect(),
+        ),
+        _ => None,
+    }
 }
 
 fn read_metrics(connection: &Connection, now: u64) -> Result<MetricsSummary, StoreError> {
@@ -2587,8 +2686,8 @@ fn insert_nonapproval_attention(
                title, detail, command_preview, risk, risk_notes, dedupe_key,
                state, expires_at, created_at
              ) VALUES (
-               ?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, NULL, 'unknown',
-               '[]', ?9, 'open', NULL, ?10
+               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, 'unknown',
+               '[]', ?10, 'open', ?11, ?12
              )",
             params![
                 id,
@@ -2596,12 +2695,14 @@ fn insert_nonapproval_attention(
                 request.provider.to_string(),
                 project,
                 turn_id,
+                request.request_id.map(|value| value.to_string()),
                 spec.kind,
                 spec.title,
                 spec.detail
                     .filter(|detail| !detail.trim().is_empty())
                     .and_then(sanitized_attention_text),
                 spec.dedupe_key,
+                request.deadline_at.map(to_i64),
                 to_i64(request.received_at),
             ],
         )
@@ -3079,6 +3180,9 @@ fn project_event<'a>(
         EventKind::PermissionRequested => {
             ("awaiting_approval", Some("widget"), "等待你批准".to_owned())
         }
+        EventKind::QuestionRequested | EventKind::ElicitationRequested => {
+            ("awaiting_approval", Some("widget"), "等待你回答".to_owned())
+        }
         EventKind::PermissionDenied => ("thinking", None, "操作已在 Agent 中拒绝".to_owned()),
         EventKind::Compacting => ("compacting", None, "正在压缩记忆".to_owned()),
         EventKind::Stopped if has_background_work(raw) => {
@@ -3238,6 +3342,8 @@ fn event_summary(raw: &Value, kind: EventKind) -> Option<String> {
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|tool| format!("请求运行 {}", sanitized_tool_name(tool))),
+        EventKind::QuestionRequested => Some("Claude AskUserQuestion".to_owned()),
+        EventKind::ElicitationRequested => Some("Claude Elicitation".to_owned()),
         EventKind::Unknown => Some("未知 Provider 事件".to_owned()),
         _ => None,
     }
@@ -3253,6 +3359,8 @@ fn event_type(kind: EventKind) -> &'static str {
         EventKind::ToolFailed => "tool.failed",
         EventKind::PermissionRequested => "approval.requested",
         EventKind::PermissionDenied => "approval.denied",
+        EventKind::QuestionRequested => "question.requested",
+        EventKind::ElicitationRequested => "elicitation.requested",
         EventKind::Notification => "notification",
         EventKind::SubagentStarted => "subagent.started",
         EventKind::SubagentStopped => "subagent.stopped",
