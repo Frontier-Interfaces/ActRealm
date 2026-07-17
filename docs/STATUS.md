@@ -2,7 +2,7 @@
 
 Last reviewed: 2026-07-17
 
-Development branch: `agent/v1-full`
+Source branch: `agent/v1-full`
 
 Current functional code commit: `311306d`
 
@@ -24,9 +24,10 @@ provide the detailed requirements and evidence.
   and pushed at the user's direction before this final manual confirmation.
 - **Final v1 release:** not yet declared. The required continuous 48-hour
   Runtime RSS soak remains unchecked.
-- **Default GitHub branch:** `main` still points to the M0 bootstrap. The full
-  development branch remains unmerged and must not be merged or made default
-  without separate user approval.
+- **Default branch alignment:** the user separately approved the alignment on
+  2026-07-17. `main` was fast-forwarded to the reviewed `agent/v1-full`
+  history without restarting Runtime, reinstalling Flow Agent, or touching the
+  live data directory.
 - **Version/tag:** Cargo remains `0.1.0`; no release tag has been created.
 
 ## Milestone matrix
@@ -90,6 +91,5 @@ Thread and must be separately planned, implemented, tested, and approved.
 2. Run and retain the continuous 48-hour Runtime RSS soak on the exact frozen
    release candidate.
 3. Re-run the full release gate after any resulting change.
-4. Obtain separate approval for commit/push of documentation changes.
-5. Obtain separate approval before merging `agent/v1-full` into `main`, changing
-   the default branch, bumping the version, tagging, or publishing a release.
+4. Obtain separate approval before bumping the version, tagging, publishing a
+   release, or changing the default branch again.
