@@ -2,7 +2,7 @@
 
 `docs/V1_ACCEPTANCE.md` is the executable delivery contract for v1 and
 `docs/STATUS.md` is the current short status. Functional work is recorded
-through M13. M5 remains a parallel final-release qualification track because
+through M14. M5 remains a parallel final-release qualification track because
 its continuous 48-hour soak is still incomplete. A test-candidate commit/push
 requires the listed automated/local gates and explicit user authorization;
 manual acceptance, merge to `main`, version/tag, and release publication are
@@ -42,6 +42,16 @@ Product invariants:
 - The runtime is local-only. Do not add telemetry, cloud SDKs, CDNs, or outbound
   update checks.
 - The v1 web client uses native HTML/CSS/JS with no framework or build step.
+- The Rust Runtime remains the single owner of Hooks, SQLite, approval state,
+  sanitization, and Provider reply channels. Native clients consume the
+  authenticated localhost API and WebSocket; they must not read or mutate the
+  Runtime database directly.
+- Keep macOS and Windows UI implementations separate under `apps/`. Share only
+  stable contracts, fixtures, terminology, and documentation. Do not vendor a
+  second copy of this Rust workspace inside a native client.
+- Foreground scheduling is an OS-client responsibility. It may activate apps
+  or windows using platform APIs, but it must not invent Provider capability or
+  approval state beyond the Runtime snapshot.
 
 Required local gate before every milestone commit:
 

@@ -13,6 +13,26 @@ Local-first attention surface for coding agents.
 Third-party asset attribution is recorded in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
+## Native clients
+
+ActRealm keeps one local Rust Runtime and separate native clients for each
+desktop platform:
+
+- `apps/macos/` contains the SwiftUI/AppKit client, including local foreground
+  scheduling, menu-bar UI, HUD, Runtime supervision, and packaging.
+- `apps/windows/` records the Windows client boundary and staged WinUI plan.
+- `shared/contracts/` contains platform-neutral settings and API contracts; UI
+  code is intentionally not shared across macOS and Windows.
+
+The native clients do not own Hooks, SQLite, or Provider reply state. Those
+remain in the Rust Runtime and are accessed through its authenticated loopback
+API and WebSocket. See [Native client architecture](docs/NATIVE_CLIENT_ARCHITECTURE.md).
+
+```bash
+apps/macos/Scripts/test.sh
+apps/macos/Scripts/package-app.sh
+```
+
 The committed `agent/v1-full` branch contains functional implementation through
 **M14**, including live session Token, current-context occupancy, estimated API
 price, and background Claude OAuth quota refresh;

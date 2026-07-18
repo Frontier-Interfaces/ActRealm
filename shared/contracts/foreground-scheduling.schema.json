@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://getactrealm.com/contracts/foreground-scheduling.schema.json",
+  "title": "ForegroundSchedulingSettings",
+  "description": "Client-owned policy for routing new attention into an operating-system foreground workflow.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "isEnabled",
+    "closesAfterAcceptance",
+    "strategy",
+    "reminderSeconds",
+    "returnsToActRoom",
+    "acceptanceSeconds",
+    "codexRule",
+    "claudeRule"
+  ],
+  "properties": {
+    "isEnabled": {
+      "type": "boolean",
+      "default": true
+    },
+    "closesAfterAcceptance": {
+      "type": "boolean",
+      "default": true
+    },
+    "strategy": {
+      "$ref": "#/$defs/strategy",
+      "default": "remind"
+    },
+    "reminderSeconds": {
+      "$ref": "#/$defs/durationSeconds",
+      "default": 10
+    },
+    "returnsToActRoom": {
+      "type": "boolean",
+      "default": true
+    },
+    "acceptanceSeconds": {
+      "$ref": "#/$defs/durationSeconds",
+      "default": 10
+    },
+    "codexRule": {
+      "$ref": "#/$defs/providerRule",
+      "default": "defaultRule"
+    },
+    "claudeRule": {
+      "$ref": "#/$defs/providerRule",
+      "default": "immediate"
+    }
+  },
+  "$defs": {
+    "strategy": {
+      "type": "string",
+      "enum": ["immediate", "remind", "actRoom"]
+    },
+    "providerRule": {
+      "type": "string",
+      "enum": ["defaultRule", "immediate", "remind", "actRoom"]
+    },
+    "durationSeconds": {
+      "type": "integer",
+      "enum": [5, 10, 30]
+    }
+  }
+}
