@@ -1,6 +1,15 @@
 /target/
+/.swiftpm/
+/.build/
+/apps/macos/.build/
+/apps/macos/.swiftpm/
+/apps/macos/dist/
+/apps/macos/snapshots/
+/apps/windows/**/bin/
+/apps/windows/**/obj/
+**/xcuserdata/
+*.xcuserstate
 /.idea/
 /.vscode/
-.DS_Store
+**/.DS_Store
 *.log
-
