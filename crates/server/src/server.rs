@@ -27,9 +27,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+use std::os::unix::net::UnixStream;
 use std::path::{Path as FilePath, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -77,6 +78,7 @@ pub struct ApiServerConfig {
     pub quota_poll_interval: Duration,
     pub install_paths: Option<InstallPaths>,
     pub enable_codex_connector: bool,
+    pub runtime_restart: Option<RuntimeRestartHandle>,
 }
 
 impl Default for ApiServerConfig {
@@ -88,7 +90,36 @@ impl Default for ApiServerConfig {
             quota_poll_interval: Duration::from_secs(5 * 60),
             install_paths: None,
             enable_codex_connector: false,
+            runtime_restart: None,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeRestartHandle {
+    sender: std_mpsc::Sender<std_mpsc::Sender<Result<(), String>>>,
+    socket_path: PathBuf,
+}
+
+impl RuntimeRestartHandle {
+    pub fn new(
+        sender: std_mpsc::Sender<std_mpsc::Sender<Result<(), String>>>,
+        socket_path: PathBuf,
+    ) -> Self {
+        Self {
+            sender,
+            socket_path,
+        }
+    }
+
+    fn request(&self) -> Result<std_mpsc::Receiver<Result<(), String>>, String> {
+        let (response_sender, response_receiver) = std_mpsc::channel();
+        self.sender
+            .send(response_sender)
+            .map_err(|_| "Runtime 控制通道不可用".to_owned())?;
+        UnixStream::connect(&self.socket_path)
+            .map_err(|error| format!("无法唤醒 bridge.sock：{error}"))?;
+        Ok(response_receiver)
     }
 }
 
@@ -173,6 +204,7 @@ impl ApiServer {
             })),
             data_paths,
             codex,
+            runtime_restart: config.runtime_restart,
         };
         let router = router(state);
         let (shutdown, shutdown_receiver) = oneshot::channel();
@@ -245,6 +277,7 @@ struct AppState {
     quota: Arc<Mutex<QuotaState>>,
     data_paths: DataPaths,
     codex: CodexManager,
+    runtime_restart: Option<RuntimeRestartHandle>,
 }
 
 #[derive(Clone)]
@@ -801,6 +834,7 @@ fn router(state: AppState) -> Router {
         .route("/assets/claude.png", get(claude_icon))
         .route("/assets/codex.png", get(codex_icon))
         .route("/api/v1/health", get(health))
+        .route("/api/v1/runtime/restart", post(restart_runtime))
         .route("/api/v1/bootstrap", post(bootstrap))
         .route("/api/v1/snapshot", get(snapshot))
         .route("/api/v1/setup", get(setup).post(change_setup))
@@ -872,6 +906,37 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
         "protocolVersion": 1
     }))
     .into_response()
+}
+
+async fn restart_runtime(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized_mutation(&state, &headers) {
+        return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_MUTATION");
+    }
+    let Some(handle) = state.runtime_restart.as_ref() else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "RUNTIME_RESTART_UNAVAILABLE",
+        );
+    };
+    let receiver = match handle.request() {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            return api_error_detail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "RUNTIME_RESTART_FAILED",
+                &error,
+            )
+        }
+    };
+    match receiver.recv_timeout(Duration::from_secs(3)) {
+        Ok(Ok(())) => Json(json!({ "ok": true, "bridge": "restarted" })).into_response(),
+        Ok(Err(error)) => api_error_detail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "RUNTIME_RESTART_FAILED",
+            &error,
+        ),
+        Err(_) => api_error(StatusCode::GATEWAY_TIMEOUT, "RUNTIME_RESTART_TIMED_OUT"),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1127,9 +1192,9 @@ impl Default for UiSettings {
     fn default() -> Self {
         Self {
             notification_rules: NotificationRules {
-                approval: "banner".to_owned(),
-                question: "banner".to_owned(),
-                error: "banner".to_owned(),
+                approval: "list".to_owned(),
+                question: "list".to_owned(),
+                error: "list".to_owned(),
                 completion: "list".to_owned(),
             },
             sound_enabled: true,
@@ -1170,8 +1235,8 @@ impl UiSettings {
                 return Err("notification mode must be banner, list, or ignore");
             }
         }
-        if !matches!(self.retention_days, 30 | 90 | 365) {
-            return Err("retentionDays must be 30, 90, or 365");
+        if !matches!(self.retention_days, 0 | 30 | 90 | 180 | 365) {
+            return Err("retentionDays must be 0, 30, 90, 180, or 365");
         }
         if !matches!(
             self.display_profile.as_str(),
@@ -2330,6 +2395,7 @@ mod tests {
                 diagnostics: root.join("flow-home/diagnostics"),
             },
             codex,
+            runtime_restart: None,
         }
     }
 
@@ -2941,7 +3007,7 @@ mod tests {
         });
         assert!(INDEX_HTML.contains("我的使用统计"));
         assert!(INDEX_HTML.contains("导出统计"));
-        assert!(APP_JS.contains("todayWidgetDecisions"));
+        assert!(APP_JS.contains("widgetApprovals"));
         assert!(APP_JS.contains("banner_shown"));
         fs::remove_dir_all(root).unwrap();
     }

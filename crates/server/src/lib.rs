@@ -2,4 +2,4 @@
 
 mod server;
 
-pub use server::{ApiServer, ApiServerConfig, ApiServerError};
+pub use server::{ApiServer, ApiServerConfig, ApiServerError, RuntimeRestartHandle};

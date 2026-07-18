@@ -959,10 +959,13 @@ fn prune_events_transaction(
     retention_days: u32,
     now: u64,
 ) -> Result<usize, StoreError> {
-    if !matches!(retention_days, 30 | 90 | 365) {
+    if !matches!(retention_days, 0 | 30 | 90 | 180 | 365) {
         return Err(StoreError::Storage(
-            "retention days must be 30, 90, or 365".to_owned(),
+            "retention days must be 0, 30, 90, 180, or 365".to_owned(),
         ));
+    }
+    if retention_days == 0 {
+        return Ok(0);
     }
     let cutoff = now.saturating_sub(u64::from(retention_days) * 86_400_000);
     connection

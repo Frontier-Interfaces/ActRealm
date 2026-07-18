@@ -15,7 +15,7 @@ use flow_agent_runtime::{
     default_database_path, ApprovalAction, DiagnosticCapture, EventSpool, RuntimeInstanceGuard,
     RuntimeStore, WaiterRegistry,
 };
-use flow_agent_server::{ApiServer, ApiServerConfig};
+use flow_agent_server::{ApiServer, ApiServerConfig, RuntimeRestartHandle};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Read, Write};
@@ -1068,7 +1068,7 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()>
         .and_then(|value| serde_json::from_str::<Value>(&value).ok())
         .and_then(|value| value.get("retentionDays").and_then(Value::as_u64))
         .and_then(|value| u32::try_from(value).ok())
-        .filter(|value| matches!(value, 30 | 90 | 365))
+        .filter(|value| matches!(value, 0 | 30 | 90 | 180 | 365))
         .unwrap_or(90);
     store
         .prune_events(retention_days, now_millis())
@@ -1080,9 +1080,11 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()>
     let _ = diagnostics.status(now_millis());
     let spool = EventSpool::new(paths.spool);
     let _ = spool.drain(|request| store.ingest(request).is_ok());
-    let listener = BridgeListener::bind(&socket_path)
+    let mut listener = BridgeListener::bind(&socket_path)
         .with_context(|| format!("failed to bind {}", socket_path.display()))?;
     let waiters = WaiterRegistry::default();
+    let (restart_sender, restart_receiver) =
+        mpsc::channel::<mpsc::Sender<std::result::Result<(), String>>>();
     let api = if approval == ApprovalMode::Widget || open {
         Some(
             ApiServer::start(
@@ -1091,6 +1093,10 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()>
                 ApiServerConfig {
                     commit_delay: commit_delay(),
                     enable_codex_connector: true,
+                    runtime_restart: Some(RuntimeRestartHandle::new(
+                        restart_sender,
+                        socket_path.clone(),
+                    )),
                     ..ApiServerConfig::default()
                 },
             )
@@ -1135,7 +1141,35 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()>
         }
     });
 
-    for stream in listener.incoming() {
+    loop {
+        let Some(stream) = listener.incoming().next() else {
+            break;
+        };
+        if let Ok(response_sender) = restart_receiver.try_recv() {
+            drop(stream);
+            for request_id in waiters.active_request_ids().unwrap_or_default() {
+                let _ = waiters.pass_through(request_id, "runtime_restart");
+            }
+            let _ = store.reconcile_orphaned_approvals(Vec::new(), now_millis());
+            drop(listener);
+            match BridgeListener::bind(&socket_path) {
+                Ok(restarted) => {
+                    listener = restarted;
+                    let _ = response_sender.send(Ok(()));
+                }
+                Err(error) => {
+                    let detail = error.to_string();
+                    let _ = response_sender.send(Err(detail.clone()));
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to restart bridge at {}: {detail}",
+                            socket_path.display()
+                        )
+                    });
+                }
+            }
+            continue;
+        }
         let Ok(mut stream) = stream else { continue };
         let prompt_lock = Arc::clone(&prompt_lock);
         let prompt_input = prompt_input.clone();

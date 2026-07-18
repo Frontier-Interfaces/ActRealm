@@ -276,6 +276,35 @@ fn real_claude_and_codex_fixtures_are_controlled_through_the_widget_api() {
         }
     }
 
+    let interrupted_hook = spawn_hook(&socket, "claude", cases[0].1);
+    let _ = wait_for_open_attention(&auth, "claude");
+    let restarted = http(
+        auth.address,
+        "POST",
+        "/api/v1/runtime/restart",
+        &headers(&auth),
+        None,
+    );
+    assert_eq!(restarted.status, 200);
+    assert_eq!(restarted.body["bridge"], "restarted");
+    assert!(socket.exists());
+    let interrupted_output = interrupted_hook.wait_with_output().unwrap();
+    assert!(interrupted_output.status.success());
+    assert!(interrupted_output.stdout.is_empty());
+    assert!(interrupted_output.stderr.is_empty());
+
+    let hook = spawn_hook(&socket, "claude", cases[0].1);
+    let attention = wait_for_open_attention(&auth, "claude");
+    decide(&auth, &attention, "approve");
+    let output = hook.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let directive: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        directive.pointer("/hookSpecificOutput/decision/behavior"),
+        Some(&Value::String("allow".to_owned()))
+    );
+
     drop(runtime);
     fs::remove_dir_all(root).unwrap();
 }

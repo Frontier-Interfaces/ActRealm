@@ -1,14 +1,21 @@
 "use strict";
 
 const ui = {
+  actRoom: document.querySelector("#act-room"),
+  menuAttentionCount: document.querySelector("#menu-attention-count"),
+  menuClock: document.querySelector("#menu-clock"),
   runtimeState: document.querySelector("#runtime-state"),
   runtimeLabel: document.querySelector("#runtime-label"),
+  runtimeFooterLabel: document.querySelector("#runtime-footer-label"),
+  runtimeSettingsLabel: document.querySelector("#runtime-settings-label"),
   offlineBanner: document.querySelector("#offline-banner"),
   attentionCount: document.querySelector("#attention-count"),
+  attentionSummary: document.querySelector("#attention-summary"),
   attentionList: document.querySelector("#attention-list"),
   sessionCount: document.querySelector("#session-count"),
   sessionList: document.querySelector("#session-list"),
   quotaList: document.querySelector("#quota-list"),
+  quotaSyncTime: document.querySelector("#quota-sync-time"),
   eventCount: document.querySelector("#event-count"),
   undoToast: document.querySelector("#undo-toast"),
   undoMessage: document.querySelector("#undo-message"),
@@ -40,6 +47,15 @@ const ui = {
   clearData: document.querySelector("#clear-data"),
   metricsSummary: document.querySelector("#metrics-summary"),
   exportMetrics: document.querySelector("#export-metrics"),
+  runtimeMonitor: document.querySelector("#runtime-monitor"),
+  runtimeRestart: document.querySelector("#runtime-restart"),
+  runtimeMonitorDetails: document.querySelector("#runtime-monitor-details"),
+  reminderRows: [...document.querySelectorAll(".reminder-row[data-rule]")],
+  retentionOptions: [...document.querySelectorAll(".retention-options button")],
+  wipeConfirmation: document.querySelector("#wipe-confirmation"),
+  wipeConfirmationInput: document.querySelector("#wipe-confirmation-input"),
+  wipeConfirm: document.querySelector("#wipe-confirm"),
+  wipeCancel: document.querySelector("#wipe-cancel"),
   notificationBanner: document.querySelector("#notification-banner"),
   notificationKind: document.querySelector("#notification-kind"),
   notificationTitle: document.querySelector("#notification-title"),
@@ -62,7 +78,7 @@ let toastTimer;
 let setupState = { providers: [], firstRun: false };
 let setupBusy = false;
 let settingsState = {
-  notificationRules: { approval: "banner", question: "banner", error: "banner", completion: "list" },
+  notificationRules: { approval: "list", question: "list", error: "list", completion: "list" },
   soundEnabled: true,
   providerMuted: { claude: false, codex: false },
   codexEnhancedActivity: true,
@@ -82,12 +98,18 @@ let selectedSessionId;
 let detailSessionId;
 let sessionActivityRefs = new Map();
 let attentionExitTimer;
+let hiddenSessions = JSON.parse(localStorage.getItem("flowAgentHiddenSessions") || "{}");
 const SESSION_VISIBLE_FOR_MS = 30 * 60 * 1000;
 const DISPLAY_PRESETS = {
   concise: ["task", "activity"],
   detailed: ["project", "task", "model", "activity", "plan", "tokens", "tool", "subagents", "environment", "recovery", "control", "jump"],
   developer: ["project", "task", "model", "activity", "plan", "tokens", "context", "tool", "permissionMode", "subagents", "environment", "recovery", "control", "jump", "titleSource", "sessionId", "providerSessionId", "providerTurnId", "lastEventAt"],
 };
+
+function updateClock() {
+  const now = new Date();
+  ui.menuClock.textContent = now.toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -123,7 +145,7 @@ function openItems() {
   const visibleStates = new Set(["open", "committing", "decision_sent"]);
   const weights = { error: 4, approval: 3, question: 2, completion: 1 };
   return snapshot.attention
-    .filter((item) => visibleStates.has(item.state))
+    .filter((item) => visibleStates.has(item.state) && notificationRule(item) !== "ignore")
     .sort((a, b) => (weights[b.kind] || 0) - (weights[a.kind] || 0) || a.createdAt - b.createdAt);
 }
 
@@ -239,7 +261,6 @@ async function loadSetup() {
   try {
     setupState = await api("/api/v1/setup");
     renderSetup();
-    if (setupState.firstRun && !sessionStorage.getItem("flowAgentSetupSeen")) openSetup();
   } catch (error) {
     showToast(`接入状态读取失败：${error.message}`);
   }
@@ -269,6 +290,7 @@ async function changeSetup(provider, action) {
 }
 
 function openSettings() {
+  ui.actRoom.hidden = true;
   ui.settingsOverlay.hidden = false;
   renderMetrics();
   ui.settingsClose.focus();
@@ -277,6 +299,7 @@ function openSettings() {
 
 function closeSettings() {
   ui.settingsOverlay.hidden = true;
+  ui.actRoom.hidden = false;
   ui.settingsTrigger.focus();
 }
 
@@ -292,10 +315,11 @@ function bridgeStatusCopy(status) {
 
 function renderSettings() {
   const rules = settingsState.notificationRules || {};
-  ui.notifyApproval.value = rules.approval || "banner";
-  ui.notifyQuestion.value = rules.question || "banner";
-  ui.notifyError.value = rules.error || "banner";
-  ui.notifyCompletion.value = rules.completion || "list";
+  const visibleRule = (value) => value === "ignore" ? "ignore" : "list";
+  ui.notifyApproval.value = visibleRule(rules.approval);
+  ui.notifyQuestion.value = visibleRule(rules.question);
+  ui.notifyError.value = visibleRule(rules.error);
+  ui.notifyCompletion.value = visibleRule(rules.completion);
   ui.soundEnabled.checked = Boolean(settingsState.soundEnabled);
   ui.muteClaude.checked = Boolean(settingsState.providerMuted?.claude);
   ui.muteCodex.checked = Boolean(settingsState.providerMuted?.codex);
@@ -306,7 +330,10 @@ function renderSettings() {
     : connector?.status === "disabled"
       ? "当前 Runtime 未启用"
       : connector?.error || "当前版本不可用";
-  ui.retentionDays.value = String(settingsState.retentionDays || 90);
+  const retention = [30, 90, 180, 0].includes(Number(settingsState.retentionDays))
+    ? Number(settingsState.retentionDays)
+    : 180;
+  ui.retentionDays.value = String(retention);
   ui.displayProfile.value = settingsState.displayProfile || "detailed";
   renderFieldSelector();
   ui.claudeBridgeStatus.textContent = bridgeStatusCopy(claudeBridge.status);
@@ -325,6 +352,19 @@ function renderSettings() {
       ? "wrap"
       : "install";
   ui.claudeBridgeAction.disabled = settingsBusy || blocked;
+  for (const row of ui.reminderRows) {
+    const key = row.dataset.rule;
+    const value = visibleRule(rules[key]);
+    for (const button of row.querySelectorAll("button[data-value]")) {
+      button.classList.toggle("active", button.dataset.value === value);
+      button.setAttribute("aria-pressed", String(button.dataset.value === value));
+    }
+  }
+  for (const button of ui.retentionOptions) {
+    const active = Number(button.dataset.value) === retention;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  }
 }
 
 function renderFieldSelector() {
@@ -350,6 +390,7 @@ async function loadSettings() {
     displayCatalog = response.displayCatalog || [];
     claudeBridge = response.claudeQuotaBridge;
     renderSettings();
+    renderAttention();
     renderSessions();
   } catch (error) {
     showToast(`设置读取失败：${error.message}`);
@@ -386,6 +427,7 @@ async function saveSettings() {
     displayCatalog = response.displayCatalog || displayCatalog;
     claudeBridge = response.claudeQuotaBridge;
     renderSettings();
+    renderAttention();
     renderSessions();
     if (previousCodexMode !== settingsState.codexEnhancedActivity) {
       showToast("Codex Hook 已更新，请在 Codex 中运行 /hooks 重新检查信任");
@@ -462,10 +504,21 @@ async function exportLocalMetrics() {
   }
 }
 
+function openClearConfirmation() {
+  ui.wipeConfirmation.hidden = false;
+  ui.wipeConfirmationInput.value = "";
+  ui.wipeConfirmationInput.focus();
+}
+
+function cancelClearConfirmation() {
+  ui.wipeConfirmation.hidden = true;
+  ui.wipeConfirmationInput.value = "";
+}
+
 async function clearLocalData() {
-  const confirmation = window.prompt("这会删除本地事件、会话、额度缓存和设置。请输入 DELETE 确认：");
+  const confirmation = ui.wipeConfirmationInput.value.trim();
   if (confirmation !== "DELETE") {
-    if (confirmation !== null) showToast("输入不匹配，没有删除任何数据");
+    showToast("请输入 DELETE；没有删除任何数据");
     return;
   }
   try {
@@ -477,6 +530,7 @@ async function clearLocalData() {
     knownAttentionIds = new Set();
     await loadSnapshot();
     await loadSettings();
+    cancelClearConfirmation();
     showToast("本地运行数据已彻底清除，Hook 接入保持不变");
   } catch (error) {
     showToast(`清除失败：${error.detail || error.message}`);
@@ -711,30 +765,41 @@ function renderInteractiveForm(item, card) {
 function renderAttention() {
   const items = openItems();
   ui.attentionCount.textContent = String(items.length);
+  ui.menuAttentionCount.textContent = String(items.length);
   ui.attentionList.replaceChildren();
+  if (items.length) {
+    const oldest = Math.min(...items.map((item) => Number(item.createdAt || Date.now())));
+    const minutes = Math.max(0, Math.floor((Date.now() - oldest) / 60000));
+    ui.attentionSummary.textContent = `最久等待 ${minutes} 分钟`;
+  } else {
+    ui.attentionSummary.textContent = "没有需要你处理的事项";
+  }
   if (!items.length) {
-    const handled = Number(snapshot.stats?.metrics?.todayWidgetDecisions || 0);
-    const detail = handled > 0
-      ? `今天你已通过面板处理 ${handled} 件；新的授权、问题、完成或错误会实时出现。`
-      : "新的授权、问题、完成或错误会实时出现在这里。";
-    ui.attentionList.append(emptyState("✓", "现在没有需要你处理的任务", detail));
-    const outcome = outcomeSummary();
-    if (outcome) ui.attentionList.append(outcome);
+    ui.attentionList.append(emptyState("✓", "全部处理完毕", "新的授权、问题、完成或错误会实时进入 OUTBOX。"));
     return;
   }
   currentAttention = Math.min(currentAttention, items.length - 1);
   const item = items[currentAttention];
   const context = attentionContext(item);
-  const card = element("article", "attention-card");
+  const card = element("article", `attention-card ${item.kind || "approval"}`);
   const kicker = element("div", "attention-kicker");
-  kicker.append(element("span", "attention-kind", `${items.length} 件待处理 · ${context.kicker}`));
-  kicker.append(element("span", "attention-state", context.state));
+  const kindLabel = {
+    approval: "等待批准",
+    native_approval: "原界面批准",
+    question: "提问",
+    completion: "完成",
+    error: "错误",
+  }[item.kind] || "待处理";
+  kicker.append(element("span", "attention-kind", kindLabel));
+  kicker.append(element("span", "attention-state", `已等 ${elapsedText(item.createdAt)}`));
   card.append(kicker, element("h3", "", attentionTitle(item)));
 
   const agentLine = element("div", "agent-line");
   agentLine.append(providerIcon(item.provider));
   agentLine.append(element("strong", "", providerName(item.provider)));
   if (item.project) agentLine.append(element("span", "", `· ${item.project}`));
+  const session = snapshot.sessions.find((candidate) => candidate.id === item.sessionId);
+  if (session?.title) agentLine.append(element("span", "", session.title));
   card.append(agentLine);
 
   const taskJump = element("button", "task-jump", "在 Agent 任务中查看 →");
@@ -757,38 +822,37 @@ function renderAttention() {
   if (interactive) {
     // The interactive form owns its submit, decline, cancel, and handoff actions.
   } else if (item.state === "open" && item.kind === "native_approval") {
-    const openProvider = element("button", "action-button", "去 Agent 处理");
+    const openProvider = element("button", "action-button", "返回原窗口");
     openProvider.type = "button";
     openProvider.addEventListener("click", () => {
-      const session = snapshot.sessions.find((candidate) => candidate.id === item.sessionId);
       if (session) activateSession(session);
       else selectSession(item.sessionId);
     });
     actions.append(openProvider);
-    actions.append(actionButton("待会提醒", "ghost", "snooze", item));
-    actions.append(actionButton("忽略", "ghost", "dismiss", item));
   } else if (item.state === "open" && item.kind === "approval") {
-    if (item.risk === "high") {
-      actions.append(actionButton("去终端核对", "", "pass_through", item));
-      actions.append(actionButton("不行", "deny", "deny", item));
-      const approve = element("button", "action-button ghost", "批准…");
-      approve.type = "button";
-      approve.addEventListener("click", () => {
-        if (window.confirm("这是高影响操作。确认仍要批准这一次请求？")) sendAction(item, "approve");
-      });
-      actions.append(approve);
-      actions.append(actionButton("忽略", "ghost", "dismiss", item));
-    } else {
-      actions.append(actionButton("批准", "", "approve", item));
-      actions.append(actionButton("不行", "deny", "deny", item));
-      actions.append(actionButton("去终端处理", "ghost", "pass_through", item));
-      actions.append(actionButton("忽略", "ghost", "dismiss", item));
-    }
+    actions.append(actionButton("允许", "", "approve", item));
+    actions.append(actionButton("拒绝", "deny", "deny", item));
+    const confirm = element("button", "action-button ghost", "二次确认后允许");
+    confirm.type = "button";
+    confirm.addEventListener("click", () => {
+      actions.replaceChildren();
+      actions.append(element("strong", "confirm-copy", "确认允许运行这项操作？"));
+      actions.append(actionButton("确认允许", "", "approve", item));
+      const cancel = element("button", "action-button ghost", "取消");
+      cancel.type = "button";
+      cancel.addEventListener("click", renderAttention);
+      actions.append(cancel);
+    });
+    actions.append(confirm);
   } else if (item.state === "open") {
-    const acknowledge = item.kind === "completion" ? "没问题，收工" : "标记已解决";
+    const acknowledge = item.kind === "completion" ? "确认完成" : "标记已解决";
     actions.append(actionButton(acknowledge, "", "ack", item));
-    actions.append(actionButton("待会提醒", "ghost", "snooze", item));
-    actions.append(actionButton("忽略", "ghost", "dismiss", item));
+    if (item.kind === "completion" && session) {
+      const back = element("button", "action-button ghost", "返回原窗口");
+      back.type = "button";
+      back.addEventListener("click", () => activateSession(session));
+      actions.append(back);
+    }
   } else if (item.state === "committing") {
     const command = latestCommand(item);
     if (command && command.state === "pending_commit") {
@@ -799,21 +863,26 @@ function renderAttention() {
     }
   }
   if (!interactive) card.append(actions);
-
-  if (items.length > 1) {
-    const pager = element("div", "pager");
-    const previous = element("button", "", "←");
-    previous.type = "button";
-    previous.setAttribute("aria-label", "上一件");
-    previous.addEventListener("click", () => { currentAttention = (currentAttention + items.length - 1) % items.length; renderAttention(); });
-    const next = element("button", "", "→");
-    next.type = "button";
-    next.setAttribute("aria-label", "下一件");
-    next.addEventListener("click", () => { currentAttention = (currentAttention + 1) % items.length; renderAttention(); });
-    pager.append(previous, element("span", "", `第 ${currentAttention + 1}/${items.length} 件`), next);
-    card.append(pager);
-  }
   ui.attentionList.append(card);
+  if (items.length > 1) {
+    ui.attentionList.append(element("div", "queue-label", `队列 · 还有 ${items.length - 1} 项`));
+    const queue = element("div", "attention-queue");
+    items.forEach((candidate, index) => {
+      if (index === currentAttention) return;
+      const row = element("button", "queue-item");
+      row.type = "button";
+      row.append(
+        element("span", `queue-kind ${candidate.kind || "approval"}`, {
+          approval: "等待批准", native_approval: "原界面批准", question: "提问", completion: "完成", error: "错误",
+        }[candidate.kind] || "待处理"),
+        element("strong", "", attentionTitle(candidate)),
+        element("span", "", elapsedText(candidate.createdAt)),
+      );
+      row.addEventListener("click", () => { currentAttention = index; renderAttention(); });
+      queue.append(row);
+    });
+    ui.attentionList.append(queue);
+  }
 }
 
 function sessionStatus(session) {
@@ -945,6 +1014,8 @@ function visibleSessions() {
   const cutoff = Date.now() - SESSION_VISIBLE_FOR_MS;
   return snapshot.sessions
     .filter((session) => {
+      const hiddenAt = Number(hiddenSessions[session.id] || 0);
+      if (hiddenAt && Number(session.lastEventAt || 0) <= hiddenAt) return false;
       const active = !["idle", "response_finished", "failed"].includes(session.execState);
       return active || Number(session.lastEventAt || 0) >= cutoff || attentionSessions.has(session.id);
     })
@@ -1053,11 +1124,50 @@ function activateSession(session) {
   void jumpSession(session);
 }
 
+async function dismissAttentionForTaskClear(item) {
+  if (item.kind === "question" && item.requestId) {
+    await api(`/api/v1/questions/${encodeURIComponent(item.requestId)}/answer`, {
+      method: "POST",
+      body: JSON.stringify({ action: "native" }),
+    });
+    return;
+  }
+  await api("/api/v1/commands", {
+    method: "POST",
+    body: JSON.stringify({
+      id: crypto.randomUUID(),
+      attentionId: item.id,
+      requestId: item.requestId || null,
+      action: "dismiss",
+    }),
+  });
+}
+
+async function clearSessionFromList(session) {
+  const related = openItems().filter((item) => item.sessionId === session.id);
+  const results = await Promise.allSettled(related.map(dismissAttentionForTaskClear));
+  const failed = results.filter((result) => result.status === "rejected").length;
+  hiddenSessions[session.id] = Number(session.lastEventAt || Date.now());
+  localStorage.setItem("flowAgentHiddenSessions", JSON.stringify(hiddenSessions));
+  if (selectedSessionId === session.id) selectedSessionId = undefined;
+  await loadSnapshot().catch(() => renderSessions());
+  if (failed) {
+    showToast(`任务已清除；${failed} 项仍需在待处理区或 Agent 原界面处理`);
+  } else if (related.length) {
+    showToast(`任务已清除，并交还 ${related.length} 项待处理事项`);
+  } else {
+    showToast("任务已从当前列表清除；收到新事件后会重新出现");
+  }
+}
+
 function renderSessions() {
   ui.sessionList.replaceChildren();
   sessionActivityRefs = new Map();
   const sessions = visibleSessions();
-  ui.sessionCount.textContent = `${sessions.length} 个任务`;
+  const waitingCount = sessions.filter((session) => sessionStatus(session).className === "waiting").length;
+  const runningCount = sessions.filter((session) => !["idle", "response_finished", "failed"].includes(session.execState) && sessionStatus(session).className !== "waiting").length;
+  const finishedCount = sessions.filter((session) => ["idle", "response_finished"].includes(session.execState)).length;
+  ui.sessionCount.textContent = `${sessions.length} 个任务 · ${waitingCount} 等你 · ${runningCount} 在跑 · ${finishedCount} 刚完成`;
   if (!sessions.length) {
     selectedSessionId = undefined;
     ui.sessionList.append(emptyState("✓", "当前没有活跃任务", "这里只保留运行中、待处理或最近 30 分钟内的任务。"));
@@ -1068,15 +1178,18 @@ function renderSessions() {
   }
   for (const session of sessions) {
     const status = sessionStatus(session);
-    const recovery = recoveryDisplay(session);
     const row = element("article", `session-row${session.id === selectedSessionId ? " selected" : ""}`);
     row.dataset.sessionId = session.id;
     row.tabIndex = 0;
-    row.addEventListener("click", () => activateSession(session));
+    const toggle = () => {
+      selectedSessionId = selectedSessionId === session.id ? undefined : session.id;
+      renderSessions();
+    };
+    row.addEventListener("click", toggle);
     row.addEventListener("keydown", (event) => {
       if (event.key === "Enter" || event.key === " ") {
         event.preventDefault();
-        activateSession(session);
+        toggle();
       }
     });
     const top = element("div", "row-top");
@@ -1086,60 +1199,15 @@ function renderSessions() {
     const clientTitle = session.providerTitle || session.title || "等待下一条任务";
     title.append(element("strong", "", clientTitle));
     title.append(element("span", `state-pill ${status.className}`.trim(), status.label));
-    const taskContent = cardFieldVisible("task") && session.providerTitle && session.title && session.providerTitle !== session.title
+    const activity = activityDisplay(session);
+    title.append(element("span", `task-right ${activity.className}`, activity.text));
+    const taskContent = session.providerTitle && session.title && session.providerTitle !== session.title
       ? element("div", "session-question", session.title)
       : undefined;
-    const project = cardFieldVisible("project") && session.project ? element("div", "session-meta", session.project) : undefined;
-    const model = cardFieldVisible("model") && session.model ? element("div", "session-meta", session.model) : undefined;
-    const jump = element("button", `session-jump ${session.jumpCapability || "unsupported"}`, session.jumpLabel || "当前环境不支持跳转");
-    jump.type = "button";
-    jump.disabled = session.jumpCapability === "unsupported";
-    jump.addEventListener("click", (event) => {
-      event.stopPropagation();
-      activateSession(session);
-    });
-    const details = element("button", "session-details", "详情");
-    details.type = "button";
-    details.addEventListener("click", (event) => {
-      event.stopPropagation();
-      openSessionDetail(session);
-    });
-    const activity = element("div", "row-subtitle session-activity");
-    const marker = element("span", "activity-marker");
-    const activityText = element("span", "activity-copy");
-    activity.append(marker, activityText);
-    sessionActivityRefs.set(session.id, { root: activity, marker, text: activityText });
     copy.append(title);
     if (taskContent) copy.append(taskContent);
-    if (project) copy.append(project);
-    if (model) copy.append(model);
-    const quickActions = element("div", "session-quick-actions");
-    if (cardFieldVisible("jump")) quickActions.append(jump);
-    quickActions.append(details);
-    if (session.canManage) {
-      const manage = element("button", "session-manage", "启用可控制连接");
-      manage.type = "button";
-      manage.addEventListener("click", (event) => {
-        event.stopPropagation();
-        manageSession(session);
-      });
-      quickActions.append(manage);
-    }
-    copy.append(quickActions);
-    if (cardFieldVisible("recovery")) copy.append(element("div", `session-recovery ${recovery.className}`, recovery.label));
-    if (cardFieldVisible("control")) copy.append(element("div", "session-meta", session.controlCapability === "managed" ? "可控制 · app-server" : "外部 Hook"));
-    if (cardFieldVisible("activity")) copy.append(activity);
-    if (cardFieldVisible("tokens") && session.tokenTotal !== undefined && session.tokenTotal !== null) {
-      copy.append(element("div", "session-meta", `本轮 ${compactCount(session.tokenTotal)} tokens`));
-    }
-    if (cardFieldVisible("context") && Number(session.contextWindowTokens) > 0) {
-      copy.append(element("div", "session-meta", `上下文 ${compactCount(session.tokenTotal || 0)} / ${compactCount(session.contextWindowTokens)}`));
-    }
-    if (cardFieldVisible("tool") && session.currentTool) copy.append(element("div", "session-meta", `工具 · ${session.currentTool}`));
-    if (cardFieldVisible("permissionMode") && session.permissionMode) copy.append(element("div", "session-meta", `权限 · ${session.permissionMode}`));
-    if (cardFieldVisible("subagents")) copy.append(element("div", "session-meta", `子 Agent · ${session.activeSubagents || 0}`));
-    if (cardFieldVisible("environment") && session.environment) copy.append(element("div", "session-meta", session.environment));
-    if (cardFieldVisible("plan") && Number.isInteger(session.planDone) && Number.isInteger(session.planTotal) && session.planTotal > 0) {
+    copy.append(element("div", "session-meta", `${providerName(session.provider)} · ${session.model || "模型未知"}`));
+    if (Number.isInteger(session.planDone) && Number.isInteger(session.planTotal) && session.planTotal > 0) {
       const progress = element("div", "plan-progress");
       const label = element("span", "", `计划 ${session.planDone}/${session.planTotal}`);
       const track = element("div", "plan-track");
@@ -1150,19 +1218,54 @@ function renderSessions() {
       const fill = element("div", "plan-fill");
       fill.style.width = `${Math.max(0, Math.min(100, session.planDone / session.planTotal * 100))}%`;
       track.append(fill);
-      progress.append(label, track);
+      progress.append(label, track, element("span", "", `${session.activeSubagents || 0} 个子 Agent 正在运行`));
       copy.append(progress);
     }
-    if (cardFieldVisible("titleSource") && session.providerTitleSource) copy.append(element("div", "session-developer", `标题来源 · ${session.providerTitleSource}`));
-    if (cardFieldVisible("sessionId")) copy.append(element("div", "session-developer", `Session · ${session.id}`));
-    if (cardFieldVisible("providerSessionId")) copy.append(element("div", "session-developer", `Provider · ${session.providerSessionId}`));
-    if (cardFieldVisible("providerTurnId") && session.providerTurnId) copy.append(element("div", "session-developer", `Turn · ${session.providerTurnId}`));
-    if (cardFieldVisible("lastEventAt")) copy.append(element("div", "session-developer", `事件 · ${new Date(session.lastEventAt).toLocaleString()}`));
+    const clear = element("button", "session-clear", "清除");
+    clear.type = "button";
+    clear.title = "从当前任务列表隐藏；收到新事件后会重新出现";
+    clear.addEventListener("click", (event) => {
+      event.stopPropagation();
+      clear.disabled = true;
+      void clearSessionFromList(session);
+    });
+    copy.append(clear);
+
+    if (session.id === selectedSessionId) {
+      const details = element("div", "task-expanded");
+      const contextWindow = Number(session.contextWindowTokens || 0);
+      const tokenTotal = Number(session.tokenTotal || 0);
+      const context = contextWindow > 0 ? `${Math.round(tokenTotal / contextWindow * 100)}%` : "—";
+      const plan = Number(session.planTotal || 0) > 0 ? `${session.planDone || 0}/${session.planTotal}（进行中）` : "未提供";
+      const pairs = [
+        ["工作区", session.environment || session.project || `${providerName(session.provider)} 客户端`],
+        ["上下文用量", context],
+        ["计划", plan],
+        ["Token 用量", session.tokenTotal == null ? "—" : compactCount(session.tokenTotal)],
+      ];
+      for (const [label, value] of pairs) {
+        const pair = element("div", "task-detail-pair");
+        pair.append(element("span", "", label), element("strong", "", value));
+        details.append(pair);
+      }
+      const waiting = openItems().find((item) => item.sessionId === session.id);
+      if (waiting) {
+        const locate = element("button", "task-locate", "查看待处理事项");
+        locate.type = "button";
+        locate.addEventListener("click", (event) => {
+          event.stopPropagation();
+          currentAttention = openItems().findIndex((item) => item.id === waiting.id);
+          renderAttention();
+          document.querySelector(".outbox-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        });
+        details.append(locate);
+      }
+      copy.append(details);
+    }
     top.append(copy);
     row.append(top);
     ui.sessionList.append(row);
   }
-  updateSessionActivity();
 }
 
 function quotaDurationLabel(minutes, fallback) {
@@ -1193,14 +1296,25 @@ function quotaSlots() {
 
 function renderQuota() {
   ui.quotaList.replaceChildren();
-  for (const quota of quotaSlots()) {
+  const slots = quotaSlots();
+  const latestCapture = Math.max(0, ...slots.map((quota) => Number(quota.capturedAt || 0)));
+  ui.quotaSyncTime.textContent = latestCapture
+    ? `最近同步 · ${new Date(latestCapture).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`
+    : "最近同步 · 等待额度来源";
+  if (!slots.length) {
+    ui.quotaList.append(emptyState("—", "暂时没有额度数据", "完成一次 Agent 对话后会在这里同步可验证额度。"));
+    return;
+  }
+  for (const quota of slots) {
     const label = quotaWindowLabel(quota);
     const hasLastValue = ["available", "stale"].includes(quota.status)
       && typeof quota.usedPct === "number"
       && typeof quota.remainingPct === "number";
     if (!hasLastValue) {
       const unavailable = element("article", "quota-unavailable");
-      unavailable.append(element("strong", "", label));
+      const unavailableTitle = element("div", "row-title");
+      unavailableTitle.append(providerIcon(quota.provider), element("strong", "", label));
+      unavailable.append(unavailableTitle);
       unavailable.append(element("p", "", quota.reason || "额度来源没有返回可验证数据"));
       unavailable.append(element("div", "quota-track"));
       if (quota.provider === "claude") {
@@ -1214,7 +1328,7 @@ function renderQuota() {
     }
     const row = element("article", `quota-row${quota.status === "stale" ? " stale" : ""}`);
     const title = element("div", "row-title");
-    title.append(element("strong", "", label));
+    title.append(providerIcon(quota.provider), element("strong", "", label));
     title.append(element("span", "section-meta", `剩余 ${Math.round(quota.remainingPct)}%`));
     row.append(title);
     const track = element("div", "quota-track");
@@ -1244,7 +1358,7 @@ function renderQuota() {
 
 function notificationRule(item) {
   const kind = item.kind === "native_approval" ? "approval" : item.kind;
-  return settingsState.notificationRules?.[kind] || "list";
+  return settingsState.notificationRules?.[kind] === "ignore" ? "ignore" : "list";
 }
 
 function isProviderMuted(provider) {
@@ -1284,13 +1398,9 @@ function showNotification(item) {
 
 function processNotifications(nextSnapshot) {
   const nextItems = (nextSnapshot.attention || []).filter((item) => ["open", "committing", "decision_sent"].includes(item.state));
-  if (notificationItemId && !nextItems.some((item) => item.id === notificationItemId)) {
-    ui.notificationBanner.hidden = true;
-    notificationItemId = undefined;
-  }
   if (notificationsPrimed) {
     const item = nextItems.find((candidate) => !knownAttentionIds.has(candidate.id));
-    if (item && notificationRule(item) === "banner" && !isProviderMuted(item.provider)) showNotification(item);
+    if (item && notificationRule(item) === "list" && !isProviderMuted(item.provider)) playNotificationSound();
   }
   knownAttentionIds = new Set(nextItems.map((item) => item.id));
 }
@@ -1383,6 +1493,8 @@ function setConnected(connected) {
   document.body.classList.toggle("disconnected", !connected);
   ui.runtimeState.classList.toggle("online", connected);
   ui.runtimeLabel.textContent = connected ? "Live · 本地" : "正在重连";
+  ui.runtimeFooterLabel.textContent = connected ? "Runtime · 本机在线" : "Runtime · 正在重连";
+  ui.runtimeSettingsLabel.textContent = connected ? "本机 Runtime 在线" : "本机 Runtime 正在重连";
   ui.offlineBanner.hidden = connected;
 }
 
@@ -1457,6 +1569,45 @@ function showToast(message) {
   toastTimer = window.setTimeout(() => { ui.toast.hidden = true; }, 3500);
 }
 
+function chooseReminder(rule, value) {
+  const control = {
+    approval: ui.notifyApproval,
+    question: ui.notifyQuestion,
+    error: ui.notifyError,
+    completion: ui.notifyCompletion,
+  }[rule];
+  if (!control) return;
+  control.value = value;
+  settingsState.notificationRules = { ...(settingsState.notificationRules || {}), [rule]: value };
+  renderSettings();
+  saveSettings();
+}
+
+function chooseRetention(value) {
+  ui.retentionDays.value = String(value);
+  settingsState.retentionDays = Number(value);
+  renderSettings();
+  saveSettings();
+}
+
+async function restartRuntime() {
+  ui.runtimeRestart.disabled = true;
+  ui.runtimeRestart.textContent = "重启中…";
+  setConnected(false);
+  try {
+    await api("/api/v1/runtime/restart", { method: "POST", body: "{}" });
+    await loadSnapshot();
+    setConnected(true);
+    showToast("Runtime 已重启 · bridge.sock 已重连");
+  } catch (error) {
+    setConnected(socket?.readyState === WebSocket.OPEN);
+    showToast(`Runtime 重启失败：${error.message}`);
+  } finally {
+    ui.runtimeRestart.disabled = false;
+    ui.runtimeRestart.textContent = "重启";
+  }
+}
+
 ui.undoButton.addEventListener("click", () => {
   if (undoCommandId) undoCommand(undoCommandId);
 });
@@ -1501,7 +1652,25 @@ for (const control of [
 ui.claudeBridgeAction.addEventListener("click", changeClaudeBridge);
 ui.exportData.addEventListener("click", exportLocalData);
 ui.exportMetrics.addEventListener("click", exportLocalMetrics);
-ui.clearData.addEventListener("click", clearLocalData);
+ui.clearData.addEventListener("click", openClearConfirmation);
+ui.wipeConfirm.addEventListener("click", clearLocalData);
+ui.wipeCancel.addEventListener("click", cancelClearConfirmation);
+ui.wipeConfirmationInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") clearLocalData();
+});
+for (const row of ui.reminderRows) {
+  for (const button of row.querySelectorAll("button[data-value]")) {
+    button.addEventListener("click", () => chooseReminder(row.dataset.rule, button.dataset.value));
+  }
+}
+for (const button of ui.retentionOptions) {
+  button.addEventListener("click", () => chooseRetention(Number(button.dataset.value)));
+}
+ui.runtimeMonitor.addEventListener("click", () => {
+  ui.runtimeMonitorDetails.hidden = !ui.runtimeMonitorDetails.hidden;
+  ui.runtimeMonitor.textContent = ui.runtimeMonitorDetails.hidden ? "查看监控" : "收起监控";
+});
+ui.runtimeRestart.addEventListener("click", restartRuntime);
 ui.notificationClose.addEventListener("click", () => { ui.notificationBanner.hidden = true; });
 ui.notificationView.addEventListener("click", () => {
   const items = openItems();
@@ -1521,6 +1690,8 @@ document.addEventListener("keydown", (event) => {
   if (!ui.settingsOverlay.hidden) closeSettings();
 });
 window.setInterval(updateSessionActivity, 1000);
+updateClock();
+window.setInterval(updateClock, 1000);
 
 (async () => {
   setConnected(false);

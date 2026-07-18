@@ -8,170 +8,222 @@
     <link rel="stylesheet" href="/app.css">
   </head>
   <body>
-    <header class="topbar">
-      <div class="brand" aria-label="Flow Agent">
-        <span class="brand-mark" aria-hidden="true">F</span>
-        <span>Flow Agent</span>
+    <div class="ambient" aria-hidden="true"></div>
+
+    <header class="mac-menubar">
+      <div class="menu-left">
+        <span class="apple-mark" aria-hidden="true">●</span>
+        <strong>flow-agent</strong>
+        <span>文件</span>
+        <span>编辑</span>
+        <span>窗口</span>
+        <span>帮助</span>
       </div>
-      <div class="top-actions">
-        <button class="setup-trigger" id="setup-trigger" type="button">接入设置</button>
-        <button class="setup-trigger" id="settings-trigger" type="button" aria-label="打开通知与数据设置">设置</button>
-        <div class="runtime-state" id="runtime-state" role="status">
-          <span class="status-dot" aria-hidden="true"></span>
-          <span id="runtime-label">正在连接本地 Runtime</span>
-        </div>
+      <div class="menu-right">
+        <span class="outbox-menu-chip" aria-label="待处理数量">
+          <span class="signal-bars" aria-hidden="true"><i></i><i></i><i></i></span>
+          <strong id="menu-attention-count">0</strong>
+        </span>
+        <button class="menu-action" id="settings-trigger" type="button" aria-label="打开通知与数据">
+          <span aria-hidden="true">♢</span>通知与数据
+        </button>
+        <time id="menu-clock">--:--:--</time>
       </div>
     </header>
 
     <div class="offline-banner" id="offline-banner" hidden>
-      与 Runtime 失去连接，正在重连
+      与 Runtime 失去连接，正在重连；当前显示的是最后一次本机快照。
     </div>
 
-    <main class="dashboard" aria-label="Agent 控制面板">
-      <section class="module attention-module" aria-labelledby="attention-heading">
-        <div class="module-heading">
-          <div>
-            <p class="eyebrow">ATTENTION</p>
-            <h1 id="attention-heading">待处理</h1>
-          </div>
-          <span class="count-badge" id="attention-count">0</span>
+    <main class="act-room" id="act-room" aria-label="Flow Agent 控制室">
+      <header class="window-toolbar">
+        <span class="traffic-lights" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span class="signal-bars brand-signal" aria-hidden="true"><i></i><i></i><i></i></span>
+        <strong>ActRealm</strong>
+        <div class="toolbar-spacer"></div>
+        <div class="runtime-state" id="runtime-state" role="status">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="runtime-label">正在连接 Runtime</span>
         </div>
-        <div class="module-body" id="attention-list" aria-live="polite"></div>
-      </section>
+      </header>
 
-      <section class="module sessions-module" aria-labelledby="sessions-heading">
-        <div class="module-heading">
-          <div>
-            <p class="eyebrow">SESSIONS</p>
-            <h2 id="sessions-heading">Agent 任务</h2>
+      <div class="control-grid">
+        <section class="glass-panel outbox-panel" aria-labelledby="attention-heading">
+          <div class="panel-heading">
+            <div>
+              <div class="heading-line">
+                <p class="panel-kicker">OUTBOX</p>
+                <span>需要你处理</span>
+              </div>
+              <p class="panel-subtitle" id="attention-summary">没有需要你处理的事项</p>
+            </div>
+            <span class="count-badge" id="attention-count">0</span>
           </div>
-          <span class="section-meta" id="session-count">0 个接入</span>
-        </div>
-        <div class="module-body list-body" id="session-list" aria-live="polite"></div>
-      </section>
+          <h1 class="sr-only" id="attention-heading">待处理</h1>
+          <div class="panel-scroll attention-list" id="attention-list" aria-live="polite"></div>
+          <div class="undo-toast inline-undo" id="undo-toast" role="status" hidden>
+            <span class="undo-ring" aria-hidden="true">3s</span>
+            <span id="undo-message">决定将在 3 秒后提交</span>
+            <button type="button" id="undo-button">撤回</button>
+          </div>
+        </section>
 
-      <section class="module quota-module" aria-labelledby="quota-heading">
-        <div class="module-heading">
-          <div>
-            <p class="eyebrow">QUOTA</p>
-            <h2 id="quota-heading">额度</h2>
+        <section class="glass-panel tasks-panel" aria-labelledby="sessions-heading">
+          <div class="panel-heading">
+            <div class="heading-line">
+              <p class="panel-kicker">AGENT TASKS</p>
+              <span>正在进行的任务 · 点击展开详情</span>
+            </div>
+            <span class="panel-meta" id="session-count">0 个任务</span>
           </div>
-        </div>
-        <div class="module-body list-body" id="quota-list" aria-live="polite"></div>
-        <footer class="activity-footer">
-          <span>本地事件</span>
-          <strong id="event-count">0</strong>
-        </footer>
-      </section>
+          <h2 class="sr-only" id="sessions-heading">Agent 任务</h2>
+          <div class="panel-scroll task-list" id="session-list" aria-live="polite"></div>
+        </section>
+
+        <section class="glass-panel quota-panel" aria-labelledby="quota-heading">
+          <div class="panel-heading">
+            <div class="heading-line">
+              <p class="panel-kicker">QUOTA</p>
+              <span>额度余量</span>
+            </div>
+          </div>
+          <h2 class="sr-only" id="quota-heading">额度</h2>
+          <div class="panel-scroll quota-list" id="quota-list" aria-live="polite"></div>
+          <footer class="runtime-footer">
+            <div><span class="runtime-dot"></span><strong id="runtime-footer-label">Runtime · 本机在线</strong></div>
+            <span id="quota-sync-time">最近同步 · --:--:--</span>
+            <span>数据仅在这台 Mac</span>
+            <strong class="legacy-only" id="event-count">0</strong>
+          </footer>
+        </section>
+      </div>
     </main>
 
-    <div class="setup-overlay" id="setup-overlay" hidden>
-      <section class="setup-dialog" role="dialog" aria-modal="true" aria-labelledby="setup-title">
-        <header class="setup-header">
-          <div>
-            <p class="eyebrow">FIRST RUN</p>
-            <h2 id="setup-title">接入你的 Agent</h2>
-            <p>Flow Agent 只接管官方授权请求；Runtime 不在线时会静默交回原终端。</p>
-          </div>
-          <button class="setup-close" id="setup-close" type="button" aria-label="关闭接入设置">×</button>
-        </header>
-        <div class="setup-safety">
-          <span>修改前自动备份</span>
-          <span>保留已有 Hook</span>
-          <span>不会绕过 Codex 信任</span>
+    <section class="settings-page" id="settings-overlay" hidden aria-labelledby="settings-title">
+      <header class="settings-page-heading">
+        <button class="back-button" id="settings-close" type="button" aria-label="返回控制室">←</button>
+        <div>
+          <p class="settings-kicker">LOCAL SETTINGS</p>
+          <h2 id="settings-title">通知与数据</h2>
+          <p>所有设置和数据都只留在这台 Mac；Flow Agent 不发送遥测。</p>
         </div>
-        <div class="setup-providers" id="setup-providers" aria-live="polite"></div>
-        <footer class="setup-footer">
-          <span>安装后启动一次真实会话，状态才会变为“已接入”。</span>
-          <button id="setup-refresh" type="button">刷新状态</button>
-        </footer>
-      </section>
-    </div>
+        <span class="local-pill"><i></i>本机 · 不发送遥测</span>
+      </header>
 
-    <div class="setup-overlay" id="settings-overlay" hidden>
-      <section class="setup-dialog settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title">
-        <header class="setup-header">
-          <div>
-            <p class="eyebrow">LOCAL SETTINGS</p>
-            <h2 id="settings-title">通知与数据</h2>
-            <p>所有设置和数据都只留在这台 Mac；Flow Agent 不发送遥测。</p>
-          </div>
-          <button class="setup-close" id="settings-close" type="button" aria-label="关闭设置">×</button>
-        </header>
-        <div class="settings-grid">
-          <section class="settings-card">
-            <h3>什么时候提醒</h3>
-            <label>等待批准<select id="notify-approval"><option value="banner">弹窗</option><option value="list">仅列表</option><option value="ignore">忽略提醒</option></select></label>
-            <label>Agent 提问<select id="notify-question"><option value="banner">弹窗</option><option value="list">仅列表</option><option value="ignore">忽略提醒</option></select></label>
-            <label>出错 / 卡住<select id="notify-error"><option value="banner">弹窗</option><option value="list">仅列表</option><option value="ignore">忽略提醒</option></select></label>
-            <label>任务完成<select id="notify-completion"><option value="banner">弹窗</option><option value="list">仅列表</option><option value="ignore">忽略提醒</option></select></label>
-            <label class="toggle-row"><span>提示音</span><input id="sound-enabled" type="checkbox"></label>
-          </section>
-          <section class="settings-card">
-            <h3>Agent 与额度</h3>
-            <label class="toggle-row"><span>Claude 静音</span><input id="mute-claude" type="checkbox"></label>
-            <label class="toggle-row"><span>Codex 静音</span><input id="mute-codex" type="checkbox"></label>
-            <label class="toggle-row"><span>Codex 工具级事件</span><input id="codex-enhanced" type="checkbox"></label>
-            <p class="settings-note">切换 Codex 工具级事件会重装 Hook，并需要重新运行 /hooks 检查信任。</p>
-            <div class="connector-status"><strong>Codex app-server Connector</strong><span id="codex-connector-status">正在检查</span></div>
-            <div class="bridge-setting">
-              <div><strong>Claude 额度桥</strong><span id="claude-bridge-status">正在检查</span></div>
-              <button id="claude-bridge-action" type="button">开启</button>
-            </div>
-          </section>
-          <section class="settings-card display-settings">
-            <h3>任务卡展示</h3>
-            <label>信息密度<select id="display-profile"><option value="concise">简洁</option><option value="detailed">详细</option><option value="developer">开发者</option></select></label>
-            <div class="field-selector" id="task-card-fields" aria-label="选择任务卡字段"></div>
-            <p class="settings-note">只提供经过清理的结构化字段；原始 Hook Payload、完整命令和对话内容永不直接展示。</p>
-          </section>
-          <section class="settings-card data-settings">
-            <h3>本地数据</h3>
-            <label>事件保留<select id="retention-days"><option value="30">30 天</option><option value="90">90 天</option><option value="365">365 天</option></select></label>
-            <div class="data-actions">
-              <button id="export-data" type="button">导出 JSON</button>
-              <button id="clear-data" class="danger" type="button">彻底清除</button>
-            </div>
-            <p class="settings-note">彻底清除需要输入 DELETE；Hook 接入和备份不会被删除。</p>
-          </section>
-          <section class="settings-card metrics-settings">
-            <div class="metrics-heading">
-              <h3>我的使用统计</h3>
-              <div><span>本机累计 · 不发送遥测</span><button id="export-metrics" type="button">导出统计</button></div>
-            </div>
-            <div class="metrics-summary" id="metrics-summary" aria-live="polite"></div>
-          </section>
+      <section class="settings-glass runtime-card">
+        <div class="runtime-icon"><i></i></div>
+        <div class="runtime-copy">
+          <span>RUNTIME</span>
+          <strong id="runtime-settings-label">本机 Runtime 在线</strong>
+          <p>Hook 事件与审批命令通过本地 <code>bridge.sock</code> 传递</p>
+        </div>
+        <div class="runtime-actions">
+          <button id="runtime-monitor" type="button">查看监控</button>
+          <button class="primary" id="runtime-restart" type="button">重启</button>
+        </div>
+        <div class="event-channel" id="runtime-monitor-details" hidden>
+          <strong>事件通道</strong><span class="event-track"><i></i></span><span>实时 · 无遥测</span>
         </div>
       </section>
-    </div>
 
-    <div class="setup-overlay" id="session-detail-overlay" hidden>
-      <section class="session-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="session-detail-title">
-        <header class="session-detail-header">
-          <div>
-            <p class="eyebrow">SESSION DETAILS</p>
-            <h2 id="session-detail-title">任务详情</h2>
-          </div>
-          <button class="setup-close" id="session-detail-close" type="button" aria-label="关闭任务详情">×</button>
-        </header>
-        <div class="session-detail-body" id="session-detail-body"></div>
-        <footer class="session-detail-footer">
-          <span>详情只来自安全字段目录，不包含原始 Hook Payload。</span>
-          <button id="session-detail-jump" type="button">当前环境不支持跳转</button>
-        </footer>
+      <section class="settings-glass reminder-settings">
+        <div class="settings-section-heading"><h3>什么时候提醒</h3><span>为每类事件选择到达方式</span></div>
+        <div class="reminder-list">
+          <article class="reminder-row" data-rule="approval">
+            <span class="reminder-dot approval"><i></i></span>
+            <div><strong>等待批准</strong><p>Agent 想运行命令，等你批准</p></div>
+            <div class="segmented-options">
+              <button type="button" data-value="ignore">不提醒</button><button type="button" data-value="list">仅列表</button>
+            </div>
+          </article>
+          <article class="reminder-row" data-rule="question">
+            <span class="reminder-dot question"><i></i></span>
+            <div><strong>Agent 提问</strong><p>Agent 有问题需要你回答</p></div>
+            <div class="segmented-options">
+              <button type="button" data-value="ignore">不提醒</button><button type="button" data-value="list">仅列表</button>
+            </div>
+          </article>
+          <article class="reminder-row" data-rule="error">
+            <span class="reminder-dot error"><i></i></span>
+            <div><strong>出错 / 卡住</strong><p>Agent 报错或长时间无进展</p></div>
+            <div class="segmented-options">
+              <button type="button" data-value="ignore">不提醒</button><button type="button" data-value="list">仅列表</button>
+            </div>
+          </article>
+          <article class="reminder-row" data-rule="completion">
+            <span class="reminder-dot completion"><i></i></span>
+            <div><strong>任务完成</strong><p>本轮修改完成，等待确认</p></div>
+            <div class="segmented-options">
+              <button type="button" data-value="ignore">不提醒</button><button type="button" data-value="list">仅列表</button>
+            </div>
+          </article>
+          <article class="reminder-row sound-row">
+            <span class="reminder-dot question"><i></i></span>
+            <div><strong>提示音</strong><p>新事件进入列表时播放轻提示音</p></div>
+            <label class="switch"><input id="sound-enabled" type="checkbox"><span></span></label>
+          </article>
+        </div>
       </section>
-    </div>
 
-    <aside class="notification-banner" id="notification-banner" role="alert" hidden>
-      <div><span id="notification-kind">Agent 提醒</span><strong id="notification-title"></strong></div>
-      <button id="notification-view" type="button">查看</button>
-      <button id="notification-close" class="notification-close" type="button" aria-label="关闭提醒">×</button>
+      <section class="settings-glass local-data-settings">
+        <div class="settings-section-heading"><h3>本地数据</h3><span>导出或清理本机记录</span></div>
+        <div class="retention-row">
+          <div><strong>事件保留</strong><p>超过保留期的本机事件自动清理</p></div>
+          <div class="segmented-options retention-options">
+            <button type="button" data-value="30">30 天</button>
+            <button type="button" data-value="90">90 天</button>
+            <button type="button" data-value="180">180 天</button>
+            <button type="button" data-value="0">永久</button>
+          </div>
+        </div>
+        <div class="data-actions">
+          <button class="dark" id="export-data" type="button">导出 JSON</button>
+          <button class="danger" id="clear-data" type="button">彻底清除</button>
+          <p>彻底清除需要输入 <strong>DELETE</strong>；Hook 接入和备份不会被删除。</p>
+        </div>
+        <div class="wipe-confirmation" id="wipe-confirmation" hidden>
+          <strong>输入 DELETE 确认彻底清除本机事件与统计</strong>
+          <input id="wipe-confirmation-input" type="text" autocomplete="off" placeholder="DELETE">
+          <button class="danger" id="wipe-confirm" type="button">确认清除</button>
+          <button id="wipe-cancel" type="button">取消</button>
+        </div>
+      </section>
+
+      <section class="settings-glass metrics-settings">
+        <div class="settings-section-heading metrics-heading">
+          <div><h3>我的使用统计</h3><span>本机累计 · 不发送遥测</span></div>
+          <button id="export-metrics" type="button">导出统计</button>
+        </div>
+        <div class="metrics-summary" id="metrics-summary" aria-live="polite"></div>
+      </section>
+
+      <div class="legacy-only" aria-hidden="true">
+        <select id="notify-approval"><option value="list">仅列表</option><option value="ignore">不提醒</option></select>
+        <select id="notify-question"><option value="list">仅列表</option><option value="ignore">不提醒</option></select>
+        <select id="notify-error"><option value="list">仅列表</option><option value="ignore">不提醒</option></select>
+        <select id="notify-completion"><option value="list">仅列表</option><option value="ignore">不提醒</option></select>
+        <input id="mute-claude" type="checkbox">
+        <input id="mute-codex" type="checkbox">
+        <input id="codex-enhanced" type="checkbox">
+        <span id="codex-connector-status"></span>
+        <span id="claude-bridge-status"></span>
+        <button id="claude-bridge-action" type="button">开启</button>
+        <select id="retention-days"><option value="30">30</option><option value="90">90</option><option value="180">180</option><option value="0">0</option></select>
+        <select id="display-profile"><option value="concise">简洁</option><option value="detailed">详细</option><option value="developer">开发者</option></select>
+        <div id="task-card-fields"></div>
+      </div>
+    </section>
+
+    <button class="legacy-only" id="setup-trigger" type="button">接入设置</button>
+    <div class="legacy-only" id="setup-overlay" hidden>
+      <section><button id="setup-close" type="button">关闭</button><div id="setup-providers"></div><button id="setup-refresh" type="button">刷新</button></section>
+    </div>
+    <div class="legacy-only" id="session-detail-overlay" hidden>
+      <section><button id="session-detail-close" type="button">关闭</button><h2 id="session-detail-title">任务详情</h2><div id="session-detail-body"></div><button id="session-detail-jump" type="button">跳转</button></section>
+    </div>
+    <aside class="legacy-only" id="notification-banner" hidden>
+      <span id="notification-kind"></span><strong id="notification-title"></strong><button id="notification-view" type="button">查看</button><button id="notification-close" type="button">关闭</button>
     </aside>
-
-    <div class="undo-toast" id="undo-toast" role="status" hidden>
-      <span id="undo-message">决定将在 3 秒后提交</span>
-      <button type="button" id="undo-button">撤回</button>
-    </div>
     <div class="toast" id="toast" role="status" hidden></div>
     <script src="/app.js" defer></script>
   </body>

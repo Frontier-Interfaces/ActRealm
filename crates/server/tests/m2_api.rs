@@ -195,10 +195,16 @@ fn embedded_ui_contract_is_small_honest_and_complete() {
         );
     }
     assert!(APP_CSS.contains("grid-template-columns"));
-    assert!(APP_CSS.contains("min-height: 48px"));
+    assert!(APP_CSS.contains("backdrop-filter: blur(50px)"));
     assert!(INDEX_HTML.contains("待处理"));
     assert!(INDEX_HTML.contains("Agent 任务"));
     assert!(INDEX_HTML.contains("额度"));
+    assert!(INDEX_HTML.contains("OUTBOX"));
+    assert!(INDEX_HTML.contains("AGENT TASKS"));
+    assert!(INDEX_HTML.contains("通知与数据"));
+    assert!(!INDEX_HTML.contains("台前调度"));
+    assert!(!INDEX_HTML.contains("HUD 胶囊"));
+    assert!(!INDEX_HTML.contains("系统通知"));
     for action in ["approve", "deny", "pass_through", "ack", "snooze"] {
         assert!(APP_JS.contains(action), "missing UI action {action}");
     }
@@ -226,7 +232,7 @@ fn embedded_ui_contract_is_small_honest_and_complete() {
     assert!(APP_JS.contains("当前环境不支持跳转"));
     assert!(APP_JS.contains("session.providerTitle"));
     assert!(APP_JS.contains("const clientTitle = session.providerTitle || session.title"));
-    assert!(APP_JS.contains("element(\"div\", \"session-meta\", session.model)"));
+    assert!(APP_JS.contains("session.model || \"模型未知\""));
     assert!(!APP_JS.contains("providerTitleSourceLabel"));
     assert!(!APP_JS.contains("当前："));
     assert!(!APP_JS.contains("session.project || \"未命名项目\""));
@@ -238,11 +244,14 @@ fn embedded_ui_contract_is_small_honest_and_complete() {
     assert!(APP_JS.contains("/assets/codex.png"));
     assert!(!include_bytes!("../../../web/assets/claude.png").is_empty());
     assert!(!include_bytes!("../../../web/assets/codex.png").is_empty());
-    assert!(INDEX_HTML.contains("Claude 额度桥"));
+    assert!(!INDEX_HTML.contains("Claude 额度桥"));
+    assert!(APP_JS.contains("changeClaudeBridge"));
     assert!(INDEX_HTML.contains("彻底清除"));
     assert!(APP_JS.contains("confirmation !== \"DELETE\""));
-    assert!(APP_CSS.contains("settings-grid"));
-    assert!(APP_CSS.contains("notification-banner"));
+    assert!(APP_CSS.contains("control-grid"));
+    assert!(APP_CSS.contains("settings-page"));
+    assert!(APP_CSS.contains("reminder-row"));
+    assert!(APP_JS.contains("/api/v1/runtime/restart"));
 }
 
 #[test]

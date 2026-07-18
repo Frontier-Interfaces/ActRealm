@@ -126,6 +126,27 @@ fn retention_and_quota_validation_reject_ambiguous_values() {
 }
 
 #[test]
+fn design_retention_options_support_180_days_and_forever() {
+    let database = Database::new("design-retention");
+    let store = RuntimeStore::open(&database.path).unwrap();
+    let now = 1_784_130_000_000;
+    store
+        .ingest(event("older-than-180-days", now - 181 * 86_400_000))
+        .unwrap();
+    store.ingest(event("current", now)).unwrap();
+
+    assert_eq!(store.prune_events(0, now).unwrap(), 0);
+    assert_eq!(
+        store.export_json(now).unwrap()["tables"]["events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(store.prune_events(180, now).unwrap(), 1);
+}
+
+#[test]
 fn interactive_question_schema_and_secret_answers_never_enter_persistent_export() {
     let database = Database::new("interactive-privacy");
     let store = RuntimeStore::open(&database.path).unwrap();
