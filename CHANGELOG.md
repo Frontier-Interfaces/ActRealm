@@ -4,7 +4,25 @@ All notable Flow Agent changes are recorded here. The project has not yet
 published a final v1 release; entries below describe development milestones on
 `agent/v1-full`, not released packages.
 
-## Unreleased - functional implementation through M13
+## Unreleased - M14 accepted candidate
+
+### M14 - Live usage, context, price, and OAuth quota
+
+- Incrementally tails Claude transcript and Codex rollout usage with bounded
+  parsing and cross-file/stream de-duplication.
+- Separates session cumulative Token, latest-turn Token, cached/reasoning
+  breakdowns, and current-context occupancy.
+- Adds explicitly labelled estimated API price with unknown-model omission.
+- Adds background Anthropic OAuth usage refresh with dynamic scoped limits,
+  Fable/extra-usage support, one-minute cadence, and StatusLine fallback.
+- Keeps OAuth credentials memory-only and keeps the last validated quota value
+  visible with its factual capture age.
+
+The 161-test workspace suite, zero-warning Clippy, release build, and explicit
+two-minute resource gate pass. The exact release was installed locally with a
+matching SHA-256, schema 7 and live OAuth/session records were verified, and
+the user accepted the candidate and authorized this commit. A branch push still
+requires separate authorization.
 
 ### M13 - Provider-owned approval-state coordination
 

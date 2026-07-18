@@ -84,7 +84,7 @@ let settingsState = {
   codexEnhancedActivity: true,
   retentionDays: 90,
   displayProfile: "detailed",
-  taskCardFields: ["project", "task", "model", "activity", "plan", "tokens", "tool", "subagents", "environment", "recovery", "control", "jump"],
+  taskCardFields: ["project", "task", "model", "activity", "plan", "tokens", "context", "tool", "subagents", "environment", "recovery", "control", "jump"],
 };
 let displayCatalog = [];
 let claudeBridge = { status: "not_installed" };
@@ -102,7 +102,7 @@ let hiddenSessions = JSON.parse(localStorage.getItem("flowAgentHiddenSessions") 
 const SESSION_VISIBLE_FOR_MS = 30 * 60 * 1000;
 const DISPLAY_PRESETS = {
   concise: ["task", "activity"],
-  detailed: ["project", "task", "model", "activity", "plan", "tokens", "tool", "subagents", "environment", "recovery", "control", "jump"],
+  detailed: ["project", "task", "model", "activity", "plan", "tokens", "context", "tool", "subagents", "environment", "recovery", "control", "jump"],
   developer: ["project", "task", "model", "activity", "plan", "tokens", "context", "tool", "permissionMode", "subagents", "environment", "recovery", "control", "jump", "titleSource", "sessionId", "providerSessionId", "providerTurnId", "lastEventAt"],
 };
 
@@ -939,6 +939,55 @@ function compactCount(value) {
   return String(count);
 }
 
+function contextUsage(session) {
+  const used = Number(session.contextUsedTokens || 0);
+  const windowSize = Number(session.contextWindowTokens || 0);
+  const providerPercent = Number(session.contextUsedPercent);
+  const percent = Number.isFinite(providerPercent) && session.contextUsedPercent != null
+    ? Math.max(0, Math.min(100, providerPercent))
+    : used > 0 && windowSize > 0
+      ? Math.max(0, Math.min(100, Math.round(used / windowSize * 100)))
+      : undefined;
+  return { used, windowSize, percent };
+}
+
+function contextUsageText(session) {
+  const context = contextUsage(session);
+  if (!context.windowSize && context.percent == null) return "—";
+  if (context.used > 0 && context.windowSize > 0) {
+    return `${compactCount(context.used)} / ${compactCount(context.windowSize)} · ${context.percent}%`;
+  }
+  return context.percent == null ? `0 / ${compactCount(context.windowSize)}` : `${context.percent}%`;
+}
+
+function estimatedCostText(session) {
+  if (session.estimatedCostUsdMicros == null) return undefined;
+  const dollars = Number(session.estimatedCostUsdMicros) / 1_000_000;
+  if (!Number.isFinite(dollars) || dollars < 0) return undefined;
+  if (dollars > 0 && dollars < 0.01) return `$${dollars.toFixed(4)}`;
+  return `$${dollars.toFixed(2)}`;
+}
+
+function appendUsageStrip(container, session) {
+  const total = session.tokenTotal == null ? undefined : compactCount(session.tokenTotal);
+  const context = contextUsage(session);
+  const cost = estimatedCostText(session);
+  if (total == null && context.percent == null && cost == null) return;
+  const strip = element("div", "session-usage-strip");
+  if (total != null) strip.append(element("span", "usage-chip", `累计 ${total} Token`));
+  if (context.percent != null) {
+    const chip = element("span", "usage-chip context", `上下文 ${context.percent}%`);
+    chip.title = contextUsageText(session);
+    strip.append(chip);
+  }
+  if (cost != null) {
+    const chip = element("span", "usage-chip cost", `估算 API 价 ${cost}`);
+    chip.title = "按公开 API 单价或 Provider 官方会话费用估算；不是订阅账单";
+    strip.append(chip);
+  }
+  container.append(strip);
+}
+
 function cardFieldVisible(field) {
   return (settingsState.taskCardFields || []).includes(field);
 }
@@ -979,11 +1028,20 @@ function openSessionDetail(session) {
       ? detailPair("计划", `${session.planDone || 0}/${session.planTotal}`)
       : undefined,
     fields.has("tokens") && session.tokenTotal !== undefined && session.tokenTotal !== null
-      ? detailPair("本轮 Token", compactCount(session.tokenTotal))
+      ? detailPair("会话累计 Token", compactCount(session.tokenTotal))
       : undefined,
     fields.has("context") && Number(session.contextWindowTokens) > 0
-      ? detailPair("上下文", `${compactCount(session.tokenTotal || 0)} / ${compactCount(session.contextWindowTokens)}`)
+      ? detailPair("本轮上下文", contextUsageText(session))
       : undefined,
+    fields.has("tokens") ? detailPair("输入 / 输出", session.inputTokens == null && session.outputTokens == null
+      ? undefined
+      : `${compactCount(session.inputTokens || 0)} / ${compactCount(session.outputTokens || 0)}`) : undefined,
+    fields.has("tokens") ? detailPair("缓存读取 / 写入", session.cacheReadTokens == null && session.cacheCreationTokens == null
+      ? undefined
+      : `${compactCount(session.cacheReadTokens || 0)} / ${compactCount(session.cacheCreationTokens || 0)}`) : undefined,
+    fields.has("tokens") ? detailPair("推理 Token", session.reasoningTokens == null ? undefined : compactCount(session.reasoningTokens)) : undefined,
+    fields.has("tokens") ? detailPair("本轮 Token", session.lastTurnTokens == null ? undefined : compactCount(session.lastTurnTokens)) : undefined,
+    fields.has("tokens") ? detailPair("估算 API 价", estimatedCostText(session)) : undefined,
     fields.has("tool") ? detailPair("当前工具", session.currentTool) : undefined,
     fields.has("permissionMode") ? detailPair("权限模式", session.permissionMode) : undefined,
     fields.has("subagents") ? detailPair("运行中的子 Agent", String(session.activeSubagents || 0)) : undefined,
@@ -1207,6 +1265,7 @@ function renderSessions() {
     copy.append(title);
     if (taskContent) copy.append(taskContent);
     copy.append(element("div", "session-meta", `${providerName(session.provider)} · ${session.model || "模型未知"}`));
+    appendUsageStrip(copy, session);
     if (Number.isInteger(session.planDone) && Number.isInteger(session.planTotal) && session.planTotal > 0) {
       const progress = element("div", "plan-progress");
       const label = element("span", "", `计划 ${session.planDone}/${session.planTotal}`);
@@ -1233,15 +1292,14 @@ function renderSessions() {
 
     if (session.id === selectedSessionId) {
       const details = element("div", "task-expanded");
-      const contextWindow = Number(session.contextWindowTokens || 0);
-      const tokenTotal = Number(session.tokenTotal || 0);
-      const context = contextWindow > 0 ? `${Math.round(tokenTotal / contextWindow * 100)}%` : "—";
       const plan = Number(session.planTotal || 0) > 0 ? `${session.planDone || 0}/${session.planTotal}（进行中）` : "未提供";
       const pairs = [
         ["工作区", session.environment || session.project || `${providerName(session.provider)} 客户端`],
-        ["上下文用量", context],
+        ["本轮上下文", contextUsageText(session)],
         ["计划", plan],
-        ["Token 用量", session.tokenTotal == null ? "—" : compactCount(session.tokenTotal)],
+        ["会话累计 Token", session.tokenTotal == null ? "—" : compactCount(session.tokenTotal)],
+        ["本轮 Token", session.lastTurnTokens == null ? "—" : compactCount(session.lastTurnTokens)],
+        ["估算 API 价", estimatedCostText(session) || "—"],
       ];
       for (const [label, value] of pairs) {
         const pair = element("div", "task-detail-pair");
@@ -1339,6 +1397,12 @@ function renderQuota() {
     row.append(track);
     const meta = element("div", "quota-meta");
     if (quota.status === "stale") meta.append(element("span", "quota-stale", "保留上次有效值"));
+    const sourceLabel = {
+      oauth_usage: "OAuth 自动同步",
+      statusline: "Claude 对话同步",
+      rollout_experimental: "本机 Session 同步",
+    }[quota.source];
+    if (sourceLabel) meta.append(element("span", "quota-source", sourceLabel));
     if (quota.planType) meta.append(element("span", "", quota.planType));
     if (quota.resetsAt) {
       const reset = new Date(Number(quota.resetsAt) * 1000);

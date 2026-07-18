@@ -1,7 +1,7 @@
 # Flow Agent Widget v1 开发计划书（施工版）
 
-版本：v1.1（M13 状态同步修订版）· 2026-07-17
-用途：本文档是 v1 的完整施工基线；功能实现已推进到 M13，当前事实状态见 `STATUS.md`，逐项验收见 `V1_ACCEPTANCE.md` 和各里程碑验证记录。
+版本：v1.1（M14 实时用量修订版）· 2026-07-18
+用途：本文档是 v1 的完整施工基线；已提交功能推进到 M13，M14 本机候选正在验收。当前事实状态见 `STATUS.md`，逐项验收见 `V1_ACCEPTANCE.md` 和各里程碑验证记录。
 修订说明：原草案统一 60 秒批准时限经真实 Provider 探针和 Open Vibe Island / CodeIsland 生产经验复核后废止，改为 Claude 24 小时、Codex 1 小时；Runtime 缺失、连接失败、socket EOF 和主动 pass-through 仍立即交还原界面。M6-M13 的功能修订已补入 §19；M5 的 48 小时稳定性门禁仍未完成，因此不得宣称 v1 正式发布。其余参考审查决策见 `REFERENCE_REVIEW.md`。
 上游文档：`AGENT_PRODUCT_PLAN.md`（产品总纲）、`SURVEY_INSIGHTS_UX_PLAN.md`（需求依据）、`COMPETITOR_ANALYSIS.md`（竞品与技术参考）。
 交互基准：`bento-touch.html`（仅作为视觉 token 与手势参考；能力、模块和数据真实性冲突时以本文为准）。
@@ -61,7 +61,7 @@
 
 ### 1.4 明确不做（v1 拒绝清单）
 
-Coach、多 Agent 接力、决策记忆的语义匹配（仅做同类命令计数）、自动授权规则、灵动岛/三分栏视图、云端/账号/遥测、移动端、历史回放页、Gemini 批准应答、interrupt/steer/任意消息注入。v1.1 已把 Claude 官方问题 Hook、显式 Codex app-server Connector、Thread 恢复和 requestUserInput 纳入 M10-M12，并在 M13 加入 Provider 原生批准状态同步；这些能力不扩大 Hook-only 会话的所有权。Codex app-server 的 command/file/permissions 三类直接批准保留为拟议 M14，当前未实现。
+Coach、多 Agent 接力、决策记忆的语义匹配（仅做同类命令计数）、自动授权规则、灵动岛/三分栏视图、云端/账号/遥测、移动端、历史回放页、Gemini 批准应答、interrupt/steer/任意消息注入。v1.1 已把 Claude 官方问题 Hook、显式 Codex app-server Connector、Thread 恢复和 requestUserInput 纳入 M10-M12，并在 M13 加入 Provider 原生批准状态同步；这些能力不扩大 Hook-only 会话的所有权。Codex app-server 的 command/file/permissions 三类直接批准保留为拟议 M15，当前未实现。
 
 ### 1.5 能力边界（必须在 UI 中诚实呈现）
 
@@ -795,7 +795,11 @@ flow-agent/
 交付：auto-review ownership、Codex request_permissions 生命周期、managed waitingOnApproval、原生/Flow 可回复批准去重、通知与任务状态同步。
 验收：原生请求没有 requestId 和允许/拒绝按钮；明确 waiting 信号不被普通 running 覆盖；明确 resolution 后中性消退；不推断批准/拒绝/执行。五轮进程回放、153 测试、Clippy、格式、release、2 分钟资源和隔离浏览器 QA 已通过；真实 Provider 最终复验仍待记录。
 
-**M14 · Codex managed approvals（候选，未实现）**
+**M14 · 实时用量、上下文、价格与 OAuth 额度（本机候选，待验收）**
+交付：Claude/Codex 会话累计与本轮 Token、真实当前上下文占用、缓存/推理拆分、明确标注的估算 API 价、Claude OAuth 动态额度（含 Fable/额外用量）、一分钟后台刷新、旧值持续展示和凭据零持久化。
+验收：Claude 流式消息和子 Agent 记录不重复计数；Codex cache/reasoning 不重复计数；上下文不使用 lifetime Token 冒充；未知模型不显示假价格；OAuth 不阻塞 UI 且 token 不进入 SQLite/缓存/日志/argv；本机真实页面和完整门禁通过后才允许提交。
+
+**M15 · Codex managed approvals（候选，未实现）**
 拟议范围：version-gated `item/commandExecution/requestApproval`、`item/fileChange/requestApproval`、`item/permissions/requestApproval`、availableDecisions、响应与 `serverRequest/resolved` 对账。只有显式 attach 且能力握手成功的 Thread 才能显示直接审批；不得承诺控制任意独立 Codex Desktop 会话。
 
 ---
@@ -845,7 +849,7 @@ flow-agent/
 | osascript 权限被拒 | 跳回降级为复制路径提示 |
 | 用户配置文件被其他工具并发修改 | 安装器文件锁 + 校验后写 + 失败回滚备份 |
 | SQLite 损坏 | 启动 integrity_check，失败则归档旧库重建；活动 Hook 因 Runtime 断开立即 pass-through |
-| Codex app-server approval schema/version 不兼容 | M13 只观察 native waiting；M14 三类 managed approval 必须经过显式能力握手、版本门禁和 fixture 后才能显示控制按钮 |
+| Codex app-server approval schema/version 不兼容 | M13 只观察 native waiting；M15 三类 managed approval 必须经过显式能力握手、版本门禁和 fixture 后才能显示控制按钮 |
 
 ---
 

@@ -5,8 +5,8 @@
 二者都可以使用命令行版或本机桌面客户端。界面运行在本机浏览器中，Runtime、
 数据库和 Hook 通信都留在本机。
 
-> 当前 `agent/v1-full` 分支的功能实现到 M13，是供本地测试的发布候选版。
-> 自动/本地门禁已经通过，但 M13 真实 Provider 最终复验和连续 48 小时发布门禁
+> 当前已提交的 `agent/v1-full` 分支功能实现到 M13；本机工作区正在验收 M14
+> 实时用量候选版。M13 真实 Provider 最终复验和连续 48 小时发布门禁
 > 仍未完成，因此不应称为最终 v1 Release。实时状态见
 > [STATUS.md](STATUS.md)。
 
@@ -305,7 +305,8 @@ Flow Agent 的故障原则是 fail-open：
 - Claude 可选的 status-line 额度桥；
 - 本机使用统计、数据导出和彻底清除。
 - 任务卡“简洁 / 详细 / 开发者”三档，以及项目、任务、模型、活动、计划、
-  Token、工具、权限模式、子 Agent、环境、恢复/控制状态和开发者 ID 等字段。
+  Token、上下文、估算 API 价、工具、权限模式、子 Agent、环境、恢复/控制状态和
+  开发者 ID 等字段。
 
 字段选择器只接受服务端安全目录中的结构化字段。原始 Hook Payload、完整命令、
 文件内容和 transcript 不会作为可选项，也不能通过手工设置 API 强行开启。任务卡
@@ -315,19 +316,26 @@ Flow Agent 的故障原则是 fail-open：
 例如 Claude 5 小时、7 天或额外命名额度，以及 Codex 5 小时、7 天、月度或未来
 新增的日额度。窗口名称和周期来自真实结构，不会把所有 Codex 账户都写成“本周”。
 
-Claude 没有自定义 `statusLine` 时可直接开启额度桥；已有自定义
+M14 起，Claude 额度优先尝试 Anthropic 的官方 OAuth usage 接口。只要本机已有
+Claude 登录凭据，Claude 桌面端或 Claude Code 的额度都可以在后台刷新，不再要求
+必须先运行一轮 Claude Code CLI。Flow Agent 每分钟最多启动一次后台刷新；请求
+期间不会卡住页面。OAuth Token 只在进程内存中短暂存在，通过 stdin 交给系统
+`curl`，不会出现在命令行参数、SQLite、缓存、日志、诊断或导出中。
+
+如果 OAuth 凭据不可用、接口限流或断网，Flow Agent 会继续显示最后一次经过校验
+的值，并回退到 status-line 额度桥。Claude 没有自定义 `statusLine` 时可直接开启
+额度桥；已有自定义
 `statusLine` 时，设置页会提供明确的“保留现有并开启”。只有点击该动作后，Flow
 Agent 才会备份完整原对象、安装代理并继续显示原 status-line 输出；卸载额度桥
 会把原对象逐字段恢复。不会静默覆盖，也不会把已有脚本的输出吞掉。开启后需让
 Claude Code 完成至少一次响应，才能产生新的额度缓存；缓存首次出现或发生变化
 时会立即刷新，不必等待常规五分钟轮询。
 
-这里的 Claude 额度来源严格属于 **Claude Code 终端的 `statusLine`**。Claude
-桌面客户端虽然可能运行本地 Agent 并产生 Hook 任务事件，但它不渲染终端
-status line，因此桌面客户端里的多轮对话不会刷新这份额度缓存。界面显示的
-“N 分钟前”是最后一次真实额度采样时间，不会拿普通对话事件伪装成额度更新。
-超过 30 分钟后仍保留最后一次有效百分比，并明确标注“保留上次有效值”；不会把
-旧数据清空，也不会假装它刚刚更新。
+界面会标明 `OAuth 自动同步`、`Claude 对话同步` 或 `本机 Session 同步`。
+“N 分钟前”始终是最后一次真实采样时间，不会拿普通对话事件伪装成额度更新；
+超过 30 分钟也不会清空或改写真实百分比。OAuth 不可用时，Claude 桌面客户端
+本身不会触发终端 status line，此时只有下一次 Claude Code status-line 响应才能
+产生新的回退样本。
 
 Codex 额度读取是只读的实验能力。适配器在有限大小的 rollout 尾部查找并严格
 校验 `rate_limits` 数值结构，展示 primary/secondary 中所有有效周期；不再绑定
@@ -350,8 +358,15 @@ Codex 额度读取是只读的实验能力。适配器在有限大小的 rollout
   transcript 路径发到浏览器。Claude 官方标题不会被旧 AI 标题倒退覆盖，后续
   用户自定义标题仍可更新。不会显示用户名充当任务名。
 - 时间以本轮从开始到结束的总时长为主，运行中同时显示当前阶段时长。
-- Token 只有在 Provider Hook/App Server 返回真实 usage 字段时才显示；没有来源就
-  隐藏，不用估算值补位。
+- Token 来自本机 Claude transcript 或 Codex rollout 的结构化 usage，约 1 秒刷新。
+  卡片中的“会话累计 Token”与“本轮 Token”是两个字段；缓存 Token 不重复计入
+  Codex input，推理 Token 不重复计入 output。
+- 上下文显示的是当前一轮占用：Claude 优先使用官方 StatusLine
+  `current_usage/context_window_size`，Codex 使用 `last_token_usage` 与 Provider
+  context window。绝不再用会话累计 Token 除以上下文窗口冒充实时占用。
+- “估算 API 价”优先使用 Provider 官方会话费用字段，否则使用带日期的本地公开
+  API 单价快照；它只是横向比较值，不是 Claude/Codex 订阅账单。未知模型不显示
+  价格，不用零元补位。
 - 待处理在原 Agent 中被批准、拒绝或结束后，会自动从待处理区消退，并同步取消
   任务卡的“等你”。“忽略”会把非授权提醒隐藏；授权忽略会先安全交回原 Agent。
 - 点击任务卡会按实际能力执行，并在卡片上明确写出：`精确打开对话`、

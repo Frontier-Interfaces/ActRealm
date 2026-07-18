@@ -365,6 +365,10 @@ button { color: inherit; }
 .state-pill.failed { border-color: rgba(255, 59, 48, .3); background: rgba(255, 59, 48, .1); color: #c53229; }
 .session-question { margin: 5px 0 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: rgba(0, 0, 0, .66); font-size: 11.5px; }
 .session-meta, .session-recovery, .session-developer { margin-top: 3px; color: rgba(0, 0, 0, .42); font-size: 10px; }
+.session-usage-strip { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 5px; }
+.usage-chip { padding: 2px 7px; border: 1px solid rgba(0, 122, 255, .16); border-radius: 999px; background: rgba(0, 122, 255, .07); color: rgba(0, 72, 150, .72); font-size: 9px; font-weight: 700; }
+.usage-chip.context { border-color: rgba(88, 86, 214, .16); background: rgba(88, 86, 214, .07); color: rgba(60, 58, 165, .76); }
+.usage-chip.cost { border-color: rgba(52, 199, 89, .2); background: rgba(52, 199, 89, .08); color: #197a35; }
 .session-developer { font-family: ui-monospace, "SF Mono", Menlo, monospace; overflow-wrap: anywhere; }
 .session-recovery.controllable { color: #1e9e46; }
 .session-recovery.lost { color: #c53229; }
@@ -414,6 +418,7 @@ button { color: inherit; }
 .quota-fill.critical { background: #ff3b30; }
 .quota-meta { margin-top: 7px; display: flex; flex-wrap: wrap; gap: 6px 10px; color: rgba(0, 0, 0, .38); font-size: 9.5px; }
 .quota-stale { color: #b06000; font-weight: 700; }
+.quota-source { color: rgba(0, 92, 190, .68); font-weight: 700; }
 .quota-unavailable { background: rgba(255, 255, 255, .42); }
 .quota-unavailable p { margin: 8px 0 0; color: rgba(0, 0, 0, .48); font-size: 10.5px; line-height: 1.5; }
 .quota-help { margin-top: 8px; padding: 4px 11px; border: 1px solid rgba(0, 0, 0, .1); border-radius: 999px; background: rgba(255, 255, 255, .6); cursor: pointer; font-size: 10px; font-weight: 600; }

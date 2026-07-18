@@ -1,7 +1,7 @@
 # Flow Agent v1 delivery contract
 
 Source baseline: `WIDGET_V1_PLAN.md` v1.1 dated 2026-07-15, amended by the
-M0-M13 verification records and summarized in `STATUS.md`. This
+M0-M14 verification records and summarized in `STATUS.md`. This
 repository file keeps the milestone gates next to the implementation; it does
 not weaken or replace the full plan.
 
@@ -236,6 +236,30 @@ without making the final v1 release complete.
       direction.
 - [ ] Real Claude/Codex Provider manual acceptance is recorded after reproducing
       both native waiting and native resolution on the installed candidate.
+
+### M14 - Live usage, context, price, and OAuth quota
+
+- [x] Claude transcript streaming updates are de-duplicated by stable
+      message/request identity, including main/sub-Agent overlap.
+- [x] Codex cumulative input/output does not add cached input or reasoning a
+      second time; last-turn usage remains separate.
+- [x] Context uses Provider current-turn fields and never lifetime Token divided
+      by the model window.
+- [x] Price is labelled `估算 API 价`; unknown/fast or unsupported models omit
+      price instead of returning zero.
+- [x] OAuth responses render all validated windows, active scoped models such
+      as Fable, null reset times, and optional extra usage.
+- [x] OAuth credentials remain memory-only and are excluded from cache,
+      SQLite, logs, diagnostics, exports, and process arguments.
+- [x] OAuth refresh runs outside the snapshot path and keeps the last validated
+      value on missing credentials, 401, 429, network failure, or old samples.
+- [x] Full 161-test workspace gate, zero-warning Clippy, release build, and
+      two-minute resource check pass on the exact local
+      candidate.
+- [x] The exact M14 release was installed with matching SHA-256; schema 7,
+      session usage, and OAuth quota windows were verified; the user accepted
+      the candidate and authorized the local commit on 2026-07-18. Push remains
+      separately gated.
 
 ## Publishing rule
 

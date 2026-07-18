@@ -12,6 +12,7 @@ flow-agent-codex-connector = { path = "../codex-connector" }
 flow-agent-core = { path = "../core" }
 flow-agent-quota = { path = "../quota" }
 flow-agent-runtime = { path = "../runtime" }
+flow-agent-usage = { path = "../usage" }
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true

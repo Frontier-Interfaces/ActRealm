@@ -9,6 +9,7 @@ members = [
     "crates/quota",
     "crates/runtime",
     "crates/server",
+    "crates/usage",
 ]
 resolver = "2"
 

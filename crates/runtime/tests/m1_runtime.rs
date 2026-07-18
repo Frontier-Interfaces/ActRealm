@@ -3,7 +3,7 @@
 use flow_agent_core::{BridgeRequest, Decision, Provider, ReplyAction, TermContext};
 use flow_agent_runtime::{
     ApprovalAction, AttentionAction, CommandState, EventSpool, InstanceError, RuntimeInstanceGuard,
-    RuntimeStore, SpoolError, StoreError, WaiterRegistry,
+    RuntimeStore, SessionUsageRecord, SpoolError, StoreError, WaiterRegistry,
 };
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -103,9 +103,57 @@ fn existing_v1_database_adds_task_titles_without_losing_sessions() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        6
+        7
     );
     drop(connection);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn local_usage_snapshots_join_existing_sessions_without_prompt_content() {
+    let root = temp_root("session-usage");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"UserPromptSubmit",
+                "session_id":"usage-session",
+                "prompt":"this text must not enter session_usage"
+            }),
+            1,
+        ))
+        .unwrap();
+    store
+        .upsert_session_usage(SessionUsageRecord {
+            provider: "codex".to_owned(),
+            provider_session_id: "usage-session".to_owned(),
+            input_tokens: Some(700),
+            output_tokens: Some(100),
+            cache_read_tokens: Some(400),
+            cache_creation_tokens: None,
+            reasoning_tokens: Some(20),
+            token_total: Some(800),
+            last_turn_tokens: Some(300),
+            context_used_tokens: Some(250),
+            context_window_tokens: Some(1_000),
+            context_used_percent: Some(25),
+            estimated_cost_usd_micros: Some(4_250),
+            cost_kind: Some("estimated_api_price".to_owned()),
+            pricing_source: Some("test_snapshot".to_owned()),
+            usage_source: "codex_rollout".to_owned(),
+            usage_quality: "official_local".to_owned(),
+            captured_at: 2,
+        })
+        .unwrap();
+    let session = store.snapshot().unwrap().sessions.remove(0);
+    assert_eq!(session.token_total, Some(800));
+    assert_eq!(session.input_tokens, Some(700));
+    assert_eq!(session.context_used_tokens, Some(250));
+    assert_eq!(session.context_used_percent, Some(25));
+    assert_eq!(session.estimated_cost_usd_micros, Some(4_250));
+    assert_eq!(session.usage_source.as_deref(), Some("codex_rollout"));
+    drop(store);
     fs::remove_dir_all(root).unwrap();
 }
 

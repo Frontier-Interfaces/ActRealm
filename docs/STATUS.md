@@ -1,10 +1,10 @@
 # Flow Agent current status
 
-Last reviewed: 2026-07-17
+Last reviewed: 2026-07-18
 
 Source branch: `agent/v1-full`
 
-Current functional code commit: `311306d`
+M14 parent commit: `25de1e1`
 
 This file is the short, current source of truth. The
 [implementation plan](WIDGET_V1_PLAN.md),
@@ -13,13 +13,16 @@ provide the detailed requirements and evidence.
 
 ## Status at a glance
 
-- **Functional implementation:** delivered through M13 on
-  `agent/v1-full`.
-- **Latest functional milestone:** M13 Provider-owned approval-state
-  coordination.
-- **Latest local gates:** 153 workspace tests passed, two explicit/manual
+- **Committed functional implementation:** delivered through M14 plus the
+  ActRealm design alignment on `agent/v1-full`.
+- **M14 acceptance:** automated/local gates passed; the exact release was
+  installed with a matching SHA-256, live session/OAuth records were verified,
+  and the user accepted the candidate and authorized the local commit on
+  2026-07-18. Push remains separately gated.
+- **Latest local gates:** 161 workspace tests passed, two explicit/manual
   tests ignored; zero-warning Clippy, format, release build, five-round native
-  request replay, isolated browser QA, and the two-minute resource gate passed.
+  request replay, and the two-minute resource gate passed. M14's resource
+  sample recorded 0.000% average idle CPU and 6,016 KiB maximum Runtime RSS.
 - **M13 real-Provider acceptance:** still pending. The milestone was committed
   and pushed at the user's direction before this final manual confirmation.
 - **Final v1 release:** not yet declared. The required continuous 48-hour
@@ -48,6 +51,7 @@ provide the detailed requirements and evidence.
 | M11 | Direct Claude questions and secret handling | Complete | [M10-M12](M10_M12_VERIFICATION.md) |
 | M12 | Codex Connector and restart recovery | Complete within the recorded boundary | [M10-M12](M10_M12_VERIFICATION.md) |
 | M13 | Provider-owned approval-state coordination | Code and automated gates complete; real-Provider acceptance pending | [M13](M13_PROVIDER_STATE_COORDINATION.md) |
+| M14 | Live usage, context, price, and OAuth quota | Code and automated/local gates complete; installed user acceptance pending | [M14](M14_USAGE_CONTEXT_QUOTA.md) |
 
 M5 is a release-qualification track, not the chronological end of feature
 development. Later functional milestones may be implemented while M5's
@@ -69,9 +73,9 @@ Agent observes and synchronizes the waiting/resolved state. It must not show
 fake allow/deny controls or infer whether the user approved, denied, or ran the
 command.
 
-## Proposed next milestone, not implemented
+## Later candidate, not implemented
 
-M14 is reserved for version-gated managed Codex app-server approval methods:
+M15 is reserved for version-gated managed Codex app-server approval methods:
 
 - `item/commandExecution/requestApproval`;
 - `item/fileChange/requestApproval`;
@@ -80,7 +84,7 @@ M14 is reserved for version-gated managed Codex app-server approval methods:
 - `serverRequest/resolved` and item completion reconciliation;
 - explicit UI capability labels and compatibility tests.
 
-M14 does not promise control of an arbitrary independently running Codex
+M15 does not promise control of an arbitrary independently running Codex
 Desktop conversation. It requires a supported, explicitly attached managed
 Thread and must be separately planned, implemented, tested, and approved.
 

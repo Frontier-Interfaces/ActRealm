@@ -16,6 +16,7 @@ use flow_agent_runtime::{
     RuntimeStore, WaiterRegistry,
 };
 use flow_agent_server::{ApiServer, ApiServerConfig, RuntimeRestartHandle};
+use flow_agent_usage::{capture_claude_statusline_usage, UsagePaths};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Read, Write};
@@ -229,7 +230,12 @@ fn run_statusline() -> Result<()> {
         return Ok(());
     }
     let paths = QuotaPaths::discover();
-    match capture_claude_statusline(&input, &paths.claude_cache(), now_millis()) {
+    let now = now_millis();
+    let usage_paths = UsagePaths::discover();
+    // Numeric session metrics are captured independently; a malformed usage
+    // extension must never break Claude's existing StatusLine or quota bridge.
+    let _ = capture_claude_statusline_usage(&input, &usage_paths.claude_status_cache_dir(), now);
+    match capture_claude_statusline(&input, &paths.claude_cache(), now) {
         Ok(entries) => println!("{}", statusline_text(&entries)),
         Err(_) => println!("Flow Agent · 额度暂不可用"),
     }
@@ -1093,6 +1099,7 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()>
                 ApiServerConfig {
                     commit_delay: commit_delay(),
                     enable_codex_connector: true,
+                    enable_claude_oauth_quota: true,
                     runtime_restart: Some(RuntimeRestartHandle::new(
                         restart_sender,
                         socket_path.clone(),

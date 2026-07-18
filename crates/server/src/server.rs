@@ -19,8 +19,9 @@ use flow_agent_installer::{
 use flow_agent_quota::{QuotaCollector, QuotaEntry, QuotaPaths};
 use flow_agent_runtime::{
     ApprovalAction, AttentionAction, CommandState, MetricEvent, QuotaRecord, RuntimeStore,
-    SessionRecord, StoreError, WaiterError, WaiterRegistry,
+    SessionRecord, SessionUsageRecord, StoreError, WaiterError, WaiterRegistry,
 };
+use flow_agent_usage::{UsageCollector, UsagePaths, UsageRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -64,6 +65,7 @@ const TASK_CARD_DISPLAY_FIELDS: &[&str] = &[
     "lastEventAt",
 ];
 const SESSION_LIST_RETENTION_MS: u64 = 30 * 60 * 1_000;
+const USAGE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const INDEX_HTML: &str = include_str!("../../../web/index.html");
 const APP_CSS: &str = include_str!("../../../web/app.css");
 const APP_JS: &str = include_str!("../../../web/app.js");
@@ -76,6 +78,7 @@ pub struct ApiServerConfig {
     pub commit_delay: Duration,
     pub snapshot_interval: Duration,
     pub quota_poll_interval: Duration,
+    pub enable_claude_oauth_quota: bool,
     pub install_paths: Option<InstallPaths>,
     pub enable_codex_connector: bool,
     pub runtime_restart: Option<RuntimeRestartHandle>,
@@ -87,7 +90,8 @@ impl Default for ApiServerConfig {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             commit_delay: Duration::from_secs(3),
             snapshot_interval: Duration::from_millis(100),
-            quota_poll_interval: Duration::from_secs(5 * 60),
+            quota_poll_interval: Duration::from_secs(60),
+            enable_claude_oauth_quota: false,
             install_paths: None,
             enable_codex_connector: false,
             runtime_restart: None,
@@ -171,6 +175,16 @@ impl ApiServer {
                 .unwrap_or_else(|| FilePath::new("."))
                 .join("sessions"),
         };
+        let mut usage_paths = UsagePaths::discover();
+        usage_paths.flow_home = install_paths.flow_home.clone();
+        let codex_home = install_paths
+            .codex_config
+            .parent()
+            .unwrap_or_else(|| FilePath::new("."));
+        usage_paths.codex_sessions = vec![
+            codex_home.join("sessions"),
+            codex_home.join("archived_sessions"),
+        ];
         let data_paths = DataPaths {
             cache: install_paths.flow_home.join("cache"),
             spool: install_paths.flow_home.join("spool"),
@@ -195,12 +209,18 @@ impl ApiServer {
             commit_delay: config.commit_delay,
             snapshot_interval: config.snapshot_interval,
             quota_poll_interval: config.quota_poll_interval,
+            claude_oauth_quota: config.enable_claude_oauth_quota,
             installer: Arc::new(Installer::new(install_paths, source_binary)),
             quota: Arc::new(Mutex::new(QuotaState {
                 collector: QuotaCollector::new(quota_paths),
                 entries: Vec::new(),
                 refreshed_at: None,
                 claude_cache_modified_at: None,
+                oauth_refresh_in_progress: false,
+            })),
+            usage: Arc::new(Mutex::new(UsageState {
+                collector: UsageCollector::new(usage_paths),
+                refreshed_at: None,
             })),
             data_paths,
             codex,
@@ -273,8 +293,10 @@ struct AppState {
     commit_delay: Duration,
     snapshot_interval: Duration,
     quota_poll_interval: Duration,
+    claude_oauth_quota: bool,
     installer: Arc<Installer>,
     quota: Arc<Mutex<QuotaState>>,
+    usage: Arc<Mutex<UsageState>>,
     data_paths: DataPaths,
     codex: CodexManager,
     runtime_restart: Option<RuntimeRestartHandle>,
@@ -304,6 +326,12 @@ struct QuotaState {
     entries: Vec<QuotaEntry>,
     refreshed_at: Option<Instant>,
     claude_cache_modified_at: Option<SystemTime>,
+    oauth_refresh_in_progress: bool,
+}
+
+struct UsageState {
+    collector: UsageCollector,
+    refreshed_at: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -1212,6 +1240,7 @@ impl Default for UiSettings {
                 "activity".to_owned(),
                 "plan".to_owned(),
                 "tokens".to_owned(),
+                "context".to_owned(),
                 "tool".to_owned(),
                 "subagents".to_owned(),
                 "environment".to_owned(),
@@ -1374,7 +1403,7 @@ fn settings_value(state: &AppState) -> Result<Value, String> {
             { "id": "model", "label": "模型", "level": "detailed" },
             { "id": "activity", "label": "实时状态与本轮时间", "level": "concise" },
             { "id": "plan", "label": "计划进度", "level": "detailed" },
-            { "id": "tokens", "label": "本轮 Token", "level": "detailed" },
+            { "id": "tokens", "label": "会话 Token 与估算价格", "level": "detailed" },
             { "id": "context", "label": "上下文占用", "level": "detailed" },
             { "id": "tool", "label": "当前工具", "level": "detailed" },
             { "id": "permissionMode", "label": "权限模式", "level": "detailed" },
@@ -2090,6 +2119,7 @@ async fn websocket_loop(mut socket: WebSocket, state: AppState) {
 fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
     let now = now_millis();
     state.codex.retry_unsynced_native_approvals();
+    refresh_session_usage(state, now)?;
     let mut snapshot = state.store.snapshot()?;
     let visible_attention_sessions = snapshot
         .attention
@@ -2190,6 +2220,50 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
     }))
 }
 
+fn refresh_session_usage(state: &AppState, now: u64) -> Result<(), StoreError> {
+    let records = {
+        let mut usage = state
+            .usage
+            .lock()
+            .map_err(|_| StoreError::Storage("usage collector lock is poisoned".to_owned()))?;
+        if usage
+            .refreshed_at
+            .is_some_and(|instant| instant.elapsed() < USAGE_POLL_INTERVAL)
+        {
+            return Ok(());
+        }
+        let records = usage.collector.collect(now);
+        usage.refreshed_at = Some(Instant::now());
+        records
+    };
+    state
+        .store
+        .upsert_session_usages(records.into_iter().map(runtime_usage_record).collect())
+}
+
+fn runtime_usage_record(record: UsageRecord) -> SessionUsageRecord {
+    SessionUsageRecord {
+        provider: record.provider,
+        provider_session_id: record.provider_session_id,
+        input_tokens: record.input_tokens,
+        output_tokens: record.output_tokens,
+        cache_read_tokens: record.cache_read_tokens,
+        cache_creation_tokens: record.cache_creation_tokens,
+        reasoning_tokens: record.reasoning_tokens,
+        token_total: record.token_total,
+        last_turn_tokens: record.last_turn_tokens,
+        context_used_tokens: record.context_used_tokens,
+        context_window_tokens: record.context_window_tokens,
+        context_used_percent: record.context_used_percent,
+        estimated_cost_usd_micros: record.estimated_cost_usd_micros,
+        cost_kind: record.cost_kind,
+        pricing_source: record.pricing_source,
+        usage_source: record.usage_source,
+        usage_quality: record.usage_quality,
+        captured_at: record.captured_at,
+    }
+}
+
 fn process_alive(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return false;
@@ -2214,27 +2288,73 @@ fn quota_entries(state: &AppState) -> Result<Vec<QuotaEntry>, StoreError> {
         || quota
             .refreshed_at
             .is_none_or(|instant| instant.elapsed() >= state.quota_poll_interval);
+    let start_oauth_refresh =
+        refresh && state.claude_oauth_quota && !quota.oauth_refresh_in_progress;
+    if start_oauth_refresh {
+        quota.oauth_refresh_in_progress = true;
+    }
     if refresh {
-        quota.entries = quota.collector.collect(now_millis());
+        let now = now_millis();
+        quota.entries = quota.collector.collect(now);
         quota.refreshed_at = Some(Instant::now());
         quota.claude_cache_modified_at = claude_cache_modified_at;
-        let persisted = quota
-            .entries
-            .iter()
-            .filter_map(|entry| {
-                Some(QuotaRecord {
-                    provider: entry.provider.clone(),
-                    window: entry.window.clone(),
-                    used_pct: entry.used_pct?,
-                    resets_at: entry.resets_at?,
-                    source: entry.source.clone(),
-                    captured_at: entry.captured_at?,
-                })
-            })
-            .collect();
+        let persisted = quota.entries.iter().filter_map(quota_record).collect();
         state.store.replace_quota_snapshots(persisted)?;
     }
-    Ok(quota.entries.clone())
+    let entries = quota.entries.clone();
+    let paths = start_oauth_refresh.then(|| quota.collector.paths().clone());
+    drop(quota);
+    if let Some(paths) = paths {
+        spawn_oauth_quota_refresh(state.quota.clone(), state.store.clone(), paths);
+    }
+    Ok(entries)
+}
+
+fn spawn_oauth_quota_refresh(
+    quota_state: Arc<Mutex<QuotaState>>,
+    store: RuntimeStore,
+    paths: QuotaPaths,
+) {
+    let state_on_failure = quota_state.clone();
+    let result = thread::Builder::new()
+        .name("flow-agent-claude-quota".to_owned())
+        .spawn(move || {
+            let now = now_millis();
+            let mut collector = QuotaCollector::new(paths);
+            let result = collector.refresh_claude_oauth(now).map(|mut entries| {
+                entries.extend(collector.collect_codex(now));
+                entries
+            });
+            let Ok(mut quota) = quota_state.lock() else {
+                return;
+            };
+            quota.oauth_refresh_in_progress = false;
+            let Ok(entries) = result else { return };
+            quota.entries = entries.clone();
+            quota.refreshed_at = Some(Instant::now());
+            quota.claude_cache_modified_at = fs::metadata(quota.collector.paths().claude_cache())
+                .and_then(|metadata| metadata.modified())
+                .ok();
+            drop(quota);
+            let persisted = entries.iter().filter_map(quota_record).collect::<Vec<_>>();
+            let _ = store.replace_quota_snapshots(persisted);
+        });
+    if result.is_err() {
+        if let Ok(mut quota) = state_on_failure.lock() {
+            quota.oauth_refresh_in_progress = false;
+        }
+    }
+}
+
+fn quota_record(entry: &QuotaEntry) -> Option<QuotaRecord> {
+    Some(QuotaRecord {
+        provider: entry.provider.clone(),
+        window: entry.window.clone(),
+        used_pct: entry.used_pct?,
+        resets_at: entry.resets_at?,
+        source: entry.source.clone(),
+        captured_at: entry.captured_at?,
+    })
 }
 
 fn command_response(status: StatusCode, id: Uuid, state: CommandState) -> Response {
@@ -2368,6 +2488,14 @@ mod tests {
             flow_home: paths.flow_home.clone(),
             codex_sessions: root.join("codex/sessions"),
         };
+        let usage_paths = UsagePaths {
+            flow_home: paths.flow_home.clone(),
+            claude_projects: vec![root.join("home/.claude/projects")],
+            codex_sessions: vec![
+                root.join("codex/sessions"),
+                root.join("codex/archived_sessions"),
+            ],
+        };
         let codex = CodexManager::disabled(store.clone());
         AppState {
             store,
@@ -2382,12 +2510,18 @@ mod tests {
             commit_delay: Duration::from_secs(3),
             snapshot_interval: Duration::from_millis(250),
             quota_poll_interval: Duration::from_secs(300),
+            claude_oauth_quota: false,
             installer: Arc::new(Installer::new(paths, std::env::current_exe().unwrap())),
             quota: Arc::new(Mutex::new(QuotaState {
                 collector: QuotaCollector::new(quota_paths),
                 entries: Vec::new(),
                 refreshed_at: None,
                 claude_cache_modified_at: None,
+                oauth_refresh_in_progress: false,
+            })),
+            usage: Arc::new(Mutex::new(UsageState {
+                collector: UsageCollector::new(usage_paths),
+                refreshed_at: None,
             })),
             data_paths: DataPaths {
                 cache: root.join("flow-home/cache"),

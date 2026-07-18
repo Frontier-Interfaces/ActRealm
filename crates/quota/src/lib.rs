@@ -7,19 +7,23 @@ use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 use thiserror::Error;
 
 const CACHE_SCHEMA_VERSION: u32 = 1;
 const CLAUDE_SOURCE: &str = "statusline";
+const CLAUDE_OAUTH_SOURCE: &str = "oauth_usage";
 const CODEX_SOURCE: &str = "rollout_experimental";
-const FRESH_FOR_MS: u64 = 30 * 60 * 1_000;
 const MAX_CLOCK_SKEW_MS: u64 = 5 * 60 * 1_000;
 const MAX_STATUSLINE_BYTES: u64 = 256 * 1_024;
 const MAX_ROLLOUT_TAIL_BYTES: u64 = 2 * 1_024 * 1_024;
 const MAX_SESSION_META_BYTES: u64 = 128 * 1_024;
 const MAX_ROLLOUT_FILES: usize = 256;
+const MAX_CREDENTIAL_BYTES: u64 = 256 * 1_024;
+const MAX_OAUTH_RESPONSE_BYTES: usize = 256 * 1_024;
+const OAUTH_RETRY_AFTER_MS: u64 = 60 * 1_000;
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
@@ -32,6 +36,10 @@ pub enum QuotaError {
     Json(#[from] serde_json::Error),
     #[error("quota I/O failed for {path}: {source}")]
     Io { path: PathBuf, source: io::Error },
+    #[error("Claude OAuth credentials are unavailable")]
+    OAuthUnavailable,
+    #[error("Claude OAuth usage request failed: {0}")]
+    OAuthRequest(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -70,6 +78,24 @@ impl QuotaEntry {
         source: &str,
         captured_at: u64,
     ) -> Self {
+        Self::available_optional(
+            provider,
+            window,
+            used_pct,
+            Some(resets_at),
+            source,
+            captured_at,
+        )
+    }
+
+    fn available_optional(
+        provider: &str,
+        window: impl Into<String>,
+        used_pct: f64,
+        resets_at: Option<u64>,
+        source: &str,
+        captured_at: u64,
+    ) -> Self {
         let used_pct = used_pct.clamp(0.0, 100.0);
         Self {
             provider: provider.to_owned(),
@@ -77,7 +103,7 @@ impl QuotaEntry {
             status: "available".to_owned(),
             used_pct: Some(used_pct),
             remaining_pct: Some(100.0 - used_pct),
-            resets_at: Some(resets_at),
+            resets_at,
             source: source.to_owned(),
             window_minutes: None,
             limit_id: None,
@@ -119,14 +145,6 @@ impl QuotaEntry {
         self.plan_type = plan_type;
         self
     }
-
-    fn mark_stale(mut self, now_ms: u64) -> Self {
-        let captured_at = self.captured_at.unwrap_or_default();
-        let minutes = now_ms.saturating_sub(captured_at) / 60_000;
-        self.status = "stale".to_owned();
-        self.reason = Some(format!("最后一次有效数据（{minutes} 分钟前）"));
-        self
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,14 +175,20 @@ impl QuotaPaths {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct QuotaCollector {
     paths: QuotaPaths,
+    oauth_credential: Option<OAuthCredential>,
+    oauth_retry_after: u64,
 }
 
 impl QuotaCollector {
     pub fn new(paths: QuotaPaths) -> Self {
-        Self { paths }
+        Self {
+            paths,
+            oauth_credential: None,
+            oauth_retry_after: 0,
+        }
     }
 
     pub fn paths(&self) -> &QuotaPaths {
@@ -175,6 +199,64 @@ impl QuotaCollector {
         let mut entries = self.collect_claude(now_ms);
         entries.extend(self.collect_codex(now_ms));
         entries
+    }
+
+    /// Fetches Anthropic's first-party OAuth usage endpoint when Claude Code
+    /// credentials are already present. The credential remains memory-only;
+    /// only validated percentages and reset timestamps enter the local cache.
+    pub fn refresh_claude_oauth(&mut self, now_ms: u64) -> Result<Vec<QuotaEntry>, QuotaError> {
+        if now_ms < self.oauth_retry_after {
+            return Err(QuotaError::OAuthRequest(
+                "temporarily rate limited".to_owned(),
+            ));
+        }
+        if self.oauth_credential.is_none() {
+            self.oauth_credential = read_oauth_credential();
+        }
+        let credential = self
+            .oauth_credential
+            .as_ref()
+            .ok_or(QuotaError::OAuthUnavailable)?;
+        let response = match fetch_oauth_usage(&credential.access_token) {
+            Ok(response) => response,
+            Err(OAuthFetchError::Unauthorized) => {
+                self.oauth_credential = read_oauth_credential();
+                let credential = self
+                    .oauth_credential
+                    .as_ref()
+                    .ok_or(QuotaError::OAuthUnavailable)?;
+                fetch_oauth_usage(&credential.access_token)
+                    .map_err(|error| self.map_oauth_error(error, now_ms))?
+            }
+            Err(error) => return Err(self.map_oauth_error(error, now_ms)),
+        };
+        let entries = oauth_entries(response, now_ms);
+        if entries.is_empty() {
+            return Err(QuotaError::OAuthRequest(
+                "response contained no supported usage windows".to_owned(),
+            ));
+        }
+        write_claude_cache(
+            &self.paths.claude_cache(),
+            CLAUDE_OAUTH_SOURCE,
+            &entries,
+            now_ms,
+        )?;
+        Ok(entries)
+    }
+
+    fn map_oauth_error(&mut self, error: OAuthFetchError, now_ms: u64) -> QuotaError {
+        match error {
+            OAuthFetchError::Unauthorized => {
+                self.oauth_credential = None;
+                QuotaError::OAuthRequest("credential was rejected".to_owned())
+            }
+            OAuthFetchError::RateLimited => {
+                self.oauth_retry_after = now_ms.saturating_add(OAUTH_RETRY_AFTER_MS);
+                QuotaError::OAuthRequest("temporarily rate limited".to_owned())
+            }
+            OAuthFetchError::Other(message) => QuotaError::OAuthRequest(message),
+        }
     }
 
     pub fn collect_claude(&self, now_ms: u64) -> Vec<QuotaEntry> {
@@ -202,7 +284,7 @@ impl QuotaCollector {
             Ok(cache)
                 if cache.schema_version == CACHE_SCHEMA_VERSION
                     && cache.provider == "claude"
-                    && cache.source == CLAUDE_SOURCE =>
+                    && matches!(cache.source.as_str(), CLAUDE_SOURCE | CLAUDE_OAUTH_SOURCE) =>
             {
                 cache
             }
@@ -231,7 +313,6 @@ impl QuotaCollector {
                 "额度缓存时间晚于本机时间",
             );
         }
-        let stale = now_ms.saturating_sub(cache.captured_at) > FRESH_FOR_MS;
         let entries = cache
             .windows
             .into_iter()
@@ -239,23 +320,17 @@ impl QuotaCollector {
                 !window.window.is_empty()
                     && window.used_pct.is_finite()
                     && (0.0..=100.0).contains(&window.used_pct)
-                    && window.resets_at > 0
             })
             .map(|window| {
-                let entry = QuotaEntry::available(
+                QuotaEntry::available_optional(
                     "claude",
                     window.window,
                     window.used_pct,
                     window.resets_at,
-                    CLAUDE_SOURCE,
+                    &cache.source,
                     cache.captured_at,
                 )
-                .with_metadata(window.window_minutes, None, window.label, None);
-                if stale {
-                    entry.mark_stale(now_ms)
-                } else {
-                    entry
-                }
+                .with_metadata(window.window_minutes, None, window.label, None)
             })
             .collect::<Vec<_>>();
         if entries.is_empty() {
@@ -288,17 +363,11 @@ impl QuotaCollector {
             {
                 continue;
             }
-            let Ok(mut entries) = read_codex_limits(&path, modified_at) else {
+            let Ok(entries) = read_codex_limits(&path, modified_at) else {
                 continue;
             };
             if entries.is_empty() {
                 continue;
-            }
-            if now_ms.saturating_sub(modified_at) > FRESH_FOR_MS {
-                entries = entries
-                    .into_iter()
-                    .map(|entry| entry.mark_stale(now_ms))
-                    .collect();
             }
             return entries;
         }
@@ -343,7 +412,454 @@ struct CacheWindow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     window_minutes: Option<u64>,
     used_pct: f64,
-    resets_at: u64,
+    resets_at: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct OAuthCredential {
+    access_token: String,
+}
+
+#[derive(Debug)]
+enum OAuthFetchError {
+    Unauthorized,
+    RateLimited,
+    Other(String),
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthUsageResponse {
+    five_hour: Option<OAuthUsageWindow>,
+    seven_day: Option<OAuthUsageWindow>,
+    seven_day_sonnet: Option<OAuthUsageWindow>,
+    seven_day_opus: Option<OAuthUsageWindow>,
+    #[serde(default)]
+    limits: Vec<OAuthLimit>,
+    extra_usage: Option<OAuthExtraUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthUsageWindow {
+    utilization: f64,
+    resets_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthLimit {
+    kind: Option<String>,
+    group: Option<String>,
+    percent: Option<f64>,
+    resets_at: Option<String>,
+    #[serde(default)]
+    is_active: bool,
+    scope: Option<OAuthScope>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthScope {
+    model: Option<OAuthModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthModel {
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthExtraUsage {
+    is_enabled: bool,
+    utilization: Option<f64>,
+}
+
+fn read_oauth_credential() -> Option<OAuthCredential> {
+    #[cfg(target_os = "macos")]
+    if let Some(credential) = read_keychain_oauth_credential() {
+        return Some(credential);
+    }
+    read_file_oauth_credential()
+}
+
+#[cfg(target_os = "macos")]
+fn read_keychain_oauth_credential() -> Option<OAuthCredential> {
+    let mut services = vec!["Claude Code-credentials".to_owned()];
+    if let Ok(output) = Command::new("/usr/bin/security")
+        .args(["dump-keychain"])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            let mut remainder = line;
+            while let Some(start) = remainder.find("\"Claude Code-credentials") {
+                let candidate = &remainder[start + 1..];
+                let Some(end) = candidate.find('"') else {
+                    break;
+                };
+                let name = &candidate[..end];
+                if name.len() <= 128 && !services.iter().any(|service| service == name) {
+                    services.push(name.to_owned());
+                }
+                remainder = &candidate[end + 1..];
+            }
+        }
+    }
+    let username = env::var("USER").ok();
+    for service in services {
+        let mut accounts = vec![None, Some("unknown")];
+        if let Some(username) = username.as_deref() {
+            accounts.push(Some(username));
+        }
+        for account in accounts {
+            let mut command = Command::new("/usr/bin/security");
+            command.args(["find-generic-password", "-s", &service]);
+            if let Some(account) = account {
+                command.args(["-a", account]);
+            }
+            let Ok(output) = command.arg("-w").output() else {
+                continue;
+            };
+            if output.status.success() {
+                if let Some(credential) = parse_oauth_credential(&output.stdout) {
+                    return Some(credential);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn read_file_oauth_credential() -> Option<OAuthCredential> {
+    let home = env::var_os("HOME").map(PathBuf::from)?;
+    let config_root = env::var_os("CLAUDE_CONFIG_DIR")
+        .and_then(|value| {
+            value
+                .to_string_lossy()
+                .split(',')
+                .map(str::trim)
+                .find(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| home.join(".claude"));
+    let path = config_root.join(".credentials.json");
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_CREDENTIAL_BYTES
+    {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    parse_oauth_credential(&bytes)
+}
+
+fn parse_oauth_credential(bytes: &[u8]) -> Option<OAuthCredential> {
+    if bytes.len() as u64 > MAX_CREDENTIAL_BYTES {
+        return None;
+    }
+    let start = bytes.iter().position(|byte| *byte == b'{')?;
+    let value = serde_json::from_slice::<Value>(&bytes[start..]).ok()?;
+    let token = value
+        .pointer("/claudeAiOauth/accessToken")
+        .or_else(|| value.pointer("/claudeAiOauth/access_token"))
+        .and_then(Value::as_str)?;
+    if token.is_empty()
+        || token.len() > 16 * 1_024
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\\'))
+    {
+        return None;
+    }
+    Some(OAuthCredential {
+        access_token: token.to_owned(),
+    })
+}
+
+fn fetch_oauth_usage(token: &str) -> Result<OAuthUsageResponse, OAuthFetchError> {
+    let mut child = Command::new("/usr/bin/curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "8",
+            "--max-filesize",
+            &MAX_OAUTH_RESPONSE_BYTES.to_string(),
+            "--output",
+            "-",
+            "--write-out",
+            "\n%{http_code}",
+            "--config",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| OAuthFetchError::Other(error.to_string()))?;
+    let config = format!(
+        "url = \"https://api.anthropic.com/api/oauth/usage\"\n\
+         header = \"Authorization: Bearer {token}\"\n\
+         header = \"anthropic-beta: oauth-2025-04-20\"\n\
+         header = \"Content-Type: application/json\"\n\
+         user-agent = \"claude-code/flow-agent\"\n"
+    );
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| OAuthFetchError::Other("curl stdin unavailable".to_owned()))?
+        .write_all(config.as_bytes())
+        .map_err(|error| OAuthFetchError::Other(error.to_string()))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| OAuthFetchError::Other(error.to_string()))?;
+    if output.stdout.len() > MAX_OAUTH_RESPONSE_BYTES.saturating_add(8) {
+        return Err(OAuthFetchError::Other(
+            "response exceeded size limit".to_owned(),
+        ));
+    }
+    let split = output
+        .stdout
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .ok_or_else(|| OAuthFetchError::Other("response omitted HTTP status".to_owned()))?;
+    let status = std::str::from_utf8(&output.stdout[split + 1..])
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .ok_or_else(|| OAuthFetchError::Other("response had invalid HTTP status".to_owned()))?;
+    match status {
+        200..=299 => serde_json::from_slice(&output.stdout[..split])
+            .map_err(|error| OAuthFetchError::Other(error.to_string())),
+        401 => Err(OAuthFetchError::Unauthorized),
+        429 => Err(OAuthFetchError::RateLimited),
+        value => Err(OAuthFetchError::Other(format!("HTTP {value}"))),
+    }
+}
+
+fn oauth_entries(response: OAuthUsageResponse, now_ms: u64) -> Vec<QuotaEntry> {
+    let mut entries = Vec::new();
+    push_oauth_window(
+        &mut entries,
+        "5h",
+        "5 小时",
+        300,
+        response.five_hour,
+        now_ms,
+    );
+    push_oauth_window(
+        &mut entries,
+        "7d",
+        "7 天",
+        10_080,
+        response.seven_day,
+        now_ms,
+    );
+    push_oauth_window(
+        &mut entries,
+        "7d_sonnet",
+        "Sonnet · 7 天",
+        10_080,
+        response.seven_day_sonnet,
+        now_ms,
+    );
+    push_oauth_window(
+        &mut entries,
+        "7d_opus",
+        "Opus · 7 天",
+        10_080,
+        response.seven_day_opus,
+        now_ms,
+    );
+    let mut seen_models = Vec::<String>::new();
+    for limit in response.limits {
+        if !limit.is_active {
+            continue;
+        }
+        let Some(percent) = limit.percent.filter(|value| value.is_finite()) else {
+            continue;
+        };
+        if !(0.0..=100.0).contains(&percent) {
+            continue;
+        }
+        let Some(model) = limit
+            .scope
+            .and_then(|scope| scope.model)
+            .and_then(|model| model.display_name)
+            .and_then(|name| bounded_label(&name))
+        else {
+            continue;
+        };
+        if seen_models.iter().any(|seen| seen == &model) {
+            continue;
+        }
+        seen_models.push(model.clone());
+        let window_minutes = if limit.group.as_deref() == Some("weekly")
+            || limit
+                .kind
+                .as_deref()
+                .is_some_and(|kind| kind.contains("weekly"))
+        {
+            Some(10_080)
+        } else {
+            None
+        };
+        let id = format!("scoped_{}", safe_window_component(&model));
+        entries.push(
+            QuotaEntry::available_optional(
+                "claude",
+                id,
+                percent,
+                limit.resets_at.as_deref().and_then(parse_rfc3339_epoch),
+                CLAUDE_OAUTH_SOURCE,
+                now_ms,
+            )
+            .with_metadata(window_minutes, None, Some(model), None),
+        );
+    }
+    if let Some(extra) = response.extra_usage {
+        if extra.is_enabled {
+            if let Some(utilization) = extra
+                .utilization
+                .filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
+            {
+                entries.push(
+                    QuotaEntry::available_optional(
+                        "claude",
+                        "extra_usage",
+                        utilization,
+                        None,
+                        CLAUDE_OAUTH_SOURCE,
+                        now_ms,
+                    )
+                    .with_metadata(
+                        None,
+                        None,
+                        Some("额外用量".to_owned()),
+                        None,
+                    ),
+                );
+            }
+        }
+    }
+    entries
+}
+
+fn push_oauth_window(
+    entries: &mut Vec<QuotaEntry>,
+    id: &str,
+    label: &str,
+    minutes: u64,
+    window: Option<OAuthUsageWindow>,
+    now_ms: u64,
+) {
+    let Some(window) = window else { return };
+    if !window.utilization.is_finite() || !(0.0..=100.0).contains(&window.utilization) {
+        return;
+    }
+    entries.push(
+        QuotaEntry::available_optional(
+            "claude",
+            id,
+            window.utilization,
+            window.resets_at.as_deref().and_then(parse_rfc3339_epoch),
+            CLAUDE_OAUTH_SOURCE,
+            now_ms,
+        )
+        .with_metadata(Some(minutes), None, Some(label.to_owned()), None),
+    );
+}
+
+fn safe_window_component(value: &str) -> String {
+    let value = value
+        .chars()
+        .filter_map(|character| {
+            if character.is_ascii_alphanumeric() {
+                Some(character.to_ascii_lowercase())
+            } else if character.is_whitespace() || matches!(character, '-' | '_') {
+                Some('_')
+            } else {
+                None
+            }
+        })
+        .take(40)
+        .collect::<String>();
+    if value.is_empty() {
+        "model".to_owned()
+    } else {
+        value
+    }
+}
+
+fn parse_rfc3339_epoch(value: &str) -> Option<u64> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+        || !value.ends_with('Z')
+    {
+        return None;
+    }
+    let number = |start: usize, end: usize| value.get(start..end)?.parse::<i64>().ok();
+    let year = number(0, 4)?;
+    let month = number(5, 7)?;
+    let day = number(8, 10)?;
+    let hour = number(11, 13)?;
+    let minute = number(14, 16)?;
+    let second = number(17, 19)?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
+    {
+        return None;
+    }
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
+    let year_of_era = adjusted_year - era * 400;
+    let shifted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(hour * 3_600 + minute * 60 + second)?;
+    u64::try_from(seconds).ok()
+}
+
+fn write_claude_cache(
+    cache_path: &Path,
+    source: &str,
+    entries: &[QuotaEntry],
+    now_ms: u64,
+) -> Result<(), QuotaError> {
+    let windows = entries
+        .iter()
+        .filter_map(|entry| {
+            Some(CacheWindow {
+                window: entry.window.clone(),
+                label: entry.limit_name.clone(),
+                window_minutes: entry.window_minutes,
+                used_pct: entry.used_pct?,
+                resets_at: entry.resets_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    let document = CacheDocument {
+        schema_version: CACHE_SCHEMA_VERSION,
+        provider: "claude".to_owned(),
+        source: source.to_owned(),
+        captured_at: now_ms,
+        windows,
+    };
+    let mut bytes = serde_json::to_vec_pretty(&document)?;
+    bytes.push(b'\n');
+    atomic_write(cache_path, &bytes, 0o600)
 }
 
 pub fn capture_claude_statusline(
@@ -384,7 +900,7 @@ pub fn capture_claude_statusline(
                 .and_then(Value::as_u64)
                 .or_else(|| canonical_window_minutes(&name)),
             used_pct,
-            resets_at,
+            resets_at: Some(resets_at),
         });
     }
     if windows.is_empty() {
@@ -411,8 +927,15 @@ pub fn capture_claude_statusline(
                 used_pct,
                 resets_at,
             } = window;
-            QuotaEntry::available("claude", window, used_pct, resets_at, CLAUDE_SOURCE, now_ms)
-                .with_metadata(window_minutes, None, label, None)
+            QuotaEntry::available_optional(
+                "claude",
+                window,
+                used_pct,
+                resets_at,
+                CLAUDE_SOURCE,
+                now_ms,
+            )
+            .with_metadata(window_minutes, None, label, None)
         })
         .collect())
 }
@@ -812,7 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_claude_cache_preserves_last_value_but_incompatible_data_stays_unavailable() {
+    fn old_claude_cache_preserves_last_value_but_incompatible_data_stays_unavailable() {
         let stale_root = root("stale");
         let paths = QuotaPaths {
             flow_home: stale_root.clone(),
@@ -824,11 +1347,11 @@ mod tests {
             1_000,
         )
         .unwrap();
-        let stale = QuotaCollector::new(paths.clone()).collect_claude(FRESH_FOR_MS + 2_000);
-        assert_eq!(stale[0].status, "stale");
-        assert_eq!(stale[0].used_pct, Some(50.0));
-        assert_eq!(stale[0].remaining_pct, Some(50.0));
-        assert_eq!(stale[0].resets_at, Some(1_784_140_000));
+        let last_known = QuotaCollector::new(paths.clone()).collect_claude(86_400_000);
+        assert_eq!(last_known[0].status, "available");
+        assert_eq!(last_known[0].used_pct, Some(50.0));
+        assert_eq!(last_known[0].remaining_pct, Some(50.0));
+        assert_eq!(last_known[0].resets_at, Some(1_784_140_000));
         fs::write(
             paths.claude_cache(),
             br#"{"schemaVersion":99,"provider":"claude","source":"statusline","capturedAt":1,"windows":[]}"#,
@@ -1036,5 +1559,68 @@ mod tests {
         assert!(!files
             .iter()
             .any(|(path, _)| path.to_string_lossy().contains("session-000")));
+    }
+
+    #[test]
+    fn oauth_usage_parses_dynamic_scoped_limits_and_null_resets() {
+        let response: OAuthUsageResponse = serde_json::from_str(
+            r#"{
+              "five_hour":{"utilization":63,"resets_at":"2026-07-18T10:00:00Z"},
+              "seven_day":{"utilization":8,"resets_at":null},
+              "limits":[
+                {"kind":"weekly_scoped","group":"weekly","percent":97,
+                 "resets_at":"2026-07-20T00:00:00Z","is_active":true,
+                 "scope":{"model":{"display_name":"Fable"}}},
+                {"kind":"weekly_scoped","group":"weekly","percent":1,
+                 "resets_at":null,"is_active":false,
+                 "scope":{"model":{"display_name":"Old model"}}}
+              ],
+              "extra_usage":{"is_enabled":true,"utilization":12.5}
+            }"#,
+        )
+        .unwrap();
+        let entries = oauth_entries(response, 123);
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].window, "5h");
+        assert!(entries[0].resets_at.is_some());
+        assert_eq!(entries[1].window, "7d");
+        assert_eq!(entries[1].resets_at, None);
+        let fable = entries
+            .iter()
+            .find(|entry| entry.limit_name.as_deref() == Some("Fable"))
+            .unwrap();
+        assert_eq!(fable.used_pct, Some(97.0));
+        assert_eq!(fable.window_minutes, Some(10_080));
+        assert!(entries
+            .iter()
+            .all(|entry| entry.limit_name.as_deref() != Some("Old model")));
+    }
+
+    #[test]
+    fn oauth_cache_contains_only_validated_usage_not_credentials() {
+        let credential = parse_oauth_credential(
+            b"\x07{\"claudeAiOauth\":{\"accessToken\":\"secret-token-value\"}}",
+        )
+        .unwrap();
+        assert_eq!(credential.access_token, "secret-token-value");
+        let root = root("oauth-cache");
+        let cache = root.join("cache/claude-rl.json");
+        let entries = vec![QuotaEntry::available_optional(
+            "claude",
+            "7d",
+            20.0,
+            None,
+            CLAUDE_OAUTH_SOURCE,
+            100,
+        )];
+        write_claude_cache(&cache, CLAUDE_OAUTH_SOURCE, &entries, 100).unwrap();
+        let saved = fs::read_to_string(cache).unwrap();
+        assert!(!saved.contains("secret-token-value"));
+        assert!(saved.contains("oauth_usage"));
+        assert_eq!(parse_rfc3339_epoch("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_rfc3339_epoch("2026-07-18T10:00:00Z"),
+            Some(1_784_368_800)
+        );
     }
 }

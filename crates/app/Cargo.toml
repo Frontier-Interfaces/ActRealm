@@ -14,6 +14,7 @@ flow-agent-installer = { path = "../installer" }
 flow-agent-quota = { path = "../quota" }
 flow-agent-runtime = { path = "../runtime" }
 flow-agent-server = { path = "../server" }
+flow-agent-usage = { path = "../usage" }
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true

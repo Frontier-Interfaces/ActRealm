@@ -13,7 +13,9 @@ Local-first attention surface for coding agents.
 Third-party asset attribution is recorded in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-The `agent/v1-full` branch contains functional implementation through **M13**;
+The committed `agent/v1-full` branch contains functional implementation through
+**M14**, including live session Token, current-context occupancy, estimated API
+price, and background Claude OAuth quota refresh;
 see the [current status](docs/STATUS.md) for the exact milestone, acceptance,
 branch, and release state. It remains a v1 test candidate because the separate
 48-hour Runtime stability gate has not passed. The branch provides the
@@ -76,6 +78,15 @@ source (for example 5 hours, 7 days, 30 days, or a named extra allowance).
 Values older than 30 minutes remain visible as the last valid sample with their
 capture time; Flow Agent never turns age into a fabricated percentage.
 
+The M14 candidate can refresh Claude quota from Anthropic's first-party OAuth
+usage endpoint when an existing Claude credential is available. It runs in the
+background and falls back to the last StatusLine cache. Credentials stay in
+memory and are never written to SQLite, cache, logs, diagnostics, export, or
+process arguments. Session usage is read incrementally from local Claude and
+Codex records: cumulative Token, current-turn context, cache/reasoning
+breakdowns, and an explicitly labelled API-price estimate are shown only when a
+validated source exists. The estimate is not a subscription bill.
+
 Agent sessions use the Provider's own local conversation title as the visible
 main title: Claude's official `session_title` plus bounded `custom-title` /
 `ai-title` compatibility records, or Codex's latest `thread_name` from its
@@ -136,6 +147,7 @@ flow-agent diagnostics clear
 - [M9 verification record](docs/M9_VERIFICATION.md)
 - [M10-M12 verification record](docs/M10_M12_VERIFICATION.md)
 - [M13 Provider-state verification record](docs/M13_PROVIDER_STATE_COORDINATION.md)
+- [M14 live usage/context/quota verification record](docs/M14_USAGE_CONTEXT_QUOTA.md)
 - [v1.1 functional-correction record](docs/V1_1_FUNCTIONAL_CORRECTIONS.md)
 
 ## Local quality gate
@@ -149,7 +161,7 @@ cargo build --workspace --release --offline
 ./scripts/m5-resource-check.sh target/release/flow-agent
 ```
 
-The common suite currently covers 153 passing tests plus two explicit/manual
+The common suite currently covers 161 passing tests plus two explicit/manual
 tests ignored by default. It covers the provider path, SQLite Runtime, waiter, spool,
 single-instance, restart, duplicate-request, authenticated API, UI contract,
 safe install/uninstall, tri-state repair, onboarding, trust inspection, factual

@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const MAX_TASK_TITLE_CHARS: usize = 64;
 const PROVIDER_TITLE_REFRESH_INTERVAL_MS: u64 = 2_000;
 const PROVIDER_TITLE_ACTIVE_WINDOW_MS: u64 = 30 * 60 * 1_000;
@@ -180,6 +180,20 @@ pub struct SessionRecord {
     pub turn_ended_at: Option<u64>,
     pub token_total: Option<u64>,
     pub context_window_tokens: Option<u64>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub last_turn_tokens: Option<u64>,
+    pub context_used_tokens: Option<u64>,
+    pub context_used_percent: Option<u32>,
+    pub estimated_cost_usd_micros: Option<u64>,
+    pub cost_kind: Option<String>,
+    pub pricing_source: Option<String>,
+    pub usage_source: Option<String>,
+    pub usage_quality: Option<String>,
+    pub usage_captured_at: Option<u64>,
     pub permission_mode: Option<String>,
     pub current_tool: Option<String>,
     pub active_subagents: u32,
@@ -277,6 +291,28 @@ pub struct QuotaRecord {
     pub captured_at: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionUsageRecord {
+    pub provider: String,
+    pub provider_session_id: String,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub token_total: Option<u64>,
+    pub last_turn_tokens: Option<u64>,
+    pub context_used_tokens: Option<u64>,
+    pub context_window_tokens: Option<u64>,
+    pub context_used_percent: Option<u32>,
+    pub estimated_cost_usd_micros: Option<u64>,
+    pub cost_kind: Option<String>,
+    pub pricing_source: Option<String>,
+    pub usage_source: String,
+    pub usage_quality: String,
+    pub captured_at: u64,
+}
+
 #[derive(Clone)]
 pub struct RuntimeStore {
     inner: Arc<StoreInner>,
@@ -356,6 +392,10 @@ enum StoreMessage {
     },
     ReplaceQuota {
         entries: Vec<QuotaRecord>,
+        reply: mpsc::SyncSender<Result<(), StoreError>>,
+    },
+    UpsertSessionUsage {
+        records: Vec<SessionUsageRecord>,
         reply: mpsc::SyncSender<Result<(), StoreError>>,
     },
     RecordMetric {
@@ -583,6 +623,19 @@ impl RuntimeStore {
         receive(receiver)
     }
 
+    pub fn upsert_session_usage(&self, record: SessionUsageRecord) -> Result<(), StoreError> {
+        self.upsert_session_usages(vec![record])
+    }
+
+    pub fn upsert_session_usages(
+        &self,
+        records: Vec<SessionUsageRecord>,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send(StoreMessage::UpsertSessionUsage { records, reply })?;
+        receive(receiver)
+    }
+
     pub fn record_metric(&self, event: MetricEvent, now: u64) -> Result<(), StoreError> {
         let (reply, receiver) = mpsc::sync_channel(1);
         self.send(StoreMessage::RecordMetric { event, now, reply })?;
@@ -791,6 +844,9 @@ fn writer_loop(
             StoreMessage::ReplaceQuota { entries, reply } => {
                 let _ = reply.send(replace_quota_transaction(&mut connection, entries));
             }
+            StoreMessage::UpsertSessionUsage { records, reply } => {
+                let _ = reply.send(upsert_session_usages(&mut connection, records));
+            }
             StoreMessage::RecordMetric { event, now, reply } => {
                 let _ = reply.send(record_metric_transaction(&mut connection, event, now));
             }
@@ -817,6 +873,80 @@ fn writer_loop(
             StoreMessage::Shutdown => break,
         }
     }
+}
+
+fn upsert_session_usages(
+    connection: &mut Connection,
+    records: Vec<SessionUsageRecord>,
+) -> Result<(), StoreError> {
+    let transaction = connection.transaction().map_err(storage_error)?;
+    for record in records {
+        upsert_session_usage_row(&transaction, record)?;
+    }
+    transaction.commit().map_err(storage_error)
+}
+
+fn upsert_session_usage_row(
+    connection: &Connection,
+    record: SessionUsageRecord,
+) -> Result<(), StoreError> {
+    if record.provider_session_id.trim().is_empty() || record.provider_session_id.len() > 128 {
+        return Err(StoreError::Storage(
+            "usage session identifier is invalid".to_owned(),
+        ));
+    }
+    connection
+        .execute(
+            "INSERT INTO session_usage(
+               provider, provider_session_id,
+               input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+               reasoning_tokens, token_total, last_turn_tokens, context_used_tokens,
+               context_window_tokens, context_used_percent, estimated_cost_usd_micros,
+               cost_kind, pricing_source, usage_source, usage_quality, captured_at
+             ) VALUES (
+               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+               ?14, ?15, ?16, ?17, ?18
+             )
+             ON CONFLICT(provider, provider_session_id) DO UPDATE SET
+               input_tokens = COALESCE(excluded.input_tokens, input_tokens),
+               output_tokens = COALESCE(excluded.output_tokens, output_tokens),
+               cache_read_tokens = COALESCE(excluded.cache_read_tokens, cache_read_tokens),
+               cache_creation_tokens = COALESCE(excluded.cache_creation_tokens, cache_creation_tokens),
+               reasoning_tokens = COALESCE(excluded.reasoning_tokens, reasoning_tokens),
+               token_total = COALESCE(excluded.token_total, token_total),
+               last_turn_tokens = COALESCE(excluded.last_turn_tokens, last_turn_tokens),
+               context_used_tokens = COALESCE(excluded.context_used_tokens, context_used_tokens),
+               context_window_tokens = COALESCE(excluded.context_window_tokens, context_window_tokens),
+               context_used_percent = COALESCE(excluded.context_used_percent, context_used_percent),
+               estimated_cost_usd_micros = COALESCE(excluded.estimated_cost_usd_micros, estimated_cost_usd_micros),
+               cost_kind = COALESCE(excluded.cost_kind, cost_kind),
+               pricing_source = COALESCE(excluded.pricing_source, pricing_source),
+               usage_source = excluded.usage_source,
+               usage_quality = excluded.usage_quality,
+               captured_at = MAX(captured_at, excluded.captured_at)",
+            params![
+                record.provider,
+                record.provider_session_id,
+                record.input_tokens.map(to_i64),
+                record.output_tokens.map(to_i64),
+                record.cache_read_tokens.map(to_i64),
+                record.cache_creation_tokens.map(to_i64),
+                record.reasoning_tokens.map(to_i64),
+                record.token_total.map(to_i64),
+                record.last_turn_tokens.map(to_i64),
+                record.context_used_tokens.map(to_i64),
+                record.context_window_tokens.map(to_i64),
+                record.context_used_percent.map(i64::from),
+                record.estimated_cost_usd_micros.map(to_i64),
+                record.cost_kind,
+                record.pricing_source,
+                record.usage_source,
+                record.usage_quality,
+                to_i64(record.captured_at),
+            ],
+        )
+        .map(|_| ())
+        .map_err(storage_error)
 }
 
 fn replace_quota_transaction(
@@ -1238,6 +1368,20 @@ fn initialize(connection: &Connection) -> Result<(), StoreError> {
               provider TEXT NOT NULL, window TEXT NOT NULL,
               used_pct REAL, resets_at INTEGER, source TEXT,
               captured_at INTEGER NOT NULL, PRIMARY KEY(provider, window)
+            );
+            CREATE TABLE IF NOT EXISTS session_usage (
+              provider TEXT NOT NULL,
+              provider_session_id TEXT NOT NULL,
+              input_tokens INTEGER, output_tokens INTEGER,
+              cache_read_tokens INTEGER, cache_creation_tokens INTEGER,
+              reasoning_tokens INTEGER, token_total INTEGER,
+              last_turn_tokens INTEGER, context_used_tokens INTEGER,
+              context_window_tokens INTEGER, context_used_percent INTEGER,
+              estimated_cost_usd_micros INTEGER,
+              cost_kind TEXT, pricing_source TEXT,
+              usage_source TEXT NOT NULL, usage_quality TEXT NOT NULL,
+              captured_at INTEGER NOT NULL,
+              PRIMARY KEY(provider, provider_session_id)
             );
             CREATE TABLE IF NOT EXISTS metrics_daily (
               day TEXT PRIMARY KEY,
@@ -2645,20 +2789,24 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
     let sessions = {
         let mut statement = connection
             .prepare(
-                "SELECT id, provider, provider_session_id, project, title,
-                        provider_title, provider_title_source, model,
-                        exec_state, approval_owner, activity, activity_since,
-                        plan_done, plan_total,
+                "SELECT sessions.id, sessions.provider, sessions.provider_session_id,
+                        sessions.project, sessions.title,
+                        sessions.provider_title, sessions.provider_title_source, sessions.model,
+                        sessions.exec_state, sessions.approval_owner,
+                        sessions.activity, sessions.activity_since,
+                        sessions.plan_done, sessions.plan_total,
                         (SELECT started_at FROM turns
                          WHERE turns.session_id = sessions.id
                          ORDER BY ordinal DESC LIMIT 1),
                         (SELECT ended_at FROM turns
                          WHERE turns.session_id = sessions.id
                          ORDER BY ordinal DESC LIMIT 1),
-                        token_total, context_window_tokens,
-                        term_app, term_session_id, term_tty,
-                        term_bundle_id, term_surface, provider_pid, last_event_at,
-                        permission_mode,
+                        COALESCE(usage.token_total, sessions.token_total),
+                        COALESCE(usage.context_window_tokens, sessions.context_window_tokens),
+                        sessions.term_app, sessions.term_session_id, sessions.term_tty,
+                        sessions.term_bundle_id, sessions.term_surface,
+                        sessions.provider_pid, sessions.last_event_at,
+                        sessions.permission_mode,
                         (SELECT tool_name FROM events
                          WHERE events.session_id = sessions.id AND tool_name IS NOT NULL
                          ORDER BY ingest_seq DESC LIMIT 1),
@@ -2666,8 +2814,19 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
                          WHERE session_subagents.session_id = sessions.id AND active = 1),
                         (SELECT provider_turn_id FROM turns
                          WHERE turns.session_id = sessions.id
-                         ORDER BY ordinal DESC LIMIT 1)
-                 FROM sessions ORDER BY last_event_at DESC",
+                         ORDER BY ordinal DESC LIMIT 1),
+                        usage.input_tokens, usage.output_tokens,
+                        usage.cache_read_tokens, usage.cache_creation_tokens,
+                        usage.reasoning_tokens, usage.last_turn_tokens,
+                        usage.context_used_tokens, usage.context_used_percent,
+                        usage.estimated_cost_usd_micros, usage.cost_kind,
+                        usage.pricing_source, usage.usage_source,
+                        usage.usage_quality, usage.captured_at
+                 FROM sessions
+                 LEFT JOIN session_usage AS usage
+                   ON usage.provider = sessions.provider
+                  AND usage.provider_session_id = sessions.provider_session_id
+                 ORDER BY sessions.last_event_at DESC",
             )
             .map_err(storage_error)?;
         let rows = statement
@@ -2721,6 +2880,22 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
                     turn_ended_at: row.get::<_, Option<i64>>(15)?.map(from_i64),
                     token_total: row.get::<_, Option<i64>>(16)?.map(from_i64),
                     context_window_tokens: row.get::<_, Option<i64>>(17)?.map(from_i64),
+                    input_tokens: row.get::<_, Option<i64>>(29)?.map(from_i64),
+                    output_tokens: row.get::<_, Option<i64>>(30)?.map(from_i64),
+                    cache_read_tokens: row.get::<_, Option<i64>>(31)?.map(from_i64),
+                    cache_creation_tokens: row.get::<_, Option<i64>>(32)?.map(from_i64),
+                    reasoning_tokens: row.get::<_, Option<i64>>(33)?.map(from_i64),
+                    last_turn_tokens: row.get::<_, Option<i64>>(34)?.map(from_i64),
+                    context_used_tokens: row.get::<_, Option<i64>>(35)?.map(from_i64),
+                    context_used_percent: row
+                        .get::<_, Option<i64>>(36)?
+                        .and_then(|value| u32::try_from(value).ok()),
+                    estimated_cost_usd_micros: row.get::<_, Option<i64>>(37)?.map(from_i64),
+                    cost_kind: row.get(38)?,
+                    pricing_source: row.get(39)?,
+                    usage_source: row.get(40)?,
+                    usage_quality: row.get(41)?,
+                    usage_captured_at: row.get::<_, Option<i64>>(42)?.map(from_i64),
                     permission_mode: row.get(25)?,
                     current_tool,
                     active_subagents: row

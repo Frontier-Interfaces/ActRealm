@@ -285,6 +285,7 @@ dependencies = [
  "flow-agent-quota",
  "flow-agent-runtime",
  "flow-agent-server",
+ "flow-agent-usage",
  "libc",
  "serde",
  "serde_json",
@@ -376,6 +377,7 @@ dependencies = [
  "flow-agent-installer",
  "flow-agent-quota",
  "flow-agent-runtime",
+ "flow-agent-usage",
  "futures-util",
  "libc",
  "serde",
@@ -385,6 +387,15 @@ dependencies = [
  "tokio-tungstenite",
  "tower",
  "uuid",
+]
+
+[[package]]
+name = "flow-agent-usage"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
