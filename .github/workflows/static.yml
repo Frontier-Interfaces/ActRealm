@@ -1,0 +1,1269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>ActRealm — Manage Agents and Bring Task Context Forward</title>
+<meta name="description" content="ActRealm brings agent tasks, status, approval requests and workspaces into one local control layer, then returns you to the right terminal, diff and preview when action is needed.">
+<style>
+:root{
+  --txt:#1d1d1f; --txt2:#6e6e73; --txt3:#86868b;
+  --bg:#ffffff; --bg2:#f5f5f7; --line:#d2d2d7;
+  --cyan:#0aa2b8; --violet:#6e5ae0; --amber:#ff9f0a; --amber-t:#b06000;
+  --green:#34c759; --red:#ff453a; --blue:#0066cc;
+  --grad:linear-gradient(100deg,#0aa2b8 10%,#6e5ae0 90%);
+  --radius:28px;
+  --shadow:0 12px 40px rgba(0,0,0,.10);
+  --shadow-sm:0 4px 16px rgba(0,0,0,.08);
+}
+*{margin:0;padding:0;box-sizing:border-box;-webkit-font-smoothing:antialiased}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro SC","PingFang SC","Source Han Sans SC","Microsoft YaHei",sans-serif;line-height:1.5;overflow-x:hidden}
+a{color:inherit;text-decoration:none}
+button{font-family:inherit;border:none;background:none;cursor:pointer;color:inherit}
+.wrap{max-width:1024px;margin:0 auto;padding:0 24px}
+.wrap-wide{max-width:1240px;margin:0 auto;padding:0 24px}
+b{color:var(--txt)}
+code{font-family:ui-monospace,Menlo,monospace;font-size:.92em;background:#ececf1;padding:2px 7px;border-radius:6px}
+
+/* ---------- reveal ---------- */
+.reveal{opacity:0;transform:translateY(30px);transition:opacity .9s cubic-bezier(.2,.6,.2,1),transform .9s cubic-bezier(.2,.6,.2,1)}
+.reveal.in{opacity:1;transform:none}
+.d1{transition-delay:.08s}.d2{transition-delay:.16s}.d3{transition-delay:.24s}
+
+/* ---------- local nav ---------- */
+.lnav{position:sticky;top:0;z-index:100;background:rgba(255,255,255,.72);backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);border-bottom:1px solid rgba(0,0,0,.08)}
+.lnav-in{display:flex;align-items:center;justify-content:space-between;height:52px;gap:14px}
+.lnav .name{display:flex;align-items:center;gap:8px;font-size:19px;font-weight:600}
+.mark{width:22px;height:22px;border-radius:6px;background:var(--grad);position:relative;flex:none}
+.mark::before{content:"";position:absolute;right:4px;top:5px;bottom:5px;width:9px;border-radius:2.5px;background:#fff}
+.mark::after{content:"";position:absolute;left:4px;top:5px;width:4px;height:3px;border-radius:1px;background:#fff;box-shadow:0 4.5px 0 #fff,0 9px 0 #fff}
+.lnav .links{display:flex;gap:24px;font-size:13px;color:var(--txt2)}
+.lnav .links a:hover{color:var(--txt)}
+.lnav .right{display:flex;align-items:center;gap:12px}
+.pill-cta{background:var(--txt);color:#fff;font-size:12.5px;font-weight:500;padding:6px 16px;border-radius:980px;transition:.2s;white-space:nowrap}
+.pill-cta:hover{transform:scale(1.04)}
+.langseg{display:flex;background:var(--bg2);border-radius:980px;padding:2px}
+.langseg button{font-size:11.5px;font-weight:600;padding:4px 11px;border-radius:980px;color:var(--txt2);transition:.2s;white-space:nowrap}
+.langseg button.on{background:#fff;color:var(--txt);box-shadow:var(--shadow-sm)}
+
+/* ---------- hero ---------- */
+.hero{padding:88px 0 0;text-align:center}
+.hero .appicon{width:88px;height:88px;border-radius:22px;background:var(--grad);margin:0 auto;position:relative;box-shadow:0 14px 34px rgba(110,90,224,.35)}
+.hero .appicon::before{content:"";position:absolute;right:18px;top:22px;bottom:22px;width:34px;border-radius:8px;background:#fff;box-shadow:0 4px 14px rgba(0,0,0,.14)}
+.hero .appicon::after{content:"";position:absolute;left:18px;top:22px;width:16px;height:12px;border-radius:4px;background:rgba(255,255,255,.92);box-shadow:0 16px 0 rgba(255,255,255,.66),0 32px 0 rgba(255,255,255,.4)}
+.hero h1{font-size:28px;font-weight:600;margin-top:22px;letter-spacing:.5px}
+.hero .cat{display:inline-block;margin-top:14px;padding:8px 20px;border-radius:980px;font-size:14.5px;font-weight:700;letter-spacing:.5px;border:1.5px solid rgba(110,90,224,.35);background:rgba(110,90,224,.06)}
+.hero .cat span{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero .slogan{font-size:clamp(42px,7.4vw,80px);font-weight:700;line-height:1.08;letter-spacing:-.02em;margin-top:10px}
+.hero .slogan .g{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero .sub{max-width:660px;margin:28px auto 0;font-size:19px;line-height:1.6;color:var(--txt2)}
+.hero .badges{margin-top:20px;font-size:13px;color:var(--txt3);letter-spacing:.5px}
+.cta-row{margin-top:30px;display:flex;gap:18px;justify-content:center;align-items:center;flex-wrap:wrap}
+.btn{display:inline-block;border-radius:980px;font-size:15.5px;font-weight:500;padding:13px 28px;transition:.2s}
+.btn-grad{background:var(--grad);color:#fff}
+.btn-grad:hover{filter:brightness(1.08);transform:scale(1.02)}
+.link-blue{color:var(--blue);font-size:15.5px}
+.link-blue:hover{text-decoration:underline}
+
+/* hero visual */
+.hero-visual{margin:64px auto 0;max-width:1100px;padding:0 24px;transform-origin:50% 0}
+.mac{background:linear-gradient(180deg,#fafafa,#f0f0f2);border:1px solid var(--line);border-radius:24px;padding:14px 14px 0;box-shadow:0 30px 80px rgba(0,0,0,.16)}
+.screen{background:linear-gradient(160deg,#eef1f6,#e6e9f2);border-radius:14px 14px 0 0;padding:22px 22px 26px;position:relative;overflow:hidden}
+.screen::before{content:"";position:absolute;inset:0;background:radial-gradient(700px 300px at 75% -10%,rgba(110,90,224,.10),transparent 60%),radial-gradient(600px 300px at 15% 0%,rgba(10,162,184,.10),transparent 60%)}
+.spaces{display:flex;gap:10px;justify-content:center;position:relative}
+.space-pill{font-size:12.5px;padding:7px 18px;border-radius:980px;background:#fff;color:var(--txt3);border:1px solid var(--line)}
+.space-pill.on{color:var(--txt);border-color:rgba(10,162,184,.5);box-shadow:0 2px 10px rgba(10,162,184,.18);font-weight:600}
+.space-pill.on .sdot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--cyan);margin-right:7px}
+.ws-grid{display:grid;grid-template-columns:150px 1fr;gap:16px;margin-top:18px;position:relative}
+.rail{display:flex;flex-direction:column;gap:10px}
+.stagecard{background:#fff;border:1px solid var(--line);border-radius:12px;padding:10px 12px;font-size:11px;color:var(--txt2);text-align:left;box-shadow:var(--shadow-sm)}
+.stagecard .row{display:flex;align-items:center;gap:6px;font-weight:600;color:var(--txt);font-size:11.5px}
+.dot{width:7px;height:7px;border-radius:50%;flex:none}
+.dot.c{background:var(--cyan)}.dot.a{background:var(--amber)}.dot.g{background:var(--green)}
+.skel{height:5px;border-radius:3px;background:#ececf1;margin-top:7px}
+.stagecard.hot{border-color:rgba(255,159,10,.55);box-shadow:0 4px 18px rgba(255,159,10,.22)}
+@keyframes breathe{0%,100%{opacity:1}50%{opacity:.35}}
+.led{animation:breathe 1.8s ease-in-out infinite}
+.dashwin{background:#fff;border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);overflow:hidden;text-align:left}
+.titlebar{display:flex;align-items:center;gap:6px;padding:10px 14px;border-bottom:1px solid #ececf1}
+.tl{width:10px;height:10px;border-radius:50%}
+.tl.r{background:#ff5f57}.tl.y{background:#febc2e}.tl.g{background:#28c840}
+.titlebar .t{margin-left:8px;font-size:11px;letter-spacing:1.5px;color:var(--txt3);font-weight:600}
+.dashrows{padding:8px 14px 6px}
+.drow{display:flex;align-items:center;gap:9px;padding:9px 2px;border-bottom:1px solid #f2f2f5;font-size:13px}
+.drow:last-child{border-bottom:none}
+.drow .nm{font-weight:600}
+.drow .st{margin-left:auto;font-size:11.5px;color:var(--txt3)}
+.chipbtn{font-size:11px;font-weight:600;color:var(--amber-t);background:rgba(255,159,10,.14);border:1px solid rgba(255,159,10,.4);padding:4px 10px;border-radius:980px;margin-left:auto;white-space:nowrap}
+.consolebar{display:flex;gap:8px;padding:10px 14px;border-top:1px solid #ececf1;background:#fafafa}
+.miniwin{flex:1;border:1px solid var(--line);border-radius:8px;padding:8px 0;text-align:center;font-size:10.5px;color:var(--txt3);background:#fff}
+.hero-cap{margin-top:16px;text-align:center;font-size:13px;color:var(--txt3)}
+.macbase{height:16px;background:linear-gradient(180deg,#e2e2e6,#c9c9cf);border-radius:0 0 18px 18px;margin:0 -14px;border-top:1px solid #d5d5da}
+
+/* ---------- highlights gallery ---------- */
+.highlights{padding:120px 0 40px}
+.sec-head{font-size:clamp(30px,4.6vw,48px);font-weight:700;letter-spacing:-.02em}
+.gallery-head{display:flex;align-items:flex-end;justify-content:space-between;gap:20px}
+.arrows{display:flex;gap:10px}
+.arrow{width:38px;height:38px;border-radius:50%;background:var(--bg2);font-size:17px;color:var(--txt2);transition:.2s;display:flex;align-items:center;justify-content:center}
+.arrow:hover{background:#e8e8ed;color:var(--txt)}
+.gallery{display:flex;gap:22px;overflow-x:auto;scroll-snap-type:x mandatory;padding:34px 24px 20px;margin:0 -24px;scrollbar-width:none}
+.gallery::-webkit-scrollbar{display:none}
+.gcard{flex:0 0 min(78vw,420px);scroll-snap-align:center;background:#0e0e12;color:#f5f5f7;border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow);transition:transform .3s}
+.gcard:hover{transform:translateY(-6px)}
+.gcard .art{height:230px;position:relative;overflow:hidden}
+.gcard .cap{padding:22px 24px 26px;font-size:17px;font-weight:600;line-height:1.45}
+.gcard .cap small{display:block;margin-top:6px;font-size:13px;font-weight:400;color:#a1a1a6}
+.art .glow{position:absolute;inset:0;background:radial-gradient(360px 200px at 70% 0%,rgba(110,90,224,.35),transparent 65%),radial-gradient(320px 200px at 20% 10%,rgba(10,162,184,.3),transparent 60%)}
+.awin{position:absolute;background:#1c1c22;border:1px solid rgba(255,255,255,.14);border-radius:10px}
+.awin .bar{height:8px;margin:8px;border-radius:4px;background:rgba(255,255,255,.14)}
+.apill{position:absolute;font-size:11px;padding:6px 14px;border-radius:980px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);color:#eee}
+.adot{position:absolute;width:10px;height:10px;border-radius:50%}
+
+/* ---------- chapters ---------- */
+.chapter{padding:110px 0}
+.chapter.alt{background:var(--bg2)}
+.kicker{font-size:14px;font-weight:700;letter-spacing:3px;color:var(--txt3)}
+.chapter h2{font-size:clamp(34px,5.2vw,58px);font-weight:700;line-height:1.12;letter-spacing:-.02em;margin-top:14px}
+.chapter h2 .g{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.chapter .lead{max-width:660px;margin-top:22px;font-size:18px;line-height:1.65;color:var(--txt2)}
+.demo-cap{margin-top:16px;font-size:13px;color:var(--txt3);text-align:center}
+
+/* tiles */
+.tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:44px}
+.tile{background:#fff;border-radius:20px;padding:26px 24px;box-shadow:var(--shadow-sm);font-size:14.5px;color:var(--txt2);line-height:1.6}
+.tile b{display:block;font-size:16.5px;margin-bottom:6px}
+.chapter:not(.alt) .tile{background:var(--bg2);box-shadow:none}
+
+/* ---------- ch1 desktop demo ---------- */
+.dt-demo{margin-top:48px;background:#fff;border-radius:var(--radius);box-shadow:var(--shadow);padding:26px;overflow:hidden}
+.dt-pills{display:flex;gap:10px;justify-content:center;flex-wrap:wrap}
+.dt-pill{font-size:13.5px;padding:9px 22px;border-radius:980px;background:#f0f0f3;color:var(--txt2);border:1px solid transparent;transition:.25s}
+.dt-pill.on{background:#fff;color:var(--txt);font-weight:600;border-color:rgba(10,162,184,.45);box-shadow:0 2px 12px rgba(10,162,184,.16)}
+.dt-view{margin-top:20px;border-radius:18px;overflow:hidden;border:1px solid var(--line);background:linear-gradient(160deg,#eef1f6,#e8ebf3)}
+.dt-track{display:flex;width:200%;transition:transform .65s cubic-bezier(.3,.7,.2,1)}
+.dt-scene{width:50%;flex:none;padding:26px;min-height:300px;position:relative}
+.docwin{max-width:420px;margin:22px auto 0;background:#fff;border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow-sm);padding-bottom:16px}
+.docwin .lines{padding:14px 18px 0}
+.docwin .ln{height:8px;border-radius:4px;background:#ececf1;margin-bottom:10px}
+.scene-tag{text-align:center;font-size:12.5px;color:var(--txt3);margin-top:18px}
+.ai-grid{display:grid;grid-template-columns:1.5fr 1fr;gap:14px;max-width:640px;margin:0 auto}
+.ai-side{display:flex;flex-direction:column;gap:10px}
+.sidewin{flex:1;background:#fff;border:1px solid var(--line);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--txt3);box-shadow:var(--shadow-sm);min-height:52px}
+.sidewin i{font-style:normal;font-weight:600}
+.kbd{display:inline-block;font-size:12px;border:1px solid var(--line);border-bottom-width:2px;border-radius:6px;padding:1px 7px;background:#fff;color:var(--txt2);font-family:ui-monospace,Menlo,monospace}
+
+/* ---------- ch2 stage demo ---------- */
+.st-demo{margin-top:48px;display:grid;grid-template-columns:260px 1fr;gap:20px;align-items:stretch}
+.st-rail{display:flex;flex-direction:column;gap:12px}
+.taskbtn{text-align:left;background:var(--bg2);border-radius:16px;padding:16px 18px;border:1.5px solid transparent;transition:.25s;font-size:13px;color:var(--txt2)}
+.taskbtn .nm{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:600;color:var(--txt)}
+.taskbtn .meta{display:block;margin-top:5px;font-size:12.5px}
+.taskbtn:hover{background:#eeeef2}
+.taskbtn.on{background:#fff;border-color:rgba(10,162,184,.55);box-shadow:0 6px 24px rgba(10,162,184,.14)}
+.taskbtn.wait.on{border-color:rgba(255,159,10,.6);box-shadow:0 6px 24px rgba(255,159,10,.18)}
+.st-stage{background:var(--bg2);border-radius:var(--radius);padding:24px;position:relative;overflow:hidden;min-height:340px}
+.st-head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+.st-head .ttl{font-size:17px;font-weight:700}
+.st-head .st{font-size:13px;color:var(--txt3)}
+.st-windows{display:grid;grid-template-columns:1.4fr 1fr;gap:12px;margin-top:16px}
+.bigwin{grid-row:span 2;background:#fff;border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow-sm);overflow:hidden;display:flex;flex-direction:column}
+.bigwin .body{flex:1;padding:12px 14px;font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--txt2);line-height:1.9}
+.smallwin{background:#fff;border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow-sm);min-height:120px;display:flex;flex-direction:column}
+.smallwin .body{flex:1;display:flex;align-items:center;justify-content:center;font-size:12.5px;color:var(--txt3);padding:10px;text-align:center;line-height:1.7}
+.swap{animation:swapin .45s cubic-bezier(.2,.7,.2,1)}
+@keyframes swapin{0%{opacity:0;transform:scale(.965) translateY(10px)}100%{opacity:1;transform:none}}
+.st-mode{margin-top:22px;display:flex;justify-content:center;align-items:center;gap:14px;font-size:13.5px;color:var(--txt2);flex-wrap:wrap}
+.seg{display:flex;background:var(--bg2);border-radius:980px;padding:3px}
+.seg button{font-size:13px;padding:7px 18px;border-radius:980px;color:var(--txt2);transition:.2s}
+.seg button.on{background:#fff;color:var(--txt);font-weight:600;box-shadow:var(--shadow-sm)}
+
+/* ---------- ch3 notify ---------- */
+.chapter.gradbg{background:
+  radial-gradient(900px 420px at 80% 0%,rgba(110,90,224,.12),transparent 60%),
+  radial-gradient(800px 400px at 10% 20%,rgba(10,162,184,.10),transparent 60%),var(--bg2)}
+.nf-demo{margin-top:48px;background:#fff;border-radius:var(--radius);box-shadow:var(--shadow);padding:30px;position:relative;overflow:hidden;min-height:330px}
+.nf-btnrow{text-align:center;margin-top:26px}
+.notif{position:absolute;top:26px;right:26px;width:min(400px,86%);background:rgba(250,250,252,.92);backdrop-filter:blur(14px);border:1px solid var(--line);border-radius:18px;box-shadow:0 18px 50px rgba(0,0,0,.18);padding:18px 20px;opacity:0;transform:translateY(-16px) scale(.97);pointer-events:none;transition:.45s cubic-bezier(.2,.7,.2,1);z-index:5}
+.notif.show{opacity:1;transform:none;pointer-events:auto}
+.notif .hd{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:700}
+.notif .bd{margin-top:8px;font-size:13px;color:var(--txt2);line-height:1.65}
+.notif .acts{margin-top:14px;display:flex;gap:10px}
+.nbtn{font-size:12.5px;font-weight:600;padding:7px 16px;border-radius:980px;transition:.2s}
+.nbtn.ok{background:var(--txt);color:#fff}
+.nbtn.ok:hover{transform:scale(1.04)}
+.nbtn.ghost{background:var(--bg2);color:var(--txt)}
+.ladder{max-width:600px;margin:0 auto}
+.lrow{display:grid;grid-template-columns:110px 1fr 190px;align-items:center;gap:14px;padding:13px 0;border-bottom:1px solid #ececf1;font-size:14px}
+.lrow:last-child{border-bottom:none}
+.lrow .lv{color:var(--txt3);font-size:13px}
+.lbar{height:10px;border-radius:5px}
+.lrow .how{color:var(--txt2);font-size:13px;text-align:right}
+
+/* ---------- ch4 report ---------- */
+.rp-demo{margin-top:48px;display:grid;grid-template-columns:1.25fr 1fr;gap:22px;align-items:start}
+.rp-card,.rp-side{background:var(--bg2);border-radius:var(--radius);padding:28px}
+.rp-card h4,.rp-side h4{font-size:13px;letter-spacing:2px;color:var(--txt3);font-weight:700}
+.rp-card .ttl{font-size:19px;font-weight:700;margin-top:8px}
+.rp-sec{margin-top:18px;font-size:14px;line-height:1.7;color:var(--txt2)}
+.rp-sec b{font-size:14.5px}
+.rp-doubt{margin-top:18px;background:rgba(255,159,10,.1);border:1px solid rgba(255,159,10,.35);border-radius:14px;padding:14px 16px;font-size:13.5px;color:var(--amber-t);line-height:1.65}
+.rp-doubt b{color:var(--amber-t)}
+.rp-verdict{margin-top:12px;background:rgba(10,162,184,.08);border:1px solid rgba(10,162,184,.35);border-radius:14px;padding:14px 16px;font-size:13.5px;color:#07697a;line-height:1.65}
+.rp-verdict b{color:#07697a}
+.rp-acts{margin-top:20px;display:flex;gap:10px;flex-wrap:wrap}
+.timeline{margin-top:18px;position:relative;padding-left:4px}
+.tstep{display:flex;gap:14px;padding:0 0 26px;position:relative}
+.tstep::before{content:"";position:absolute;left:9px;top:22px;bottom:0;width:2px;background:#e2e2e7}
+.tstep:last-child{padding-bottom:6px}
+.tstep:last-child::before{display:none}
+.tdot{width:20px;height:20px;border-radius:50%;background:#fff;border:2px solid #cfcfd6;flex:none;position:relative;z-index:1;transition:.25s}
+.tstep.done .tdot{border-color:var(--green);background:var(--green);box-shadow:0 0 0 4px rgba(52,199,89,.15)}
+.tstep.cur .tdot{border-color:var(--cyan);background:#fff;box-shadow:0 0 0 4px rgba(10,162,184,.18)}
+.tstep .tt{font-size:14px;font-weight:600;line-height:20px}
+.tstep .ts{font-size:12px;color:var(--txt3);margin-top:2px}
+.tstep.rolled{opacity:.32;filter:saturate(0)}
+.rollbtn{margin-top:14px;width:100%;text-align:center;font-size:13.5px;font-weight:600;color:var(--red);background:rgba(255,69,58,.08);border:1px solid rgba(255,69,58,.3);padding:11px;border-radius:14px;transition:.2s}
+.rollbtn:hover{background:rgba(255,69,58,.14)}
+
+/* ---------- photo bands (real scenes) ---------- */
+.photo-band{position:relative;height:min(74vh,620px);overflow:hidden;background:#101014}
+.photo-band img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
+.photo-band .shade{position:absolute;inset:0;background:linear-gradient(180deg,rgba(0,0,0,.05) 30%,rgba(0,0,0,.62) 100%)}
+.photo-band .txt{position:absolute;left:0;right:0;bottom:0;padding:0 24px 54px;color:#fff;text-align:center}
+.photo-band .txt .pk{font-size:13px;font-weight:700;letter-spacing:3px;opacity:.8}
+.photo-band .txt .pl{margin-top:10px;font-size:clamp(26px,4.6vw,44px);font-weight:700;letter-spacing:-.01em;text-shadow:0 2px 24px rgba(0,0,0,.45)}
+.photo-band .txt .ps{margin-top:10px;font-size:15px;opacity:.85}
+.photo-band .credit{position:absolute;right:14px;bottom:12px;font-size:10.5px;color:rgba(255,255,255,.55);z-index:2}
+
+/* ---------- stats band ---------- */
+.band{position:relative;background:#101014;color:#f5f5f7;padding:110px 0;text-align:center;overflow:hidden}
+.band .bgimg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.34;filter:saturate(.85)}
+.band .bgshade{position:absolute;inset:0;background:linear-gradient(180deg,rgba(12,12,16,.82),rgba(12,12,16,.9))}
+.band .wrap{position:relative;z-index:1}
+.band .g{background:linear-gradient(100deg,#3ed3e4,#9b8cff);-webkit-background-clip:text;background-clip:text;color:transparent}
+.band .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;margin-top:64px}
+.band .num{font-size:clamp(44px,6vw,68px);font-weight:700;background:linear-gradient(100deg,#3ed3e4,#9b8cff);-webkit-background-clip:text;background-clip:text;color:transparent}
+.band .lbl{margin:10px auto 0;max-width:280px;font-size:14.5px;color:#a1a1a6;line-height:1.6}
+.band .src{margin-top:54px;font-size:12px;color:#6e6e73}
+
+/* ---------- compat ---------- */
+.compat{padding:120px 0;text-align:center}
+.chips{margin-top:44px;display:flex;flex-wrap:wrap;gap:12px;justify-content:center}
+.chip{padding:13px 28px;border-radius:980px;background:var(--bg2);font-size:15px;font-weight:600;transition:.2s}
+.chip:hover{transform:translateY(-3px);box-shadow:var(--shadow-sm)}
+.chip.soon{color:var(--txt3);font-weight:400;background:#fff;border:1px dashed var(--line)}
+.compat .note{margin-top:28px;font-size:13px;color:var(--txt3)}
+
+/* ---------- faq ---------- */
+.faq{background:var(--bg2);padding:110px 0}
+.faq-list{margin-top:44px;border-top:1px solid var(--line)}
+.qa{border-bottom:1px solid var(--line)}
+.qa .q{width:100%;display:flex;justify-content:space-between;align-items:center;gap:20px;text-align:left;padding:24px 4px;font-size:18px;font-weight:600}
+.qa .q .ic{font-size:22px;color:var(--txt3);transition:transform .35s;flex:none}
+.qa.open .q .ic{transform:rotate(45deg)}
+.qa .a{max-height:0;overflow:hidden;transition:max-height .45s cubic-bezier(.3,.7,.2,1)}
+.qa .a p{padding:0 4px 26px;max-width:760px;font-size:15.5px;line-height:1.7;color:var(--txt2)}
+
+/* ---------- cta ---------- */
+.cta{padding:130px 0;text-align:center;background:
+  radial-gradient(700px 340px at 30% 0%,rgba(10,162,184,.10),transparent 60%),
+  radial-gradient(700px 340px at 75% 100%,rgba(110,90,224,.12),transparent 60%)}
+.cta .sec-head{font-size:clamp(34px,5.2vw,56px)}
+.cta .lead{max-width:600px;margin:20px auto 0;font-size:17.5px;color:var(--txt2);line-height:1.65}
+.mono{margin-top:26px;font-family:ui-monospace,Menlo,monospace;font-size:13.5px;color:var(--txt3)}
+.gtxt{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+
+/* ---------- agent presence ---------- */
+.duty{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;font-weight:600;color:var(--txt3);border:1px solid var(--line);border-radius:980px;padding:3px 11px;white-space:nowrap}
+.ddot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:breathe 1.8s ease-in-out infinite;flex:none}
+.feed{max-width:640px;margin:30px auto 0;background:#0e0e12;border-radius:16px;padding:16px 20px 14px;text-align:left;box-shadow:var(--shadow)}
+.feed-head{display:flex;align-items:center;gap:8px;font-size:11px;letter-spacing:2px;color:#9a9aa2;font-weight:700}
+.feed-body{margin-top:10px;font-family:ui-monospace,Menlo,monospace;font-size:12.5px;line-height:2.1;color:#c7ccd6;min-height:164px}
+.fl:last-child::after{content:"▍";color:#3ed3e4;animation:breathe 1s infinite}
+
+/* ---------- division of labor loop ---------- */
+.loop{padding:100px 0 120px}
+.loop .lead{max-width:640px;margin-top:20px;font-size:18px;line-height:1.65;color:var(--txt2)}
+.loop-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:26px;margin-top:48px}
+.lcard{background:var(--bg2);border-radius:20px;padding:24px 22px;font-size:13.5px;color:var(--txt2);line-height:1.65;position:relative}
+.lcard .ln{display:block;font-size:12px;font-weight:700;letter-spacing:2px;color:var(--txt3);margin-bottom:10px}
+.lcard b{display:block;font-size:16.5px;margin-bottom:6px;color:var(--txt)}
+.lcard:not(:last-child)::after{content:"→";position:absolute;right:-21px;top:50%;transform:translateY(-50%);color:#b8b8bf;font-size:17px}
+
+/* ---------- manifesto ---------- */
+.manifesto{background:#0b0b0f;color:#f5f5f7;padding:130px 0;text-align:center}
+.manifesto .mani{max-width:840px;margin:0 auto;font-size:clamp(21px,3vw,32px);font-weight:600;line-height:1.7;letter-spacing:-.01em}
+.manifesto .mani .g{background:linear-gradient(100deg,#3ed3e4,#9b8cff);-webkit-background-clip:text;background-clip:text;color:transparent}
+.mani-sign{margin-top:30px;font-size:14px;color:#6e6e73}
+
+/* ---------- footer ---------- */
+footer{border-top:1px solid var(--line);padding:32px 0 44px;font-size:12.5px;color:var(--txt3)}
+.foot-in{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap}
+.footnote{margin-top:14px;font-size:11.5px;line-height:1.7}
+
+/* ---------- toast ---------- */
+#toast{position:fixed;left:50%;bottom:34px;transform:translateX(-50%) translateY(20px);background:rgba(29,29,31,.92);color:#fff;font-size:13.5px;padding:11px 22px;border-radius:980px;opacity:0;pointer-events:none;transition:.4s cubic-bezier(.2,.7,.2,1);z-index:200;box-shadow:0 10px 30px rgba(0,0,0,.25);max-width:86vw;text-align:center}
+#toast.show{opacity:1;transform:translateX(-50%)}
+
+/* ---------- roadmap badges ---------- */
+.rmk{display:inline-block;margin-left:10px;font-size:11px;font-weight:700;letter-spacing:1.5px;color:var(--amber-t);background:rgba(255,159,10,.14);border:1px solid rgba(255,159,10,.4);padding:3px 10px;border-radius:980px;vertical-align:2px}
+.demo-badge{position:absolute;top:14px;right:16px;font-size:10.5px;font-weight:700;letter-spacing:1px;color:var(--txt3);background:#fff;border:1px dashed var(--line);padding:3px 10px;border-radius:980px}
+.rp-card{position:relative}
+
+/* ---------- shipping-today outbox demo ---------- */
+.ob-demo{margin-top:48px;max-width:720px}
+.ob-card{background:#fff;border:1.5px solid rgba(255,159,10,.45);border-radius:20px;padding:22px 24px;box-shadow:0 10px 36px rgba(255,159,10,.12)}
+.ob-badges{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.obb{font-size:11px;font-weight:700;padding:3px 10px;border-radius:980px}
+.obb.amber{color:var(--amber-t);background:rgba(255,159,10,.14);border:1px solid rgba(255,159,10,.4)}
+.obb.red{color:#c53229;background:rgba(255,69,58,.1);border:1px solid rgba(255,69,58,.35)}
+.ob-wait{margin-left:auto;font-size:11.5px;color:var(--txt3)}
+.ob-title{margin-top:12px;font-size:18px;font-weight:700}
+.ob-src{margin-top:6px;font-size:12.5px;color:var(--txt3)}
+.ob-cmd{margin-top:14px;display:flex;align-items:center;gap:10px;background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:10px 14px;font-family:ui-monospace,Menlo,monospace;font-size:13px}
+.ob-tool{font-size:11px;font-weight:700;background:#fff;border:1px solid var(--line);padding:2px 8px;border-radius:6px}
+.ob-risk{margin-top:10px;font-size:12.5px;color:var(--amber-t)}
+.ob-acts{margin-top:16px;display:flex;gap:10px;flex-wrap:wrap}
+.undo-pill{margin-top:14px;display:flex;align-items:center;gap:12px;background:rgba(52,199,89,.1);border:1px solid rgba(52,199,89,.35);border-radius:980px;padding:10px 14px}
+.undo-ring{width:34px;height:34px;border-radius:50%;background:conic-gradient(#1e9e46 100%,#dfe7df 0);display:flex;align-items:center;justify-content:center;flex:none}
+.undo-ring i{font-style:normal;width:26px;height:26px;border-radius:50%;background:#fff;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#1e9e46}
+.undo-txt{font-size:13px;color:#1e6f3d;flex:1;line-height:1.5}
+[hidden]{display:none!important}
+
+@media(max-width:860px){
+  .lnav .links{display:none}
+  .loop-grid{grid-template-columns:1fr}
+  .lcard:not(:last-child)::after{content:"↓";right:auto;left:50%;top:auto;bottom:-24px;transform:translateX(-50%)}
+  .ws-grid{grid-template-columns:1fr}
+  .rail{flex-direction:row}
+  .rail .stagecard{flex:1}
+  .tiles{grid-template-columns:1fr}
+  .st-demo{grid-template-columns:1fr}
+  .st-rail{flex-direction:row;overflow-x:auto;padding-bottom:4px}
+  .st-rail .taskbtn{flex:1 0 200px}
+  .rp-demo{grid-template-columns:1fr}
+  .band .grid{grid-template-columns:1fr}
+  .lrow{grid-template-columns:90px 1fr}
+  .lrow .how{grid-column:1/3;text-align:left}
+  .ai-grid{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+
+<!-- ============ local nav ============ -->
+<nav class="lnav"><div class="wrap-wide lnav-in">
+  <span style="display:inline-flex;align-items:center;gap:12px"><a class="name" href="#top"><span class="mark"></span>ActRealm</a><span class="duty"><span class="ddot"></span><span data-i="nav.duty"></span></span></span>
+  <div class="links">
+    <a href="#highlights" data-i="nav.hl"></a><a href="#now" data-i="nav.now"></a><a href="#ws" data-i="nav.ws"></a><a href="#stage" data-i="nav.st"></a><a href="#notify" data-i="nav.nf"></a><a href="#report" data-i="nav.rp"></a><a href="#faq" data-i="nav.faq"></a>
+  </div>
+  <div class="right">
+    <div class="langseg" id="langSeg">
+      <button data-l="en" class="on">EN</button><button data-l="zh">中文</button>
+    </div>
+    <a class="pill-cta" href="#cta" data-i="nav.cta"></a>
+  </div>
+</div></nav>
+
+<!-- ============ hero ============ -->
+<header class="hero" id="top">
+  <div class="wrap">
+    <div class="appicon reveal"></div>
+    <h1 class="reveal d1" data-i="brand.name">ActRealm</h1>
+    <div class="reveal d1"><div class="cat"><span data-i="hero.cat"></span></div></div>
+    <div class="slogan reveal d1" data-i="hero.slogan"></div>
+    <p class="sub reveal d2" data-i="hero.sub"></p>
+    <div class="badges reveal d2" data-i="hero.badges"></div>
+    <div class="cta-row reveal d3">
+      <a class="btn btn-grad" href="#cta" data-i="hero.cta1"></a>
+      <a class="link-blue" href="#ws" data-i="hero.cta2"></a>
+    </div>
+  </div>
+
+  <div class="hero-visual reveal d3" id="heroVisual">
+    <div class="mac">
+      <div class="screen">
+        <div class="spaces">
+          <span class="space-pill" data-i="mock.d1"></span>
+          <span class="space-pill on"><span class="sdot"></span><span data-i="mock.ws"></span></span>
+        </div>
+        <div class="ws-grid">
+          <div class="rail">
+            <div class="stagecard"><div class="row"><span class="dot c"></span><span data-i="mock.s1"></span></div><div class="skel" style="width:80%"></div><div class="skel" style="width:55%"></div></div>
+            <div class="stagecard hot"><div class="row"><span class="dot a led"></span><span data-i="mock.s2"></span></div><div class="skel" style="width:80%;background:rgba(255,159,10,.25)"></div><div class="skel" style="width:55%"></div></div>
+            <div class="stagecard"><div class="row"><span class="dot g"></span><span data-i="mock.s3"></span></div><div class="skel" style="width:80%"></div><div class="skel" style="width:55%"></div></div>
+          </div>
+          <div class="dashwin">
+            <div class="titlebar"><span class="tl r"></span><span class="tl y"></span><span class="tl g"></span><span class="t" data-i="mock.dash"></span></div>
+            <div class="dashrows">
+              <div class="drow"><span class="dot c"></span><span class="nm" data-i="mock.r1"></span><span class="st" data-i="mock.r1s"></span></div>
+              <div class="drow"><span class="dot a led"></span><span class="nm" data-i="mock.r2"></span><span class="chipbtn" data-i="mock.r2b"></span></div>
+              <div class="drow"><span class="dot g"></span><span class="nm" data-i="mock.r3"></span><span class="st" data-i="mock.r3s"></span></div>
+            </div>
+            <div class="consolebar">
+              <div class="miniwin" data-i="w.term"></div><div class="miniwin">diff</div><div class="miniwin" data-i="w.prev"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="macbase"></div>
+    </div>
+    <p class="hero-cap" data-i="mock.cap"></p>
+    <div class="feed">
+      <div class="feed-head"><span class="ddot"></span><span data-i="feed.title"></span></div>
+      <div class="feed-body" id="feedBody"></div>
+    </div>
+  </div>
+</header>
+
+<!-- ============ highlights ============ -->
+<section class="highlights" id="highlights"><div class="wrap-wide">
+  <div class="gallery-head reveal">
+    <h2 class="sec-head" data-i="hl.head"></h2>
+    <div class="arrows"><button class="arrow" id="galL" aria-label="Previous">←</button><button class="arrow" id="galR" aria-label="Next">→</button></div>
+  </div>
+  <div class="gallery reveal d1" id="gallery">
+    <div class="gcard"><div class="art"><div class="glow"></div>
+        <span class="apill" style="top:26px;left:24px" data-i="hl.p1"></span>
+        <span class="apill" style="top:26px;left:118px;border-color:rgba(62,211,228,.6);color:#3ed3e4" data-i="hl.p2"></span>
+        <div class="awin" style="top:80px;left:24px;right:150px;bottom:-30px"><div class="bar" style="width:40%"></div><div class="bar" style="width:70%"></div><div class="bar" style="width:55%"></div></div>
+        <div class="awin" style="top:96px;right:24px;width:110px;height:60px"></div>
+        <div class="awin" style="top:166px;right:24px;width:110px;height:60px"></div>
+      </div>
+      <div class="cap" data-i="hl.c1"></div>
+    </div>
+    <div class="gcard"><div class="art"><div class="glow"></div>
+        <div class="awin" style="top:30px;left:24px;width:92px;height:52px"></div>
+        <div class="awin" style="top:92px;left:24px;width:92px;height:52px;border-color:rgba(255,159,10,.7)"><div class="bar" style="background:rgba(255,159,10,.4);width:60%"></div></div>
+        <div class="awin" style="top:154px;left:24px;width:92px;height:52px"></div>
+        <div class="awin" style="top:40px;left:150px;right:24px;bottom:24px"><div class="bar" style="width:35%"></div><div class="bar" style="width:75%"></div><div class="bar" style="width:60%"></div><div class="bar" style="width:45%"></div></div>
+        <span class="adot led" style="top:104px;left:36px;background:#ff9f0a"></span>
+      </div>
+      <div class="cap" data-i="hl.c2"></div>
+    </div>
+    <div class="gcard"><div class="art"><div class="glow"></div>
+        <div class="awin" style="top:56px;left:40px;right:40px;height:120px;border-color:rgba(255,159,10,.5)">
+          <div class="bar" style="width:45%;background:rgba(255,255,255,.3)"></div>
+          <div class="bar" style="width:80%"></div><div class="bar" style="width:66%"></div>
+          <span class="apill" style="bottom:14px;left:8px;font-size:10px;padding:4px 10px;background:rgba(255,255,255,.9);color:#111" data-i="hl.pa"></span>
+          <span class="apill" style="bottom:14px;left:80px;font-size:10px;padding:4px 10px" data-i="hl.pb"></span>
+        </div>
+        <span class="adot led" style="top:66px;left:52px;background:#ff9f0a"></span>
+      </div>
+      <div class="cap" data-i="hl.c3"></div>
+    </div>
+    <div class="gcard"><div class="art"><div class="glow"></div>
+        <div class="awin" style="top:30px;left:32px;right:32px;bottom:-20px">
+          <div class="bar" style="width:30%;background:rgba(62,211,228,.5)"></div>
+          <div class="bar" style="width:76%"></div><div class="bar" style="width:64%"></div>
+          <div class="bar" style="width:50%;background:rgba(255,159,10,.4)"></div>
+          <div class="bar" style="width:70%"></div>
+        </div>
+        <span class="adot" style="bottom:44px;left:52px;background:#34c759"></span>
+        <span class="adot" style="bottom:44px;left:112px;background:#34c759"></span>
+        <span class="adot" style="bottom:44px;left:172px;background:#34c759"></span>
+        <span class="adot" style="bottom:44px;left:232px;background:#3ed3e4"></span>
+      </div>
+      <div class="cap" data-i="hl.c4"></div>
+    </div>
+    <div class="gcard"><div class="art"><div class="glow"></div>
+        <div class="awin" style="top:40px;left:40px;right:40px;height:130px;display:flex;align-items:center;justify-content:center">
+          <span style="font-family:ui-monospace,Menlo,monospace;font-size:13px;color:#8ee7ef">MIT · local-first · no required backend</span>
+        </div>
+      </div>
+      <div class="cap" data-i="hl.c5"></div>
+    </div>
+    <div class="gcard"><div class="art">
+        <img src="https://images.unsplash.com/photo-1754039985001-ccafee437736?q=70&w=1200&auto=format&fit=crop" alt="A real multi-monitor developer desk" loading="lazy" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover" onerror="this.style.display='none'">
+      </div>
+      <div class="cap" data-i="hl.c6"></div>
+    </div>
+  </div>
+</div></section>
+
+<!-- ============ division of labor ============ -->
+<section class="loop"><div class="wrap">
+  <div class="kicker reveal" data-i="lp.k"></div>
+  <h2 class="sec-head reveal d1" style="margin-top:14px" data-i="lp.h"></h2>
+  <p class="lead reveal d2" data-i="lp.lead"></p>
+  <div class="loop-grid reveal d2">
+    <div class="lcard"><span class="ln">01</span><div data-i="lp.c1"></div></div>
+    <div class="lcard"><span class="ln">02</span><div data-i="lp.c2"></div></div>
+    <div class="lcard"><span class="ln">03</span><div data-i="lp.c3"></div></div>
+    <div class="lcard"><span class="ln">04</span><div data-i="lp.c4"></div></div>
+  </div>
+</div></section>
+
+<!-- ============ shipping today ============ -->
+<section class="chapter alt" id="now"><div class="wrap">
+  <div class="kicker reveal" data-i="now.k"></div>
+  <h2 class="reveal d1" data-i="now.h"></h2>
+  <p class="lead reveal d2" data-i="now.lead"></p>
+
+  <div class="ob-demo reveal d2">
+    <div class="ob-card" id="obCard">
+      <div class="ob-badges"><span class="obb amber" data-i="now.b1"></span><span class="obb red" data-i="now.b2"></span><span class="ob-wait" data-i="now.wait"></span></div>
+      <div class="ob-title" data-i="now.title"></div>
+      <div class="ob-src" data-i="now.src"></div>
+      <div class="ob-cmd"><span class="ob-tool">Bash</span><code style="background:none;padding:0">curl &lt;redacted&gt; | sh</code></div>
+      <div class="ob-risk" data-i="now.risk"></div>
+      <div class="ob-acts">
+        <button class="nbtn ok" id="obCheck" data-i="now.a1"></button>
+        <button class="nbtn ghost" id="obDeny" data-i="now.a2"></button>
+        <button class="nbtn ghost" id="obAllow" data-i="now.a3"></button>
+      </div>
+    </div>
+    <div class="undo-pill" id="undoPill" hidden>
+      <span class="undo-ring" id="undoRing"><i id="undoNum">3</i></span>
+      <span class="undo-txt" id="undoTxt"></span>
+      <button class="nbtn ghost" id="undoBtn" data-i="now.u2"></button>
+    </div>
+    <p class="demo-cap" data-i="now.cap"></p>
+  </div>
+
+  <div class="tiles">
+    <div class="tile reveal" data-i="now.t1"></div>
+    <div class="tile reveal d1" data-i="now.t2"></div>
+    <div class="tile reveal d2" data-i="now.t3"></div>
+  </div>
+</div></section>
+
+<!-- ============ photo band A ============ -->
+<section class="photo-band reveal">
+  <img src="https://images.unsplash.com/photo-1486312338219-ce68d2c6f44d?q=70&w=2000&auto=format&fit=crop" alt="A person typing on a MacBook Pro" loading="lazy" onerror="this.style.display='none'">
+  <div class="shade"></div>
+  <div class="txt">
+    <div class="pk" data-i="pbA.k"></div>
+    <div class="pl" data-i="pbA.l"></div>
+    <div class="ps" data-i="pbA.s"></div>
+  </div>
+  <span class="credit">Photo: Glenn Carstens-Peters / Unsplash</span>
+</section>
+
+<!-- ============ ch1: AI workspace ============ -->
+<section class="chapter alt" id="ws"><div class="wrap">
+  <div class="kicker reveal" data-i="ws.k"></div>
+  <h2 class="reveal d1" data-i="ws.h"></h2>
+  <p class="lead reveal d2" data-i="ws.lead"></p>
+
+  <div class="dt-demo reveal d2">
+    <div class="dt-pills">
+      <button class="dt-pill on" data-d="0" data-i="mock.d1"></button>
+      <button class="dt-pill" data-d="1" data-i="hl.p2"></button>
+    </div>
+    <div class="dt-view"><div class="dt-track" id="dtTrack">
+      <div class="dt-scene">
+        <div class="docwin">
+          <div class="titlebar"><span class="tl r"></span><span class="tl y"></span><span class="tl g"></span><span class="t" data-i="ws.doc"></span></div>
+          <div class="lines"><div class="ln" style="width:82%"></div><div class="ln" style="width:94%"></div><div class="ln" style="width:70%"></div><div class="ln" style="width:88%"></div><div class="ln" style="width:45%"></div></div>
+        </div>
+        <p class="scene-tag" data-i="ws.tag1"></p>
+      </div>
+      <div class="dt-scene">
+        <div class="ai-grid">
+          <div class="dashwin">
+            <div class="titlebar"><span class="tl r"></span><span class="tl y"></span><span class="tl g"></span><span class="t">DASHBOARD</span></div>
+            <div class="dashrows">
+              <div class="drow"><span class="dot c"></span><span class="nm" data-i="ws.r1"></span><span class="st" data-i="ws.r1s"></span></div>
+              <div class="drow"><span class="dot a led"></span><span class="nm" data-i="ws.r2"></span><span class="st" style="color:var(--amber-t)" data-i="ws.r2s"></span></div>
+              <div class="drow"><span class="dot g"></span><span class="nm" data-i="ws.r3"></span><span class="st" data-i="ws.r3s"></span></div>
+            </div>
+          </div>
+          <div class="ai-side">
+            <div class="sidewin"><i data-i="w.term"></i></div>
+            <div class="sidewin"><i>diff</i></div>
+            <div class="sidewin"><i data-i="w.prev"></i></div>
+          </div>
+        </div>
+        <p class="scene-tag" data-i="ws.tag2"></p>
+      </div>
+    </div></div>
+    <p class="demo-cap" data-i="ws.cap"></p>
+  </div>
+
+  <div class="tiles">
+    <div class="tile reveal" data-i="ws.t1"></div>
+    <div class="tile reveal d1" data-i="ws.t2"></div>
+    <div class="tile reveal d2" data-i="ws.t3"></div>
+  </div>
+</div></section>
+
+<!-- ============ ch2: stage switch ============ -->
+<section class="chapter" id="stage"><div class="wrap">
+  <div class="kicker reveal" data-i="st.k"></div>
+  <h2 class="reveal d1" data-i="st.h"></h2>
+  <p class="lead reveal d2" data-i="st.lead"></p>
+
+  <div class="st-demo reveal d2">
+    <div class="st-rail" id="stRail">
+      <button class="taskbtn on" data-t="a"><span class="nm"><span class="dot c"></span><span data-i="st.ta"></span></span><span class="meta" data-i="st.tam"></span></button>
+      <button class="taskbtn wait" data-t="b"><span class="nm"><span class="dot a led"></span><span data-i="st.tb"></span></span><span class="meta" style="color:var(--amber-t)" data-i="st.tbm"></span></button>
+      <button class="taskbtn" data-t="c"><span class="nm"><span class="dot g"></span><span data-i="st.tc"></span></span><span class="meta" data-i="st.tcm"></span></button>
+    </div>
+    <div class="st-stage">
+      <div id="stContent">
+        <div class="st-head"><span class="ttl" id="stTitle"></span><span class="st" id="stStatus"></span></div>
+        <div class="st-windows">
+          <div class="bigwin"><div class="titlebar"><span class="tl r"></span><span class="tl y"></span><span class="tl g"></span><span class="t" data-i="w.term"></span></div><div class="body" id="stTerm"></div></div>
+          <div class="smallwin"><div class="titlebar"><span class="tl r"></span><span class="tl y"></span><span class="tl g"></span><span class="t">diff</span></div><div class="body" id="stDiff"></div></div>
+          <div class="smallwin"><div class="titlebar"><span class="tl r"></span><span class="tl y"></span><span class="tl g"></span><span class="t" data-i="w.prev"></span></div><div class="body" id="stPrev"></div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <p class="demo-cap reveal d3" data-i="st.cap"></p>
+</div></section>
+
+<!-- ============ photo band B ============ -->
+<section class="photo-band reveal">
+  <img src="https://images.unsplash.com/photo-1461632830798-3adb3034e4c8?q=70&w=2000&auto=format&fit=crop" alt="A developer working on an iMac" loading="lazy" onerror="this.style.display='none'">
+  <div class="shade"></div>
+  <div class="txt">
+    <div class="pk" data-i="pbB.k"></div>
+    <div class="pl" data-i="pbB.l"></div>
+    <div class="ps" data-i="pbB.s"></div>
+  </div>
+  <span class="credit">Photo: Lee Campbell / Unsplash</span>
+</section>
+
+<!-- ============ ch3: notify ============ -->
+<section class="chapter gradbg" id="notify"><div class="wrap">
+  <div class="kicker reveal" data-i="nf.k"></div>
+  <h2 class="reveal d1" data-i="nf.h"></h2>
+  <p class="lead reveal d2" data-i="nf.lead"></p>
+
+  <div class="nf-demo reveal d2">
+    <div class="ladder">
+      <div class="lrow"><span class="lv" data-i="nf.l1"></span><div class="lbar" style="width:34%;background:rgba(52,199,89,.35)"></div><span class="how" data-i="nf.l1h"></span></div>
+      <div class="lrow"><span class="lv" data-i="nf.l2"></span><div class="lbar" style="width:62%;background:rgba(255,159,10,.4)"></div><span class="how" data-i="nf.l2h"></span></div>
+      <div class="lrow"><span class="lv" data-i="nf.l3"></span><div class="lbar" style="width:88%;background:rgba(110,90,224,.35)"></div><span class="how" data-i="nf.l3h"></span></div>
+    </div>
+    <div class="nf-btnrow">
+      <button class="btn btn-grad" id="nfTrigger" data-i="nf.btn"></button>
+    </div>
+    <div class="notif" id="notif">
+      <div class="hd"><span class="dot a led"></span><span data-i="nf.nh"></span></div>
+      <div class="bd" data-i="nf.nb"></div>
+      <div class="acts">
+        <button class="nbtn ok" id="nfOk" data-i="nf.na"></button>
+        <button class="nbtn ghost" id="nfGo" data-i="nf.ng"></button>
+      </div>
+    </div>
+  </div>
+  <p class="demo-cap reveal d3" data-i="nf.cap"></p>
+</div></section>
+
+<!-- ============ ch4: report ============ -->
+<section class="chapter" id="report"><div class="wrap">
+  <div class="kicker reveal"><span data-i="rp.k"></span><span class="rmk" data-i="rm.badge"></span></div>
+  <h2 class="reveal d1" data-i="rp.h"></h2>
+  <p class="lead reveal d2" data-i="rp.lead"></p>
+
+  <div class="rp-demo reveal d2">
+    <div class="rp-card">
+      <span class="demo-badge" data-i="rm.demo"></span>
+      <h4 data-i="rp.card"></h4>
+      <div class="ttl" data-i="rp.ttl"></div>
+      <div class="rp-sec" data-i="rp.s1"></div>
+      <div class="rp-sec" data-i="rp.s2"></div>
+      <div class="rp-verdict" data-i="rp.verdict"></div>
+      <div class="rp-doubt" data-i="rp.doubt"></div>
+      <div class="rp-acts">
+        <button class="nbtn ok" id="rpDiff" data-i="rp.b1"></button>
+        <button class="nbtn ghost" id="rpPass" data-i="rp.b2"></button>
+      </div>
+    </div>
+    <div class="rp-side">
+      <h4 data-i="rp.tl"></h4>
+      <div class="timeline" id="tline">
+        <div class="tstep done"><span class="tdot"></span><div><div class="tt" data-i="rp.p1"></div><div class="ts" data-i="rp.p1s"></div></div></div>
+        <div class="tstep done"><span class="tdot"></span><div><div class="tt" data-i="rp.p2"></div><div class="ts" data-i="rp.p2s"></div></div></div>
+        <div class="tstep done"><span class="tdot"></span><div><div class="tt" data-i="rp.p3"></div><div class="ts" data-i="rp.p3s"></div></div></div>
+        <div class="tstep cur"><span class="tdot"></span><div><div class="tt" data-i="rp.p4"></div><div class="ts" data-i="rp.p4s"></div></div></div>
+      </div>
+      <button class="rollbtn" id="rollBtn"></button>
+    </div>
+  </div>
+</div></section>
+
+<!-- ============ stats band ============ -->
+<section class="band">
+  <img class="bgimg" src="https://images.unsplash.com/photo-1719400471588-575b23e27bd7?q=70&w=2000&auto=format&fit=crop" alt="A late-night multi-monitor workspace" loading="lazy" onerror="this.style.display='none'">
+  <div class="bgshade"></div>
+  <div class="wrap">
+  <h2 class="sec-head reveal" data-i="band.h"></h2>
+  <div class="grid">
+    <div class="reveal"><div class="num" data-n="94" data-suf="%">0%</div><div class="lbl" data-i="band.l1"></div></div>
+    <div class="reveal d1"><div class="num" data-i="band.min"></div><div class="lbl" data-i="band.l2"></div></div>
+    <div class="reveal d2"><div class="num" data-n="80" data-suf="%">0%</div><div class="lbl" data-i="band.l3"></div></div>
+  </div>
+  <div class="src reveal d3" data-i="band.src"></div>
+</div></section>
+
+<!-- ============ compat ============ -->
+<section class="compat" id="compat"><div class="wrap">
+  <div class="kicker reveal" data-i="cp.k"></div>
+  <h2 class="sec-head reveal d1" style="margin-top:14px" data-i="cp.h"></h2>
+  <p class="lead reveal d2" style="max-width:560px;margin:20px auto 0;font-size:17px;color:var(--txt2);line-height:1.65" data-i="cp.lead"></p>
+  <div class="chips reveal d2">
+    <span class="chip">Claude Code</span><span class="chip">Codex</span>
+    <span class="chip soon" data-i="cp.gm"></span><span class="chip soon" data-i="cp.s0"></span><span class="chip soon" data-i="cp.s1"></span><span class="chip soon" data-i="cp.s2"></span><span class="chip soon" data-i="cp.s3"></span><span class="chip soon" data-i="cp.s4"></span>
+  </div>
+  <p class="note reveal d3" data-i="cp.note"></p>
+</div></section>
+
+<!-- ============ photo band C ============ -->
+<section class="photo-band reveal">
+  <img src="https://images.unsplash.com/photo-1573167130797-8453176c73d0?q=70&w=2000&auto=format&fit=crop" alt="An engineer working calmly on a MacBook" loading="lazy" onerror="this.style.display='none'">
+  <div class="shade"></div>
+  <div class="txt">
+    <div class="pk" data-i="pbC.k"></div>
+    <div class="pl" data-i="pbC.l"></div>
+    <div class="ps" data-i="pbC.s"></div>
+  </div>
+  <span class="credit">Photo: Christina @ wocintechchat.com / Unsplash</span>
+</section>
+
+<!-- ============ faq ============ -->
+<section class="faq" id="faq"><div class="wrap">
+  <h2 class="sec-head reveal" data-i="faq.h"></h2>
+  <div class="faq-list reveal d1">
+    <div class="qa open">
+      <button class="q"><span data-i="faq.q1"></span><span class="ic">＋</span></button>
+      <div class="a"><p data-i="faq.a1"></p></div>
+    </div>
+    <div class="qa">
+      <button class="q"><span data-i="faq.q2"></span><span class="ic">＋</span></button>
+      <div class="a"><p data-i="faq.a2"></p></div>
+    </div>
+    <div class="qa">
+      <button class="q"><span data-i="faq.q3"></span><span class="ic">＋</span></button>
+      <div class="a"><p data-i="faq.a3"></p></div>
+    </div>
+    <div class="qa">
+      <button class="q"><span data-i="faq.q4"></span><span class="ic">＋</span></button>
+      <div class="a"><p data-i="faq.a4"></p></div>
+    </div>
+    <div class="qa">
+      <button class="q"><span data-i="faq.q5"></span><span class="ic">＋</span></button>
+      <div class="a"><p data-i="faq.a5"></p></div>
+    </div>
+  </div>
+</div></section>
+
+<!-- ============ manifesto ============ -->
+<section class="manifesto"><div class="wrap">
+  <p class="mani reveal" data-i="mani.body"></p>
+  <p class="mani-sign reveal d1" data-i="mani.sign"></p>
+</div></section>
+
+<!-- ============ cta ============ -->
+<section class="cta" id="cta"><div class="wrap">
+  <h2 class="sec-head reveal" data-i="cta.h"></h2>
+  <p class="lead reveal d1" data-i="cta.lead"></p>
+  <div class="cta-row reveal d2">
+    <a class="btn btn-grad" href="#" id="ctaGit"></a>
+    <a class="link-blue" href="#" id="ctaCom"></a>
+  </div>
+  <div class="mono reveal d3">open source · build from GitHub · packaged installs ship with M1</div>
+</div></section>
+
+<footer><div class="wrap">
+  <div class="foot-in">
+    <span style="display:flex;align-items:center;gap:8px"><span class="mark" style="width:18px;height:18px"></span><b style="font-size:13px">ActRealm</b></span>
+    <span data-i="foot.line"></span>
+  </div>
+  <p class="footnote" data-i="foot.note"></p>
+</div></footer>
+
+<div id="toast"></div>
+
+<script>
+/* ================= i18n ================= */
+const I18N={
+en:{
+  _title:"ActRealm — Manage Agents and Bring Task Context Forward",
+  "brand.name":"ActRealm",
+  "nav.hl":"Overview","nav.now":"Current build","nav.ws":"Workspace","nav.st":"Task context","nav.nf":"Risk control","nav.rp":"Review roadmap","nav.faq":"FAQ","nav.cta":"View on GitHub",
+  "nav.duty":"Local · Open source","feed.title":"ACTREALM · LOCAL TASK EVENTS · TARGET EXPERIENCE",
+  "rm.badge":"ROADMAP · IN DEVELOPMENT","rm.demo":"Concept demo · in development",
+  "lp.k":"OPERATING MODEL","lp.h":"A new operating model for agent work.",
+  "lp.lead":"Traditional operating systems manage applications, files and device permissions. ActRealm adds the missing layer for agent tasks, workspace context, approvals and human handoffs.",
+  "lp.c1":"<b>A task becomes the unit of work.</b>Send work to Claude Code, Codex or another connected agent.",
+  "lp.c2":"<b>The agent keeps executing.</b>Each task retains its own state, window group and working context.",
+  "lp.c3":"<b>ActRealm governs the loop.</b>Status, wait time, approval requests and recovery points are organized in one layer.",
+  "lp.c4":"<b>People retain authority.</b>Evidence, risk and context arrive before authorization or final acceptance.",
+  "mani.body":"Operating systems were designed around applications, windows and files. Agents introduce a different unit of work: a task that can continue, wait, request authority and return with a result. <span class='g'>ActRealm is the open operating layer that connects those tasks to human control.</span>",
+  "mani.sign":"— The ActRealm Project",
+  "hero.cat":"The open agent operating layer for desktop",
+  "hero.slogan":"Manage agents in one place.<br><span class='g'>Bring the right task context forward.</span>",
+  "hero.sub":"ActRealm brings tasks, status, approval requests and workspaces from Claude Code, Codex and other desktop agents into one local control layer. When a task needs you, return directly to its terminal, diff and preview.",
+  "hero.badges":"MIT licensed · Local by default · Built for macOS",
+  "hero.cta1":"View on GitHub","hero.cta2":"See the workflow >",
+  "mock.d1":"Desktop 1 · Your work","mock.ws":"Agent Workspace",
+  "mock.s1":"codex · Running","mock.s2":"claude · Needs you","mock.s3":"cleanup · Done",
+  "mock.dash":"ACTREALM DASHBOARD · ALL TASKS",
+  "mock.r1":"codex · Refactoring payments","mock.r1s":"Running · 12 min",
+  "mock.r2":"claude-code · Schema change","mock.r2b":"Open task context",
+  "mock.r3":"Data cleanup","mock.r3s":"Done in 6:12 · Report ready",
+  "mock.cap":"<span class='kbd'>⌥ Space</span>&nbsp; Move between your current work and the Agent Workspace.",
+  "w.term":"Terminal","w.prev":"Preview",
+  "now.k":"CURRENT BUILD","now.h":"The first complete handoff loop<br><span class='g'>is already running.</span>",
+  "now.lead":"The current build covers approval requests, risk levels, a three-second undo window, task overview, quota status and one-keystroke return to the original task. High-risk actions still require verification, and missing data is never presented as certainty.",
+  "now.b1":"Approval required","now.b2":"High risk","now.wait":"waiting 6 min 02 s",
+  "now.title":"Codex requests permission to run a Bash command",
+  "now.src":"Codex · actrealm · task: upgrade deps and fix the build script",
+  "now.risk":"Compound command · request expires in 54 min",
+  "now.a1":"Verify in original window","now.a2":"Deny","now.a3":"Allow after confirmation","now.a3c":"Confirm authorization?",
+  "now.u1":"Authorization sent for <code>git status</code> · awaiting tool confirmation","now.u2":"Undo","now.u3":"Confirmed · Codex continues.",
+  "now.cap":"The demo separates authorization sent from authorization confirmed, with three seconds to withdraw the decision.",
+  "now.t1":"<b>Visible usage limits.</b> See remaining Claude and Codex quota, reset time and the freshness of each reading.",
+  "now.t2":"<b>No invented status.</b> Missing tool events, plan data or usage readings remain explicitly unavailable.",
+  "now.t3":"<b>Minimal content exposure.</b> Commands are redacted, paths are shortened and task output is not repeated in the overview.",
+  "hl.head":"The missing operating layer between agents and people.",
+  "hl.p1":"Desktop 1","hl.p2":"✦ Agent Workspace","hl.pa":"Plan A","hl.pb":"Details",
+  "hl.c1":"An execution surface for agent tasks.<small>Agent windows and context remain separate from your primary desktop.</small>",
+  "hl.c2":"Task state becomes visible system state.<small>See what is running, waiting, blocked or complete.</small>",
+  "hl.c3":"Authority follows explicit policy.<small>Low-risk updates stay quiet; high-risk actions return to the original window.</small>",
+  "hl.c4":"Review extends the control loop.<small>Test, diff and risk checks remain on the roadmap.</small>",
+  "hl.c5":"Open source and local by default.<small>No ActRealm account or required cloud backend.</small>",
+  "hl.c6":"One layer across agent tools.<small>Adapters translate different tools into a consistent task and handoff model.</small>",
+  "pbA.k":"FOCUS","pbA.l":"Your primary desktop for thinking. A separate workspace for execution.","pbA.s":"Two contexts remain independent until a decision connects them.",
+  "ws.k":"DEDICATED WORKSPACE",
+  "ws.h":"A separate desktop<br><span class='g'>for agent execution.</span>",
+  "ws.lead":"ActRealm guides you through creating a dedicated macOS workspace for agent windows and the task Dashboard. When a task needs input, one keystroke returns you to the relevant window while your primary desktop remains intact. Automatic window arrangement is experimental and requires a one-time Accessibility grant.",
+  "ws.doc":"The doc you're writing",
+  "ws.tag1":"Your current document and application layout remain unchanged.",
+  "ws.tag2":"Agent tasks, windows and the Dashboard are organized in a separate workspace.",
+  "ws.r1":"Payment refactor","ws.r1s":"Running","ws.r2":"Schema change","ws.r2s":"Needs you","ws.r3":"Data cleanup","ws.r3s":"Done",
+  "ws.cap":"Use the tabs above to compare the two desktops. On macOS, <span class='kbd'>⌥ Space</span> moves between the current desktop and Agent Workspace.",
+  "ws.t1":"<b>Less desktop interference.</b> Agent windows remain separate from the applications you are actively using.",
+  "ws.t2":"<b>One task overview.</b> Status, intent, wait time and pending decisions are collected in the Dashboard.",
+  "ws.t3":"<b>Direct return.</b> One keystroke moves between the primary desktop and the Agent Workspace.",
+  "st.k":"TASK CONTEXT",
+  "st.h":"Return directly<br><span class='g'>to the task that needs you.</span>",
+  "st.lead":"Each task maps to a window group containing its terminal, diff and preview. When input is required, ActRealm explains what changed and lets you choose whether to switch. The original task context remains in place.",
+  "st.ta":"Task A · Payment refactor","st.tam":"claude · Running · Plan 3 / 7",
+  "st.tb":"Task B · Schema change","st.tbm":"claude-code · Needs you · One question",
+  "st.tc":"Task C · Data cleanup","st.tcm":"codex · Done · 6 min 12 s",
+  "st.cap":"Select a task to compare window groups. In the product, switching always follows a prompt and never takes focus without confirmation.",
+  "pbB.k":"CONTEXT","pbB.l":"When judgment is required, the full task context is ready.","pbB.s":"Terminal, diff and preview remain where the work took place.",
+  "nf.k":"INTERVENTION POLICY",
+  "nf.h":"Interruption should<br><span class='g'>match the risk.</span>",
+  "nf.lead":"Completed work appears as a quiet Dashboard update. Decisions receive a concise notification with wait time and context. High-risk actions must be verified in the original window.",
+  "nf.l1":"Done","nf.l1h":"Dashboard glow · Silent",
+  "nf.l2":"Needs decision","nf.l2h":"Task summary · Return to context",
+  "nf.l3":"High risk","nf.l3h":"Verify in the original window",
+  "nf.btn":"Simulate a handoff",
+  "nf.nh":"Claude Code is waiting for your decision",
+  "nf.nb":"The index strategy for the orders table requires confirmation. The full question and related context remain in the original window. Waiting 2 min 10 s.",
+  "nf.na":"Return to original window","nf.ng":"Locate in Dashboard",
+  "nf.cap":"Current policy: silent updates for completion, contextual prompts for decisions and original-window verification for high risk. Request batching remains on the roadmap.",
+  "rp.k":"STRUCTURED REVIEW",
+  "rp.h":"A machine check<br><span class='g'>before human acceptance.</span>",
+  "rp.lead":"ActRealm Review is in development. The planned workflow re-runs tests, inspects the diff, checks the reported result and isolates items that require judgment. The system provides evidence and a recommendation; final acceptance remains with the user. Git checkpoints preserve a recoverable state for code tasks.",
+  "rp.card":"WORK REPORT","rp.ttl":"Payment refactor · 8 min 47 s",
+  "rp.verdict":"<b>ActRealm Review · 1 item requires judgment</b><br>Tests: 53 / 53 passed · Diff check: no unexpected files changed · Timeout threshold requires confirmation.",
+  "rp.s1":"<b>What changed</b><br>payment.ts +86 −22 · api.ts +31 −9 · 3 new test cases",
+  "rp.s2":"<b>Key decisions</b><br>① Retries switched to exponential backoff ② Callbacks replaced with Promises",
+  "rp.doubt":"<b>Requires confirmation</b><br>Timeout increased from 3s to 10s. Confirm that the change is consistent with the current SLA.",
+  "rp.b1":"View full diff","rp.b2":"Approve",
+  "rp.tl":"CHECKPOINT TIMELINE",
+  "rp.p1":"Plan approved","rp.p1s":"14:02 · Plan A confirmed",
+  "rp.p2":"Core refactor done","rp.p2s":"14:07 · 2 files",
+  "rp.p3":"All tests passing","rp.p3s":"14:10 · 53 cases",
+  "rp.p4":"Report generated","rp.p4s":"14:11 · Awaiting review",
+  "roll.do":"Roll back to “All tests passing”","roll.undo":"Restore latest state",
+  "band.h":"Why make the <span class='g'>handoff</span> the core problem?",
+  "band.min":"5–10<span style='font-size:26px'> min</span>",
+  "band.l1":"of respondents want to understand task state without repeatedly switching windows",
+  "band.l2":"is the task length most likely to create an attention gap: waiting wastes time, leaving makes the task easy to forget",
+  "band.l3":"of respondents have missed a stalled task, an error or a request waiting for input",
+  "band.src":"Source: ActRealm research on desktop-agent workflows · sample size and field date to be published",
+  "cp.k":"OPEN INTERFACE",
+  "cp.h":"One operating layer,<span class='gtxt'> across agent tools.</span>",
+  "cp.lead":"ActRealm converts native hooks and notification events from different tools into a consistent model for task state, authority and handoff. New tools can connect without changing the control loop.",
+  "cp.gm":"Gemini CLI · In development","cp.s0":"Cursor · Community plan",
+  "cp.s1":"Kimi · Community plan","cp.s2":"Trae · Community plan","cp.s3":"OpenCode · Community plan","cp.s4":"Ollama · Community plan",
+  "cp.note":"Claude Code and Codex supported in the current build · macOS first · Windows on the roadmap",
+  "pbC.k":"RHYTHM","pbC.l":"When the task is complete, return to the work already in progress.","pbC.s":"ActRealm is designed to reduce status checking and context recovery, not add another surface to manage.",
+  "faq.h":"Product details.",
+  "faq.q1":"What is ActRealm?",
+  "faq.a1":"ActRealm is an open agent operating layer for desktop. It runs above the existing operating system, separates agent execution from the primary workspace, and consolidates task state, approvals and context handoffs. It does not replace macOS; it adds the task and control model that desktop agents need.",
+  "faq.q2":"Does it cost anything? How do I get it?",
+  "faq.a2":"ActRealm is MIT licensed. The source can be built locally from GitHub today; a packaged macOS installer is planned for the M1 release.",
+  "faq.q3":"Which AI tools are supported?",
+  "faq.a3":"The current build supports Claude Code and Codex. A Gemini CLI adapter is in development. The adapter layer is designed so the community can add support for additional tools without changing the core workspace.",
+  "faq.q4":"Does my code or conversation get uploaded?",
+  "faq.a4":"ActRealm itself requires no account or cloud backend, and its workspace data remains local by default. Data handling by the underlying AI tools still follows their own configuration and service terms. The planned Review feature may optionally use a model API supplied and explicitly enabled by the user.",
+  "faq.q5":"What are the system requirements?",
+  "faq.a5":"The current version requires macOS 15 or later. Spaces and Stage Manager provide the system-level desktop and window grouping. Experimental automatic window arrangement requires a one-time Accessibility grant. Windows support remains on the roadmap.",
+  "cta.h":"Build the Agent Operating Layer<span class='gtxt'> with us.</span>",
+  "cta.lead":"The source is open today. M1 focuses on the approval loop, task state, quota status and direct return to context, starting with Claude Code and Codex on macOS. Try the current build, open an issue or contribute the next adapter.",
+  "cta.git":"GitHub · Star & Watch","cta.com":"Join the early community >",
+  "foot.line":"The open agent operating layer for desktop · MIT License",
+  "foot.note":"Survey figures come from ActRealm research on desktop-agent workflows; sample size and field date should be published with the final investor page. Roadmap-tagged capabilities are in development and are not part of the current build. Stage Manager and Spaces are macOS system features; Apple, macOS and Stage Manager are trademarks of Apple Inc. This project is not affiliated with Apple Inc. Photography from Unsplash, used under the Unsplash License.",
+  toasts:{okA:"Returned to the original window (demo)",goStage:"Task located (see Task Context)",diff:"Full diff opened (demo)",pass:"Report accepted (demo)",rolled:"Rolled back to “All tests passing”",restored:"Restored to the latest checkpoint",git:"Demo page: GitHub repository opening soon",com:"Demo page: early community opening soon",obSent:"Authorization sent · 3 s to undo",obUndo:"Withdrawn · authorization did not take effect",obDone:"Confirmed · Codex continues",obCheck:"Returned to the original window (demo)",obDeny:"Denied (demo)"},
+  feedLines:[
+    "09:41:02  claude-code · started “schema migration”",
+    "09:41:05  workspace · task window group registered",
+    "09:46:58  decision required · index strategy",
+    "09:47:02  task context ready · original window available",
+    "09:47:12  request waiting · 14 seconds",
+    "09:47:16  → waiting for your decision"
+  ],
+  tasks:{
+    a:{title:"Task A · Payment refactor · claude",status:"Running · Plan 3 / 7",term:"$ claude<br>▸ Running Bash — output stays in the original window<br>▸ Plan 3 / 7 · test phase<br>▍Working…",diff:"payment.ts +86 −22",prev:"Checkout flow · Live preview"},
+    b:{title:"Task B · Schema change · claude-code",status:"Needs you · One question",term:"$ claude-code<br>Asked a question about the orders-table index.<br>Details wait in the original window.<br>▍Waiting for your answer…",diff:"migration.sql +18 −0",prev:"OUTBOX · 1 item pending"},
+    c:{title:"Task C · Data cleanup · codex",status:"Done · 6 min 12 s",term:"$ codex<br>Turn finished — changes ready for your confirm.<br>(Codex reports turn-level status only.)",diff:"clean.py +42 −6",prev:"Awaiting your confirm"}
+  }
+},
+zh:{
+  _title:"ActRealm — 统一管理 Agent，按需调度任务现场",
+  "brand.name":"ActRealm · 枢界",
+  "nav.hl":"概览","nav.now":"当前版本","nav.ws":"工作区","nav.st":"任务交接","nav.nf":"风险控制","nav.rp":"审阅路线图","nav.faq":"FAQ","nav.cta":"GitHub",
+  "nav.duty":"本地 · 开源","feed.title":"ACTREALM · 本地任务事件 · 目标体验演示",
+  "rm.badge":"ROADMAP · 开发中","rm.demo":"概念演示 · 开发中",
+  "lp.k":"运行模型","lp.h":"为 Agent 工作建立新的操作模型。",
+  "lp.lead":"传统操作系统管理应用、文件和设备权限。ActRealm 补上 Agent 任务、工作上下文、操作审批与人机交接这一层。",
+  "lp.c1":"<b>任务成为工作单元。</b>将工作交给 Claude Code、Codex 或其他已经接入的 Agent。",
+  "lp.c2":"<b>Agent 持续执行。</b>每个任务保留自己的状态、窗口组与工作上下文。",
+  "lp.c3":"<b>ActRealm 管理闭环。</b>状态、等待时间、授权请求与恢复点被组织在同一层。",
+  "lp.c4":"<b>人保留最终权限。</b>在授权或验收前，先看到相应的证据、风险和上下文。",
+  "mani.body":"传统操作系统围绕应用、窗口和文件建立。Agent 带来了新的工作单元：一个任务可以持续执行、等待输入、请求权限，并带着结果返回。<span class='g'>ActRealm 是连接 Agent 任务与人类控制的开放操作层。</span>",
+  "mani.sign":"—— ActRealm 项目",
+  "hero.cat":"桌面端的开源 Agent 操作层",
+  "hero.slogan":"统一管理 Agent，<br><span class='g'>按需调度任务现场。</span>",
+  "hero.sub":"ActRealm 将 Claude Code、Codex 等桌面 Agent 的任务、状态、授权请求与工作界面统一纳入本地控制。需要介入时，直接返回对应的终端、diff 与预览。",
+  "hero.badges":"MIT 开源 · 默认本地运行 · macOS 优先",
+  "hero.cta1":"查看 GitHub","hero.cta2":"了解工作方式 >",
+  "mock.d1":"桌面 1 · 日常工作","mock.ws":"Agent 工作区",
+  "mock.s1":"codex · 运行中","mock.s2":"claude · 待确认","mock.s3":"清洗 · 已完成",
+  "mock.dash":"ACTREALM DASHBOARD · 任务总览",
+  "mock.r1":"codex · 重构支付模块","mock.r1s":"运行中 · 12 分",
+  "mock.r2":"claude-code · schema 变更","mock.r2b":"打开任务上下文",
+  "mock.r3":"数据清洗","mock.r3s":"完成 6:12 · 报告已生成",
+  "mock.cap":"<span class='kbd'>⌥ Space</span>&nbsp; 在当前工作与 Agent 工作区之间切换。",
+  "w.term":"终端","w.prev":"预览",
+  "now.k":"当前版本","now.h":"第一条完整的任务交接闭环，<br><span class='g'>已经可以运行。</span>",
+  "now.lead":"当前构建已覆盖审批请求、风险分级、3 秒撤回、任务总览、额度状态与一键返回任务窗口。高风险操作仍需人工核验；缺少数据时，ActRealm 不会把推断呈现为事实。",
+  "now.b1":"待处理","now.b2":"高风险","now.wait":"已等待 6 分 02 秒",
+  "now.title":"Codex 请求执行一条 Bash 命令",
+  "now.src":"Codex · actrealm · 任务：升级依赖并修复构建脚本",
+  "now.risk":"包含复合命令 · 请求将在 54 分钟后失效",
+  "now.a1":"返回原窗口核验","now.a2":"拒绝","now.a3":"确认后允许","now.a3c":"确认授权？",
+  "now.u1":"已发送 <code>git status</code> 的授权 · 等待工具确认","now.u2":"撤回","now.u3":"工具已确认 · Codex 继续执行。",
+  "now.cap":"演示将「授权已发送」与「工具已确认」分开，并保留 3 秒撤回时间。",
+  "now.t1":"<b>使用额度可见。</b>查看 Claude 与 Codex 的剩余额度、重置时间和数据更新时间。",
+  "now.t2":"<b>不推断缺失数据。</b>缺少工具事件、计划信息或额度数据时，界面会明确显示不可用。",
+  "now.t3":"<b>最小化内容暴露。</b>命令默认脱敏，路径仅保留必要目录，任务输出不在总览中重复展示。",
+  "hl.head":"Agent 与人之间，缺少一层操作系统能力。",
+  "hl.p1":"桌面 1","hl.p2":"✦ Agent 工作区","hl.pa":"方案 A","hl.pb":"查看详情",
+  "hl.c1":"Agent 任务的执行空间。<small>窗口与上下文和主要工作桌面保持分离。</small>",
+  "hl.c2":"任务状态成为系统状态。<small>清楚看到运行、等待、阻塞与完成。</small>",
+  "hl.c3":"权限遵循明确策略。<small>低风险状态静默更新，高风险操作返回原窗口核验。</small>",
+  "hl.c4":"审阅延伸控制闭环。<small>测试、diff 与风险检查仍在路线图中。</small>",
+  "hl.c5":"开源，默认本地运行。<small>不要求 ActRealm 账号或必需的云端后台。</small>",
+  "hl.c6":"一层连接多种 Agent 工具。<small>适配器将不同工具转换为统一的任务与交接模型。</small>",
+  "pbA.k":"专注","pbA.l":"主桌面用于思考，独立工作区用于执行。","pbA.s":"两套上下文保持分离，只在需要判断时连接。",
+  "ws.k":"独立工作区",
+  "ws.h":"为 Agent 保留一个<br><span class='g'>独立桌面。</span>",
+  "ws.lead":"ActRealm 引导用户在 macOS 上建立专属 Agent 工作区，将任务窗口与 Dashboard 集中管理。需要介入时，可以直接返回对应窗口，同时保持主桌面的原有状态。自动整理窗口目前属于实验性能力，需要一次性授予辅助功能权限。",
+  "ws.doc":"你正在写的文档",
+  "ws.tag1":"当前文档与应用布局保持不变。",
+  "ws.tag2":"Agent 的任务、窗口与 Dashboard 集中在独立工作区。",
+  "ws.r1":"重构支付模块","ws.r1s":"在跑","ws.r2":"schema 变更","ws.r2s":"待确认","ws.r3":"数据清洗","ws.r3s":"完成",
+  "ws.cap":"点按上方标签比较两个桌面。实际使用中，<span class='kbd'>⌥ Space</span> 用于在当前桌面与 Agent 工作区之间切换。",
+  "ws.t1":"<b>减少桌面干扰。</b>Agent 窗口与正在使用的应用保持分离。",
+  "ws.t2":"<b>统一任务视图。</b>状态、意图、等待时间与待处理事项集中在 Dashboard。",
+  "ws.t3":"<b>快速返回上下文。</b>按下 ⌥ Space，在主桌面与 Agent 工作区之间切换。",
+  "st.k":"任务上下文",
+  "st.h":"需要介入时，<br><span class='g'>直接回到对应任务。</span>",
+  "st.lead":"每个任务对应一个包含终端、diff 与预览的窗口组。任务需要输入时，ActRealm 先说明发生了什么，再由用户决定是否切换。原有任务上下文保持不变。",
+  "st.ta":"任务 A · 重构支付","st.tam":"claude · 运行中 · 计划 3 / 7",
+  "st.tb":"任务 B · schema 变更","st.tbm":"claude-code · 待确认 · 需要你回答",
+  "st.tc":"任务 C · 数据清洗","st.tcm":"codex · 已完成 · 6 分 12 秒",
+  "st.cap":"选择左侧任务可以比较不同窗口组。实际使用中，切换始终先经过提示，不会在未经确认时夺取焦点。",
+  "pbB.k":"上下文","pbB.l":"需要作出判断时，完整任务上下文已经准备好。","pbB.s":"终端、diff 与预览保留在工作发生的位置。",
+  "nf.k":"介入策略",
+  "nf.h":"打扰强度，<br><span class='g'>由任务风险决定。</span>",
+  "nf.lead":"普通完成状态进入 Dashboard，不主动打扰；需要判断时显示任务摘要与等待时间；涉及高风险命令时，用户必须返回原始窗口核验。",
+  "nf.l1":"完成","nf.l1h":"Dashboard 微光 · 无声",
+  "nf.l2":"待决策","nf.l2h":"任务摘要 · 返回上下文",
+  "nf.l3":"高风险","nf.l3h":"去原窗口核对",
+  "nf.btn":"模拟一次交接请求",
+  "nf.nh":"Claude Code 正在等待你的决定",
+  "nf.nb":"orders 表的索引方案需要确认。完整问题与相关上下文保留在原始窗口。已等待 2 分 10 秒。",
+  "nf.na":"返回原窗口","nf.ng":"在 Dashboard 中定位",
+  "nf.cap":"当前策略：完成状态静默更新，决策请求提供上下文，高风险操作返回原窗口核验。同类请求的批量处理仍在路线图中。",
+  "rp.k":"结构化审阅",
+  "rp.h":"在人工验收前，<br><span class='g'>先完成一轮机器检查。</span>",
+  "rp.lead":"ActRealm Review 仍在开发中。规划中的流程将复跑测试、检查 diff、核对执行结果，并把需要人工判断的部分单独列出。系统提供证据和建议，最终验收仍由用户完成。代码任务可通过 Git 检查点保留可恢复状态。",
+  "rp.card":"完工报告","rp.ttl":"重构支付模块 · 用时 8 分 47 秒",
+  "rp.verdict":"<b>ActRealm Review · 1 项需要人工判断</b><br>测试：53 / 53 通过 · diff 检查：未发现计划外文件变更 · 超时阈值需要确认。",
+  "rp.s1":"<b>变更内容</b><br>payment.ts +86 −22 · api.ts +31 −9 · 新增 3 个测试用例",
+  "rp.s2":"<b>关键决策</b><br>① 重试逻辑改为指数退避 ② 弃用回调，改用 Promise",
+  "rp.doubt":"<b>需要确认</b><br>超时阈值由 3 秒调整为 10 秒。请确认该修改是否符合当前 SLA。",
+  "rp.b1":"查看完整 diff","rp.b2":"验收通过",
+  "rp.tl":"检查点时间线",
+  "rp.p1":"计划确认","rp.p1s":"14:02 · 方案 A 获批",
+  "rp.p2":"核心重构完成","rp.p2s":"14:07 · 2 个文件",
+  "rp.p3":"测试全部通过","rp.p3s":"14:10 · 53 项用例",
+  "rp.p4":"报告生成","rp.p4s":"14:11 · 等待验收",
+  "roll.do":"回滚到「测试全部通过」","roll.undo":"恢复到最新状态",
+  "band.h":"为什么把<span class='g'>任务交接</span>作为核心问题？",
+  "band.min":"5-10<span style='font-size:26px'> 分钟</span>",
+  "band.l1":"的受访者希望在不频繁切换窗口的情况下掌握 Agent 任务状态",
+  "band.l2":"是最容易形成注意力空档的任务时长：等待会浪费时间，离开后又容易遗忘",
+  "band.l3":"的受访者曾未能及时发现任务暂停、发生错误或正在等待输入",
+  "band.src":"来源：ActRealm 桌面 Agent 工作流调研 · 正式发布时补充样本量与调研时间",
+  "cp.k":"开放接口",
+  "cp.h":"一层操作模型，<span class='gtxt'>连接多种 Agent 工具。</span>",
+  "cp.lead":"ActRealm 将不同工具提供的原生 hooks 与通知事件转换为统一的任务状态、权限与交接模型。新增工具不需要改变核心控制闭环。",
+  "cp.gm":"Gemini CLI · 开发中","cp.s0":"Cursor · 社区适配计划",
+  "cp.s1":"Kimi · 社区适配计划","cp.s2":"Trae · 社区适配计划","cp.s3":"OpenCode · 社区适配计划","cp.s4":"Ollama · 社区适配计划",
+  "cp.note":"当前构建支持 Claude Code 与 Codex · macOS 优先 · Windows 仍在路线图中",
+  "pbC.k":"节奏","pbC.l":"任务完成后，回到原来正在进行的工作。","pbC.s":"ActRealm 的目标是减少状态检查和上下文恢复，而不是增加一个需要管理的界面。",
+  "faq.h":"产品说明。",
+  "faq.q1":"ActRealm 是什么？",
+  "faq.a1":"ActRealm 是桌面端的开源 Agent 操作层。它运行在现有操作系统之上，将 Agent 执行与主要工作区分离，并集中处理任务状态、操作审批和上下文交接。它不替代 macOS，而是补上桌面 Agent 所需的任务与控制模型。",
+  "faq.q2":"收费吗？如何获取？",
+  "faq.a2":"ActRealm 采用 MIT License 开源。当前可以从 GitHub 获取源码并在本地构建；macOS 安装包计划随 M1 版本提供。",
+  "faq.q3":"支持哪些 AI 工具？",
+  "faq.a3":"当前构建支持 Claude Code 与 Codex，Gemini CLI 适配器正在开发中。适配层允许社区为其他 Agent 工具增加支持，而不需要修改核心工作区。",
+  "faq.q4":"我的代码和对话会上传吗？",
+  "faq.a4":"ActRealm 本身不要求账号或云端后台，工作区数据默认保留在本机。底层 AI 工具的数据处理方式仍取决于各自的配置和服务条款。规划中的 Review 功能可以选择使用用户提供并明确启用的模型 API。",
+  "faq.q5":"系统要求是什么？",
+  "faq.a5":"当前版本需要 macOS 15 或更新版本。Spaces 与 Stage Manager 提供系统级桌面和窗口分组；实验性的自动整理窗口能力需要一次性授予辅助功能权限。Windows 支持仍在路线图中。",
+  "cta.h":"共同构建<span class='gtxt'> Agent 操作层。</span>",
+  "cta.lead":"当前源码已经开放。M1 将重点完善审批闭环、任务状态、额度信息与上下文返回，从 macOS 上的 Claude Code 与 Codex 开始。欢迎试用当前构建、提交 issue，或为新的 Agent 工具编写适配器。",
+  "cta.git":"GitHub · Star & Watch","cta.com":"加入早期社区 >",
+  "foot.line":"桌面端的开源 Agent 操作层 · MIT License",
+  "foot.note":"页面中的比例数据来自 ActRealm 桌面 Agent 工作流调研；正式投资人页面应补充样本量与调研时间。标注 ROADMAP 的能力仍在开发中，不属于当前构建。Stage Manager 与 Spaces 为 macOS 系统功能；Apple、macOS 与 Stage Manager 为 Apple Inc. 商标，本项目与 Apple Inc. 无关联。场景摄影来自 Unsplash，并依据 Unsplash License 使用。",
+  toasts:{okA:"已返回原窗口（演示）",goStage:"已定位任务（见「任务上下文」）",diff:"已打开完整 diff（演示）",pass:"报告已确认验收（演示）",rolled:"已回滚至「测试全部通过」检查点",restored:"已恢复到最新检查点",git:"演示页面：GitHub 仓库即将开放",com:"演示页面：早期社区即将开放",obSent:"授权已发送 · 3 秒内可撤回",obUndo:"已撤回 · 授权未生效",obDone:"工具已确认 · Codex 继续执行",obCheck:"已返回原窗口（演示）",obDeny:"已拒绝（演示）"},
+  feedLines:[
+    "09:41:02  claude-code · 开始「schema 迁移」",
+    "09:41:05  工作区 · 已登记任务窗口组",
+    "09:46:58  需要决策 · 索引方案",
+    "09:47:02  任务上下文已就绪 · 可返回原窗口",
+    "09:47:12  请求等待中 · 14 秒",
+    "09:47:16  → 等待你的决定"
+  ],
+  tasks:{
+    a:{title:"任务 A · 重构支付 · claude",status:"运行中 · 计划 3 / 7",term:"$ claude<br>▸ 正在运行 Bash——输出仅在原窗口显示<br>▸ 计划 3 / 7 · 测试阶段<br>▍工作中…",diff:"payment.ts +86 −22",prev:"结账流程 · 实时预览"},
+    b:{title:"任务 B · schema 变更 · claude-code",status:"待确认 · 需要你回答",term:"$ claude-code<br>就 orders 表索引提出了一个问题。<br>问题详情在原窗口等你。<br>▍等待你的回答…",diff:"migration.sql +18 −0",prev:"OUTBOX · 1 项待处理"},
+    c:{title:"任务 C · 数据清洗 · codex",status:"已完成 · 用时 6 分 12 秒",term:"$ codex<br>本轮已完成，修改待你确认。<br>（Codex 仅提供轮级状态。）",diff:"clean.py +42 −6",prev:"待你确认"}
+  }
+}
+};
+
+let cur="en";
+let activeTask="a";
+let rolled=false;
+
+function t(k){return I18N[cur][k]||"";}
+
+function applyLang(l){
+  cur=l;
+  document.documentElement.lang=(l==="zh"?"zh-CN":"en");
+  document.title=I18N[l]._title;
+  document.querySelectorAll("[data-i]").forEach(el=>{
+    const v=I18N[l][el.dataset.i];
+    if(v!==undefined)el.innerHTML=v;
+  });
+  document.querySelectorAll("#langSeg button").forEach(b=>b.classList.toggle("on",b.dataset.l===l));
+  document.getElementById("ctaGit").textContent=t("cta.git").replace("&amp;","&");
+  document.getElementById("ctaCom").textContent=t("cta.com");
+  document.getElementById("rollBtn").textContent=t(rolled?"roll.undo":"roll.do");
+  renderTask(activeTask,false);
+  document.querySelectorAll(".qa.open .a").forEach(a=>a.style.maxHeight=a.scrollHeight+"px");
+  startFeed();
+  if(typeof obReset==="function")obReset();
+}
+
+/* ================= live activity feed ================= */
+let feedTimer=null;
+function startFeed(){
+  const body=document.getElementById("feedBody");
+  clearTimeout(feedTimer);body.innerHTML="";
+  const lines=I18N[cur].feedLines;
+  let li=0,ci=0,curEl=null;
+  function step(){
+    if(li>=lines.length){
+      feedTimer=setTimeout(()=>{body.innerHTML="";li=0;ci=0;curEl=null;feedTimer=setTimeout(step,400);},3400);
+      return;
+    }
+    if(!curEl){
+      curEl=document.createElement("div");curEl.className="fl";
+      if(lines[li].includes("→"))curEl.style.color="#ffb454";
+      body.appendChild(curEl);
+    }
+    ci++;curEl.textContent=lines[li].slice(0,ci);
+    if(ci>=lines[li].length){li++;ci=0;curEl=null;feedTimer=setTimeout(step,430);}
+    else feedTimer=setTimeout(step,13);
+  }
+  step();
+}
+
+/* ================= toast ================= */
+let toastTimer=null;
+function toast(msg){
+  const el=document.getElementById("toast");
+  el.textContent=msg;el.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer=setTimeout(()=>el.classList.remove("show"),2200);
+}
+
+/* ================= reveal ================= */
+const io=new IntersectionObserver(es=>{
+  es.forEach(e=>{if(e.isIntersecting){e.target.classList.add("in");io.unobserve(e.target);}});
+},{threshold:.15});
+document.querySelectorAll(".reveal").forEach(el=>io.observe(el));
+
+/* ================= hero scale ================= */
+const hv=document.getElementById("heroVisual");
+addEventListener("scroll",()=>{
+  const s=Math.max(1,1.045-scrollY/2600);
+  hv.style.transform=`scale(${s.toFixed(4)})`;
+},{passive:true});
+
+/* ================= gallery ================= */
+const gal=document.getElementById("gallery");
+const step=()=>Math.min(gal.clientWidth*.8,444);
+document.getElementById("galL").onclick=()=>gal.scrollBy({left:-step(),behavior:"smooth"});
+document.getElementById("galR").onclick=()=>gal.scrollBy({left:step(),behavior:"smooth"});
+
+/* ================= ch1 desktop switcher ================= */
+const dtTrack=document.getElementById("dtTrack");
+document.querySelectorAll(".dt-pill").forEach(p=>{
+  p.addEventListener("click",()=>{
+    document.querySelectorAll(".dt-pill").forEach(x=>x.classList.remove("on"));
+    p.classList.add("on");
+    dtTrack.style.transform=p.dataset.d==="1"?"translateX(-50%)":"translateX(0)";
+  });
+});
+
+/* ================= ch2 stage demo ================= */
+const stContent=document.getElementById("stContent");
+function renderTask(k,animate=true){
+  const task=I18N[cur].tasks[k];
+  document.getElementById("stTitle").textContent=task.title;
+  document.getElementById("stStatus").textContent=task.status;
+  document.getElementById("stTerm").innerHTML=task.term;
+  document.getElementById("stDiff").textContent=task.diff;
+  document.getElementById("stPrev").textContent=task.prev;
+  if(animate){stContent.classList.remove("swap");void stContent.offsetWidth;stContent.classList.add("swap");}
+  document.querySelectorAll(".taskbtn").forEach(b=>b.classList.toggle("on",b.dataset.t===k));
+}
+function showTask(k){activeTask=k;renderTask(k,true);}
+document.querySelectorAll(".taskbtn").forEach(b=>b.addEventListener("click",()=>showTask(b.dataset.t)));
+
+/* ================= shipping-today outbox demo ================= */
+let obTick=null,obTimer=null,obArmed=false;
+function obReset(){
+  clearInterval(obTick);clearTimeout(obTimer);obArmed=false;
+  const card=document.getElementById("obCard"),pill=document.getElementById("undoPill");
+  if(!card)return;
+  card.hidden=false;pill.hidden=true;
+  document.getElementById("obAllow").textContent=t("now.a3");
+  document.getElementById("undoBtn").hidden=false;
+  document.getElementById("undoNum").textContent="3";
+  document.getElementById("undoRing").style.background="conic-gradient(#1e9e46 100%,#dfe7df 0)";
+  document.getElementById("undoTxt").innerHTML=t("now.u1");
+}
+(function(){
+  const card=document.getElementById("obCard");if(!card)return;
+  const pill=document.getElementById("undoPill"),allow=document.getElementById("obAllow"),
+        ring=document.getElementById("undoRing"),num=document.getElementById("undoNum"),
+        txt=document.getElementById("undoTxt"),undoBtn=document.getElementById("undoBtn");
+  document.getElementById("obCheck").addEventListener("click",()=>toast(I18N[cur].toasts.obCheck));
+  document.getElementById("obDeny").addEventListener("click",()=>toast(I18N[cur].toasts.obDeny));
+  allow.addEventListener("click",()=>{
+    if(!obArmed){obArmed=true;allow.textContent=t("now.a3c");return;}
+    card.hidden=true;pill.hidden=false;undoBtn.hidden=false;
+    txt.innerHTML=t("now.u1");toast(I18N[cur].toasts.obSent);
+    let s=3;num.textContent=s;ring.style.background="conic-gradient(#1e9e46 100%,#dfe7df 0)";
+    clearInterval(obTick);
+    obTick=setInterval(()=>{
+      s--;
+      if(s<=0){
+        clearInterval(obTick);num.textContent="✓";
+        ring.style.background="conic-gradient(#1e9e46 100%,#dfe7df 0)";
+        txt.innerHTML=t("now.u3");undoBtn.hidden=true;
+        toast(I18N[cur].toasts.obDone);
+        obTimer=setTimeout(obReset,2600);
+      }else{
+        num.textContent=s;
+        ring.style.background=`conic-gradient(#1e9e46 ${(s/3*100).toFixed(0)}%,#dfe7df 0)`;
+      }
+    },1000);
+  });
+  undoBtn.addEventListener("click",()=>{toast(I18N[cur].toasts.obUndo);obReset();});
+})();
+
+/* ================= ch3 notification demo ================= */
+const notif=document.getElementById("notif");
+document.getElementById("nfTrigger").addEventListener("click",()=>notif.classList.add("show"));
+document.getElementById("nfOk").addEventListener("click",()=>{notif.classList.remove("show");toast(I18N[cur].toasts.okA);});
+document.getElementById("nfGo").addEventListener("click",()=>{notif.classList.remove("show");toast(I18N[cur].toasts.goStage);});
+
+/* ================= ch4 report demo ================= */
+document.getElementById("rpDiff").addEventListener("click",()=>toast(I18N[cur].toasts.diff));
+document.getElementById("rpPass").addEventListener("click",()=>toast(I18N[cur].toasts.pass));
+document.getElementById("rollBtn").addEventListener("click",function(){
+  const steps=[...document.querySelectorAll("#tline .tstep")];
+  if(!rolled){
+    steps[3].classList.add("rolled");steps[3].classList.remove("cur");
+    steps[2].classList.add("cur");
+    toast(I18N[cur].toasts.rolled);
+  }else{
+    steps[3].classList.remove("rolled");steps[3].classList.add("cur");
+    steps[2].classList.remove("cur");
+    toast(I18N[cur].toasts.restored);
+  }
+  rolled=!rolled;
+  this.textContent=t(rolled?"roll.undo":"roll.do");
+});
+
+/* ================= stats count-up ================= */
+const nio=new IntersectionObserver(es=>{
+  es.forEach(e=>{
+    if(!e.isIntersecting)return;
+    const el=e.target,target=+el.dataset.n,suf=el.dataset.suf||"";
+    const t0=performance.now();
+    (function tick(ts){
+      const p=Math.min(1,(ts-t0)/1200),ease=1-Math.pow(1-p,3);
+      el.textContent=Math.round(target*ease)+suf;
+      if(p<1)requestAnimationFrame(tick);
+    })(t0);
+    nio.unobserve(el);
+  });
+},{threshold:.6});
+document.querySelectorAll(".num[data-n]").forEach(el=>nio.observe(el));
+
+/* ================= faq accordion ================= */
+document.querySelectorAll(".qa").forEach(qa=>{
+  const q=qa.querySelector(".q"),a=qa.querySelector(".a");
+  q.addEventListener("click",()=>{
+    const open=qa.classList.contains("open");
+    document.querySelectorAll(".qa.open").forEach(o=>{o.classList.remove("open");o.querySelector(".a").style.maxHeight="0px";});
+    if(!open){qa.classList.add("open");a.style.maxHeight=a.scrollHeight+"px";}
+  });
+});
+
+/* ================= cta demo links ================= */
+document.getElementById("ctaGit").addEventListener("click",e=>{e.preventDefault();toast(I18N[cur].toasts.git);});
+document.getElementById("ctaCom").addEventListener("click",e=>{e.preventDefault();toast(I18N[cur].toasts.com);});
+
+/* ================= language switch ================= */
+document.querySelectorAll("#langSeg button").forEach(b=>{
+  b.addEventListener("click",()=>{if(b.dataset.l!==cur)applyLang(b.dataset.l);});
+});
+
+/* init: default English */
+applyLang("en");
+</script>
+</body>
+</html>
