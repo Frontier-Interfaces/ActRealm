@@ -48,18 +48,20 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em;background:#ececf1
 .langseg button.on{background:#fff;color:var(--txt);box-shadow:var(--shadow-sm)}
 
 /* ---------- hero ---------- */
-.hero{padding:88px 0 0;text-align:center}
+.hero{padding:72px 0 0;text-align:center}
+.hero>.wrap{max-width:1280px}
 .hero .appicon{width:88px;height:88px;border-radius:22px;background:var(--grad);margin:0 auto;position:relative;box-shadow:0 14px 34px rgba(110,90,224,.35)}
 .hero .appicon::before{content:"";position:absolute;right:18px;top:22px;bottom:22px;width:34px;border-radius:8px;background:#fff;box-shadow:0 4px 14px rgba(0,0,0,.14)}
 .hero .appicon::after{content:"";position:absolute;left:18px;top:22px;width:16px;height:12px;border-radius:4px;background:rgba(255,255,255,.92);box-shadow:0 16px 0 rgba(255,255,255,.66),0 32px 0 rgba(255,255,255,.4)}
 .hero h1{font-size:28px;font-weight:600;margin-top:22px;letter-spacing:.5px}
 .hero .cat{display:inline-block;margin-top:14px;padding:8px 20px;border-radius:980px;font-size:14.5px;font-weight:700;letter-spacing:.5px;border:1.5px solid rgba(110,90,224,.35);background:rgba(110,90,224,.06)}
 .hero .cat span{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
-.hero .slogan{font-size:clamp(42px,7.4vw,80px);font-weight:700;line-height:1.08;letter-spacing:-.02em;margin-top:10px}
+.hero .slogan{font-size:clamp(38px,4.35vw,60px);font-weight:700;line-height:1.06;letter-spacing:-.035em;margin-top:22px;text-wrap:balance}
+.hero .slogan .line{display:block;white-space:nowrap}
 .hero .slogan .g{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
-.hero .sub{max-width:660px;margin:28px auto 0;font-size:19px;line-height:1.6;color:var(--txt2)}
-.hero .badges{margin-top:20px;font-size:13px;color:var(--txt3);letter-spacing:.5px}
-.cta-row{margin-top:30px;display:flex;gap:18px;justify-content:center;align-items:center;flex-wrap:wrap}
+.hero .sub{max-width:760px;margin:24px auto 0;font-size:17.5px;line-height:1.6;color:var(--txt2);text-wrap:balance}
+.hero .badges{margin-top:17px;font-size:13px;color:var(--txt3);letter-spacing:.5px}
+.cta-row{margin-top:26px;display:flex;gap:18px;justify-content:center;align-items:center;flex-wrap:wrap}
 .btn{display:inline-block;border-radius:980px;font-size:15.5px;font-weight:500;padding:13px 28px;transition:.2s}
 .btn-grad{background:var(--grad);color:#fff}
 .btn-grad:hover{filter:brightness(1.08);transform:scale(1.02)}
@@ -333,6 +335,11 @@ footer{border-top:1px solid var(--line);padding:32px 0 44px;font-size:12.5px;col
 [hidden]{display:none!important}
 
 @media(max-width:860px){
+  .hero{padding-top:56px}
+  .hero>.wrap{padding:0 20px}
+  .hero .slogan{font-size:clamp(36px,7.2vw,46px);line-height:1.08;margin-top:20px}
+  .hero .slogan .line{white-space:normal}
+  .hero .sub{max-width:640px;font-size:16.5px;line-height:1.55;margin-top:22px}
   .lnav .links{display:none}
   .loop-grid{grid-template-columns:1fr}
   .lcard:not(:last-child)::after{content:"↓";right:auto;left:50%;top:auto;bottom:-24px;transform:translateX(-50%)}
@@ -797,7 +804,7 @@ en:{
   "mani.body":"Operating systems were designed around applications, windows and files. Agents introduce a different unit of work: a task that can continue, wait, request authority and return with a result. <span class='g'>ActRealm is the open operating layer that connects those tasks to human control.</span>",
   "mani.sign":"— The ActRealm Project",
   "hero.cat":"The open agent operating layer for desktop",
-  "hero.slogan":"Manage agents in one place.<br><span class='g'>Bring the right task context forward.</span>",
+  "hero.slogan":"<span class='line'>Manage agents in one place.</span><span class='line g'>Bring the right task context forward.</span>",
   "hero.sub":"ActRealm brings tasks, status, approval requests and workspaces from Claude Code, Codex and other desktop agents into one local control layer. When a task needs you, return directly to its terminal, diff and preview.",
   "hero.badges":"MIT licensed · Local by default",
   "hero.cta1":"View on GitHub","hero.cta2":"See the workflow >",
@@ -934,7 +941,7 @@ zh:{
   "mani.body":"传统操作系统围绕应用、窗口和文件建立。Agent 带来了新的工作单元：一个任务可以持续执行、等待输入、请求权限，并带着结果返回。<span class='g'>ActRealm 是连接 Agent 任务与人类控制的开放操作层。</span>",
   "mani.sign":"—— ActRealm 项目",
   "hero.cat":"桌面端的开源 Agent 操作层",
-  "hero.slogan":"统一管理 Agent，<br><span class='g'>按需调度任务现场。</span>",
+  "hero.slogan":"<span class='line'>统一管理 Agent，</span><span class='line g'>按需调度任务现场。</span>",
   "hero.sub":"ActRealm 将 Claude Code、Codex 等桌面 Agent 的任务、状态、授权请求与工作界面统一纳入本地控制。需要介入时，直接返回对应的终端、diff 与预览。",
   "hero.badges":"MIT 开源 · 默认本地运行",
   "hero.cta1":"查看 GitHub","hero.cta2":"了解工作方式 >",
