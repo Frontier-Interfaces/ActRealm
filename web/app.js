@@ -96,9 +96,19 @@ let eventUiLatencies = [];
 let selectedSessionId;
 let detailSessionId;
 let sessionActivityRefs = new Map();
+let sessionRenderSignatures = new Map();
+let lastAttentionRenderSignature;
+let lastQuotaRenderSignature;
 let attentionExitTimer;
+let reconnectTimer;
+let setupRefreshTimer;
+let lastSocketFrameAt = 0;
+let lastSnapshotAt = 0;
+let fallbackSnapshotInFlight = false;
 let hiddenSessions = JSON.parse(localStorage.getItem("flowAgentHiddenSessions") || "{}");
 const SESSION_VISIBLE_FOR_MS = 30 * 60 * 1000;
+const SOCKET_STALE_AFTER_MS = 25 * 1000;
+const SNAPSHOT_FALLBACK_AFTER_MS = 15 * 1000;
 const DISPLAY_PRESETS = {
   concise: ["task", "activity"],
   detailed: ["project", "task", "model", "activity", "plan", "tokens", "context", "tool", "subagents", "environment", "recovery", "control", "jump"],
@@ -761,10 +771,21 @@ function renderInteractiveForm(item, card) {
   return true;
 }
 
-function renderAttention() {
+function attentionRenderSignature() {
   const items = openItems();
-  ui.attentionCount.textContent = String(items.length);
-  ui.attentionList.replaceChildren();
+  const sessionIds = new Set(items.map((item) => item.sessionId));
+  return JSON.stringify({
+    currentAttention,
+    items,
+    commands: snapshot.commands.filter((command) => items.some((item) => item.id === command.attentionId)),
+    sessions: snapshot.sessions
+      .filter((session) => sessionIds.has(session.id))
+      .map((session) => ({ id: session.id, title: session.title, providerTitle: session.providerTitle, project: session.project })),
+  });
+}
+
+function updateAttentionTimes() {
+  const items = openItems();
   if (items.length) {
     const oldest = Math.min(...items.map((item) => Number(item.createdAt || Date.now())));
     const minutes = Math.max(0, Math.floor((Date.now() - oldest) / 60000));
@@ -772,6 +793,15 @@ function renderAttention() {
   } else {
     ui.attentionSummary.textContent = "没有需要你处理的事项";
   }
+  updateMarkedElapsed(ui.attentionList);
+}
+
+function renderAttention() {
+  lastAttentionRenderSignature = attentionRenderSignature();
+  const items = openItems();
+  ui.attentionCount.textContent = String(items.length);
+  ui.attentionList.replaceChildren();
+  updateAttentionTimes();
   if (!items.length) {
     ui.attentionList.append(emptyState("✓", "全部处理完毕", "新的授权、问题、完成或错误会实时进入 OUTBOX。"));
     return;
@@ -789,7 +819,7 @@ function renderAttention() {
     error: "错误",
   }[item.kind] || "待处理";
   kicker.append(element("span", "attention-kind", kindLabel));
-  kicker.append(element("span", "attention-state", `已等 ${elapsedText(item.createdAt)}`));
+  kicker.append(markLiveElapsed(element("span", "attention-state"), item.createdAt, "已等 "));
   card.append(kicker, element("h3", "", attentionTitle(item)));
 
   const agentLine = element("div", "agent-line");
@@ -874,7 +904,7 @@ function renderAttention() {
           approval: "等待批准", native_approval: "原界面批准", question: "提问", completion: "完成", error: "错误",
         }[candidate.kind] || "待处理"),
         element("strong", "", attentionTitle(candidate)),
-        element("span", "", elapsedText(candidate.createdAt)),
+        markLiveElapsed(element("span", ""), candidate.createdAt),
       );
       row.addEventListener("click", () => { currentAttention = index; renderAttention(); });
       queue.append(row);
@@ -884,9 +914,7 @@ function renderAttention() {
 }
 
 function sessionStatus(session) {
-  const waiting = snapshot.attention
-    .filter((item) => item.sessionId === session.id && ["open", "committing", "decision_sent"].includes(item.state))
-    .sort((left, right) => left.createdAt - right.createdAt);
+  const waiting = blockingAttentionForSession(session);
   if (waiting.length) {
     const first = waiting[0];
     const suffix = waiting.length > 1 ? ` ×${waiting.length}` : "";
@@ -897,6 +925,8 @@ function sessionStatus(session) {
     return { label: `待处理${suffix}`, className: "waiting" };
   }
   if (session.execState === "failed") return { label: "出错", className: "failed" };
+  const completion = pendingAttentionForSession(session).find((item) => item.kind === "completion");
+  if (!isSessionActive(session) && completion) return { label: "待确认", className: "waiting" };
   if (["idle", "response_finished"].includes(session.execState)) return { label: "空闲", className: "idle" };
   return { label: "在跑", className: "" };
 }
@@ -917,6 +947,35 @@ function elapsedText(since, until = Date.now()) {
   const minutes = Math.floor(seconds / 60);
   if (minutes < 60) return `${minutes} 分 ${seconds % 60} 秒`;
   return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
+}
+
+function markLiveElapsed(node, since, prefix = "", suffix = "") {
+  node.dataset.liveElapsedSince = String(Number(since || Date.now()));
+  node.dataset.liveElapsedPrefix = prefix;
+  node.dataset.liveElapsedSuffix = suffix;
+  node.textContent = `${prefix}${elapsedText(node.dataset.liveElapsedSince)}${suffix}`;
+  return node;
+}
+
+function updateMarkedElapsed(root) {
+  for (const node of root.querySelectorAll("[data-live-elapsed-since]")) {
+    node.textContent = `${node.dataset.liveElapsedPrefix || ""}${elapsedText(node.dataset.liveElapsedSince)}${node.dataset.liveElapsedSuffix || ""}`;
+  }
+}
+
+function isSessionActive(session) {
+  return !["idle", "response_finished", "failed"].includes(session.execState);
+}
+
+function pendingAttentionForSession(session) {
+  return snapshot.attention
+    .filter((item) => item.sessionId === session.id && ["open", "committing", "decision_sent"].includes(item.state))
+    .sort((left, right) => left.createdAt - right.createdAt);
+}
+
+function blockingAttentionForSession(session) {
+  return pendingAttentionForSession(session)
+    .filter((item) => ["approval", "native_approval", "question"].includes(item.kind));
 }
 
 function turnTiming(session) {
@@ -1083,9 +1142,7 @@ function visibleSessions() {
 }
 
 function activityDisplay(session) {
-  const waiting = snapshot.attention
-    .filter((item) => item.sessionId === session.id && ["open", "committing", "decision_sent"].includes(item.state))
-    .sort((a, b) => a.createdAt - b.createdAt)[0];
+  const waiting = blockingAttentionForSession(session)[0];
   if (waiting) {
     const text = waiting.kind === "native_approval"
       ? `${providerName(waiting.provider)} 正在请求批准，请回原界面处理`
@@ -1098,6 +1155,14 @@ function activityDisplay(session) {
       className: "waiting",
       marker: "!",
       text: `${text} · ${turnTiming(session)} · 已等 ${elapsedText(waiting.createdAt)}`,
+    };
+  }
+  const completion = pendingAttentionForSession(session).find((item) => item.kind === "completion");
+  if (!isSessionActive(session) && completion) {
+    return {
+      className: "waiting",
+      marker: "✓",
+      text: `本轮已完成，等待确认 · ${turnTiming(session)} · 已等 ${elapsedText(completion.createdAt)}`,
     };
   }
   const timing = turnTiming(session);
@@ -1122,11 +1187,10 @@ function activityDisplay(session) {
 function updateSessionActivity() {
   for (const [sessionId, ref] of sessionActivityRefs) {
     const session = snapshot.sessions.find((candidate) => candidate.id === sessionId);
-    if (!session || !ref.marker.isConnected) continue;
+    if (!session || !ref.root.isConnected) continue;
     const display = activityDisplay(session);
-    ref.root.className = `row-subtitle session-activity ${display.className}`;
-    ref.marker.textContent = display.marker;
-    ref.text.textContent = display.text;
+    ref.root.className = `task-right ${display.className}`;
+    ref.root.textContent = display.text;
   }
 }
 
@@ -1216,23 +1280,15 @@ async function clearSessionFromList(session) {
   }
 }
 
-function renderSessions() {
-  ui.sessionList.replaceChildren();
-  sessionActivityRefs = new Map();
-  const sessions = visibleSessions();
-  const waitingCount = sessions.filter((session) => sessionStatus(session).className === "waiting").length;
-  const runningCount = sessions.filter((session) => !["idle", "response_finished", "failed"].includes(session.execState) && sessionStatus(session).className !== "waiting").length;
-  const finishedCount = sessions.filter((session) => ["idle", "response_finished"].includes(session.execState)).length;
-  ui.sessionCount.textContent = `${sessions.length} 个任务 · ${waitingCount} 等你 · ${runningCount} 在跑 · ${finishedCount} 刚完成`;
-  if (!sessions.length) {
-    selectedSessionId = undefined;
-    ui.sessionList.append(emptyState("✓", "当前没有活跃任务", "这里只保留运行中、待处理或最近 30 分钟内的任务。"));
-    return;
-  }
-  if (selectedSessionId && !sessions.some((session) => session.id === selectedSessionId)) {
-    selectedSessionId = undefined;
-  }
-  for (const session of sessions) {
+function sessionRenderSignature(session) {
+  return JSON.stringify({
+    session,
+    attention: pendingAttentionForSession(session),
+    selected: session.id === selectedSessionId,
+  });
+}
+
+function buildSessionRow(session) {
     const status = sessionStatus(session);
     const row = element("article", `session-row${session.id === selectedSessionId ? " selected" : ""}`);
     row.dataset.sessionId = session.id;
@@ -1256,7 +1312,9 @@ function renderSessions() {
     title.append(element("strong", "", clientTitle));
     title.append(element("span", `state-pill ${status.className}`.trim(), status.label));
     const activity = activityDisplay(session);
-    title.append(element("span", `task-right ${activity.className}`, activity.text));
+    const activityNode = element("span", `task-right ${activity.className}`, activity.text);
+    sessionActivityRefs.set(session.id, { root: activityNode });
+    title.append(activityNode);
     const taskContent = session.providerTitle && session.title && session.providerTitle !== session.title
       ? element("div", "session-question", session.title)
       : undefined;
@@ -1320,7 +1378,68 @@ function renderSessions() {
     }
     top.append(copy);
     row.append(top);
-    ui.sessionList.append(row);
+    return row;
+}
+
+function renderSessions() {
+  const sessions = visibleSessions();
+  if (selectedSessionId && !sessions.some((session) => session.id === selectedSessionId)) {
+    selectedSessionId = undefined;
+  }
+  const waitingCount = sessions.filter((session) => sessionStatus(session).className === "waiting").length;
+  const runningCount = sessions.filter((session) => isSessionActive(session) && sessionStatus(session).className !== "waiting").length;
+  const finishedCount = sessions.filter((session) => ["idle", "response_finished"].includes(session.execState)).length;
+  ui.sessionCount.textContent = `${sessions.length} 个任务 · ${waitingCount} 等你 · ${runningCount} 在跑 · ${finishedCount} 刚完成`;
+  if (!sessions.length) {
+    selectedSessionId = undefined;
+    sessionActivityRefs.clear();
+    sessionRenderSignatures.clear();
+    if (!ui.sessionList.querySelector(".session-empty")) {
+      const empty = emptyState("✓", "当前没有活跃任务", "这里只保留运行中、待处理或最近 30 分钟内的任务。");
+      empty.classList.add("session-empty");
+      ui.sessionList.replaceChildren(empty);
+    }
+    return;
+  }
+
+  const scrollTop = ui.sessionList.scrollTop;
+  const focusedSessionId = document.activeElement?.closest?.(".session-row")?.dataset.sessionId;
+  const existingRows = new Map(
+    [...ui.sessionList.querySelectorAll(".session-row[data-session-id]")]
+      .map((row) => [row.dataset.sessionId, row]),
+  );
+  const nextIds = new Set(sessions.map((session) => session.id));
+  const desiredRows = [];
+  for (const session of sessions) {
+    const signature = sessionRenderSignature(session);
+    const existing = existingRows.get(session.id);
+    let row = existing;
+    if (!existing || sessionRenderSignatures.get(session.id) !== signature) {
+      sessionActivityRefs.delete(session.id);
+      row = buildSessionRow(session);
+      if (existing) existing.replaceWith(row);
+    }
+    sessionRenderSignatures.set(session.id, signature);
+    desiredRows.push(row);
+  }
+  for (let index = 0; index < desiredRows.length; index += 1) {
+    const row = desiredRows[index];
+    const current = ui.sessionList.children[index];
+    if (current !== row) ui.sessionList.insertBefore(row, current || null);
+  }
+  for (const child of [...ui.sessionList.children]) {
+    const sessionId = child.dataset?.sessionId;
+    if (!sessionId || !nextIds.has(sessionId)) child.remove();
+  }
+  for (const sessionId of [...sessionRenderSignatures.keys()]) {
+    if (!nextIds.has(sessionId)) {
+      sessionRenderSignatures.delete(sessionId);
+      sessionActivityRefs.delete(sessionId);
+    }
+  }
+  ui.sessionList.scrollTop = scrollTop;
+  if (focusedSessionId) {
+    ui.sessionList.querySelector(`[data-session-id="${CSS.escape(focusedSessionId)}"]`)?.focus({ preventScroll: true });
   }
 }
 
@@ -1350,7 +1469,25 @@ function quotaSlots() {
   });
 }
 
+function quotaRenderSignature() {
+  return JSON.stringify(quotaSlots());
+}
+
+function updateQuotaTimes() {
+  for (const node of ui.quotaList.querySelectorAll("[data-quota-captured-at]")) {
+    const minutes = Math.max(0, Math.floor((Date.now() - Number(node.dataset.quotaCapturedAt)) / 60000));
+    node.textContent = minutes > 0 ? `${minutes} 分钟前更新` : "刚刚更新";
+  }
+  for (const node of ui.quotaList.querySelectorAll("[data-quota-resets-at]")) {
+    const reset = new Date(Number(node.dataset.quotaResetsAt));
+    node.textContent = reset.getTime() <= Date.now()
+      ? "已到重置时间，等待同步"
+      : `${reset.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })} 重置`;
+  }
+}
+
 function renderQuota() {
+  lastQuotaRenderSignature = quotaRenderSignature();
   ui.quotaList.replaceChildren();
   const slots = quotaSlots();
   const latestCapture = Math.max(0, ...slots.map((quota) => Number(quota.capturedAt || 0)));
@@ -1404,18 +1541,19 @@ function renderQuota() {
     if (quota.planType) meta.append(element("span", "", quota.planType));
     if (quota.resetsAt) {
       const reset = new Date(Number(quota.resetsAt) * 1000);
-      const resetLabel = reset.getTime() <= Date.now()
-        ? "已到重置时间，等待同步"
-        : `${reset.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })} 重置`;
-      meta.append(element("span", "", resetLabel));
+      const resetNode = element("span", "");
+      resetNode.dataset.quotaResetsAt = String(reset.getTime());
+      meta.append(resetNode);
     }
     if (quota.capturedAt) {
-      const minutes = Math.floor((Date.now() - Number(quota.capturedAt)) / 60000);
-      meta.append(element("span", "", minutes > 0 ? `${minutes} 分钟前更新` : "刚刚更新"));
+      const capturedNode = element("span", "");
+      capturedNode.dataset.quotaCapturedAt = String(Number(quota.capturedAt));
+      meta.append(capturedNode);
     }
     row.append(meta);
     ui.quotaList.append(row);
   }
+  updateQuotaTimes();
 }
 
 function notificationRule(item) {
@@ -1483,11 +1621,14 @@ function render(nextSnapshot) {
       attentionExitTimer = undefined;
       renderAttention();
     }, 180);
-  } else if (!attentionExitTimer) {
+  } else if (!attentionExitTimer && attentionRenderSignature() !== lastAttentionRenderSignature) {
     renderAttention();
+  } else {
+    updateAttentionTimes();
   }
   renderSessions();
-  renderQuota();
+  if (quotaRenderSignature() !== lastQuotaRenderSignature) renderQuota();
+  else updateQuotaTimes();
   ui.eventCount.textContent = String(snapshot.stats?.eventCount || 0);
   const eventCount = Number(snapshot.stats?.eventCount || 0);
   if (eventCount > renderedEventCount) {
@@ -1542,9 +1683,11 @@ async function bootstrap() {
 async function loadSnapshot() {
   try {
     render(await api("/api/v1/snapshot"));
+    lastSnapshotAt = Date.now();
   } catch (error) {
     if (String(error.message) === "UNAUTHORIZED" && await bootstrap()) {
       render(await api("/api/v1/snapshot"));
+      lastSnapshotAt = Date.now();
       return;
     }
     throw error;
@@ -1560,29 +1703,74 @@ function setConnected(connected) {
   ui.offlineBanner.hidden = connected;
 }
 
+function scheduleSetupRefresh() {
+  window.clearTimeout(setupRefreshTimer);
+  setupRefreshTimer = window.setTimeout(() => {
+    setupRefreshTimer = undefined;
+    void loadSetup();
+  }, 500);
+}
+
 function connectSocket() {
   if (!csrfToken) return;
+  if (socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(socket.readyState)) return;
+  window.clearTimeout(reconnectTimer);
+  reconnectTimer = undefined;
   const scheme = location.protocol === "https:" ? "wss" : "ws";
-  socket = new WebSocket(`${scheme}://${location.host}/api/v1/ws?csrf=${encodeURIComponent(csrfToken)}`);
-  socket.addEventListener("open", () => { reconnectDelay = 500; setConnected(true); });
-  socket.addEventListener("message", (event) => {
+  const currentSocket = new WebSocket(`${scheme}://${location.host}/api/v1/ws?csrf=${encodeURIComponent(csrfToken)}`);
+  socket = currentSocket;
+  currentSocket.addEventListener("open", () => {
+    if (socket !== currentSocket) return;
+    reconnectDelay = 500;
+    lastSocketFrameAt = Date.now();
+  });
+  currentSocket.addEventListener("message", (event) => {
+    if (socket !== currentSocket) return;
     try {
       const frame = JSON.parse(event.data);
+      lastSocketFrameAt = Date.now();
+      setConnected(true);
+      if (frame.type === "heartbeat") return;
       if (frame.type === "snapshot") {
         const previousEventCount = Number(snapshot.stats?.eventCount || 0);
         render(frame.snapshot);
-        if (Number(snapshot.stats?.eventCount || 0) !== previousEventCount) loadSetup();
+        lastSnapshotAt = Date.now();
+        if (Number(snapshot.stats?.eventCount || 0) !== previousEventCount) scheduleSetupRefresh();
       }
     } catch (_) {
       showToast("Runtime 返回了无法识别的消息");
     }
   });
-  socket.addEventListener("close", () => {
+  currentSocket.addEventListener("close", () => {
+    if (socket !== currentSocket) return;
+    socket = undefined;
     setConnected(false);
-    window.setTimeout(connectSocket, reconnectDelay);
+    reconnectTimer = window.setTimeout(connectSocket, reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 2, 10000);
   });
-  socket.addEventListener("error", () => socket.close());
+  currentSocket.addEventListener("error", () => currentSocket.close());
+}
+
+async function refreshSnapshotFallback() {
+  if (fallbackSnapshotInFlight || !csrfToken) return;
+  fallbackSnapshotInFlight = true;
+  try {
+    await loadSnapshot();
+  } catch (_) {
+    // The WebSocket reconnect path owns the visible connection state.
+  } finally {
+    fallbackSnapshotInFlight = false;
+  }
+}
+
+function maintainLiveConnection() {
+  if (document.visibilityState !== "visible") return;
+  const now = Date.now();
+  if (socket?.readyState === WebSocket.OPEN && now - lastSocketFrameAt > SOCKET_STALE_AFTER_MS) {
+    socket.close();
+    return;
+  }
+  if (now - lastSnapshotAt > SNAPSHOT_FALLBACK_AFTER_MS) void refreshSnapshotFallback();
 }
 
 async function sendAction(item, action) {
@@ -1751,9 +1939,28 @@ document.addEventListener("keydown", (event) => {
   if (!ui.setupOverlay.hidden) closeSetup();
   if (!ui.settingsOverlay.hidden) closeSettings();
 });
-window.setInterval(updateSessionActivity, 1000);
-updateClock();
-window.setInterval(updateClock, 1000);
+
+function updateLiveTimes() {
+  updateClock();
+  updateSessionActivity();
+  updateAttentionTimes();
+  updateQuotaTimes();
+}
+
+function resumeLiveView() {
+  updateLiveTimes();
+  maintainLiveConnection();
+  if (!socket || socket.readyState === WebSocket.CLOSED) connectSocket();
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") resumeLiveView();
+});
+window.addEventListener("focus", resumeLiveView);
+window.addEventListener("pageshow", resumeLiveView);
+updateLiveTimes();
+window.setInterval(updateLiveTimes, 1000);
+window.setInterval(maintainLiveConnection, 5000);
 
 (async () => {
   setConnected(false);

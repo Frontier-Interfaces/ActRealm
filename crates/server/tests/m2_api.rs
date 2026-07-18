@@ -164,6 +164,7 @@ fn start(name: &str) -> (PathBuf, RuntimeStore, WaiterRegistry, ApiServer) {
         ApiServerConfig {
             commit_delay: Duration::from_millis(60),
             snapshot_interval: Duration::from_millis(20),
+            heartbeat_interval: Duration::from_millis(40),
             install_paths: Some(flow_agent_installer::InstallPaths {
                 flow_home: root.join("flow-home"),
                 claude_settings: root.join("home/.claude/settings.json"),
@@ -245,6 +246,12 @@ fn embedded_ui_contract_is_small_honest_and_complete() {
     assert!(APP_JS.contains("session.providerTitle"));
     assert!(APP_JS.contains("const clientTitle = session.providerTitle || session.title"));
     assert!(APP_JS.contains("session.model || \"模型未知\""));
+    assert!(APP_JS.contains("sessionActivityRefs.set(session.id"));
+    assert!(APP_JS.contains("data-live-elapsed-since"));
+    assert!(APP_JS.contains("attentionRenderSignature() !== lastAttentionRenderSignature"));
+    assert!(APP_JS.contains("frame.type === \"heartbeat\""));
+    assert!(APP_JS.contains("SNAPSHOT_FALLBACK_AFTER_MS"));
+    assert!(!APP_CSS.contains(".task-expanded { margin-top: 9px; padding-top: 10px; border-top: 1px solid rgba(0, 0, 0, .06); display: grid; grid-template-columns: 1fr 1fr; gap: 6px 24px; animation:"));
     assert!(!APP_JS.contains("providerTitleSourceLabel"));
     assert!(!APP_JS.contains("当前："));
     assert!(!APP_JS.contains("session.project || \"未命名项目\""));
@@ -541,6 +548,14 @@ fn pass_through_ack_snooze_and_websocket_snapshot_are_real() {
         assert!(quota
             .iter()
             .all(|entry| entry["status"] == "unavailable" && entry.get("usedPct").is_none()));
+        let heartbeat = tokio::time::timeout(Duration::from_secs(1), websocket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let heartbeat: Value = serde_json::from_str(heartbeat.to_text().unwrap()).unwrap();
+        assert_eq!(heartbeat["type"], "heartbeat");
+        assert!(heartbeat["serverTime"].as_u64().is_some());
         websocket.close(None).await.unwrap();
     });
 

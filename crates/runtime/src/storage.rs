@@ -1680,6 +1680,12 @@ fn ingest_transaction(
         &request.raw,
         occurred_at,
     )?;
+    reconcile_superseded_nonblocking_attention(
+        &transaction,
+        &session_id,
+        parsed.kind,
+        occurred_at,
+    )?;
     let observed_native_permission = is_observed_codex_permission_start(&request);
     let attention_id = match parsed.kind {
         EventKind::PermissionRequested if observed_native_permission => {
@@ -3392,6 +3398,38 @@ fn is_observed_codex_permission_start(request: &BridgeRequest) -> bool {
         && request.event_name() == Some("PreToolUse")
         && request.raw.get("tool_name").and_then(Value::as_str) == Some("request_permissions")
         && !request.needs_reply
+}
+
+fn reconcile_superseded_nonblocking_attention(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    kind: EventKind,
+    occurred_at: i64,
+) -> Result<(), StoreError> {
+    if !matches!(
+        kind,
+        EventKind::SessionStarted
+            | EventKind::PromptSubmitted
+            | EventKind::ToolStarted
+            | EventKind::PermissionRequested
+            | EventKind::QuestionRequested
+            | EventKind::ElicitationRequested
+            | EventKind::Compacting
+            | EventKind::SubagentStarted
+            | EventKind::TaskCreated
+    ) {
+        return Ok(());
+    }
+    transaction
+        .execute(
+            "UPDATE attention_items SET state = 'resolved', resolved_at = ?2,
+               resolution = 'superseded_by_activity', expires_at = NULL
+             WHERE session_id = ?1 AND kind IN ('completion', 'error')
+               AND state IN ('open', 'snoozed') AND created_at < ?2",
+            params![session_id, occurred_at],
+        )
+        .map_err(storage_error)?;
+    Ok(())
 }
 
 fn reconcile_observed_native_permission(

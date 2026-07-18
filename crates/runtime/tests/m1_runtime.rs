@@ -1534,6 +1534,126 @@ fn factual_error_question_and_completion_attention_support_local_actions() {
 }
 
 #[test]
+fn new_activity_resolves_stale_completion_and_error_without_hiding_running_state() {
+    let root = temp_root("superseded-nonblocking-attention");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+
+    for (at, event, turn, tool_name) in [
+        (1_000, "UserPromptSubmit", "turn-1", None),
+        (1_100, "PreToolUse", "turn-1", Some("Write")),
+        (1_200, "Stop", "turn-1", None),
+    ] {
+        let mut raw = json!({
+            "hook_event_name": event,
+            "session_id": "resumed-session",
+            "turn_id": turn,
+            "cwd": "/tmp/example-project"
+        });
+        if let Some(tool_name) = tool_name {
+            raw["tool_name"] = Value::String(tool_name.to_owned());
+            raw["tool_input"] = json!({ "file_path": "/tmp/example-project/file.rs" });
+        }
+        store
+            .ingest(BridgeRequest::from_hook_at(Provider::Codex, raw, at))
+            .unwrap();
+    }
+    let stopped = store.snapshot().unwrap();
+    let completion = stopped
+        .attention
+        .iter()
+        .find(|item| item.kind == "completion")
+        .unwrap();
+    assert_eq!(completion.state, "open");
+    assert_eq!(stopped.sessions[0].exec_state, "response_finished");
+
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "resumed-session",
+                "turn_id": "turn-2",
+                "cwd": "/tmp/example-project",
+                "prompt": "继续检查实时状态"
+            }),
+            2_000,
+        ))
+        .unwrap();
+    let resumed = store.snapshot().unwrap();
+    let completion = resumed
+        .attention
+        .iter()
+        .find(|item| item.kind == "completion")
+        .unwrap();
+    assert_eq!(completion.state, "resolved");
+    assert_eq!(
+        completion.resolution.as_deref(),
+        Some("superseded_by_activity")
+    );
+    assert_eq!(resumed.sessions[0].exec_state, "thinking");
+
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name": "StopFailure",
+                "session_id": "resumed-session",
+                "turn_id": "turn-2",
+                "cwd": "/tmp/example-project",
+                "error": "temporary failure"
+            }),
+            2_100,
+        ))
+        .unwrap();
+    assert!(store
+        .snapshot()
+        .unwrap()
+        .attention
+        .iter()
+        .any(|item| item.kind == "error" && item.state == "open"));
+
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "resumed-session",
+                "turn_id": "turn-3",
+                "cwd": "/tmp/example-project",
+                "prompt": "失败后继续"
+            }),
+            2_200,
+        ))
+        .unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "resumed-session",
+                "turn_id": "turn-3",
+                "cwd": "/tmp/example-project",
+                "tool_name": "Read",
+                "tool_input": { "file_path": "/tmp/example-project/file.rs" }
+            }),
+            2_300,
+        ))
+        .unwrap();
+    let recovered = store.snapshot().unwrap();
+    let error = recovered
+        .attention
+        .iter()
+        .find(|item| item.kind == "error")
+        .unwrap();
+    assert_eq!(error.state, "resolved");
+    assert_eq!(error.resolution.as_deref(), Some("superseded_by_activity"));
+    assert_eq!(recovered.sessions[0].exec_state, "tool_running");
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn provider_handled_approval_resolves_attention_and_session_waiting_state() {
     let root = temp_root("provider-handled-approval");
     let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();

@@ -77,6 +77,7 @@ pub struct ApiServerConfig {
     pub bind: SocketAddr,
     pub commit_delay: Duration,
     pub snapshot_interval: Duration,
+    pub heartbeat_interval: Duration,
     pub quota_poll_interval: Duration,
     pub enable_claude_oauth_quota: bool,
     pub install_paths: Option<InstallPaths>,
@@ -90,6 +91,7 @@ impl Default for ApiServerConfig {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             commit_delay: Duration::from_secs(3),
             snapshot_interval: Duration::from_millis(100),
+            heartbeat_interval: Duration::from_secs(10),
             quota_poll_interval: Duration::from_secs(60),
             enable_claude_oauth_quota: false,
             install_paths: None,
@@ -208,6 +210,7 @@ impl ApiServer {
             expected_origin: format!("http://{address}"),
             commit_delay: config.commit_delay,
             snapshot_interval: config.snapshot_interval,
+            heartbeat_interval: config.heartbeat_interval,
             quota_poll_interval: config.quota_poll_interval,
             claude_oauth_quota: config.enable_claude_oauth_quota,
             installer: Arc::new(Installer::new(install_paths, source_binary)),
@@ -292,6 +295,7 @@ struct AppState {
     expected_origin: String,
     commit_delay: Duration,
     snapshot_interval: Duration,
+    heartbeat_interval: Duration,
     quota_poll_interval: Duration,
     claude_oauth_quota: bool,
     installer: Arc<Installer>,
@@ -2097,6 +2101,7 @@ async fn websocket(
 
 async fn websocket_loop(mut socket: WebSocket, state: AppState) {
     let mut last_payload = String::new();
+    let mut last_heartbeat = Instant::now();
     while let Ok(snapshot) = snapshot_value(&state) {
         let payload = json!({ "type": "snapshot", "snapshot": snapshot }).to_string();
         if payload != last_payload {
@@ -2108,6 +2113,17 @@ async fn websocket_loop(mut socket: WebSocket, state: AppState) {
                 break;
             }
             last_payload = payload;
+        }
+        if last_heartbeat.elapsed() >= state.heartbeat_interval {
+            let heartbeat = json!({
+                "type": "heartbeat",
+                "serverTime": now_millis(),
+            })
+            .to_string();
+            if socket.send(Message::Text(heartbeat.into())).await.is_err() {
+                break;
+            }
+            last_heartbeat = Instant::now();
         }
         match tokio::time::timeout(state.snapshot_interval, socket.recv()).await {
             Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => break,
@@ -2509,6 +2525,7 @@ mod tests {
             expected_origin: "http://127.0.0.1:43111".to_owned(),
             commit_delay: Duration::from_secs(3),
             snapshot_interval: Duration::from_millis(250),
+            heartbeat_interval: Duration::from_secs(10),
             quota_poll_interval: Duration::from_secs(300),
             claude_oauth_quota: false,
             installer: Arc::new(Installer::new(paths, std::env::current_exe().unwrap())),
