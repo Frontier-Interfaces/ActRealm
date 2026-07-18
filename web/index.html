@@ -10,40 +10,24 @@
   <body>
     <div class="ambient" aria-hidden="true"></div>
 
-    <header class="mac-menubar">
-      <div class="menu-left">
-        <span class="apple-mark" aria-hidden="true">●</span>
-        <strong>flow-agent</strong>
-        <span>文件</span>
-        <span>编辑</span>
-        <span>窗口</span>
-        <span>帮助</span>
-      </div>
-      <div class="menu-right">
-        <span class="outbox-menu-chip" aria-label="待处理数量">
-          <span class="signal-bars" aria-hidden="true"><i></i><i></i><i></i></span>
-          <strong id="menu-attention-count">0</strong>
-        </span>
-        <button class="menu-action" id="settings-trigger" type="button" aria-label="打开通知与数据">
-          <span aria-hidden="true">♢</span>通知与数据
-        </button>
-        <time id="menu-clock">--:--:--</time>
-      </div>
-    </header>
-
     <div class="offline-banner" id="offline-banner" hidden>
       与 Runtime 失去连接，正在重连；当前显示的是最后一次本机快照。
     </div>
 
     <main class="act-room" id="act-room" aria-label="Flow Agent 控制室">
       <header class="window-toolbar">
-        <span class="traffic-lights" aria-hidden="true"><i></i><i></i><i></i></span>
         <span class="signal-bars brand-signal" aria-hidden="true"><i></i><i></i><i></i></span>
         <strong>ActRealm</strong>
         <div class="toolbar-spacer"></div>
-        <div class="runtime-state" id="runtime-state" role="status">
-          <span class="status-dot" aria-hidden="true"></span>
-          <span id="runtime-label">正在连接 Runtime</span>
+        <div class="toolbar-actions">
+          <button class="toolbar-action" id="settings-trigger" type="button" aria-label="打开通知与数据">
+            <span aria-hidden="true">♢</span>通知与数据
+          </button>
+          <time class="toolbar-clock" id="menu-clock">--:--:--</time>
+          <div class="runtime-state" id="runtime-state" role="status">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span id="runtime-label">正在连接 Runtime</span>
+          </div>
         </div>
       </header>
 

@@ -202,6 +202,18 @@ fn embedded_ui_contract_is_small_honest_and_complete() {
     assert!(INDEX_HTML.contains("OUTBOX"));
     assert!(INDEX_HTML.contains("AGENT TASKS"));
     assert!(INDEX_HTML.contains("通知与数据"));
+    assert!(!INDEX_HTML.contains("mac-menubar"));
+    assert!(!INDEX_HTML.contains("traffic-lights"));
+    let toolbar = INDEX_HTML
+        .split_once("<header class=\"window-toolbar\">")
+        .unwrap()
+        .1
+        .split_once("</header>")
+        .unwrap()
+        .0;
+    assert!(toolbar.contains("id=\"settings-trigger\""));
+    assert!(toolbar.contains("id=\"menu-clock\""));
+    assert!(toolbar.contains("id=\"runtime-state\""));
     assert!(!INDEX_HTML.contains("台前调度"));
     assert!(!INDEX_HTML.contains("HUD 胶囊"));
     assert!(!INDEX_HTML.contains("系统通知"));

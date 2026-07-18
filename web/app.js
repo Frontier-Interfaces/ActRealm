@@ -2,7 +2,6 @@
 
 const ui = {
   actRoom: document.querySelector("#act-room"),
-  menuAttentionCount: document.querySelector("#menu-attention-count"),
   menuClock: document.querySelector("#menu-clock"),
   runtimeState: document.querySelector("#runtime-state"),
   runtimeLabel: document.querySelector("#runtime-label"),
@@ -765,7 +764,6 @@ function renderInteractiveForm(item, card) {
 function renderAttention() {
   const items = openItems();
   ui.attentionCount.textContent = String(items.length);
-  ui.menuAttentionCount.textContent = String(items.length);
   ui.attentionList.replaceChildren();
   if (items.length) {
     const oldest = Math.min(...items.map((item) => Number(item.createdAt || Date.now())));

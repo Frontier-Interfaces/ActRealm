@@ -4,7 +4,7 @@ Last reviewed: 2026-07-18
 
 Source branch: `agent/v1-full`
 
-M14 parent commit: `25de1e1`
+Current M14 functional commit: `5a29d88`
 
 This file is the short, current source of truth. The
 [implementation plan](WIDGET_V1_PLAN.md),
@@ -19,6 +19,10 @@ provide the detailed requirements and evidence.
   installed with a matching SHA-256, live session/OAuth records were verified,
   and the user accepted the candidate and authorized the local commit on
   2026-07-18. Push remains separately gated.
+- **Post-M14 UI refinement:** the redundant simulated macOS menu bar and
+  traffic lights were removed; Notification & Data, local time, and Runtime
+  state now share the single ActRealm toolbar. Focused checks and local visual
+  acceptance passed on 2026-07-18; commit was authorized separately from push.
 - **Latest local gates:** 161 workspace tests passed, two explicit/manual
   tests ignored; zero-warning Clippy, format, release build, five-round native
   request replay, and the two-minute resource gate passed. M14's resource
@@ -51,14 +55,14 @@ provide the detailed requirements and evidence.
 | M11 | Direct Claude questions and secret handling | Complete | [M10-M12](M10_M12_VERIFICATION.md) |
 | M12 | Codex Connector and restart recovery | Complete within the recorded boundary | [M10-M12](M10_M12_VERIFICATION.md) |
 | M13 | Provider-owned approval-state coordination | Code and automated gates complete; real-Provider acceptance pending | [M13](M13_PROVIDER_STATE_COORDINATION.md) |
-| M14 | Live usage, context, price, and OAuth quota | Code and automated/local gates complete; installed user acceptance pending | [M14](M14_USAGE_CONTEXT_QUOTA.md) |
+| M14 | Live usage, context, price, and OAuth quota | Complete; exact release installed and accepted locally | [M14](M14_USAGE_CONTEXT_QUOTA.md) |
 
 M5 is a release-qualification track, not the chronological end of feature
 development. Later functional milestones may be implemented while M5's
 long-running release gate remains open; that does not make the final v1 release
 complete.
 
-## Capability boundary after M13
+## Capability boundary after M14
 
 Flow Agent can directly respond only when it owns a live, official reply
 channel:

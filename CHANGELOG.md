@@ -6,6 +6,16 @@ published a final v1 release; entries below describe development milestones on
 
 ## Unreleased - M14 accepted candidate
 
+### Post-M14 - Single-toolbar visual refinement
+
+- Removes the decorative macOS menu bar and red/yellow/green traffic lights.
+- Keeps one in-page ActRealm toolbar with the brand on the left and
+  Notification & Data, local time, and truthful Runtime state on the right.
+- Adds an embedded-UI regression contract so the removed chrome cannot return
+  accidentally. The focused UI test, JavaScript syntax check, format/diff
+  checks, and workspace release build pass; the user accepted the visual result
+  and authorized the local commit.
+
 ### M14 - Live usage, context, price, and OAuth quota
 
 - Incrementally tails Claude transcript and Codex rollout usage with bounded

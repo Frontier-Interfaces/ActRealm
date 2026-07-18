@@ -72,28 +72,7 @@ button { color: inherit; }
   to { transform: translateX(470%); }
 }
 
-.mac-menubar {
-  position: relative;
-  z-index: 20;
-  height: 28px;
-  padding: 0 14px;
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  background: rgba(255, 255, 255, .5);
-  border-bottom: 1px solid rgba(255, 255, 255, .65);
-  backdrop-filter: blur(30px) saturate(1.8);
-  -webkit-backdrop-filter: blur(30px) saturate(1.8);
-  font-size: 12px;
-}
-
-.menu-left, .menu-right { display: flex; align-items: center; gap: 14px; }
-.menu-left span:not(.apple-mark) { color: rgba(0, 0, 0, .55); }
-.apple-mark { width: 12px; overflow: hidden; color: rgba(0, 0, 0, .82); font-size: 16px; line-height: 1; }
-.menu-right { margin-left: auto; }
-.menu-right time { min-width: 56px; color: rgba(0, 0, 0, .7); font-variant-numeric: tabular-nums; }
-
-.outbox-menu-chip, .menu-action, .runtime-state, .local-pill {
+.toolbar-action, .runtime-state, .local-pill {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -102,9 +81,8 @@ button { color: inherit; }
   background: rgba(255, 255, 255, .55);
 }
 
-.outbox-menu-chip { padding: 2px 9px; }
-.menu-action { padding: 3px 11px; cursor: pointer; font-size: 11px; font-weight: 700; }
-.menu-action:hover, .menu-action:focus-visible { background: rgba(255, 255, 255, .9); }
+.toolbar-action { padding: 4px 11px; cursor: pointer; font-size: 10.5px; font-weight: 700; }
+.toolbar-action:hover, .toolbar-action:focus-visible { background: rgba(255, 255, 255, .9); }
 
 .signal-bars { display: inline-flex; align-items: flex-end; gap: 2px; color: #3b6ef0; }
 .signal-bars i { width: 3px; border-radius: 2px; background: currentColor; }
@@ -115,7 +93,7 @@ button { color: inherit; }
 .offline-banner {
   position: fixed;
   left: 50%;
-  top: 40px;
+  top: 68px;
   z-index: 100;
   transform: translateX(-50%);
   max-width: calc(100vw - 32px);
@@ -130,7 +108,7 @@ button { color: inherit; }
 
 .act-room {
   width: min(1600px, 96vw);
-  height: calc(100vh - 28px);
+  height: 100vh;
   margin: 0 auto;
   padding: 16px 0 14px;
   display: flex;
@@ -153,14 +131,17 @@ button { color: inherit; }
   -webkit-backdrop-filter: blur(50px) saturate(1.8);
 }
 
-.traffic-lights { display: flex; gap: 8px; }
-.traffic-lights i { width: 12px; height: 12px; border-radius: 50%; }
-.traffic-lights i:nth-child(1) { background: #ff5f57; }
-.traffic-lights i:nth-child(2) { background: #febc2e; }
-.traffic-lights i:nth-child(3) { background: #28c840; }
-.brand-signal { margin-left: 4px; }
+.brand-signal { margin-left: 2px; }
 .window-toolbar > strong { font-size: 14px; }
 .toolbar-spacer { flex: 1; }
+.toolbar-actions { display: flex; align-items: center; gap: 10px; }
+.toolbar-clock {
+  min-width: 56px;
+  color: rgba(0, 0, 0, .58);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
 
 .runtime-state {
   padding: 4px 11px;
@@ -549,7 +530,7 @@ button { color: inherit; }
 
 @media (max-width: 1120px) {
   html, body { overflow: auto; }
-  .act-room { width: min(96vw, 900px); height: auto; min-height: calc(100vh - 28px); }
+  .act-room { width: min(96vw, 900px); height: auto; min-height: 100vh; }
   .control-grid { grid-template-columns: 1fr 1fr; }
   .tasks-panel { grid-row: span 2; }
   .glass-panel { min-height: 420px; }
@@ -557,8 +538,10 @@ button { color: inherit; }
 }
 
 @media (max-width: 760px) {
-  .menu-left span:not(.apple-mark), .menu-left strong { display: none; }
-  .menu-right { gap: 7px; }
+  .window-toolbar { gap: 8px; padding-inline: 10px; }
+  .toolbar-actions { gap: 6px; }
+  .toolbar-action { padding-inline: 8px; }
+  .toolbar-clock { min-width: 52px; }
   .control-grid { grid-template-columns: 1fr; }
   .tasks-panel { grid-row: auto; }
   .glass-panel { min-height: 460px; }

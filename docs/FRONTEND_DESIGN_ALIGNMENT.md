@@ -1,6 +1,6 @@
 # Flow Agent × Claude Design 前端对齐说明
 
-状态：本地候选，尚未 commit/push，等待用户本机验收。
+状态：ActRealm 主界面对齐已落地；2026-07-18 单标题栏精简已通过本机视觉验收并获准 commit，push 仍需单独授权。
 
 设计基准：`Flow Agent Interactive Demo04.dc.html`。可见界面与可见功能以该设计为准；Flow Agent 已有后端能力不删除，设计没有入口的能力先隐藏，后续可重新接回。
 
@@ -8,7 +8,7 @@
 
 ### ActRealm 控制室
 
-- macOS 风格顶栏、Runtime 状态和本机时间。
+- 使用单一 ActRealm 标题栏：不再模拟 macOS 系统菜单栏，也不显示装饰性的红黄绿窗口圆点；品牌位于左侧，“通知与数据”、本机时间和真实 Runtime 状态位于右侧。
 - `OUTBOX / AGENT TASKS / QUOTA` 三栏比例、玻璃材质、颜色、密度和交互层级对齐设计。
 - OUTBOX 支持批准、拒绝、二次确认后允许、问题回答、完成确认、返回原 Agent 和三秒撤回。
 - Provider 原生审批与 Flow Agent 可回复审批严格分开：原生审批只允许返回原界面，不显示虚假的批准/拒绝按钮。
@@ -72,3 +72,7 @@
 - Claude/Codex 五轮控制链路、Bridge 重启期间 fail-open、重启后再次审批。
 - 1600×600 浏览器视觉检查、任务展开、通知与数据页和浏览器错误日志。
 - 精确两分钟 CPU/RSS 稳定性门禁。
+
+本次单标题栏精简属于纯前端增量：JavaScript 语法、Rust 格式、diff
+whitespace、嵌入式 UI 回归测试和 workspace release 构建均通过，并完成
+本机视觉验收。完整 M14 门禁证据见 `M14_USAGE_CONTEXT_QUOTA.md`。
