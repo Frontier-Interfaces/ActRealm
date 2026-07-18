@@ -40,7 +40,7 @@ The main product surface must obey these visible rules:
     answered in Attention; secrets remain memory-only.
 14. Restart recovery distinguishes managed/controllable, external/observing,
     waiting-for-event, lost-control, and ended without restoring old waiters.
-15. Provider-native approval and Flow-controlled approval are separate:
+15. Provider-native approval and ActRealm-controlled approval are separate:
     native-only waiting has no allow/deny controls, follows explicit Provider
     resolution, and never fabricates the outcome.
 
@@ -55,15 +55,15 @@ Adopted lessons:
 
 - Open Vibe Island's later wrapper mode demonstrated that a custom Claude
   status line can remain visible while a managed wrapper reads the same stdin
-  for quota capture. Flow Agent uses its own installer, backup, locking,
+  for quota capture. ActRealm uses its own installer, backup, locking,
   delegate, stable-binary, and uninstall implementation.
 - Open Vibe Island's bounded Codex rollout scanning and CodeIsland's local
   activity/session modeling reinforced the existing local-only, event-derived
-  design. Flow Agent keeps a strict schema allowlist and does not read response
+  design. ActRealm keeps a strict schema allowlist and does not read response
   text to construct quota.
 - CodeIsland's local title-store design and Open Vibe Island's Codex App Server
-  thread metadata confirmed that client titles are separate from prompts. Flow
-  Agent uses the lower-risk local index/Hook path instead of starting a second
+  thread metadata confirmed that client titles are separate from prompts.
+  ActRealm uses the lower-risk local index/Hook path instead of starting a second
   Provider subprocess: official Claude `session_title`, bounded Claude
   custom/AI title records, and Codex's bounded `session_index.jsonl` tail.
 - Both references treat missing or stale local data as unavailable instead of
@@ -109,7 +109,7 @@ Adopted lessons:
 
 ### M13 Provider-state boundary
 
-- Codex auto-review/guardian ownership cannot create a competing Flow Agent
+- Codex auto-review/guardian ownership cannot create a competing ActRealm
   reply waiter.
 - Native `request_permissions` and managed `waitingOnApproval` produce an
   observation-only item without a replyable request ID.
@@ -159,7 +159,7 @@ Adopted lessons:
 - Claude Desktop can install the shared user-level Hook configuration without
   launching its GUI executable for a version check.
 - Codex Desktop exposes its bundled official `codex` executable as the manual
-  `/hooks` review command. Flow Agent still never writes or bypasses trust.
+  `/hooks` review command. ActRealm still never writes or bypasses trust.
 - Setup JSON and the first-run UI distinguish desktop-app detection from a
   global CLI and explain that the latter is not required.
 - The Claude status-line quota bridge remains CLI-only because Claude Desktop
@@ -170,12 +170,12 @@ Adopted lessons:
 
 | Gate | Result |
 | --- | --- |
-| `cargo test -p flow-agent-runtime --test m1_runtime --offline` | PASS, 25 tests including title provenance, migration, restart, usage, and jump privacy |
-| `cargo test -p flow-agent-quota --lib --offline` | PASS, 7 tests including dynamic windows and stale-value retention |
-| `cargo test -p flow-agent-installer --test m4_statusline --offline` | PASS, 4 tests including wrapper/restore |
-| `cargo test -p flow-agent-server --lib --offline` | PASS, 11 tests including safe display fields, interactive questions, recovery truthfulness, jump targets, and immediate Claude cache refresh |
-| `cargo test -p flow-agent-server --test m2_api --offline` | PASS, 3 authenticated API cases |
-| `cargo test -p flow-agent --test m2_widget_e2e --offline` | PASS, 5 Claude + 5 Codex control flows |
+| `cargo test -p actrealm-runtime --test m1_runtime --offline` | PASS, 25 tests including title provenance, migration, restart, usage, and jump privacy |
+| `cargo test -p actrealm-quota --lib --offline` | PASS, 7 tests including dynamic windows and stale-value retention |
+| `cargo test -p actrealm-installer --test m4_statusline --offline` | PASS, 4 tests including wrapper/restore |
+| `cargo test -p actrealm-server --lib --offline` | PASS, 11 tests including safe display fields, interactive questions, recovery truthfulness, jump targets, and immediate Claude cache refresh |
+| `cargo test -p actrealm-server --test m2_api --offline` | PASS, 3 authenticated API cases |
+| `cargo test -p actrealm --test m2_widget_e2e --offline` | PASS, 5 Claude + 5 Codex control flows |
 | `cargo clippy --workspace --all-targets --offline -- -D warnings` | PASS, zero warnings |
 | `cargo test --workspace --offline` | PASS, 140 tests, two explicit resource/manual-preview tests ignored by default, and all doc-tests |
 | `cargo build --workspace --release --offline` | PASS |

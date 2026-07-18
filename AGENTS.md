@@ -1,4 +1,4 @@
-# Flow Agent repository guidance
+# ActRealm repository guidance
 
 `docs/V1_ACCEPTANCE.md` is the executable delivery contract for v1 and
 `docs/STATUS.md` is the current short status. Functional work is recorded
@@ -18,7 +18,7 @@ Product invariants:
 - Codex direct question answers require an explicitly attached, version-gated
   app-server Connector. Hook-only Codex sessions remain observe/approval-only
   and must never be shown as managed or directly answerable.
-- Provider-native approval is not the same as a request-keyed Flow Agent reply
+- Provider-native approval is not the same as a request-keyed ActRealm reply
   channel. Native `request_permissions` / `waitingOnApproval` is observation
   only: no request ID, no allow/deny controls, neutral resolution, and no
   inference that the user approved, denied, or executed the action.
@@ -60,6 +60,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --offline -- -D warnings
 cargo test --workspace --offline
 cargo build --workspace --release --offline
+./scripts/check-actrealm-language.sh
 ```
 
 Run milestone-specific integration, security, and performance checks in

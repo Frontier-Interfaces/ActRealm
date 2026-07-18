@@ -1,5 +1,5 @@
 use crate::fsutil::ensure_private_directory;
-use flow_agent_core::BridgeRequest;
+use actrealm_core::BridgeRequest;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs::{self, File, OpenOptions};

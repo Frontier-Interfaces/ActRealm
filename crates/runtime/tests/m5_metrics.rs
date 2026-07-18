@@ -1,5 +1,5 @@
-use flow_agent_core::{BridgeRequest, Provider, PERMISSION_COMMIT_DELAY_MS};
-use flow_agent_runtime::{ApprovalAction, MetricEvent, RuntimeStore};
+use actrealm_core::{BridgeRequest, Provider, PERMISSION_COMMIT_DELAY_MS};
+use actrealm_runtime::{ApprovalAction, MetricEvent, RuntimeStore};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
@@ -13,7 +13,7 @@ struct Database {
 impl Database {
     fn new() -> Self {
         let root = std::env::temp_dir().join(format!(
-            "flow-agent-m5-metrics-{}-{}",
+            "actrealm-m5-metrics-{}-{}",
             std::process::id(),
             Uuid::now_v7()
         ));

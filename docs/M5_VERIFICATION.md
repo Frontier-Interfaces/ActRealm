@@ -22,11 +22,11 @@ complete, creating a final v1 tag, or publishing a final v1 release.
 - notification banners and application opens are counted only when the
   authenticated local UI reports the action.
 
-`flow-agent export-metrics` and `/api/v1/metrics/export` produce a separate,
+`actrealm export-metrics` and `/api/v1/metrics/export` produce a separate,
 aggregate-only JSON file. It contains the schema version, export time,
 definitions, and daily counters. It contains no session, event, attention,
 command, project, or path data. The existing full local backup remains a
-separate `flow-agent export` operation.
+separate `actrealm export` operation.
 
 ### Diagnostic capture and redaction
 
@@ -126,12 +126,12 @@ node --check web/app.js
   PASS
 ./scripts/m0-e2e.sh
   PASS: Claude allow, Codex deny, pass-through, missing-Runtime fail-open
-cargo test -p flow-agent --test m5_performance --offline -- --nocapture
+cargo test -p actrealm --test m5_performance --offline -- --nocapture
   PASS: nonblocking_hook_p95_ms=3.164
-cargo test -p flow-agent-server --test m5_performance --offline -- --nocapture
+cargo test -p actrealm-server --test m5_performance --offline -- --nocapture
   PASS: event_to_websocket_p95_ms=104.811
-FLOW_AGENT_RESOURCE_DURATION_SECONDS=15 \
-  ./scripts/m5-resource-check.sh target/release/flow-agent
+ACTREALM_RESOURCE_DURATION_SECONDS=15 \
+  ./scripts/m5-resource-check.sh target/release/actrealm
   PASS: CPU average 0.000%, RSS maximum 5,408 KiB
 git diff --check
   PASS

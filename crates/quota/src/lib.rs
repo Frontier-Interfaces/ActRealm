@@ -149,7 +149,7 @@ impl QuotaEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuotaPaths {
-    pub flow_home: PathBuf,
+    pub actrealm_home: PathBuf,
     pub codex_sessions: PathBuf,
 }
 
@@ -158,20 +158,20 @@ impl QuotaPaths {
         let home = env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
-        let flow_home = env::var_os("FLOW_AGENT_HOME")
+        let actrealm_home = env::var_os("ACTREALM_HOME")
             .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".flow-agent"));
+            .unwrap_or_else(|| home.join(".actrealm"));
         let codex_home = env::var_os("CODEX_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".codex"));
         Self {
-            flow_home,
+            actrealm_home,
             codex_sessions: codex_home.join("sessions"),
         }
     }
 
     pub fn claude_cache(&self) -> PathBuf {
-        self.flow_home.join("cache/claude-rl.json")
+        self.actrealm_home.join("cache/claude-rl.json")
     }
 }
 
@@ -600,7 +600,7 @@ fn fetch_oauth_usage(token: &str) -> Result<OAuthUsageResponse, OAuthFetchError>
          header = \"Authorization: Bearer {token}\"\n\
          header = \"anthropic-beta: oauth-2025-04-20\"\n\
          header = \"Content-Type: application/json\"\n\
-         user-agent = \"claude-code/flow-agent\"\n"
+         user-agent = \"claude-code/actrealm\"\n"
     );
     child
         .stdin
@@ -950,9 +950,9 @@ pub fn statusline_text(entries: &[QuotaEntry]) -> String {
         })
         .collect::<Vec<_>>();
     if parts.is_empty() {
-        "Flow Agent · 额度等待首次响应".to_owned()
+        "ActRealm · 额度等待首次响应".to_owned()
     } else {
-        format!("Flow Agent · {}", parts.join(" · "))
+        format!("ActRealm · {}", parts.join(" · "))
     }
 }
 
@@ -1230,7 +1230,7 @@ fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), QuotaError> 
         .and_then(|value| value.to_str())
         .unwrap_or("quota");
     let temporary = parent.join(format!(
-        ".{name}.flow-agent.{}.{}.tmp",
+        ".{name}.actrealm.{}.{}.tmp",
         std::process::id(),
         TEMP_ID.fetch_add(1, Ordering::Relaxed)
     ));
@@ -1280,7 +1280,7 @@ mod tests {
 
     fn root(name: &str) -> PathBuf {
         let path = PathBuf::from("/tmp").join(format!(
-            "flow-agent-quota-{name}-{}-{}",
+            "actrealm-quota-{name}-{}-{}",
             std::process::id(),
             TEMP_ID.fetch_add(1, Ordering::Relaxed)
         ));
@@ -1327,7 +1327,7 @@ mod tests {
             0o600
         );
         let collected = QuotaCollector::new(QuotaPaths {
-            flow_home: root.clone(),
+            actrealm_home: root.clone(),
             codex_sessions: root.join("none"),
         })
         .collect_claude(1_784_130_100_000);
@@ -1338,7 +1338,7 @@ mod tests {
     fn old_claude_cache_preserves_last_value_but_incompatible_data_stays_unavailable() {
         let stale_root = root("stale");
         let paths = QuotaPaths {
-            flow_home: stale_root.clone(),
+            actrealm_home: stale_root.clone(),
             codex_sessions: stale_root.join("none"),
         };
         capture_claude_statusline(
@@ -1363,7 +1363,7 @@ mod tests {
 
         let future_root = root("future-claude");
         let future_paths = QuotaPaths {
-            flow_home: future_root.clone(),
+            actrealm_home: future_root.clone(),
             codex_sessions: future_root.join("none"),
         };
         capture_claude_statusline(
@@ -1418,7 +1418,7 @@ mod tests {
             .unwrap()
             .as_millis() as u64;
         let collector = QuotaCollector::new(QuotaPaths {
-            flow_home: root.join("flow"),
+            actrealm_home: root.join("flow"),
             codex_sessions: root.clone(),
         });
         let entries = collector.collect_codex(now);
@@ -1457,7 +1457,7 @@ mod tests {
             .unwrap()
             .as_millis() as u64;
         let entries = QuotaCollector::new(QuotaPaths {
-            flow_home: root.join("flow"),
+            actrealm_home: root.join("flow"),
             codex_sessions: root.clone(),
         })
         .collect_codex(captured_at);
@@ -1468,7 +1468,7 @@ mod tests {
         assert_eq!(entries[1].window, "10080m");
 
         let future = QuotaCollector::new(QuotaPaths {
-            flow_home: root.join("future-flow"),
+            actrealm_home: root.join("future-flow"),
             codex_sessions: directory
                 .parent()
                 .unwrap()
@@ -1502,7 +1502,7 @@ mod tests {
             .unwrap()
             .as_millis() as u64;
         let entries = QuotaCollector::new(QuotaPaths {
-            flow_home: root.join("flow"),
+            actrealm_home: root.join("flow"),
             codex_sessions: root.clone(),
         })
         .collect_codex(captured_at);
@@ -1531,7 +1531,7 @@ mod tests {
             .unwrap()
             .as_millis() as u64;
         let entries = QuotaCollector::new(QuotaPaths {
-            flow_home: root.join("flow"),
+            actrealm_home: root.join("flow"),
             codex_sessions: root.clone(),
         })
         .collect_codex(captured_at);

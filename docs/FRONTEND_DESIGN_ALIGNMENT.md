@@ -1,17 +1,17 @@
-# Flow Agent × Claude Design 前端对齐说明
+# ActRealm × Claude Design 前端对齐说明
 
 状态：ActRealm 主界面对齐已落地；2026-07-18 单标题栏精简已通过本机视觉验收并获准 commit，push 仍需单独授权。
 
-设计基准：`Flow Agent Interactive Demo04.dc.html`。可见界面与可见功能以该设计为准；Flow Agent 已有后端能力不删除，设计没有入口的能力先隐藏，后续可重新接回。
+设计基准：`ActRealm Interactive Demo04.dc.html`。可见界面与可见功能以该设计为准；ActRealm 已有后端能力不删除，设计没有入口的能力先隐藏，后续可重新接回。
 
 ## 本轮可见范围
 
-### ActRealm 控制室
+### ActRealm 工作区
 
 - 使用单一 ActRealm 标题栏：不再模拟 macOS 系统菜单栏，也不显示装饰性的红黄绿窗口圆点；品牌位于左侧，“通知与数据”、本机时间和真实 Runtime 状态位于右侧。
 - `OUTBOX / AGENT TASKS / QUOTA` 三栏比例、玻璃材质、颜色、密度和交互层级对齐设计。
 - OUTBOX 支持批准、拒绝、二次确认后允许、问题回答、完成确认、返回原 Agent 和三秒撤回。
-- Provider 原生审批与 Flow Agent 可回复审批严格分开：原生审批只允许返回原界面，不显示虚假的批准/拒绝按钮。
+- Provider 原生审批与 ActRealm 可回复审批严格分开：原生审批只允许返回原界面，不显示虚假的批准/拒绝按钮。
 - 任务卡显示 Provider 真图标、官方会话标题/任务内容、模型、实时状态、总耗时、计划和子 Agent；点击展开安全详情。
 - 清除任务会安全交还关联中的阻塞请求并隐藏任务；收到更新事件后任务重新出现，不删除历史数据。
 - 额度按 Provider 实际返回的任意窗口动态渲染，不写死“本周”；不可用和过期数据不会伪造成实时额度。
@@ -25,9 +25,10 @@
 - 导出本机事件、导出聚合统计和输入 `DELETE` 后彻底清除。
 - 活跃天数、面板决定数、处理率、交还率、平均响应和页面渲染 p95。
 
-## 明确排除
+## Web 控制界面明确排除
 
-- 按用户要求移除“台前调度”页面及其入口。
+- Web 控制界面按设计移除“台前调度”页面及其入口；macOS 原生客户端仍将其作为
+  依赖辅助功能权限的实验性能力，不改变 Runtime 的任务或审批状态。
 - 移除 HUD 胶囊和系统通知；不申请 macOS 通知权限。
 - 不直接展示原始 Hook JSON，不把秘密答案写入 SQLite、日志或导出。
 
@@ -50,7 +51,7 @@
 
 即使设计示例没有完整覆盖，生产界面仍需显示真实状态：
 
-- Provider 原生审批只能回原界面处理；Flow Agent 只有持有活跃 waiter 时才能显示批准/拒绝。
+- Provider 原生审批只能回原界面处理；ActRealm 只有持有活跃 waiter 时才能显示批准/拒绝。
 - Claude AskUserQuestion、Elicitation 和 Codex requestUserInput 按真实 Schema 渲染单选、多选、自由输入和秘密字段。
 - Runtime 离线、重连、额度不可用/过期必须明确显示，不能沿用最后一次在线文案。
 - “重启”只安全重启本地 Bridge 通道：旧 waiter 先 fail-open，再重绑 0600 Socket；不伪装成操作系统级进程监督器。

@@ -112,9 +112,9 @@ private struct GeneralSettingsTab: View {
             SettingsGroup(title: "RUNTIME") {
                 runtimeControlRow
                 GroupDivider()
-                runtimeRow(label: "Socket", value: "~/.flow-agent/run/bridge.sock")
+                runtimeRow(label: "Socket", value: "~/.actrealm/run/bridge.sock")
                 GroupDivider()
-                runtimeRow(label: "Data folder", value: "~/.flow-agent")
+                runtimeRow(label: "Data folder", value: "~/.actrealm")
                 if let message = model.runtimeActionMessage {
                     GroupDivider()
                     Text(message)

@@ -107,7 +107,7 @@ impl UsageRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsagePaths {
-    pub flow_home: PathBuf,
+    pub actrealm_home: PathBuf,
     pub claude_projects: Vec<PathBuf>,
     pub codex_sessions: Vec<PathBuf>,
 }
@@ -117,9 +117,9 @@ impl UsagePaths {
         let home = env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
-        let flow_home = env::var_os("FLOW_AGENT_HOME")
+        let actrealm_home = env::var_os("ACTREALM_HOME")
             .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".flow-agent"));
+            .unwrap_or_else(|| home.join(".actrealm"));
         let mut claude_roots = Vec::new();
         if let Some(value) = env::var_os("CLAUDE_CONFIG_DIR") {
             for value in value.to_string_lossy().split(',') {
@@ -134,7 +134,7 @@ impl UsagePaths {
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".codex"));
         Self {
-            flow_home,
+            actrealm_home,
             claude_projects: claude_roots,
             codex_sessions: vec![
                 codex_home.join("sessions"),
@@ -144,7 +144,7 @@ impl UsagePaths {
     }
 
     pub fn claude_status_cache_dir(&self) -> PathBuf {
-        self.flow_home.join("cache/claude-session-usage")
+        self.actrealm_home.join("cache/claude-session-usage")
     }
 }
 
@@ -162,7 +162,7 @@ struct StatusCacheDocument {
 }
 
 /// Captures Claude's official StatusLine session metrics. The returned text is
-/// intentionally not used; Flow Agent's existing quota status text remains the
+/// intentionally not used; ActRealm's existing quota status text remains the
 /// visible StatusLine output.
 pub fn capture_claude_statusline_usage(
     input: &[u8],
@@ -1240,7 +1240,7 @@ mod tests {
     fn temp_dir(label: &str) -> PathBuf {
         let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let path = env::temp_dir().join(format!(
-            "flow-agent-usage-{label}-{}-{id}",
+            "actrealm-usage-{label}-{}-{id}",
             std::process::id()
         ));
         fs::create_dir_all(&path).expect("create temp directory");

@@ -1,23 +1,23 @@
 #!/bin/zsh
-# Packages ActRealm.app: SwiftUI frontend + the Rust flow-agent backend
-# bundled as Contents/Helpers/flow-agent.
+# Packages ActRealm.app: SwiftUI frontend + the Rust actrealm backend
+# bundled as Contents/Helpers/actrealm.
 #
 # Usage: Scripts/package-app.sh [output-dir]
-#   FLOW_AGENT_REPO   path to the Rust checkout (default: monorepo root)
-#   FLOW_AGENT_SKIP_RUST_BUILD=1 reuses the existing release backend binary
-#   FLOW_AGENT_SWIFT_CONFIGURATION=debug packages a debug Swift build
+#   ACTREALM_REPO   path to the Rust checkout (default: monorepo root)
+#   ACTREALM_SKIP_RUST_BUILD=1 reuses the existing release backend binary
+#   ACTREALM_SWIFT_CONFIGURATION=debug packages a debug Swift build
 #   SDKROOT           macOS SDK (default: installed 26.0 SDK, then xcrun)
 set -euo pipefail
 
 SCRIPT_DIR="${0:a:h}"
 PACKAGE_DIR="${SCRIPT_DIR:h}" # apps/macos/
 REPO_ROOT="${PACKAGE_DIR:h:h}"
-RUST_REPO="${FLOW_AGENT_REPO:-$REPO_ROOT}"
-SWIFT_CONFIGURATION="${FLOW_AGENT_SWIFT_CONFIGURATION:-release}"
+RUST_REPO="${ACTREALM_REPO:-$REPO_ROOT}"
+SWIFT_CONFIGURATION="${ACTREALM_SWIFT_CONFIGURATION:-release}"
 if [[ "$SWIFT_CONFIGURATION" == "release" ]]; then
-  SWIFT_DEBUG_INFO="${FLOW_AGENT_SWIFT_DEBUG_INFO:-none}"
+  SWIFT_DEBUG_INFO="${ACTREALM_SWIFT_DEBUG_INFO:-none}"
 else
-  SWIFT_DEBUG_INFO="${FLOW_AGENT_SWIFT_DEBUG_INFO:-dwarf}"
+  SWIFT_DEBUG_INFO="${ACTREALM_SWIFT_DEBUG_INFO:-dwarf}"
 fi
 OUT_DIR="${1:-$PACKAGE_DIR/dist}"
 APP="$OUT_DIR/ActRealm.app"
@@ -27,20 +27,20 @@ if [[ -z "${SDKROOT:-}" ]]; then
 fi
 
 if [[ ! -f "$RUST_REPO/Cargo.toml" ]]; then
-  echo "error: flow-agent checkout not found at $RUST_REPO" >&2
-  echo "       set FLOW_AGENT_REPO=/path/to/flow-agent" >&2
+  echo "error: actrealm checkout not found at $RUST_REPO" >&2
+  echo "       set ACTREALM_REPO=/path/to/actrealm" >&2
   exit 1
 fi
 [[ -f "$INFO_PLIST" ]] || { echo "error: missing $INFO_PLIST" >&2; exit 1; }
-if [[ "${FLOW_AGENT_SKIP_RUST_BUILD:-0}" == "1" ]]; then
+if [[ "${ACTREALM_SKIP_RUST_BUILD:-0}" == "1" ]]; then
   echo "==> Reusing existing Rust backend (release)"
-  [[ -x "$RUST_REPO/target/release/flow-agent" ]] || {
-    echo "error: reusable Rust backend not found at $RUST_REPO/target/release/flow-agent" >&2
+  [[ -x "$RUST_REPO/target/release/actrealm" ]] || {
+    echo "error: reusable Rust backend not found at $RUST_REPO/target/release/actrealm" >&2
     exit 1
   }
 else
   echo "==> Building Rust backend (release)"
-  (cd "$RUST_REPO" && cargo build --release -p flow-agent)
+  (cd "$RUST_REPO" && cargo build --release -p actrealm)
 fi
 
 echo "==> Building SwiftUI app ($SWIFT_CONFIGURATION)"
@@ -57,12 +57,12 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$APP/Contents/Resources"
 
 cp "$SWIFT_BIN" "$APP/Contents/MacOS/ActRealm"
-cp "$RUST_REPO/target/release/flow-agent" "$APP/Contents/Helpers/flow-agent"
+cp "$RUST_REPO/target/release/actrealm" "$APP/Contents/Helpers/actrealm"
 cp "$INFO_PLIST" "$APP/Contents/Info.plist"
 plutil -lint "$APP/Contents/Info.plist"
 
 echo "==> Codesigning (ad-hoc)"
-codesign --force -s - "$APP/Contents/Helpers/flow-agent"
+codesign --force -s - "$APP/Contents/Helpers/actrealm"
 codesign --force -s - "$APP/Contents/MacOS/ActRealm"
 codesign --force -s - "$APP"
 

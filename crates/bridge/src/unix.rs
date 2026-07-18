@@ -1,4 +1,4 @@
-use flow_agent_core::{BridgeRequest, BridgeResponse, ReplyAction, MAX_HOOK_PAYLOAD_BYTES};
+use actrealm_core::{BridgeRequest, BridgeResponse, ReplyAction, MAX_HOOK_PAYLOAD_BYTES};
 use std::env;
 use std::fs::{self, DirBuilder};
 use std::io::{self, BufRead, BufReader, Write};
@@ -39,13 +39,13 @@ pub enum BridgeError {
 }
 
 pub fn default_socket_path() -> PathBuf {
-    if let Some(root) = env::var_os("FLOW_AGENT_HOME") {
+    if let Some(root) = env::var_os("ACTREALM_HOME") {
         return PathBuf::from(root).join("run/bridge.sock");
     }
     let home = env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".flow-agent/run/bridge.sock")
+    home.join(".actrealm/run/bridge.sock")
 }
 
 pub fn unix_socket_path_limit() -> usize {
@@ -173,7 +173,7 @@ impl BridgeListener {
                 builder.recursive(true).mode(0o700).create(parent)?;
             }
             // Never chmod an arbitrary existing directory supplied via --socket
-            // (for example /private/tmp). Directories created by flow-agent are
+            // (for example /private/tmp). Directories created by actrealm are
             // private from their first usable moment.
             if created_parent {
                 fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
@@ -248,11 +248,11 @@ fn socket_is_private(path: &Path) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flow_agent_core::{Decision, Provider};
+    use actrealm_core::{Decision, Provider};
     use std::thread;
 
     fn temp_socket(name: &str) -> PathBuf {
-        env::temp_dir().join(format!("flow-agent-{name}-{}.sock", std::process::id()))
+        env::temp_dir().join(format!("actrealm-{name}-{}.sock", std::process::id()))
     }
 
     #[test]

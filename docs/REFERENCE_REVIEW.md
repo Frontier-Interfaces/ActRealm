@@ -2,31 +2,31 @@
 
 Status: accepted as an M0 gate on 2026-07-15. These decisions amend the
 `WIDGET_V1_PLAN.md` v1.1 baseline where real probes or production reference
-experience disproved an assumption. They do not expand Flow Agent into managed
+experience disproved an assumption. They do not expand ActRealm into managed
 session control.
 
 ## Reviewed inputs
 
-| Project | Reviewed revision | License | Use in Flow Agent |
+| Project | Reviewed revision | License | Use in ActRealm |
 | --- | --- | --- | --- |
 | [Open Vibe Island](https://github.com/Octane0411/open-vibe-island) | `6e5e7a6a5b5097ee627a7d4dea6226c128747a71` | GPL-3.0 | Architecture and failure-mode study only; no source copied |
-| [CodeIsland](https://github.com/wxtsky/CodeIsland) | `3e2aec7fa87c56b0f5129d7ba11d0dc3699dd500` | MIT | Architecture and failure-mode study; Flow Agent remains an independent Rust implementation |
+| [CodeIsland](https://github.com/wxtsky/CodeIsland) | `3e2aec7fa87c56b0f5129d7ba11d0dc3699dd500` | MIT | Architecture and failure-mode study; ActRealm remains an independent Rust implementation |
 
 The review covered hook CLIs, socket servers, installers, health checks,
 permission queues, session reducers, process discovery, diagnostics, quota
 bridges, tests, and project documentation. Current official provider contracts
-and Flow Agent's live Claude Code 2.1.210 / Codex CLI 0.144.4 probes remain the
+and ActRealm's live Claude Code 2.1.210 / Codex CLI 0.144.4 probes remain the
 authority when a third-party example conflicts with them.
 
 ## Accepted decisions
 
-| Area | Production lesson | Flow Agent decision | Gate |
+| Area | Production lesson | ActRealm decision | Gate |
 | --- | --- | --- | --- |
 | Human approval | A 60-second global deadline is too short for an attention surface | Claude waits up to 24 hours; Codex waits up to 1 hour. Runtime absence, connect failure, socket EOF, or explicit pass-through still returns native control immediately. Tests inject millisecond budgets. | M0 |
 | Hook stdin | Provider launchers can leave stdin open | Hook input has an independent 5-second hard deadline and 256 KB cap; failure is silent pass-through. | M0 |
 | Hook output | Old examples can lag provider contracts | Emit only the current official minimal `PermissionRequest` directive. Never add unsupported Codex `continue`, `stopReason`, or `suppressOutput`. Empty stdout is pass-through. | M0 |
 | Default Codex events | Full tool lifecycle hooks can add terminal noise | Default to `SessionStart`, `UserPromptSubmit`, `PermissionRequest`, and `Stop`; make `PreToolUse` / `PostToolUse` an explicit enhanced-observation option. | M3 |
-| Request identity | A session ID cannot identify concurrent or repeated approvals | Key waiters by Flow Agent `requestId` plus provider correlation fields; maintain a concurrent request queue across sessions. | M1 |
+| Request identity | A session ID cannot identify concurrent or repeated approvals | Key waiters by ActRealm `requestId` plus provider correlation fields; maintain a concurrent request queue across sessions. | M1 |
 | Duplicate requests | A provider can repeat the same logical approval | Deduplicate by provider correlation key. Replacing a waiter must resolve the older waiter safely and never reuse its decision. | M1 |
 | Socket half-close | Read-side EOF can be a normal client `SHUT_WR`, not disconnection | Never auto-deny or drain waiters solely because request-side EOF is observed. Add a half-close regression test and distinguish real peer failure. | M1 |
 | Runtime restart | Permission continuations cannot survive a process restart safely | Keep waiters memory-only; expire old approvals after restart; never replay a permission request from spool. | M1 |
@@ -42,8 +42,8 @@ authority when a third-party example conflicts with them.
 
 ## Explicitly rejected patterns
 
-- Copying GPL-3.0 implementation code into Flow Agent's MIT codebase.
-- Treating a successful Flow Agent write as proof that the provider executed an
+- Copying GPL-3.0 implementation code into ActRealm's MIT codebase.
+- Treating a successful ActRealm write as proof that the provider executed an
   action; later provider evidence is required.
 - Auto-denying a permission because the client half-closed its write side.
 - Indexing pending permission state by session ID alone.

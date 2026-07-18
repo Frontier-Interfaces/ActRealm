@@ -1,6 +1,6 @@
 # Changelog
 
-All notable Flow Agent changes are recorded here. The project has not yet
+All notable ActRealm changes are recorded here. The project has not yet
 published a final v1 release; entries below describe development milestones on
 `agent/v1-full`, not released packages.
 
@@ -36,11 +36,11 @@ requires separate authorization.
 
 ### M13 - Provider-owned approval-state coordination
 
-- Detects Provider-owned Codex review and avoids creating a competing Flow
-  Agent waiter.
+- Detects Provider-owned Codex review and avoids creating a competing ActRealm
+  waiter.
 - Tracks native `request_permissions` and managed `waitingOnApproval` states.
 - Clears native waiting only on an explicit Provider resolution signal.
-- Distinguishes observation-only native approval from Flow-controlled approval
+- Distinguishes observation-only native approval from ActRealm-controlled approval
   in Attention, task state, notifications, and available actions.
 - Keeps approval outcome neutral when the Provider does not expose it.
 

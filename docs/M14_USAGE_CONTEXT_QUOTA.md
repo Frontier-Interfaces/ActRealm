@@ -71,7 +71,7 @@ the user's subscription bill.
   license file;
 - `graykode/abtop`: incremental local-file tailing and bounded refresh cadence.
 
-Flow Agent's Rust collector, persistence model, security boundaries, and UI
+ActRealm's Rust collector, persistence model, security boundaries, and UI
 rendering are implemented independently for this repository.
 
 ## Verification state

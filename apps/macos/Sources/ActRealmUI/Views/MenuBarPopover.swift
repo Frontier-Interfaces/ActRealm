@@ -46,7 +46,7 @@ public struct MenuBarPopoverView: View {
     private var header: some View {
         HStack(spacing: 8) {
             LogoMark()
-            Text("flow-agent")
+            Text("actrealm")
                 .font(.system(size: 13, weight: .bold))
                 .foregroundStyle(DT.textStrong)
             Spacer()
@@ -169,7 +169,7 @@ public struct MenuBarPopoverView: View {
 
     private var footer: some View {
         HStack {
-            Button("Open flow-agent…") { openMainWindow() }
+            Button("Open actrealm…") { openMainWindow() }
             Spacer()
             Button("Settings…") {
                 NSApp.activate(ignoringOtherApps: true)

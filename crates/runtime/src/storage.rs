@@ -2,8 +2,8 @@ use crate::fsutil::ensure_private_directory;
 use crate::title::{
     resolve_codex_session_titles, resolve_event_title, resolve_session_title, ProviderTitle,
 };
-use flow_agent_core::{BridgeRequest, Decision, EventKind, Provider, PERMISSION_COMMIT_DELAY_MS};
-use flow_agent_providers::parse_hook;
+use actrealm_core::{BridgeRequest, Decision, EventKind, Provider, PERMISSION_COMMIT_DELAY_MS};
+use actrealm_providers::parse_hook;
 use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -423,13 +423,13 @@ enum StoreMessage {
 }
 
 pub fn default_database_path() -> PathBuf {
-    if let Some(root) = env::var_os("FLOW_AGENT_HOME") {
+    if let Some(root) = env::var_os("ACTREALM_HOME") {
         return PathBuf::from(root).join("data.sqlite");
     }
     env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".flow-agent/data.sqlite")
+        .join(".actrealm/data.sqlite")
 }
 
 impl RuntimeStore {
@@ -440,7 +440,7 @@ impl RuntimeStore {
         initialize(&connection)?;
         let (sender, receiver) = mpsc::channel();
         let writer = thread::Builder::new()
-            .name("flow-agent-sqlite-writer".to_owned())
+            .name("actrealm-sqlite-writer".to_owned())
             .spawn(move || writer_loop(connection, path, receiver))
             .map_err(|error| StoreError::Storage(error.to_string()))?;
         Ok(Self {
@@ -1714,7 +1714,7 @@ fn ingest_transaction(
                     } else {
                         "Claude 正在询问"
                     },
-                    detail: Some("可直接在 Flow Agent 回答；答案不会写入本地历史。"),
+                    detail: Some("可直接在 ActRealm 回答；答案不会写入本地历史。"),
                     dedupe_key: request
                         .request_id
                         .map(|id| format!("interactive:{id}"))
@@ -3055,7 +3055,7 @@ fn read_metrics(connection: &Connection, now: u64) -> Result<MetricsSummary, Sto
 fn select_or_create_turn(
     transaction: &Transaction<'_>,
     session_id: &str,
-    parsed: &flow_agent_providers::ParsedHookEvent,
+    parsed: &actrealm_providers::ParsedHookEvent,
     occurred_at: i64,
     kind: EventKind,
     terminal_session: bool,

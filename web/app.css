@@ -106,7 +106,7 @@ button { color: inherit; }
   color: #8a5600;
 }
 
-.act-room {
+.actrealm-workspace {
   width: min(1600px, 96vw);
   height: 100vh;
   margin: 0 auto;
@@ -530,7 +530,7 @@ button { color: inherit; }
 
 @media (max-width: 1120px) {
   html, body { overflow: auto; }
-  .act-room { width: min(96vw, 900px); height: auto; min-height: 100vh; }
+  .actrealm-workspace { width: min(96vw, 900px); height: auto; min-height: 100vh; }
   .control-grid { grid-template-columns: 1fr 1fr; }
   .tasks-panel { grid-row: span 2; }
   .glass-panel { min-height: 420px; }

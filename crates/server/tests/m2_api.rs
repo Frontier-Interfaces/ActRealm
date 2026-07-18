@@ -1,8 +1,8 @@
 #![cfg(unix)]
 
-use flow_agent_core::{BridgeRequest, Decision, Provider};
-use flow_agent_runtime::{RuntimeStore, WaiterRegistry};
-use flow_agent_server::{ApiServer, ApiServerConfig};
+use actrealm_core::{BridgeRequest, Decision, Provider};
+use actrealm_runtime::{RuntimeStore, WaiterRegistry};
+use actrealm_server::{ApiServer, ApiServerConfig};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::fs;
@@ -26,7 +26,7 @@ struct HttpResponse {
 
 fn temp_root(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
-        "flow-agent-m2-{name}-{}-{}",
+        "actrealm-m2-{name}-{}-{}",
         std::process::id(),
         Uuid::now_v7()
     ))
@@ -150,7 +150,7 @@ fn auth_headers<'a>(origin: &'a str, cookie: &'a str, csrf: &'a str) -> [(&'a st
     [
         ("Origin", origin),
         ("Cookie", cookie),
-        ("X-Flow-Agent-CSRF", csrf),
+        ("X-ActRealm-CSRF", csrf),
     ]
 }
 
@@ -164,8 +164,8 @@ fn start(name: &str) -> (PathBuf, RuntimeStore, WaiterRegistry, ApiServer) {
         ApiServerConfig {
             commit_delay: Duration::from_millis(60),
             snapshot_interval: Duration::from_millis(20),
-            install_paths: Some(flow_agent_installer::InstallPaths {
-                flow_home: root.join("flow-home"),
+            install_paths: Some(actrealm_installer::InstallPaths {
+                actrealm_home: root.join("actrealm-home"),
                 claude_settings: root.join("home/.claude/settings.json"),
                 codex_hooks: root.join("home/.codex/hooks.json"),
                 codex_config: root.join("home/.codex/config.toml"),
@@ -181,7 +181,7 @@ fn ingest_waiting(
     store: &RuntimeStore,
     waiters: &WaiterRegistry,
     event: BridgeRequest,
-) -> flow_agent_runtime::RegisterResult {
+) -> actrealm_runtime::RegisterResult {
     store.ingest(event.clone()).unwrap();
     waiters.register_at(&event, now_millis()).unwrap()
 }

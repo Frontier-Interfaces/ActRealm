@@ -1,5 +1,5 @@
-use flow_agent_core::{EventKind, Provider};
-use flow_agent_providers::parse_hook;
+use actrealm_core::{EventKind, Provider};
+use actrealm_providers::parse_hook;
 use serde_json::json;
 
 fn fixture(contents: &str) -> serde_json::Value {

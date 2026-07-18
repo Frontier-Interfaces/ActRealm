@@ -79,13 +79,13 @@ public struct ForegroundSchedulingView: View {
                 shadowRadius: 8,
                 shadowY: 2
             )
-            .help("返回 Act Room")
+            .help("返回 ActRealm 工作区")
 
             VStack(alignment: .leading, spacing: 4) {
                 Text("台前调度")
                     .font(.system(size: 23, weight: .heavy))
                     .foregroundStyle(DT.textStrong)
-                Text("决定 Agent 什么时候进入前台，以及何时把控制权还给 Act Room")
+                Text("决定 Agent 什么时候进入前台，以及何时把控制权还给 ActRealm 工作区")
                     .font(DT.body(12.5))
                     .foregroundStyle(DT.textSecondary)
             }
@@ -155,9 +155,9 @@ public struct ForegroundSchedulingView: View {
                             Text("工作桌面 2")
                         }
                     }
-                    WorkspaceMetric(title: "Act Room") {
+                    WorkspaceMetric(title: "ActRealm 工作区") {
                         WorkspaceAvailabilityValue(
-                            available: workspace.isActRoomReady,
+                            available: workspace.isActRealmWorkspaceReady,
                             readyText: "已就位",
                             unavailableText: "未就位"
                         )
@@ -219,7 +219,7 @@ public struct ForegroundSchedulingView: View {
                         strategy: .remind,
                         selected: settings.strategy == .remind,
                         title: "先提醒，再打开",
-                        detail: "Act Room 先提醒；没有处理时，再自动打开 Agent。",
+                        detail: "ActRealm 工作区先提醒；没有处理时，再自动打开 Agent。",
                         steps: [
                             FlowToken("任务到达", tone: .neutral),
                             FlowToken("提醒倒计时", tone: .amber),
@@ -235,9 +235,9 @@ public struct ForegroundSchedulingView: View {
                     )
 
                     StrategyCard(
-                        strategy: .actRoom,
-                        selected: settings.strategy == .actRoom,
-                        title: "只留在 Act Room",
+                        strategy: .actRealmWorkspace,
+                        selected: settings.strategy == .actRealmWorkspace,
+                        title: "只留在 ActRealm 工作区",
                         detail: "任务只进入待处理列表，不自动切换窗口。",
                         steps: [
                             FlowToken("任务到达", tone: .neutral),
@@ -246,7 +246,7 @@ public struct ForegroundSchedulingView: View {
                         ],
                         recommended: false,
                         reminderSeconds: nil,
-                        onSelect: { chooseStrategy(.actRoom) },
+                        onSelect: { chooseStrategy(.actRealmWorkspace) },
                         onSeconds: nil
                     )
                 }
@@ -257,7 +257,7 @@ public struct ForegroundSchedulingView: View {
     // MARK: - After opening
 
     private var afterOpening: some View {
-        let available = settings.strategy != .actRoom
+        let available = settings.strategy != .actRealmWorkspace
         return SchedulingPageCard {
             VStack(alignment: .leading, spacing: 14) {
                 HStack(alignment: .firstTextBaseline, spacing: 9) {
@@ -269,7 +269,7 @@ public struct ForegroundSchedulingView: View {
                         .foregroundStyle(DT.textSecondary)
                     Spacer()
                     if !available {
-                        Text("「只留在 Act Room」无需此行为")
+                        Text("「只留在 ActRealm 工作区」无需此行为")
                             .font(.system(size: 10, weight: .bold))
                             .foregroundStyle(DT.textWeak)
                             .padding(.horizontal, 11)
@@ -283,15 +283,15 @@ public struct ForegroundSchedulingView: View {
                     SettingsInsetRow {
                         HStack(spacing: 14) {
                             VStack(alignment: .leading, spacing: 3) {
-                                Text("自动返回 Act Room")
+                                Text("自动返回 ActRealm 工作区")
                                     .font(.system(size: 12.5, weight: .bold))
                                     .foregroundStyle(DT.textPrimary)
-                                Text("Agent 打开后若未被接收，自动把控制权交还 Act Room")
+                                Text("Agent 打开后若未被接收，自动把控制权交还 ActRealm 工作区")
                                     .font(DT.body(10.5))
                                     .foregroundStyle(DT.textWeak)
                             }
                             Spacer()
-                            SchedulingSwitch(isOn: binding(\.returnsToActRoom))
+                            SchedulingSwitch(isOn: binding(\.returnsToActRealmWorkspace))
                         }
                     }
 
@@ -301,7 +301,7 @@ public struct ForegroundSchedulingView: View {
                                 Text("等待用户进入当前工作桌面")
                                     .font(.system(size: 12.5, weight: .bold))
                                     .foregroundStyle(DT.textPrimary)
-                                Text("超时仍未进入调度桌面，则恢复 Act Room")
+                                Text("超时仍未进入调度桌面，则恢复 ActRealm 工作区")
                                     .font(DT.body(10.5))
                                     .foregroundStyle(DT.textWeak)
                             }
@@ -314,8 +314,8 @@ public struct ForegroundSchedulingView: View {
                             )
                         }
                     }
-                    .opacity(settings.returnsToActRoom ? 1 : 0.4)
-                    .allowsHitTesting(settings.returnsToActRoom)
+                    .opacity(settings.returnsToActRealmWorkspace ? 1 : 0.4)
+                    .allowsHitTesting(settings.returnsToActRealmWorkspace)
 
                     Button {
                         withAnimation(.easeOut(duration: 0.24)) {
@@ -407,7 +407,7 @@ public struct ForegroundSchedulingView: View {
         switch strategy {
         case .immediate: label = "立即打开 Agent"
         case .remind: label = "先提醒，再打开"
-        case .actRoom: label = "只留在 Act Room"
+        case .actRealmWorkspace: label = "只留在 ActRealm 工作区"
         }
         model.showToast("到达策略：\(label)")
     }
@@ -559,31 +559,31 @@ private struct WorkspaceReadinessPill: View {
         .overlay(Capsule().strokeBorder(stroke, lineWidth: 1))
     }
 
-    private var isReady: Bool { status.isActRoomReady && status.isAgentAvailable }
+    private var isReady: Bool { status.isActRealmWorkspaceReady && status.isAgentAvailable }
 
     private var label: String {
-        if !status.isActRoomReady { return "Act Room 尚未就位" }
+        if !status.isActRealmWorkspaceReady { return "ActRealm 工作区尚未就位" }
         if !status.isAgentAvailable { return "目标 Agent 当前未运行" }
         return "台前调度已就绪"
     }
 
     private var dotColor: Color {
-        if !status.isActRoomReady { return DT.redText }
+        if !status.isActRealmWorkspaceReady { return DT.redText }
         return isReady ? DT.greenDot : DT.amberDot
     }
 
     private var textColor: Color {
-        if !status.isActRoomReady { return DT.redText }
+        if !status.isActRealmWorkspaceReady { return DT.redText }
         return isReady ? DT.greenText : DT.amberText
     }
 
     private var background: Color {
-        if !status.isActRoomReady { return DT.redBg }
+        if !status.isActRealmWorkspaceReady { return DT.redBg }
         return isReady ? DT.greenBg : DT.amberBg
     }
 
     private var stroke: Color {
-        if !status.isActRoomReady { return DT.redStroke }
+        if !status.isActRealmWorkspaceReady { return DT.redStroke }
         return isReady ? DT.greenStroke : DT.amberStroke
     }
 }
@@ -839,7 +839,7 @@ private struct MouseAcceptanceExplanation: View {
             )
             AcceptanceRule(
                 icon: "arrow.uturn.backward",
-                text: "鼠标仍在其他工作桌面 → 倒计时结束后恢复 Act Room",
+                text: "鼠标仍在其他工作桌面 → 倒计时结束后恢复 ActRealm 工作区",
                 tone: .amber
             )
 
@@ -847,7 +847,7 @@ private struct MouseAcceptanceExplanation: View {
                 HStack(spacing: 12) {
                     DesktopDiagram(
                         title: "调度工作桌面",
-                        labels: ["Act Room", "Agent"],
+                        labels: ["ActRealm 工作区", "Agent"],
                         selected: true,
                         showsMouse: false
                     )
@@ -875,7 +875,7 @@ private struct MouseAcceptanceExplanation: View {
                             .font(.system(size: 8, weight: .heavy))
                             .foregroundStyle(DT.amberText)
                     }
-                    Text("当前未接收：鼠标仍在其他工作桌面 · 倒计时结束后返回 Act Room")
+                    Text("当前未接收：鼠标仍在其他工作桌面 · 倒计时结束后返回 ActRealm 工作区")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(DT.amberText)
                     Spacer()
@@ -932,14 +932,14 @@ private struct DesktopDiagram: View {
                 HStack(spacing: 7) {
                     ForEach(labels, id: \.self) { label in
                         Text(label)
-                            .font(.system(size: 10, weight: label == "Act Room" ? .bold : .semibold))
-                            .foregroundStyle(label == "Act Room" ? DT.blueText : DT.textSecondary)
+                            .font(.system(size: 10, weight: label == "ActRealm 工作区" ? .bold : .semibold))
+                            .foregroundStyle(label == "ActRealm 工作区" ? DT.blueText : DT.textSecondary)
                             .padding(.horizontal, 9)
                             .padding(.vertical, 5)
                             .background(DT.cardStrong, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                             .overlay(
                                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .strokeBorder(label == "Act Room" ? DT.blueBadgeStroke : DT.neutralBadgeStroke, lineWidth: 1)
+                                    .strokeBorder(label == "ActRealm 工作区" ? DT.blueBadgeStroke : DT.neutralBadgeStroke, lineWidth: 1)
                             )
                     }
                 }
@@ -1016,8 +1016,8 @@ private struct RulePreviewContent: View {
                 .init(
                     "等待桌面接收 \(settings.acceptanceSeconds) 秒",
                     tone: .green,
-                    branch: settings.returnsToActRoom ? "未进入桌面 → 返回 Act Room" : "保持前台继续等待",
-                    branchTone: settings.returnsToActRoom ? .amber : .green
+                    branch: settings.returnsToActRealmWorkspace ? "未进入桌面 → 返回 ActRealm 工作区" : "保持前台继续等待",
+                    branchTone: settings.returnsToActRealmWorkspace ? .amber : .green
                 ),
             ]
         case .remind:
@@ -1028,11 +1028,11 @@ private struct RulePreviewContent: View {
                 .init(
                     "等待桌面接收 \(settings.acceptanceSeconds) 秒",
                     tone: .green,
-                    branch: settings.returnsToActRoom ? "未进入桌面 → 返回 Act Room" : "保持前台继续等待",
-                    branchTone: settings.returnsToActRoom ? .amber : .green
+                    branch: settings.returnsToActRealmWorkspace ? "未进入桌面 → 返回 ActRealm 工作区" : "保持前台继续等待",
+                    branchTone: settings.returnsToActRealmWorkspace ? .amber : .green
                 ),
             ]
-        case .actRoom:
+        case .actRealmWorkspace:
             return [
                 .init("新任务", tone: .neutral),
                 .init("进入待处理列表", tone: .blue),
@@ -1047,16 +1047,16 @@ private struct RulePreviewContent: View {
         }
         switch settings.strategy {
         case .immediate:
-            let ending = settings.returnsToActRoom
-                ? "，\(settings.acceptanceSeconds) 秒内未进入桌面则返回 Act Room"
+            let ending = settings.returnsToActRealmWorkspace
+                ? "，\(settings.acceptanceSeconds) 秒内未进入桌面则返回 ActRealm 工作区"
                 : "，不自动返回"
             return "新任务直接在调度桌面打开对应 Agent\(ending)"
         case .remind:
-            let ending = settings.returnsToActRoom
+            let ending = settings.returnsToActRealmWorkspace
                 ? "；\(settings.acceptanceSeconds) 秒未进入桌面则返回"
                 : ""
-            return "先在 Act Room 提醒 \(settings.reminderSeconds) 秒，未处理再自动打开 Agent\(ending)"
-        case .actRoom:
+            return "先在 ActRealm 工作区提醒 \(settings.reminderSeconds) 秒，未处理再自动打开 Agent\(ending)"
+        case .actRealmWorkspace:
             return "任务只进入待处理列表，不自动切换窗口，由你手动打开"
         }
     }
@@ -1176,7 +1176,7 @@ private extension ForegroundArrivalStrategy {
         switch self {
         case .immediate: "立即打开"
         case .remind: "先提醒，再打开"
-        case .actRoom: "只留在 Act Room"
+        case .actRealmWorkspace: "只留在 ActRealm 工作区"
         }
     }
 }
@@ -1187,7 +1187,7 @@ private extension ForegroundAgentRule {
         case .defaultRule: "使用默认"
         case .immediate: "立即打开"
         case .remind: "先提醒"
-        case .actRoom: "只进待处理"
+        case .actRealmWorkspace: "只进待处理"
         }
     }
 
@@ -1196,7 +1196,7 @@ private extension ForegroundAgentRule {
         case .defaultRule: "跟随全局策略"
         case .immediate: "立即打开 Agent"
         case .remind: "先提醒，再打开"
-        case .actRoom: "只进入待处理列表"
+        case .actRealmWorkspace: "只进入待处理列表"
         }
     }
 }

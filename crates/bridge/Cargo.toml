@@ -1,12 +1,12 @@
 [package]
-name = "flow-agent-bridge"
+name = "actrealm-bridge"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-flow-agent-core = { path = "../core" }
+actrealm-core = { path = "../core" }
 libc.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

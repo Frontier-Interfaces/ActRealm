@@ -1,5 +1,5 @@
 [package]
-name = "flow-agent-quota"
+name = "actrealm-quota"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

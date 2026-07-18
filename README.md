@@ -65,8 +65,8 @@ The current build includes:
 - **a native macOS client codebase** with menu-bar UI, HUD, Runtime supervision,
   and experimental foreground scheduling.
 
-The product is named **ActRealm**. The current Runtime executable and CLI retain
-the name `flow-agent` for compatibility.
+The product, Runtime executable, and CLI all use the name **ActRealm**
+(`actrealm` on the command line).
 
 ## How the control loop works
 
@@ -111,14 +111,14 @@ cargo build --workspace --release
 Install only the Provider integrations present on your machine:
 
 ```bash
-./target/release/flow-agent install-hooks claude
-./target/release/flow-agent install-hooks codex --enhanced-codex-activity
+./target/release/actrealm install-hooks claude
+./target/release/actrealm install-hooks codex --enhanced-codex-activity
 ```
 
 Then keep the Runtime running in its own terminal:
 
 ```bash
-./target/release/flow-agent serve --open
+./target/release/actrealm serve --open
 ```
 
 `serve --open` starts the local Runtime, opens the authenticated control page on
@@ -131,7 +131,7 @@ ActRealm never bypasses that review. After starting a fresh Provider session,
 verify the complete path from another terminal:
 
 ```bash
-~/.flow-agent/bin/flow-agent doctor
+~/.actrealm/bin/actrealm doctor
 ```
 
 Installation is complete only when the stable helper exists, the Runtime
@@ -143,7 +143,7 @@ checklist and recovery steps.
 ## Native macOS client
 
 The SwiftUI/AppKit client lives in `apps/macos/` and packages the repository's
-Rust Runtime as `ActRealm.app/Contents/Helpers/flow-agent`.
+Rust Runtime as `ActRealm.app/Contents/Helpers/actrealm`.
 
 ```bash
 apps/macos/Scripts/test.sh
@@ -162,7 +162,7 @@ available.
 | Local Runtime and web control surface | Current test candidate | Functional through M14; M13 real-Provider acceptance and the 48-hour soak remain open |
 | Claude Code and Codex | Current build | Local sessions only; direct actions depend on the actual reply channel |
 | Native macOS client | Testable source | Packaging works locally; foreground/window activation still needs broader manual acceptance |
-| Automatic Agent Workspace arrangement | Experimental | Requires macOS Accessibility permission and must fail without changing Runtime state |
+| Automatic ActRealm Workspace arrangement | Experimental | Requires macOS Accessibility permission and must fail without changing Runtime state |
 | ActRealm Review | In development | Planned test, diff, evidence, and checkpoint review; not part of the current build |
 | Gemini CLI adapter | In development | Not shipped as a current supported Provider |
 | Windows client | Roadmap | Runtime platform abstractions must land before the WinUI shell |
@@ -198,8 +198,9 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --offline -- -D warnings
 cargo test --workspace --offline
 cargo build --workspace --release --offline
+./scripts/check-actrealm-language.sh
 ./scripts/m0-e2e.sh
-./scripts/m5-resource-check.sh target/release/flow-agent
+./scripts/m5-resource-check.sh target/release/actrealm
 apps/macos/Scripts/test.sh
 ```
 

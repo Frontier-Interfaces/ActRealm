@@ -11,7 +11,7 @@ evidence and does not claim an independent historical candidate.
 - Claude.app and ChatGPT/Codex.app can satisfy Provider discovery without a
   same-name global CLI.
 - Codex Desktop exposes its bundled official executable for the user-owned
-  `/hooks` trust review; Flow Agent never edits or bypasses trust.
+  `/hooks` trust review; ActRealm never edits or bypasses trust.
 - Provider-side progress, denial, stop, failure, new prompt, or session end
   reconciles matching Attention and removes stale `等你` state when the Hook
   supplies a reliable resolution signal.
@@ -41,7 +41,7 @@ Primary implementation commits: `63c6fce` and `120e89d`.
 
 ## Capability boundary
 
-M8 does not claim that Flow Agent owns an independently running Provider
+M8 does not claim that ActRealm owns an independently running Provider
 session. Exact jump requires a verified locator. Restarted external Hook
 sessions may be observable but not controllable, and old approval/question
 waiters always expire.

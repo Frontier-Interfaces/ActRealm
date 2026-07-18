@@ -73,11 +73,11 @@ intentionally not shipped in v1; it did not delay either P0 provider.
 | --- | --- |
 | `cargo clippy --workspace --all-targets --offline -- -D warnings` | PASS, zero warnings |
 | `cargo test --workspace --offline` | PASS, 91 tests |
-| `cargo test -p flow-agent-quota --offline` | PASS, 5 schema/freshness/privacy/bounded-scan cases |
-| `cargo test -p flow-agent-installer --offline` | PASS, including 3 status-line safety cases |
-| `cargo test -p flow-agent-runtime --offline` | PASS, including 3 data transaction cases |
-| `cargo test -p flow-agent-server --offline` | PASS, authenticated M4 API plus M2 regressions |
-| `cargo test -p flow-agent --test m4_cli --offline` | PASS, 3 single-binary cases |
+| `cargo test -p actrealm-quota --offline` | PASS, 5 schema/freshness/privacy/bounded-scan cases |
+| `cargo test -p actrealm-installer --offline` | PASS, including 3 status-line safety cases |
+| `cargo test -p actrealm-runtime --offline` | PASS, including 3 data transaction cases |
+| `cargo test -p actrealm-server --offline` | PASS, authenticated M4 API plus M2 regressions |
+| `cargo test -p actrealm --test m4_cli --offline` | PASS, 3 single-binary cases |
 | `cargo build --workspace --release --offline` | PASS |
 | `node --check web/app.js` | PASS |
 | `./scripts/m0-e2e.sh` | PASS, Claude allow, Codex deny, pass-through, missing-runtime fail-open |

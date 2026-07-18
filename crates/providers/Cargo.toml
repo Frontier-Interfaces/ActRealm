@@ -1,12 +1,12 @@
 [package]
-name = "flow-agent-providers"
+name = "actrealm-providers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-flow-agent-core = { path = "../core" }
+actrealm-core = { path = "../core" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

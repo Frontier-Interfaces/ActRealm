@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
-use flow_agent_core::{BridgeRequest, Decision, Provider, ReplyAction, TermContext};
-use flow_agent_runtime::{
+use actrealm_core::{BridgeRequest, Decision, Provider, ReplyAction, TermContext};
+use actrealm_runtime::{
     ApprovalAction, AttentionAction, CommandState, EventSpool, InstanceError, RuntimeInstanceGuard,
     RuntimeStore, SessionUsageRecord, SpoolError, StoreError, WaiterRegistry,
 };
@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 fn temp_root(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
-        "flow-agent-m1-{name}-{}-{}",
+        "actrealm-m1-{name}-{}-{}",
         std::process::id(),
         Uuid::now_v7()
     ))
@@ -340,7 +340,7 @@ fn restart_restores_running_session_and_keeps_private_jump_locator_out_of_json()
                 "session_id":provider_session_id,
                 "turn_id":"turn-1",
                 "cwd":"/tmp/restart-project",
-                "prompt":"Continue after Flow Agent restarts"
+                "prompt":"Continue after ActRealm restarts"
             }),
             50_000,
         );
@@ -752,10 +752,7 @@ fn codex_request_permissions_hook_tracks_native_request_without_claiming_a_decis
     );
     assert!(!start.needs_reply);
     let ingested = store.ingest(start).unwrap();
-    assert_eq!(
-        ingested.kind,
-        flow_agent_core::EventKind::PermissionRequested
-    );
+    assert_eq!(ingested.kind, actrealm_core::EventKind::PermissionRequested);
 
     let waiting = store.snapshot().unwrap();
     assert_eq!(waiting.attention.len(), 1);
@@ -773,7 +770,7 @@ fn codex_request_permissions_hook_tracks_native_request_without_claiming_a_decis
     );
 
     // Open Island's reducer deliberately protects actionable state from an
-    // incidental running update. Flow Agent must do the same.
+    // incidental running update. ActRealm must do the same.
     store
         .ingest(BridgeRequest::from_hook_at(
             Provider::Codex,

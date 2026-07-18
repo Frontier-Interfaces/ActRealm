@@ -37,11 +37,11 @@ Sanitized live input is checked in under `fixtures/claude/2.1.210/` and
 | --- | --- |
 | Claude Code 2.1.210 allow | PASS: native UI reported approval by PermissionRequest hook; the safe probe proceeded |
 | Claude Code 2.1.210 deny | PASS: native UI reported denial; the command did not execute |
-| Claude Code 2.1.210 pass-through | PASS: empty Flow Agent stdout restored a usable native approval dialog |
+| Claude Code 2.1.210 pass-through | PASS: empty ActRealm stdout restored a usable native approval dialog |
 | Codex CLI 0.144.4 allow | PASS: PermissionRequest was followed by PostToolUse and Stop |
 | Codex CLI 0.144.4 deny | PASS: hook blocked execution; no PostToolUse followed |
-| Codex CLI 0.144.4 pass-through | PASS: empty Flow Agent stdout restored native approval; native No remained usable |
-| Codex trust boundary | PASS: untrusted project emitted no Flow Agent events; trusting the exact `/hooks` command enabled the full lifecycle |
+| Codex CLI 0.144.4 pass-through | PASS: empty ActRealm stdout restored native approval; native No remained usable |
+| Codex trust boundary | PASS: untrusted project emitted no ActRealm events; trusting the exact `/hooks` command enabled the full lifecycle |
 
 Live probes used an isolated local repository and a non-mutating dry-run push
 or a command that failed before any push. No remote repository state changed.

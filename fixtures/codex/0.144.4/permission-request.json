@@ -7,7 +7,7 @@
   "turn_id": "fixture-codex-turn",
   "tool_name": "Bash",
   "tool_input": {
-    "command": "printf flow-agent-probe"
+    "command": "printf actrealm-probe"
   },
   "model": "redacted-model"
 }

@@ -186,7 +186,7 @@ public struct HUDCapsuleView: View {
                 .frame(maxWidth: 300, alignment: .leading)
                 Button("立即打开") { model.openForegroundAgentNow() }
                     .buttonStyle(PillButtonStyle(rank: .primary, fontSize: 11, horizontalPadding: 14))
-                Button("留在 Act Room") { model.keepForegroundTaskInActRoom() }
+                Button("留在 ActRealm 工作区") { model.keepForegroundTaskInActRealmWorkspace() }
                     .buttonStyle(PillButtonStyle(rank: .secondary, fontSize: 11, horizontalPadding: 14))
             }
         case .opening:
@@ -216,14 +216,14 @@ public struct HUDCapsuleView: View {
                 }
                 .frame(maxWidth: 360, alignment: .leading)
             }
-        case .returnedToActRoom:
+        case .returnedToActRealmWorkspace:
             HStack(spacing: 10) {
                 Image(systemName: "arrow.uturn.backward")
                     .font(.system(size: 13, weight: .bold))
                     .foregroundStyle(DT.amberText)
                     .frame(width: 32, height: 32)
                     .background(DT.amberBg, in: Circle())
-                Text("未检测到进入调度工作桌面，已返回 Act Room")
+                Text("未检测到进入调度工作桌面，已返回 ActRealm 工作区")
                     .font(.system(size: 12.5, weight: .bold))
                     .foregroundStyle(DT.textStrong)
             }
@@ -256,10 +256,10 @@ public struct HUDCapsuleView: View {
 
     private func dispatchHint(_ dispatch: ForegroundDispatchState) -> String {
         switch dispatch.phase {
-        case .reminding: "倒计时结束后自动打开 · 也可以留在 Act Room"
+        case .reminding: "倒计时结束后自动打开 · 也可以留在 ActRealm 工作区"
         case .opening: "正在把对应 Agent 带到前台"
         case .awaitingWorkspace: "进入调度工作桌面即视为已接收"
-        case .returnedToActRoom: "任务仍保留在待处理列表"
+        case .returnedToActRealmWorkspace: "任务仍保留在待处理列表"
         }
     }
 

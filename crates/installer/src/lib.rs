@@ -14,7 +14,7 @@ use toml_edit::DocumentMut;
 
 const CONFIG_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
 const STATE_SCHEMA_VERSION: u32 = 1;
-const CLAUDE_ORIGINAL_STATUSLINE_KEY: &str = "_flowAgentOriginalStatusLine";
+const CLAUDE_ORIGINAL_STATUSLINE_KEY: &str = "_actRealmOriginalStatusLine";
 static UNIQUE_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 const CLAUDE_EVENTS: &[&str] = &[
@@ -182,7 +182,7 @@ fn is_executable_file(path: &Path) -> bool {
 #[cfg(target_os = "macos")]
 fn application_roots() -> Vec<PathBuf> {
     if cfg!(debug_assertions) {
-        if let Some(roots) = env::var_os("FLOW_AGENT_TEST_APPLICATIONS_PATH") {
+        if let Some(roots) = env::var_os("ACTREALM_TEST_APPLICATIONS_PATH") {
             return env::split_paths(&roots).collect();
         }
     }
@@ -209,7 +209,7 @@ pub struct InstallOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallPaths {
-    pub flow_home: PathBuf,
+    pub actrealm_home: PathBuf,
     pub claude_settings: PathBuf,
     pub codex_hooks: PathBuf,
     pub codex_config: PathBuf,
@@ -220,14 +220,14 @@ impl InstallPaths {
         let home = env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or(InstallerError::MissingHome)?;
-        let flow_home = env::var_os("FLOW_AGENT_HOME")
+        let actrealm_home = env::var_os("ACTREALM_HOME")
             .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".flow-agent"));
+            .unwrap_or_else(|| home.join(".actrealm"));
         let codex_home = env::var_os("CODEX_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".codex"));
         Ok(Self {
-            flow_home,
+            actrealm_home,
             claude_settings: home.join(".claude/settings.json"),
             codex_hooks: codex_home.join("hooks.json"),
             codex_config: codex_home.join("config.toml"),
@@ -242,19 +242,19 @@ impl InstallPaths {
     }
 
     pub fn stable_binary(&self) -> PathBuf {
-        self.flow_home.join("bin/flow-agent")
+        self.actrealm_home.join("bin/actrealm")
     }
 
     pub fn statusline_helper(&self) -> PathBuf {
-        self.flow_home.join("bin/statusline")
+        self.actrealm_home.join("bin/statusline")
     }
 
     pub fn statusline_delegate(&self) -> PathBuf {
-        self.flow_home.join("bin/statusline-delegate")
+        self.actrealm_home.join("bin/statusline-delegate")
     }
 
     pub fn state_file(&self) -> PathBuf {
-        self.flow_home.join("install-state.json")
+        self.actrealm_home.join("install-state.json")
     }
 }
 
@@ -375,7 +375,7 @@ pub enum InstallerError {
         backup: Option<PathBuf>,
         reason: String,
     },
-    #[error("Flow Agent state is malformed: {path}; backup: {backup:?}; {reason}")]
+    #[error("ActRealm state is malformed: {path}; backup: {backup:?}; {reason}")]
     MalformedState {
         path: PathBuf,
         backup: Option<PathBuf>,
@@ -383,9 +383,9 @@ pub enum InstallerError {
     },
     #[error("Codex inline hook definitions conflict with hooks.json: {events:?}")]
     CodexInlineHooksConflict { events: Vec<String> },
-    #[error("Claude already has a custom statusLine; Flow Agent will not replace it")]
+    #[error("Claude already has a custom statusLine; ActRealm will not replace it")]
     ClaudeStatuslineConflict,
-    #[error("Claude custom statusLine has no command that Flow Agent can preserve")]
+    #[error("Claude custom statusLine has no command that ActRealm can preserve")]
     ClaudeStatuslineNotWrappable,
     #[error("installer lock failed: {0}")]
     Lock(io::Error),
@@ -563,7 +563,7 @@ impl Installer {
     }
 
     pub fn install_claude_statusline(&self) -> Result<InstallReport, InstallerError> {
-        let _lock = InstallLock::acquire(&self.paths.flow_home)?;
+        let _lock = InstallLock::acquire(&self.paths.actrealm_home)?;
         self.validate_source_binary()?;
         let config_path = self.paths.claude_settings.clone();
         let (original, existed) = self.load_provider_json(&config_path)?;
@@ -606,7 +606,7 @@ impl Installer {
     }
 
     pub fn install_claude_statusline_wrapper(&self) -> Result<InstallReport, InstallerError> {
-        let _lock = InstallLock::acquire(&self.paths.flow_home)?;
+        let _lock = InstallLock::acquire(&self.paths.actrealm_home)?;
         self.validate_source_binary()?;
         let config_path = self.paths.claude_settings.clone();
         let (original, existed) = self.load_provider_json(&config_path)?;
@@ -639,7 +639,7 @@ impl Installer {
         };
         let binary_changed = self.install_stable_binary()?;
         let delegate = format!(
-            "#!/bin/sh\n# Original Claude statusLine preserved by Flow Agent.\n{original_command}\n"
+            "#!/bin/sh\n# Original Claude statusLine preserved by ActRealm.\n{original_command}\n"
         );
         atomic_write(
             &self.paths.statusline_delegate(),
@@ -668,7 +668,7 @@ impl Installer {
     }
 
     pub fn uninstall_claude_statusline(&self) -> Result<InstallReport, InstallerError> {
-        let _lock = InstallLock::acquire(&self.paths.flow_home)?;
+        let _lock = InstallLock::acquire(&self.paths.actrealm_home)?;
         let config_path = self.paths.claude_settings.clone();
         let (original, existed) = self.load_provider_json(&config_path)?;
         let mut updated = original.clone();
@@ -722,7 +722,7 @@ impl Installer {
         provider: HookProvider,
         options: InstallOptions,
     ) -> Result<InstallReport, InstallerError> {
-        let _lock = InstallLock::acquire(&self.paths.flow_home)?;
+        let _lock = InstallLock::acquire(&self.paths.actrealm_home)?;
         self.install_locked(provider, options)
     }
 
@@ -801,7 +801,7 @@ impl Installer {
     }
 
     pub fn uninstall(&self, provider: HookProvider) -> Result<InstallReport, InstallerError> {
-        let _lock = InstallLock::acquire(&self.paths.flow_home)?;
+        let _lock = InstallLock::acquire(&self.paths.actrealm_home)?;
         let mut state = self.load_state()?;
         let config_path = self.paths.provider_config(provider).to_path_buf();
         let (original, existed) = self.load_provider_json(&config_path)?;
@@ -859,7 +859,7 @@ impl Installer {
         provider: HookProvider,
         options: InstallOptions,
     ) -> Result<RepairReport, InstallerError> {
-        let _lock = InstallLock::acquire(&self.paths.flow_home)?;
+        let _lock = InstallLock::acquire(&self.paths.actrealm_home)?;
         let previous_intent = provider_intent(&self.load_state()?, provider);
         if previous_intent != InstallIntent::Installed {
             return Ok(RepairReport {
@@ -1053,7 +1053,7 @@ impl Installer {
                 source: io::Error::new(io::ErrorKind::NotFound, "backup source is missing"),
             });
         }
-        let backups = self.paths.flow_home.join("backups");
+        let backups = self.paths.actrealm_home.join("backups");
         ensure_private_directory(&backups)?;
         let file_name = source_path
             .file_name()
@@ -1132,9 +1132,9 @@ fn hook_group(provider: HookProvider, event: &str, command: &str) -> Value {
         handler.insert(
             "statusMessage".to_owned(),
             Value::String(if event == "PermissionRequest" {
-                "Waiting for Flow Agent approval".to_owned()
+                "Waiting for ActRealm approval".to_owned()
             } else {
-                "Updating Flow Agent".to_owned()
+                "Updating ActRealm".to_owned()
             }),
         );
     }
@@ -1594,10 +1594,10 @@ fn atomic_write(path: &Path, bytes: &[u8], default_mode: u32) -> Result<(), Inst
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
-        .unwrap_or("flow-agent");
+        .unwrap_or("actrealm");
     let unique = UNIQUE_FILE_ID.fetch_add(1, Ordering::Relaxed);
     let temporary = parent.join(format!(
-        ".{name}.flow-agent.{}.{}.tmp",
+        ".{name}.actrealm.{}.{}.tmp",
         std::process::id(),
         unique
     ));
@@ -1671,8 +1671,8 @@ struct InstallLock {
 }
 
 impl InstallLock {
-    fn acquire(flow_home: &Path) -> Result<Self, InstallerError> {
-        let run = flow_home.join("run");
+    fn acquire(actrealm_home: &Path) -> Result<Self, InstallerError> {
+        let run = actrealm_home.join("run");
         ensure_private_directory(&run)?;
         let path = run.join("hooks-install.lock");
         refuse_symlink(&path)?;

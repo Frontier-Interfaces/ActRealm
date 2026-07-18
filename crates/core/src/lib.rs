@@ -12,7 +12,7 @@ pub const MAX_HOOK_PAYLOAD_BYTES: usize = 256 * 1024;
 pub const CLAUDE_PERMISSION_DEADLINE_MS: u64 = 24 * 60 * 60 * 1_000;
 pub const CODEX_PERMISSION_DEADLINE_MS: u64 = 60 * 60 * 1_000;
 pub const PERMISSION_COMMIT_DELAY_MS: u64 = 3_000;
-pub const DOCTOR_PROBE_EVENT: &str = "FlowAgentDoctorProbe";
+pub const DOCTOR_PROBE_EVENT: &str = "ActRealmDoctorProbe";
 
 pub const fn permission_deadline_ms(provider: Provider) -> Option<u64> {
     match provider {
@@ -420,7 +420,7 @@ impl BridgeRequest {
             provider_session_id: owned_raw_string(&raw, "session_id"),
             provider_turn_id: owned_raw_string(&raw, "turn_id"),
             prompt_id: owned_raw_string(&raw, "prompt_id"),
-            role: std::env::var("FLOW_AGENT_ROLE").unwrap_or_else(|_| "primary".to_owned()),
+            role: std::env::var("ACTREALM_ROLE").unwrap_or_else(|_| "primary".to_owned()),
             received_at,
             deadline_at: needs_reply.then(|| {
                 received_at.saturating_add(permission_deadline_ms(provider).unwrap_or_default())
@@ -440,7 +440,7 @@ impl BridgeRequest {
             id: Uuid::now_v7(),
             request_id: Some(request_id),
             provider: Provider::Claude,
-            provider_session_id: Some("flow-agent-doctor".to_owned()),
+            provider_session_id: Some("actrealm-doctor".to_owned()),
             provider_turn_id: None,
             prompt_id: None,
             role: "diagnostic".to_owned(),
@@ -452,7 +452,7 @@ impl BridgeRequest {
             term: None,
             raw: serde_json::json!({
                 "hook_event_name": DOCTOR_PROBE_EVENT,
-                "session_id": "flow-agent-doctor"
+                "session_id": "actrealm-doctor"
             }),
         }
     }
@@ -553,7 +553,7 @@ impl BridgeResponse {
                 Decision::Allow => ReplyAction::Allow,
                 Decision::Deny => ReplyAction::Deny,
             },
-            message: (decision == Decision::Deny).then(|| "User denied via Flow Agent".to_owned()),
+            message: (decision == Decision::Deny).then(|| "User denied via ActRealm".to_owned()),
             reason: None,
             runtime_instance_id: None,
             payload: None,
@@ -633,7 +633,7 @@ fn terminal_context() -> Option<TermContext> {
         .ok()
         .or_else(|| std::env::var("LC_TERMINAL").ok());
     let bundle_id = std::env::var("__CFBundleIdentifier").ok();
-    let surface = std::env::var("FLOW_AGENT_SURFACE")
+    let surface = std::env::var("ACTREALM_SURFACE")
         .ok()
         .filter(|value| matches!(value.as_str(), "terminal" | "codex_app" | "claude_app"))
         .or_else(|| infer_surface(app.as_deref(), bundle_id.as_deref()));
@@ -641,7 +641,7 @@ fn terminal_context() -> Option<TermContext> {
         app,
         session_id: std::env::var("TERM_SESSION_ID").ok(),
         tty: std::env::var("TTY").ok(),
-        title: std::env::var("FLOW_AGENT_TERM_TITLE").ok(),
+        title: std::env::var("ACTREALM_TERM_TITLE").ok(),
         bundle_id,
         surface,
         provider_pid: u32::try_from(unsafe { libc::getppid() }).ok(),
@@ -684,7 +684,7 @@ pub fn permission_directive(provider: Provider, decision: Decision) -> Option<Va
     };
     let mut decision_value = serde_json::json!({ "behavior": behavior });
     if decision == Decision::Deny {
-        decision_value["message"] = Value::String("User denied via Flow Agent".into());
+        decision_value["message"] = Value::String("User denied via ActRealm".into());
     }
 
     Some(serde_json::json!({
@@ -715,7 +715,7 @@ pub fn hook_directive(request: &BridgeRequest, response: &BridgeResponse) -> Opt
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
                     "permissionDecision": "allow",
-                    "permissionDecisionReason": "Answered by Flow Agent",
+                    "permissionDecisionReason": "Answered by ActRealm",
                     "updatedInput": Value::Object(updated_input)
                 }
             }))

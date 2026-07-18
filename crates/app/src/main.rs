@@ -1,22 +1,22 @@
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
-use flow_agent_bridge::{default_socket_path, validate_socket_path, BridgeClient, BridgeListener};
-use flow_agent_core::{
+use actrealm_bridge::{default_socket_path, validate_socket_path, BridgeClient, BridgeListener};
+use actrealm_core::{
     hook_directive, permission_deadline_ms, BlockingRequestKind, BridgeRequest, Decision, Provider,
     DOCTOR_PROBE_EVENT, MAX_HOOK_PAYLOAD_BYTES, PERMISSION_COMMIT_DELAY_MS,
 };
-use flow_agent_installer::{
+use actrealm_installer::{
     codex_config_enables_auto_review, discover_provider_availability, BinaryHealth,
     CodexFeatureStatus, CodexTrustStatus, ConfigHealth, HookProvider, InstallIntent,
     InstallOptions, InstallPaths, Installer,
 };
-use flow_agent_quota::{capture_claude_statusline, statusline_text, QuotaPaths};
-use flow_agent_runtime::{
+use actrealm_quota::{capture_claude_statusline, statusline_text, QuotaPaths};
+use actrealm_runtime::{
     default_database_path, ApprovalAction, DiagnosticCapture, EventSpool, RuntimeInstanceGuard,
     RuntimeStore, WaiterRegistry,
 };
-use flow_agent_server::{ApiServer, ApiServerConfig, RuntimeRestartHandle};
-use flow_agent_usage::{capture_claude_statusline_usage, UsagePaths};
+use actrealm_server::{ApiServer, ApiServerConfig, RuntimeRestartHandle};
+use actrealm_usage::{capture_claude_statusline_usage, UsagePaths};
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Read, Write};
@@ -34,7 +34,7 @@ const PROVIDER_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "flow-agent",
+    name = "actrealm",
     version,
     about = "Local-first agent attention runtime"
 )]
@@ -73,7 +73,7 @@ enum Command {
         #[arg(long)]
         repair: bool,
     },
-    /// Remove only Flow Agent hook entries and preserve all user configuration.
+    /// Remove only ActRealm hook entries and preserve all user configuration.
     UninstallHooks {
         #[arg(value_enum, default_value_t = HookTarget::All)]
         provider: HookTarget,
@@ -84,7 +84,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Export all locally persisted, sanitized Flow Agent data as JSON.
+    /// Export all locally persisted, sanitized ActRealm data as JSON.
     Export,
     /// Export only aggregate daily metrics, with no session or event records.
     ExportMetrics,
@@ -93,7 +93,7 @@ enum Command {
         #[command(subcommand)]
         action: DiagnosticsCommand,
     },
-    /// Claude Code status line bridge. Installed and invoked by Flow Agent.
+    /// Claude Code status line bridge. Installed and invoked by ActRealm.
     #[command(hide = true)]
     Statusline,
 }
@@ -226,7 +226,7 @@ fn run_statusline() -> Result<()> {
         .take((MAX_HOOK_PAYLOAD_BYTES + 1) as u64)
         .read_to_end(&mut input);
     if input.len() > MAX_HOOK_PAYLOAD_BYTES {
-        println!("Flow Agent · 额度输入过大");
+        println!("ActRealm · 额度输入过大");
         return Ok(());
     }
     let paths = QuotaPaths::discover();
@@ -237,18 +237,18 @@ fn run_statusline() -> Result<()> {
     let _ = capture_claude_statusline_usage(&input, &usage_paths.claude_status_cache_dir(), now);
     match capture_claude_statusline(&input, &paths.claude_cache(), now) {
         Ok(entries) => println!("{}", statusline_text(&entries)),
-        Err(_) => println!("Flow Agent · 额度暂不可用"),
+        Err(_) => println!("ActRealm · 额度暂不可用"),
     }
     Ok(())
 }
 
 fn install_hooks(target: HookTarget, enhanced_codex_activity: bool, repair: bool) -> Result<()> {
-    validate_socket_path(&default_socket_path()).context("invalid Flow Agent socket path")?;
+    validate_socket_path(&default_socket_path()).context("invalid ActRealm socket path")?;
     for provider in target.providers() {
         ensure_provider_available(*provider)?;
     }
     let paths = InstallPaths::discover()?;
-    let source_binary = std::env::current_exe().context("failed to locate flow-agent binary")?;
+    let source_binary = std::env::current_exe().context("failed to locate actrealm binary")?;
     let installer = Installer::new(paths, source_binary);
     let options = InstallOptions {
         enhanced_codex_activity,
@@ -286,7 +286,7 @@ fn install_hooks(target: HookTarget, enhanced_codex_activity: bool, repair: bool
             let command = availability
                 .codex_review_command()
                 .unwrap_or_else(|| "codex".to_owned());
-            println!("Codex requires one manual trust step: run {command}, then run /hooks, review and trust each Flow Agent command hook.");
+            println!("Codex requires one manual trust step: run {command}, then run /hooks, review and trust each ActRealm command hook.");
         }
     }
     Ok(())
@@ -294,7 +294,7 @@ fn install_hooks(target: HookTarget, enhanced_codex_activity: bool, repair: bool
 
 fn uninstall_hooks(target: HookTarget) -> Result<()> {
     let paths = InstallPaths::discover()?;
-    let source_binary = std::env::current_exe().context("failed to locate flow-agent binary")?;
+    let source_binary = std::env::current_exe().context("failed to locate actrealm binary")?;
     let installer = Installer::new(paths, source_binary);
     for provider in target.providers() {
         let report = installer.uninstall(*provider)?;
@@ -358,7 +358,7 @@ struct ProviderVerification {
 
 fn doctor(json: bool) -> Result<()> {
     let paths = InstallPaths::discover()?;
-    let source_binary = std::env::current_exe().context("failed to locate flow-agent binary")?;
+    let source_binary = std::env::current_exe().context("failed to locate actrealm binary")?;
     let installer = Installer::new(paths.clone(), source_binary);
     let socket_path = default_socket_path();
     let mut checks = Vec::new();
@@ -382,7 +382,7 @@ fn doctor(json: bool) -> Result<()> {
                 "Unix socket path is too long",
                 error.to_string(),
                 Repairability::Manual,
-                Some("Set FLOW_AGENT_HOME to a shorter absolute path"),
+                Some("Set ACTREALM_HOME to a shorter absolute path"),
             ));
             false
         }
@@ -480,7 +480,7 @@ fn add_cli_check(checks: &mut Vec<DiagnosticCheck>, provider: HookProvider) {
             &format!("{} client is not installed", provider.as_str()),
             "No CLI in PATH or supported macOS desktop app was found".to_owned(),
             Repairability::Manual,
-            Some("Install the provider desktop app or CLI, then run flow-agent doctor again"),
+            Some("Install the provider desktop app or CLI, then run actrealm doctor again"),
         ));
         return;
     }
@@ -555,7 +555,7 @@ fn add_cli_check(checks: &mut Vec<DiagnosticCheck>, provider: HookProvider) {
 
 fn add_provider_checks(
     checks: &mut Vec<DiagnosticCheck>,
-    inspection: &flow_agent_installer::ProviderInspection,
+    inspection: &actrealm_installer::ProviderInspection,
 ) {
     let provider = inspection.provider.as_str();
     match inspection.config_health {
@@ -587,12 +587,12 @@ fn add_provider_checks(
             &format!("{provider} is not connected"),
             format!("{} is missing", inspection.config_path.display()),
             Repairability::Manual,
-            Some(&format!("Run flow-agent install-hooks {provider}")),
+            Some(&format!("Run actrealm install-hooks {provider}")),
         )),
         ConfigHealth::Valid if inspection.definition_matches_manifest => checks.push(diagnostic(
             &format!("{provider}.config"),
             DiagnosticStatus::Pass,
-            &format!("{provider} Flow Agent hooks match the installation manifest"),
+            &format!("{provider} ActRealm hooks match the installation manifest"),
             format!(
                 "{} managed handlers in {}",
                 inspection.owned_handlers,
@@ -604,23 +604,23 @@ fn add_provider_checks(
         ConfigHealth::Valid if inspection.owned_handlers > 0 => checks.push(diagnostic(
             &format!("{provider}.config"),
             DiagnosticStatus::Fail,
-            &format!("{provider} Flow Agent hooks are incomplete or changed"),
+            &format!("{provider} ActRealm hooks are incomplete or changed"),
             format!(
                 "found {} managed handlers; expected {}",
                 inspection.owned_handlers, inspection.expected_handlers
             ),
             Repairability::Manual,
             Some(&format!(
-                "Review the configuration, then explicitly run flow-agent install-hooks {provider}"
+                "Review the configuration, then explicitly run actrealm install-hooks {provider}"
             )),
         )),
         ConfigHealth::Valid => checks.push(diagnostic(
             &format!("{provider}.config"),
             DiagnosticStatus::Warning,
-            &format!("{provider} has no Flow Agent hooks"),
+            &format!("{provider} has no ActRealm hooks"),
             inspection.config_path.display().to_string(),
             Repairability::Manual,
-            Some(&format!("Run flow-agent install-hooks {provider}")),
+            Some(&format!("Run actrealm install-hooks {provider}")),
         )),
     }
 
@@ -640,7 +640,7 @@ fn add_provider_checks(
                 "Stable hook binary is not installed",
                 inspection.binary_path.display().to_string(),
                 Repairability::Manual,
-                Some(&format!("Run flow-agent install-hooks {provider}")),
+                Some(&format!("Run actrealm install-hooks {provider}")),
             ));
         }
         health => checks.push(diagnostic(
@@ -668,7 +668,7 @@ fn add_provider_checks(
 
 fn add_codex_checks(
     checks: &mut Vec<DiagnosticCheck>,
-    inspection: &flow_agent_installer::ProviderInspection,
+    inspection: &actrealm_installer::ProviderInspection,
 ) {
     if let Some(error) = inspection.codex_config_error.as_deref() {
         checks.push(diagnostic(
@@ -677,7 +677,7 @@ fn add_codex_checks(
             "Codex config.toml is malformed",
             error.to_owned(),
             Repairability::Manual,
-            Some("Fix or restore config.toml; Flow Agent will not rewrite malformed TOML"),
+            Some("Fix or restore config.toml; ActRealm will not rewrite malformed TOML"),
         ));
         return;
     }
@@ -734,7 +734,7 @@ fn add_codex_checks(
         Some(CodexTrustStatus::TrustedStatePresent) => checks.push(diagnostic(
             "codex.trust",
             DiagnosticStatus::Pass,
-            "Codex trust state covers every Flow Agent hook",
+            "Codex trust state covers every ActRealm hook",
             "Exact hook locations are enabled with trusted hashes newer than the installed definition".to_owned(),
             Repairability::NotApplicable,
             None,
@@ -743,17 +743,17 @@ fn add_codex_checks(
             "codex.trust",
             DiagnosticStatus::Warning,
             "Codex Hook review is still required",
-            "Flow Agent never writes Codex trust state or bypasses its security review".to_owned(),
+            "ActRealm never writes Codex trust state or bypasses its security review".to_owned(),
             Repairability::Manual,
-            Some("Open Codex, run /hooks, review each Flow Agent command, then trust and trigger a new session"),
+            Some("Open Codex, run /hooks, review each ActRealm command, then trust and trigger a new session"),
         )),
         Some(CodexTrustStatus::NotInstalled) => checks.push(diagnostic(
             "codex.trust",
             DiagnosticStatus::Warning,
             "Codex trust is not applicable until hooks are installed",
-            "No Flow Agent Codex hook was found".to_owned(),
+            "No ActRealm Codex hook was found".to_owned(),
             Repairability::Manual,
-            Some("Run flow-agent install-hooks codex"),
+            Some("Run actrealm install-hooks codex"),
         )),
         Some(CodexTrustStatus::ConfigMalformed) | None => {}
     }
@@ -773,7 +773,7 @@ fn add_runtime_checks(
             "Runtime probe skipped because the socket path is invalid",
             socket_path.display().to_string(),
             Repairability::Manual,
-            Some("Shorten FLOW_AGENT_HOME first"),
+            Some("Shorten ACTREALM_HOME first"),
         ));
         add_real_event_checks(checks, provider_verifications, None);
         return;
@@ -788,7 +788,7 @@ fn add_runtime_checks(
                     "Runtime socket permissions are unsafe",
                     format!("{} has mode {mode:o}", socket_path.display()),
                     Repairability::Automatic,
-                    Some("Stop and restart Flow Agent Runtime"),
+                    Some("Stop and restart ActRealm Runtime"),
                 ));
             } else {
                 checks.push(diagnostic(
@@ -807,7 +807,7 @@ fn add_runtime_checks(
             "Runtime path exists but is not a Unix socket",
             socket_path.display().to_string(),
             Repairability::Manual,
-            Some("Inspect the path before removing it, then restart Flow Agent Runtime"),
+            Some("Inspect the path before removing it, then restart ActRealm Runtime"),
         )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(diagnostic(
             "runtime.socket_permissions",
@@ -816,10 +816,10 @@ fn add_runtime_checks(
             } else {
                 DiagnosticStatus::Warning
             },
-            "Flow Agent Runtime is not running",
+            "ActRealm Runtime is not running",
             socket_path.display().to_string(),
             Repairability::Automatic,
-            Some("Start flow-agent serve --approval widget"),
+            Some("Start actrealm serve --approval widget"),
         )),
         Err(error) => checks.push(diagnostic(
             "runtime.socket_permissions",
@@ -827,7 +827,7 @@ fn add_runtime_checks(
             "Runtime socket could not be inspected",
             error.to_string(),
             Repairability::Manual,
-            Some("Check the Flow Agent home directory permissions"),
+            Some("Check the ActRealm home directory permissions"),
         )),
     }
 
@@ -855,7 +855,7 @@ fn add_runtime_checks(
             "Runtime returned an unexpected diagnostic response",
             "The bridge connected but did not acknowledge the probe".to_owned(),
             Repairability::Automatic,
-            Some("Restart Flow Agent Runtime and rerun doctor"),
+            Some("Restart ActRealm Runtime and rerun doctor"),
         )),
         Err(error) => checks.push(diagnostic(
             "runtime.control_loop",
@@ -867,7 +867,7 @@ fn add_runtime_checks(
             "Runtime control round trip is unavailable",
             error.to_string(),
             Repairability::Automatic,
-            Some("Start or restart flow-agent serve --approval widget"),
+            Some("Start or restart actrealm serve --approval widget"),
         )),
     }
     add_real_event_checks(checks, provider_verifications, probe_summary.as_ref());
@@ -907,7 +907,7 @@ fn add_real_event_checks(
                 "A diagnostic bridge probe is not counted as provider evidence".to_owned(),
                 Repairability::Manual,
                 Some(&format!(
-                    "Start a new {provider} session, then run flow-agent doctor again"
+                    "Start a new {provider} session, then run actrealm doctor again"
                 )),
             ));
         }
@@ -936,15 +936,15 @@ fn add_pass_through_check(
         return;
     }
     let missing_socket = paths
-        .flow_home
+        .actrealm_home
         .join(format!("run/doctor-missing-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&missing_socket);
     let mut child = match std::process::Command::new(&stable_binary)
         .args(["hook", "--provider", "claude", "--socket"])
         .arg(&missing_socket)
-        .env("FLOW_AGENT_HOME", &paths.flow_home)
-        .env("FLOW_AGENT_STDIN_TIMEOUT_MS", "500")
-        .env("FLOW_AGENT_HOOK_REPLY_TIMEOUT_MS", "100")
+        .env("ACTREALM_HOME", &paths.actrealm_home)
+        .env("ACTREALM_STDIN_TIMEOUT_MS", "500")
+        .env("ACTREALM_HOOK_REPLY_TIMEOUT_MS", "100")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -965,7 +965,7 @@ fn add_pass_through_check(
     };
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(
-            br#"{"hook_event_name":"PermissionRequest","session_id":"flow-agent-doctor","tool_name":"Bash","tool_input":{"command":"true"}}"#,
+            br#"{"hook_event_name":"PermissionRequest","session_id":"actrealm-doctor","tool_name":"Bash","tool_input":{"command":"true"}}"#,
         );
     }
     match wait_child_with_timeout(child, Duration::from_secs(2)) {
@@ -1012,7 +1012,7 @@ fn add_pass_through_check(
 }
 
 fn print_doctor_report(report: &DoctorReport) {
-    println!("Flow Agent doctor: {:?}", report.overall);
+    println!("ActRealm doctor: {:?}", report.overall);
     for check in &report.checks {
         let marker = match check.status {
             DiagnosticStatus::Pass => "✓",
@@ -1116,7 +1116,7 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()>
     if let Some(api) = api.as_ref() {
         let _ = writeln!(
             runtime_output,
-            "Flow Agent control panel: {}",
+            "ActRealm control panel: {}",
             api.bootstrap_url()
         );
         if open {
@@ -1127,7 +1127,7 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()>
     }
     let _ = writeln!(
         runtime_output,
-        "flow-agent runtime listening on {}",
+        "actrealm runtime listening on {}",
         socket_path.display()
     );
     let _ = runtime_output.flush();
@@ -1189,10 +1189,8 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()>
             };
             if request.event_name() == Some(DOCTOR_PROBE_EVENT) {
                 if let Some(request_id) = request.request_id {
-                    let mut response = flow_agent_core::BridgeResponse::pass_through(
-                        request_id,
-                        "doctor_probe_ok",
-                    );
+                    let mut response =
+                        actrealm_core::BridgeResponse::pass_through(request_id, "doctor_probe_ok");
                     if let Ok(snapshot) = store.snapshot() {
                         let latest_claude = snapshot
                             .sessions
@@ -1404,7 +1402,7 @@ fn delayed_decision(decision: Decision) -> RuntimeOutcome {
 }
 
 fn commit_delay() -> Duration {
-    std::env::var("FLOW_AGENT_COMMIT_DELAY_MS")
+    std::env::var("ACTREALM_COMMIT_DELAY_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_millis)
@@ -1436,7 +1434,7 @@ fn undo_requested(receiver: &mpsc::Receiver<PromptInput>, timeout: Duration) -> 
 }
 
 fn run_hook(provider: Provider, socket_path: PathBuf) -> Result<()> {
-    if std::env::var("FLOW_AGENT_SKIP_HOOKS").as_deref() == Ok("1") {
+    if std::env::var("ACTREALM_SKIP_HOOKS").as_deref() == Ok("1") {
         return Ok(());
     }
     let input = read_hook_input()?;
@@ -1547,7 +1545,7 @@ fn read_hook_input() -> Result<Vec<u8>> {
 }
 
 fn stdin_timeout() -> Duration {
-    std::env::var("FLOW_AGENT_STDIN_TIMEOUT_MS")
+    std::env::var("ACTREALM_STDIN_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_millis)
@@ -1555,7 +1553,7 @@ fn stdin_timeout() -> Duration {
 }
 
 fn reply_timeout(provider: Provider) -> Duration {
-    if let Ok(value) = std::env::var("FLOW_AGENT_HOOK_REPLY_TIMEOUT_MS") {
+    if let Ok(value) = std::env::var("ACTREALM_HOOK_REPLY_TIMEOUT_MS") {
         if let Ok(milliseconds) = value.parse::<u64>() {
             return Duration::from_millis(milliseconds);
         }

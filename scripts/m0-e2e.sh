@@ -2,8 +2,8 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-BIN="$ROOT/target/release/flow-agent"
-TMP_ROOT="${TMPDIR:-/private/tmp}/flow-agent-m0-e2e-$$"
+BIN="$ROOT/target/release/actrealm"
+TMP_ROOT="${TMPDIR:-/private/tmp}/actrealm-m0-e2e-$$"
 SOCKET="$TMP_ROOT/bridge.sock"
 SERVER_LOG="$TMP_ROOT/server.log"
 DATABASE="$TMP_ROOT/bridge.sqlite"
@@ -35,7 +35,7 @@ wait_for_socket() {
 start_server() {
     mode=$1
     mkdir -p "$TMP_ROOT"
-    FLOW_AGENT_COMMIT_DELAY_MS=0 \
+    ACTREALM_COMMIT_DELAY_MS=0 \
         "$BIN" serve --approval "$mode" --socket "$SOCKET" >"$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
     wait_for_socket

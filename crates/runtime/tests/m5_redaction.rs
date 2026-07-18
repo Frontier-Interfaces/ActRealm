@@ -1,5 +1,5 @@
-use flow_agent_core::{BridgeRequest, Provider};
-use flow_agent_runtime::RuntimeStore;
+use actrealm_core::{BridgeRequest, Provider};
+use actrealm_runtime::RuntimeStore;
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
@@ -8,7 +8,7 @@ use uuid::Uuid;
 #[test]
 fn persisted_command_previews_are_categories_not_truncated_raw_commands() {
     let root = PathBuf::from("/tmp").join(format!(
-        "flow-agent-m5-redaction-{}-{}",
+        "actrealm-m5-redaction-{}-{}",
         std::process::id(),
         Uuid::now_v7()
     ));

@@ -3,7 +3,7 @@ import SwiftUI
 
 // MARK: - Logo
 
-/// Three rounded vertical bars — the flow-agent mark.
+/// Three rounded vertical bars — the actrealm mark.
 struct LogoMark: View {
     var barWidth: CGFloat = 3
     var heights: [CGFloat] = [6, 11, 8]

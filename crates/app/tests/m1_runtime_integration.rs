@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use flow_agent_runtime::RuntimeStore;
+use actrealm_runtime::RuntimeStore;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,7 +18,7 @@ fn temp_root(name: &str) -> PathBuf {
 }
 
 fn warm_binary() {
-    let output = Command::new(env!("CARGO_BIN_EXE_flow-agent"))
+    let output = Command::new(env!("CARGO_BIN_EXE_actrealm"))
         .arg("--version")
         .output()
         .unwrap();
@@ -62,7 +62,7 @@ fn spawn_provider_hook_with_timeout(
     payload: &Value,
     timeout_ms: u64,
 ) -> Child {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_flow-agent"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_actrealm"))
         .args([
             "hook",
             "--provider",
@@ -70,7 +70,7 @@ fn spawn_provider_hook_with_timeout(
             "--socket",
             socket.to_str().unwrap(),
         ])
-        .env("FLOW_AGENT_HOOK_REPLY_TIMEOUT_MS", timeout_ms.to_string())
+        .env("ACTREALM_HOOK_REPLY_TIMEOUT_MS", timeout_ms.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -114,9 +114,9 @@ fn non_permission_event_spools_offline_and_replays_once_on_startup() {
         "turn_id": "spooled-turn",
         "cwd": "/tmp/example-project"
     });
-    let mut hook = Command::new(env!("CARGO_BIN_EXE_flow-agent"))
+    let mut hook = Command::new(env!("CARGO_BIN_EXE_actrealm"))
         .args(["hook", "--provider", "codex"])
-        .env("FLOW_AGENT_HOME", &home)
+        .env("ACTREALM_HOME", &home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -132,9 +132,9 @@ fn non_permission_event_spools_offline_and_replays_once_on_startup() {
             .unwrap_or(false)
     });
 
-    let mut runtime = Command::new(env!("CARGO_BIN_EXE_flow-agent"))
+    let mut runtime = Command::new(env!("CARGO_BIN_EXE_actrealm"))
         .args(["serve", "--approval", "pass-through"])
-        .env("FLOW_AGENT_HOME", &home)
+        .env("ACTREALM_HOME", &home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -163,7 +163,7 @@ fn duplicate_permission_passes_old_waiter_and_decides_only_the_new_one() {
     let root = temp_root("duplicate");
     fs::create_dir_all(&root).unwrap();
     let socket = root.join("bridge.sock");
-    let mut runtime = Command::new(env!("CARGO_BIN_EXE_flow-agent"))
+    let mut runtime = Command::new(env!("CARGO_BIN_EXE_actrealm"))
         .args([
             "serve",
             "--approval",
@@ -171,7 +171,7 @@ fn duplicate_permission_passes_old_waiter_and_decides_only_the_new_one() {
             "--socket",
             socket.to_str().unwrap(),
         ])
-        .env("FLOW_AGENT_COMMIT_DELAY_MS", "250")
+        .env("ACTREALM_COMMIT_DELAY_MS", "250")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -232,7 +232,7 @@ fn second_runtime_cannot_replace_the_live_instance_or_its_socket() {
     let root = temp_root("single-instance");
     fs::create_dir_all(&root).unwrap();
     let socket = root.join("bridge.sock");
-    let mut first = Command::new(env!("CARGO_BIN_EXE_flow-agent"))
+    let mut first = Command::new(env!("CARGO_BIN_EXE_actrealm"))
         .args([
             "serve",
             "--approval",
@@ -240,7 +240,7 @@ fn second_runtime_cannot_replace_the_live_instance_or_its_socket() {
             "--socket",
             socket.to_str().unwrap(),
         ])
-        .env("FLOW_AGENT_HOME", &root)
+        .env("ACTREALM_HOME", &root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -248,7 +248,7 @@ fn second_runtime_cannot_replace_the_live_instance_or_its_socket() {
         .unwrap();
     wait_until("first runtime socket", || socket.exists());
 
-    let second = Command::new(env!("CARGO_BIN_EXE_flow-agent"))
+    let second = Command::new(env!("CARGO_BIN_EXE_actrealm"))
         .args([
             "serve",
             "--approval",
@@ -287,7 +287,7 @@ fn provider_side_tool_progress_releases_widget_waiters_for_claude_and_codex() {
     fs::create_dir_all(&root).unwrap();
     let socket = root.join("bridge.sock");
     let database = socket.with_extension("sqlite");
-    let mut runtime = Command::new(env!("CARGO_BIN_EXE_flow-agent"))
+    let mut runtime = Command::new(env!("CARGO_BIN_EXE_actrealm"))
         .args([
             "serve",
             "--approval",
@@ -295,7 +295,7 @@ fn provider_side_tool_progress_releases_widget_waiters_for_claude_and_codex() {
             "--socket",
             socket.to_str().unwrap(),
         ])
-        .env("FLOW_AGENT_HOME", &root)
+        .env("ACTREALM_HOME", &root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -352,7 +352,7 @@ fn codex_native_permission_hook_lifecycle_is_observed_neutrally_for_five_rounds(
     fs::create_dir_all(&root).unwrap();
     let socket = root.join("bridge.sock");
     let database = socket.with_extension("sqlite");
-    let mut runtime = Command::new(env!("CARGO_BIN_EXE_flow-agent"))
+    let mut runtime = Command::new(env!("CARGO_BIN_EXE_actrealm"))
         .args([
             "serve",
             "--approval",
@@ -360,7 +360,7 @@ fn codex_native_permission_hook_lifecycle_is_observed_neutrally_for_five_rounds(
             "--socket",
             socket.to_str().unwrap(),
         ])
-        .env("FLOW_AGENT_HOME", &root)
+        .env("ACTREALM_HOME", &root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

@@ -120,7 +120,7 @@ impl CodexConnector {
         };
         let reader_connector = connector.clone();
         thread::Builder::new()
-            .name("flow-agent-codex-reader".to_owned())
+            .name("actrealm-codex-reader".to_owned())
             .spawn(move || {
                 for line in BufReader::new(reader).lines() {
                     let Ok(line) = line else { break };
@@ -165,8 +165,8 @@ impl CodexConnector {
             "initialize",
             json!({
                 "clientInfo": {
-                    "name": "flow-agent",
-                    "title": "Flow Agent",
+                    "name": "actrealm",
+                    "title": "ActRealm",
                     "version": env!("CARGO_PKG_VERSION")
                 },
                 "capabilities": {
@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn persistent_proxy_initializes_lists_resumes_and_routes_server_requests() {
         let root = std::env::temp_dir().join(format!(
-            "flow-agent-codex-connector-{}-{}",
+            "actrealm-codex-connector-{}-{}",
             std::process::id(),
             Instant::now().elapsed().as_nanos()
         ));

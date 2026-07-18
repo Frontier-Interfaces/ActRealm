@@ -8,7 +8,7 @@ can be reviewed together, but platform UI code is not shared.
 
 ```text
 ActRealm/
-├── crates/                    Rust Runtime and flow-agent CLI
+├── crates/                    Rust Runtime and actrealm CLI
 ├── web/                       Existing browser control surface
 ├── apps/
 │   ├── macos/                 SwiftUI + AppKit client
@@ -39,7 +39,7 @@ reply channels and keeps foreground behavior replaceable per operating system.
 
 ```text
 Claude/Codex event
-  -> flow-agent Hook or managed Connector
+  -> actrealm Hook or managed Connector
   -> Runtime normalization and SQLite state
   -> authenticated snapshot/WebSocket
   -> native derived state
@@ -59,11 +59,11 @@ Keep the scheduling state machine small and portable:
 1. An open Attention item arrives with stable ID, Provider, kind, and safe title.
 2. The client applies its local global policy and optional Provider override.
 3. The policy enters `reminding`, `opening`, `awaitingWorkspace`, or
-   `returnedToActRoom`.
+   `returnedToActRealmWorkspace`.
 4. A platform executor activates the target application and observes whether
    the expected workspace became active.
 5. If activation cannot be confirmed, the client returns to ActRealm or leaves
-   the item in Act Room; the Runtime attention state is unchanged.
+   the item in ActRealm Workspace; the Runtime attention state is unchanged.
 
 macOS implements the executor with AppKit and `NSWorkspace`. Windows should
 implement the same policy semantics with Windows APIs and an explicit failure

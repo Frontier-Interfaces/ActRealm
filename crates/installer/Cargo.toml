@@ -1,5 +1,5 @@
 [package]
-name = "flow-agent-installer"
+name = "actrealm-installer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

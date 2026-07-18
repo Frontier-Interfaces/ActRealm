@@ -1,4 +1,4 @@
-use flow_agent_installer::{
+use actrealm_installer::{
     ClaudeStatuslineStatus, HookProvider, InstallOptions, InstallPaths, Installer,
 };
 use serde_json::{json, Value};
@@ -18,18 +18,18 @@ struct Fixture {
 impl Fixture {
     fn new(name: &str) -> Self {
         let root = PathBuf::from("/tmp").join(format!(
-            "flow-agent-statusline-{name}-{}-{}",
+            "actrealm-statusline-{name}-{}-{}",
             std::process::id(),
             ID.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        let source = root.join("source-flow-agent");
+        let source = root.join("source-actrealm");
         fs::write(&source, b"binary").unwrap();
         fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
         Self {
             paths: InstallPaths {
-                flow_home: root.join("flow"),
+                actrealm_home: root.join("flow"),
                 claude_settings: root.join("home/.claude/settings.json"),
                 codex_hooks: root.join("home/.codex/hooks.json"),
                 codex_config: root.join("home/.codex/config.toml"),
@@ -77,7 +77,7 @@ fn existing_custom_statusline_is_never_replaced_or_backed_up_as_if_managed() {
     assert_eq!(read_json(&fixture.paths.claude_settings), original);
     assert!(!fixture.paths.statusline_helper().exists());
     assert!(!fixture.paths.stable_binary().exists());
-    assert!(!fixture.paths.flow_home.join("backups").exists());
+    assert!(!fixture.paths.actrealm_home.join("backups").exists());
 }
 
 #[test]
@@ -101,7 +101,7 @@ fn explicit_wrapper_mode_preserves_runs_and_restores_the_custom_statusline() {
     let installed = read_json(&fixture.paths.claude_settings);
     assert_eq!(installed["keep"], original["keep"]);
     assert_eq!(
-        installed["_flowAgentOriginalStatusLine"],
+        installed["_actRealmOriginalStatusLine"],
         original["statusLine"]
     );
     assert!(installed["statusLine"]["command"]

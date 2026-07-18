@@ -1,4 +1,4 @@
-# Flow Agent v1 delivery contract
+# ActRealm v1 delivery contract
 
 Source baseline: `WIDGET_V1_PLAN.md` v1.1 dated 2026-07-15, amended by the
 M0-M14 verification records and summarized in `STATUS.md`. This
@@ -7,7 +7,7 @@ not weaken or replace the full plan.
 
 ## Release shape
 
-- One Rust binary, `flow-agent`.
+- One Rust binary, `actrealm`.
 - macOS-first local runtime plus embedded 1600x600 native web UI.
 - Three modules only: Attention, Agent sessions, and Quota.
 - Claude Code and Codex local sessions are P0, whether launched from their CLI
@@ -69,7 +69,7 @@ not weaken or replace the full plan.
 
 - [x] Claude and Codex hook installation uses backup, semantic merge, lock,
       temporary file, and atomic rename.
-- [x] Uninstall removes only Flow Agent entries and preserves user semantics.
+- [x] Uninstall removes only ActRealm entries and preserves user semantics.
 - [x] Installation intent is tri-state and repair never recreates intentionally
       removed or uninstalled hooks.
 - [x] Stable hook binary installation, `CODEX_HOME`, canonical/legacy feature
@@ -141,7 +141,7 @@ without making the final v1 release complete.
 - [x] Claude.app and ChatGPT/Codex.app can satisfy Provider discovery without a
       global same-name CLI.
 - [x] Codex trust remains a user-controlled `/hooks` review and is never
-      written or bypassed by Flow Agent.
+      written or bypassed by ActRealm.
 - [x] Provider-handled progress/resolution removes matching stale Attention and
       task waiting state only when a reliable signal exists.
 - [x] Attention supports safe ignore/dismiss and a visible exit transition.
@@ -200,7 +200,7 @@ without making the final v1 release complete.
       private persistent official app-server Unix Socket and proxy transport;
       it does not require Codex's standalone-only daemon command.
 - [x] Explicit attach uses thread/list and thread/resume; managed Thread IDs
-      persist and are rejoined after Flow Agent restarts.
+      persist and are rejoined after ActRealm restarts.
 - [x] item/tool/requestUserInput maps to the same memory-only question model
       and writes ToolRequestUserInputResponse keyed by official question IDs.
 - [x] External Hook sessions use captured parent-process liveness and expose
@@ -216,7 +216,7 @@ without making the final v1 release complete.
 
 ### M13 - Provider-owned approval-state coordination
 
-- [x] Codex auto-review/guardian ownership avoids a competing Flow Agent
+- [x] Codex auto-review/guardian ownership avoids a competing ActRealm
       blocking waiter.
 - [x] Native `PreToolUse(request_permissions)` creates an observation-only
       waiting item with no replyable request ID.
@@ -228,7 +228,7 @@ without making the final v1 release complete.
 - [x] Provider resolution clears notifications, stale Attention, task `等你`,
       and any competing unsent waiter transactionally.
 - [x] Native approval UI exposes only original-Agent handling, snooze, and
-      ignore; Flow-controlled approval retains allow/deny/pass-through.
+      ignore; ActRealm-controlled approval retains allow/deny/pass-through.
 - [x] Five-round native lifecycle replay, 153-test workspace suite,
       zero-warning Clippy, format, release build, two-minute resource gate, and
       isolated browser QA pass.

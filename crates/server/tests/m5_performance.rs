@@ -1,8 +1,8 @@
 #![cfg(unix)]
 
-use flow_agent_core::{BridgeRequest, Provider};
-use flow_agent_runtime::{RuntimeStore, WaiterRegistry};
-use flow_agent_server::{ApiServer, ApiServerConfig};
+use actrealm_core::{BridgeRequest, Provider};
+use actrealm_runtime::{RuntimeStore, WaiterRegistry};
+use actrealm_server::{ApiServer, ApiServerConfig};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::fs;
@@ -64,7 +64,7 @@ fn p95(samples: &mut [Duration]) -> Duration {
 #[test]
 fn event_to_websocket_render_entry_p95_is_below_300_ms() {
     let root = PathBuf::from("/tmp").join(format!(
-        "flow-agent-m5-ui-perf-{}-{}",
+        "actrealm-m5-ui-perf-{}-{}",
         std::process::id(),
         Uuid::now_v7()
     ));
@@ -74,8 +74,8 @@ fn event_to_websocket_render_entry_p95_is_below_300_ms() {
         store.clone(),
         WaiterRegistry::default(),
         ApiServerConfig {
-            install_paths: Some(flow_agent_installer::InstallPaths {
-                flow_home: root.join("flow-home"),
+            install_paths: Some(actrealm_installer::InstallPaths {
+                actrealm_home: root.join("actrealm-home"),
                 claude_settings: root.join("home/.claude/settings.json"),
                 codex_hooks: root.join("home/.codex/hooks.json"),
                 codex_config: root.join("home/.codex/config.toml"),

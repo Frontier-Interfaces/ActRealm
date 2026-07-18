@@ -3,6 +3,131 @@
 version = 4
 
 [[package]]
+name = "actrealm"
+version = "0.1.0"
+dependencies = [
+ "actrealm-bridge",
+ "actrealm-core",
+ "actrealm-installer",
+ "actrealm-quota",
+ "actrealm-runtime",
+ "actrealm-server",
+ "actrealm-usage",
+ "anyhow",
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "actrealm-bridge"
+version = "0.1.0"
+dependencies = [
+ "actrealm-core",
+ "libc",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "actrealm-codex-connector"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "actrealm-core"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "actrealm-installer"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml_edit",
+]
+
+[[package]]
+name = "actrealm-providers"
+version = "0.1.0"
+dependencies = [
+ "actrealm-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "actrealm-quota"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "actrealm-runtime"
+version = "0.1.0"
+dependencies = [
+ "actrealm-core",
+ "actrealm-providers",
+ "libc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "actrealm-server"
+version = "0.1.0"
+dependencies = [
+ "actrealm-codex-connector",
+ "actrealm-core",
+ "actrealm-installer",
+ "actrealm-quota",
+ "actrealm-runtime",
+ "actrealm-usage",
+ "axum",
+ "futures-util",
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+ "tower",
+ "uuid",
+]
+
+[[package]]
+name = "actrealm-usage"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -272,131 +397,6 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
-
-[[package]]
-name = "flow-agent"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "flow-agent-bridge",
- "flow-agent-core",
- "flow-agent-installer",
- "flow-agent-quota",
- "flow-agent-runtime",
- "flow-agent-server",
- "flow-agent-usage",
- "libc",
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
-name = "flow-agent-bridge"
-version = "0.1.0"
-dependencies = [
- "flow-agent-core",
- "libc",
- "serde_json",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "flow-agent-codex-connector"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "flow-agent-core"
-version = "0.1.0"
-dependencies = [
- "libc",
- "serde",
- "serde_json",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "flow-agent-installer"
-version = "0.1.0"
-dependencies = [
- "libc",
- "serde",
- "serde_json",
- "thiserror",
- "toml_edit",
-]
-
-[[package]]
-name = "flow-agent-providers"
-version = "0.1.0"
-dependencies = [
- "flow-agent-core",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "flow-agent-quota"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "flow-agent-runtime"
-version = "0.1.0"
-dependencies = [
- "flow-agent-core",
- "flow-agent-providers",
- "libc",
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "flow-agent-server"
-version = "0.1.0"
-dependencies = [
- "axum",
- "flow-agent-codex-connector",
- "flow-agent-core",
- "flow-agent-installer",
- "flow-agent-quota",
- "flow-agent-runtime",
- "flow-agent-usage",
- "futures-util",
- "libc",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-tungstenite",
- "tower",
- "uuid",
-]
-
-[[package]]
-name = "flow-agent-usage"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
-]
 
 [[package]]
 name = "form_urlencoded"

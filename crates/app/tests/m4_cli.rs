@@ -12,7 +12,7 @@ struct Root(PathBuf);
 impl Root {
     fn new(name: &str) -> Self {
         let path = PathBuf::from("/tmp").join(format!(
-            "flow-agent-m4-cli-{name}-{}-{}",
+            "actrealm-m4-cli-{name}-{}-{}",
             std::process::id(),
             ID.fetch_add(1, Ordering::Relaxed)
         ));
@@ -22,10 +22,10 @@ impl Root {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_flow-agent"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_actrealm"));
         command
             .env("HOME", self.0.join("home"))
-            .env("FLOW_AGENT_HOME", self.0.join("flow-home"))
+            .env("ACTREALM_HOME", self.0.join("actrealm-home"))
             .env("CODEX_HOME", self.0.join("codex-home"));
         command
     }
@@ -70,7 +70,7 @@ fn statusline_command_caches_only_quota_and_prints_remaining_windows() {
     assert!(stdout.contains("7d 剩余 40%"));
     assert!(output.stderr.is_empty());
 
-    let cache = fs::read_to_string(root.0.join("flow-home/cache/claude-rl.json")).unwrap();
+    let cache = fs::read_to_string(root.0.join("actrealm-home/cache/claude-rl.json")).unwrap();
     assert!(!cache.contains("must-not-persist"));
     assert!(!cache.contains("private/workspace"));
 }
@@ -89,7 +89,7 @@ fn malformed_statusline_input_is_nonfatal_and_never_creates_a_cache() {
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("额度暂不可用"));
-    assert!(!root.0.join("flow-home/cache/claude-rl.json").exists());
+    assert!(!root.0.join("actrealm-home/cache/claude-rl.json").exists());
 }
 
 #[test]

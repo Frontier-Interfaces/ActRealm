@@ -1,0 +1,18 @@
+name: ActRealm language guard
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  language:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Reject legacy product language
+        run: ./scripts/check-actrealm-language.sh

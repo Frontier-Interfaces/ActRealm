@@ -8,8 +8,8 @@
   "permission_mode": "default",
   "tool_name": "Bash",
   "tool_input": {
-    "command": "printf flow-agent-probe"
+    "command": "printf actrealm-probe"
   },
-  "tool_response": "flow-agent-probe",
+  "tool_response": "actrealm-probe",
   "tool_use_id": "fixture-codex-tool-use"
 }

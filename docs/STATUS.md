@@ -1,4 +1,4 @@
-# Flow Agent current status
+# ActRealm current status
 
 Last reviewed: 2026-07-18
 
@@ -33,7 +33,7 @@ provide the detailed requirements and evidence.
   Runtime RSS soak remains unchecked.
 - **Default branch alignment:** the user separately approved the alignment on
   2026-07-17. `main` was fast-forwarded to the reviewed `agent/v1-full`
-  history without restarting Runtime, reinstalling Flow Agent, or touching the
+  history without restarting Runtime, reinstalling ActRealm, or touching the
   live data directory.
 - **Version/tag:** Cargo remains `0.1.0`; no release tag has been created.
 
@@ -64,7 +64,7 @@ complete.
 
 ## Capability boundary after M14
 
-Flow Agent can directly respond only when it owns a live, official reply
+ActRealm can directly respond only when it owns a live, official reply
 channel:
 
 - request-keyed Claude/Codex Hook `PermissionRequest` allow, deny, or
@@ -72,8 +72,8 @@ channel:
 - Claude `AskUserQuestion` and `Elicitation` Hook replies;
 - Codex app-server `item/tool/requestUserInput` after explicit managed attach.
 
-When Codex or Claude exposes an approval only in its own native interface, Flow
-Agent observes and synchronizes the waiting/resolved state. It must not show
+When Codex or Claude exposes an approval only in its own native interface,
+ActRealm observes and synchronizes the waiting/resolved state. It must not show
 fake allow/deny controls or infer whether the user approved, denied, or ran the
 command.
 

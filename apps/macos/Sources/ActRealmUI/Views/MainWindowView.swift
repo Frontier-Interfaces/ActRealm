@@ -2,15 +2,15 @@ import ActRealmKit
 import SwiftUI
 
 public enum MainWindowPage: Sendable, Hashable {
-    case actRoom
+    case actRealmWorkspace
     case foregroundScheduling
 }
 
-/// Native SwiftUI reproduction of `Flow Agent Interactive Demo.dc.html`.
+/// Native SwiftUI reproduction of `ActRealm Interactive Demo.dc.html`.
 /// The hidden native title bar keeps real macOS traffic-light controls while
 /// this view supplies the interaction model's floating glass header.
 public struct MainWindowView: View {
-    public init(initialPage: MainWindowPage = .actRoom) {
+    public init(initialPage: MainWindowPage = .actRealmWorkspace) {
         _page = State(initialValue: initialPage)
     }
 
@@ -30,7 +30,7 @@ public struct MainWindowView: View {
                 .padding(.top, 16)
 
             Group {
-                if page == .actRoom {
+                if page == .actRealmWorkspace {
                     GeometryReader { proxy in
                         let gap: CGFloat = 16
                         let available = max(0, proxy.size.width - gap * 2)
@@ -50,7 +50,7 @@ public struct MainWindowView: View {
                     .transition(.opacity.combined(with: .scale(scale: 0.99)))
                 } else {
                     ForegroundSchedulingView {
-                        switchPage(to: .actRoom)
+                        switchPage(to: .actRealmWorkspace)
                     }
                     .transition(.opacity.combined(with: .move(edge: .trailing)))
                 }
@@ -79,8 +79,8 @@ public struct MainWindowView: View {
         .animation(.easeOut(duration: 0.22), value: model.toastMessage)
         .animation(.easeOut(duration: 0.25), value: page)
         .onChange(of: model.foregroundDispatch?.phase) { _, phase in
-            if phase == .returnedToActRoom {
-                switchPage(to: .actRoom)
+            if phase == .returnedToActRealmWorkspace {
+                switchPage(to: .actRealmWorkspace)
             }
         }
     }
