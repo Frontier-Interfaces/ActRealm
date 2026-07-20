@@ -6,6 +6,30 @@ published a final v1 release; entries below describe development milestones on
 
 ## Unreleased - M14 accepted candidate
 
+### Post-M14 - First-run workspace and Agent setup center candidate
+
+- Adds an honest first-run state to the main three-column workspace when no
+  Claude or Codex integration is installed: OUTBOX, Agent Tasks, and Quota all
+  explain the same disconnected state instead of showing generic empty data.
+- Adds one visible Agent-status/setup entry in the ActRealm toolbar and a
+  unified, on-theme setup center based on the approved board 6/7 direction.
+- Connect, repair, uninstall, refresh, and Codex trust guidance call the
+  existing authenticated `/api/v1/setup` API; no setup action is a visual
+  placeholder and no unsupported Provider is advertised.
+- Keeps Provider discovery truthful for CLI-only, desktop-only, and mixed
+  installations. Codex trust remains an explicit user action in the official
+  interface, with a copyable command supplied by the Runtime.
+- Links “查看接入指南” directly to the maintained Chinese GitHub guide and
+  refreshes setup state after Runtime events or returning to the page.
+- Adds an isolated ignored preview harness for visual QA without changing the
+  user's real Hook configuration, plus embedded-UI regression coverage for the
+  first-run contract.
+
+The JavaScript syntax, static UI contract, format/diff checks, Rust workspace
+suite, release build, and board 6/7 visual acceptance pass. Exact real-Provider
+events and remaining local gates stay open. The user authorized the local
+candidate commit on 2026-07-20; push remains separately gated.
+
 ### Post-M14 - Usage, pricing, and OAuth hardening candidate
 
 - Adds a versioned per-model price registry with distinct `provider_estimate`

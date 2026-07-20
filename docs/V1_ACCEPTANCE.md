@@ -81,6 +81,16 @@ not weaken or replace the full plan.
 - [x] `doctor` reports an overlong Unix Socket path before attempting Hook
       installation or Runtime startup.
 - [x] Unknown fields and events are visible and never panic.
+- [x] With neither Provider installed, the three-column workspace shows one
+      consistent first-run state and never substitutes cached/demo tasks or
+      quota for a live connection.
+- [x] A visible Agent setup center maps Claude/Codex detection and status to the
+      authenticated setup API; install, repair, reinstall, uninstall, refresh,
+      and Codex trust guidance are real actions rather than placeholders.
+- [x] Unsupported Provider placeholders are absent, and Codex trust remains a
+      manual action in the official interface.
+- [ ] The exact candidate passes local board 6/7 visual QA and real
+      Claude/Codex install, trust, refresh, repair, and uninstall acceptance.
 
 ### M4 - quota, settings, and P1
 
@@ -317,6 +327,41 @@ without making the final v1 release complete.
       maximum Runtime RSS.
 - [ ] The exact tested release is installed and accepted locally by the user.
 - [ ] Commit and push are separately authorized by the user.
+
+### Post-M14 - first-run workspace and Agent setup center
+
+- [x] Initial setup state is loaded before the first workspace render, avoiding
+      a generic empty-state flash before `firstRun` is known.
+- [x] The toolbar exposes truthful Agent connection state and opens one setup
+      center for both first-run and returning users.
+- [x] Provider rows disclose detected CLI/Desktop source, configuration path,
+      backend status, and the exact next action.
+- [x] Runtime events and a return to the visible page trigger bounded setup
+      re-detection; offline mutation controls are disabled.
+- [x] “查看接入指南” opens the maintained Chinese guide on the
+      `agent/v1-full` branch.
+- [x] An isolated ignored preview harness uses temporary config paths and does
+      not touch the user's real Provider Hook files.
+- [x] The isolated first-run preview harness ran for 300 seconds and exited
+      cleanly in the user's ordinary terminal on 2026-07-20.
+- [x] JavaScript syntax, embedded UI contract, format, zero-warning Clippy,
+      full Rust workspace suite, release build, and language contract pass.
+- [ ] macOS Swift and two-minute Runtime resource gates pass in an ordinary
+      local terminal; the managed Codex sandbox rejected SwiftPM sandboxing and
+      Unix Socket bind before these gates could execute.
+- [x] Board 6 empty state and board 7 setup-center visual direction are
+      accepted locally by the user on 2026-07-20.
+- [ ] Board 7 real Claude/Codex detection, install, trust, refresh, repair, and
+      uninstall behavior is accepted on the exact installed candidate.
+- [x] The installed stable helper exactly matches the release candidate
+      SHA-256; Claude/Codex Hook manifests, helper execution, canonical Codex
+      feature, Codex trust hashes, and private Socket permissions pass Doctor.
+- [ ] Fresh Claude and Codex sessions each deliver a real post-install event
+      and appear as connected in the setup center.
+- [x] The user explicitly authorized the local candidate commit on 2026-07-20
+      with the remaining real-event and local resource gates still recorded as
+      open.
+- [ ] Push is separately authorized by the user.
 
 ## Publishing rule
 

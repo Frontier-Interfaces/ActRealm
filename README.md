@@ -52,6 +52,9 @@ The current build includes:
 
 - **Claude Code and Codex integration** through local Hooks and an explicit,
   version-gated Codex app-server Connector;
+- **an honest first-run workspace and unified Agent setup center** that detects
+  CLI/Desktop installations, performs real backup-preserving install, repair,
+  refresh, and uninstall actions, and keeps Codex trust user-controlled;
 - **one task overview** for Provider state, current activity, wait time,
   questions, approval requests, completion, and quota status;
 - **a capability-aware approval loop** with risk labels, allow/deny/pass-through
@@ -243,6 +246,7 @@ change how those tools handle data.
 - [M14 live usage, context, price, and quota evidence](docs/M14_USAGE_CONTEXT_QUOTA.md)
 - [Post-M14 live-state and Runtime-recovery evidence](docs/POST_M14_REALTIME_RECOVERY.md)
 - [Post-M14 usage, pricing, and OAuth hardening](docs/POST_M14_USAGE_OAUTH_HARDENING.md)
+- [Post-M14 first-run onboarding and setup center](docs/POST_M14_FIRST_RUN_ONBOARDING.md)
 - [Development plan](docs/WIDGET_V1_PLAN.md)
 - [Development changelog](CHANGELOG.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)

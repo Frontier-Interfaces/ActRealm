@@ -5,6 +5,8 @@ const ui = {
   menuClock: document.querySelector("#menu-clock"),
   runtimeState: document.querySelector("#runtime-state"),
   runtimeLabel: document.querySelector("#runtime-label"),
+  agentStatusTrigger: document.querySelector("#agent-status-trigger"),
+  agentStatusLabel: document.querySelector("#agent-status-label"),
   runtimeFooterLabel: document.querySelector("#runtime-footer-label"),
   runtimeSettingsLabel: document.querySelector("#runtime-settings-label"),
   offlineBanner: document.querySelector("#offline-banner"),
@@ -21,9 +23,11 @@ const ui = {
   undoButton: document.querySelector("#undo-button"),
   toast: document.querySelector("#toast"),
   setupTrigger: document.querySelector("#setup-trigger"),
+  setupTriggerLabel: document.querySelector("#setup-trigger-label"),
   setupOverlay: document.querySelector("#setup-overlay"),
   setupClose: document.querySelector("#setup-close"),
   setupProviders: document.querySelector("#setup-providers"),
+  setupSummary: document.querySelector("#setup-summary"),
   setupRefresh: document.querySelector("#setup-refresh"),
   settingsTrigger: document.querySelector("#settings-trigger"),
   settingsOverlay: document.querySelector("#settings-overlay"),
@@ -73,11 +77,14 @@ let csrfToken = sessionStorage.getItem("actrealm.csrf");
 let snapshot = { sessions: [], attention: [], commands: [], quota: [], stats: {} };
 let currentAttention = 0;
 let socket;
+let runtimeConnected = false;
 let reconnectDelay = 500;
 let undoCommandId;
 let toastTimer;
 let setupState = { providers: [], firstRun: false };
+let setupLoaded = false;
 let setupBusy = false;
+let setupLoading = false;
 let settingsState = {
   notificationRules: { approval: "list", question: "list", error: "list", completion: "list" },
   soundEnabled: true,
@@ -104,6 +111,7 @@ let lastQuotaRenderSignature;
 let attentionExitTimer;
 let reconnectTimer;
 let setupRefreshTimer;
+let lastSetupAt = 0;
 let lastSocketFrameAt = 0;
 let lastSnapshotAt = 0;
 let fallbackSnapshotInFlight = false;
@@ -114,6 +122,8 @@ let hiddenSessions = JSON.parse(localStorage.getItem("actrealm.hiddenSessions") 
 const SESSION_VISIBLE_FOR_MS = 30 * 60 * 1000;
 const SOCKET_STALE_AFTER_MS = 25 * 1000;
 const SNAPSHOT_FALLBACK_AFTER_MS = 15 * 1000;
+const SETUP_FOCUS_REFRESH_AFTER_MS = 5 * 1000;
+const USER_GUIDE_URL = "https://github.com/Frontier-Interfaces/ActRealm/blob/agent/v1-full/docs/USER_GUIDE_zh-CN.md";
 const DISPLAY_PRESETS = {
   concise: ["task", "activity"],
   detailed: ["project", "task", "model", "activity", "plan", "tokens", "context", "tool", "subagents", "environment", "recovery", "control", "jump"],
@@ -155,6 +165,49 @@ function emptyState(icon, title, detail) {
   return root;
 }
 
+function onboardingTaskEmpty() {
+  const root = element("div", "empty-state onboarding-task-empty");
+  const icon = element("div", "onboarding-empty-icon");
+  const signal = element("span", "signal-bars onboarding-signal");
+  signal.append(element("i"), element("i"), element("i"));
+  icon.append(signal);
+  root.append(icon);
+  root.append(element("h3", "", "尚未连接任何 Agent"));
+  root.append(element("p", "", "连接 Claude 或 Codex 后，正在运行的任务与需要你处理的事会显示在这里。数据仅留在本机。"));
+  const actions = element("div", "onboarding-actions");
+  const connect = element("button", "onboarding-primary", "＋ 连接 Agent");
+  connect.type = "button";
+  connect.addEventListener("click", openSetup);
+  actions.append(connect, guideLink("onboarding-guide"));
+  root.append(actions);
+  const providers = element("div", "onboarding-provider-shortcuts");
+  for (const provider of setupState.providers || []) {
+    const shortcut = element("span", "onboarding-provider-shortcut");
+    shortcut.append(providerIcon(provider.provider), element("span", "", `连接 ${providerName(provider.provider)}`));
+    providers.append(shortcut);
+  }
+  root.append(providers);
+  return root;
+}
+
+function onboardingQuotaState() {
+  const root = element("div", "onboarding-quota-list");
+  for (const provider of setupState.providers || []) {
+    const row = element("article", "quota-unavailable onboarding-quota-provider");
+    const heading = element("div", "onboarding-quota-heading");
+    heading.append(providerIcon(provider.provider), element("strong", "", providerName(provider.provider)));
+    heading.append(element("span", "setup-status muted", "未接入"));
+    row.append(heading);
+    row.append(element("p", "", provider.status === "provider_missing"
+      ? "尚未检测到桌面客户端或 CLI。"
+      : "安全接入并产生真实会话后读取可验证额度。"));
+    root.append(row);
+  }
+  const privacy = element("p", "onboarding-privacy", "数据仅在这台 Mac · 不发送遥测");
+  root.append(privacy);
+  return root;
+}
+
 function openItems() {
   const visibleStates = new Set(["open", "committing", "decision_sent"]);
   const weights = { error: 4, approval: 3, question: 2, completion: 1 };
@@ -185,6 +238,18 @@ function providerName(provider) {
   return { claude: "Claude", codex: "Codex", gemini: "Gemini" }[provider] || provider || "Agent";
 }
 
+function guideLink(className = "", label = "查看接入指南") {
+  const link = element("a", className, label);
+  link.href = USER_GUIDE_URL;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  return link;
+}
+
+function isFirstRun() {
+  return setupLoaded && Boolean(setupState.firstRun);
+}
+
 function setupStatus(status) {
   return {
     not_installed: { label: "未接入", className: "muted", detail: "不会修改现有配置，点击后先备份再语义合并。" },
@@ -202,32 +267,116 @@ function setupStatus(status) {
 function setupButton(label, className, handler, disabled = false) {
   const button = element("button", `setup-action ${className || ""}`.trim(), label);
   button.type = "button";
-  button.disabled = disabled || setupBusy;
+  button.disabled = disabled || setupBusy || !runtimeConnected;
   button.addEventListener("click", handler);
   return button;
 }
 
+function setupDetectedText(provider) {
+  if (provider.cliInstalled && provider.desktopInstalled) return "检测到桌面客户端与 CLI";
+  if (provider.desktopInstalled) return "检测到桌面客户端 · 不要求全局 CLI";
+  if (provider.cliInstalled) return "检测到 CLI";
+  return "尚未检测到可用客户端";
+}
+
+async function copyCodexTrustCommand(provider) {
+  const command = provider.reviewCommand;
+  if (!command) {
+    showToast("没有检测到可用的 Codex 启动命令，请查看接入指南");
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(command);
+    showToast("Codex 启动命令已复制；请在终端运行后输入 /hooks");
+  } catch (_) {
+    showToast("复制失败；请手动复制卡片中的 Codex 启动命令");
+  }
+}
+
+function renderSetupSummary() {
+  const providers = setupState.providers || [];
+  const connected = providers.filter((provider) => provider.status === "connected").length;
+  const pending = providers.filter((provider) => !["connected", "not_installed", "provider_missing", "cli_missing"].includes(provider.status)).length;
+  ui.setupSummary.replaceChildren(
+    element("span", "setup-summary-ready", `已接入 ${connected}`),
+    element("span", pending ? "setup-summary-pending" : "setup-summary-muted", `待处理 ${pending}`),
+  );
+}
+
+function renderSetupHeader() {
+  const providers = setupState.providers || [];
+  const connected = providers.filter((provider) => provider.status === "connected").length;
+  const pending = providers.filter((provider) => !["connected", "not_installed", "provider_missing", "cli_missing"].includes(provider.status)).length;
+  ui.agentStatusTrigger.classList.toggle("connected", connected > 0 && pending === 0);
+  ui.agentStatusTrigger.classList.toggle("needs-attention", pending > 0);
+  if (!setupLoaded) {
+    ui.agentStatusLabel.textContent = "正在检测 Agent";
+    ui.setupTriggerLabel.textContent = "连接 Agent";
+  } else if (isFirstRun()) {
+    ui.agentStatusLabel.textContent = "未连接 Agent";
+    ui.setupTriggerLabel.textContent = "连接 Agent";
+  } else if (pending > 0) {
+    ui.agentStatusLabel.textContent = connected ? `${connected} 个已接入 · ${pending} 待处理` : `${pending} 项接入待处理`;
+    ui.setupTriggerLabel.textContent = "完成接入";
+  } else {
+    ui.agentStatusLabel.textContent = `${connected} 个 Agent 已接入`;
+    ui.setupTriggerLabel.textContent = "Agent 接入";
+  }
+  ui.setupTrigger.classList.toggle("needs-attention", setupLoaded && (isFirstRun() || pending > 0));
+}
+
 function renderSetup() {
   ui.setupProviders.replaceChildren();
+  renderSetupSummary();
   for (const provider of setupState.providers || []) {
     const status = setupStatus(provider.status);
-    const card = element("article", "setup-provider");
-    const heading = element("div", "setup-provider-heading");
+    const card = element("article", "setup-provider-row");
     const identity = element("div", "setup-identity");
     identity.append(providerIcon(provider.provider));
-    identity.append(element("strong", "", providerName(provider.provider)));
-    heading.append(identity, element("span", `setup-status ${status.className}`, status.label));
-    card.append(heading, element("p", "setup-detail", status.detail));
-    const detected = provider.cliInstalled && provider.desktopInstalled
-      ? "已检测：桌面客户端 + CLI"
-      : provider.desktopInstalled
-        ? "已检测：桌面客户端（不需要全局 CLI）"
-        : provider.cliInstalled
-          ? "已检测：CLI"
-          : "尚未检测到可用客户端";
-    card.append(element("div", "setup-runtime", detected));
+    const identityCopy = element("div", "setup-identity-copy");
+    identityCopy.append(
+      element("strong", "", provider.provider === "claude" ? "Claude Code" : "Codex"),
+      element("span", "", setupDetectedText(provider)),
+    );
+    identity.append(identityCopy);
+
+    const config = element("div", "setup-config");
+    config.append(element("span", "", "配置"));
+    const configPath = element("code", "", provider.configPath || "尚未生成配置路径");
+    configPath.title = provider.configPath || "";
+    config.append(configPath);
+
+    const state = element("div", "setup-provider-state");
+    state.append(element("span", `setup-status ${status.className}`, status.label));
+    state.append(element("p", "setup-detail", status.detail));
+
+    const actions = element("div", "setup-actions");
+    if (provider.canRepair) {
+      actions.append(setupButton("修复二进制", "primary", () => changeSetup(provider.provider, "repair")));
+    } else if (provider.status === "not_installed") {
+      actions.append(setupButton("安全接入", "primary", () => changeSetup(provider.provider, "install")));
+    } else if (provider.status === "needs_reinstall") {
+      actions.append(setupButton("检查后重新安装", "primary", () => changeSetup(provider.provider, "install")));
+    } else if (provider.status === "needs_trust") {
+      if (provider.reviewCommand) actions.append(setupButton("复制信任命令", "primary", () => copyCodexTrustCommand(provider)));
+      actions.append(setupButton("刷新状态", "ghost", loadSetup));
+      actions.append(setupButton("移除接入", "danger", () => changeSetup(provider.provider, "uninstall")));
+    } else if (["installed_unverified", "connected"].includes(provider.status)) {
+      actions.append(setupButton("刷新状态", "primary", loadSetup));
+      actions.append(setupButton("移除接入", "danger", () => changeSetup(provider.provider, "uninstall")));
+    } else if (["inline_conflict", "error"].includes(provider.status)) {
+      actions.append(setupButton("重新检测", "ghost", loadSetup));
+    } else if (["provider_missing", "cli_missing"].includes(provider.status)) {
+      actions.append(guideLink("setup-action ghost", "查看安装说明"));
+    } else {
+      actions.append(setupButton("重新检测", "ghost", loadSetup));
+    }
+
+    card.append(identity, config, state, actions);
 
     if (provider.provider === "codex" && provider.status === "needs_trust") {
+      const trust = element("div", "setup-trust");
+      trust.append(element("strong", "", "Codex 信任必须由你在官方界面确认"));
       const steps = element("ol", "trust-steps");
       const startStep = provider.cliInstalled
         ? "打开任意 Codex 终端会话"
@@ -235,48 +384,42 @@ function renderSetup() {
       for (const step of [startStep, "输入 /hooks", "核对命令路径后选择信任", "启动一个新会话并回到这里刷新"]) {
         steps.append(element("li", "", step));
       }
-      card.append(steps);
+      trust.append(steps);
+      if (provider.reviewCommand) trust.append(element("code", "setup-review-command", provider.reviewCommand));
+      card.append(trust);
     }
-    const path = element("div", "setup-path", provider.configPath || "");
-    path.title = provider.configPath || "";
-    card.append(path);
-    const actions = element("div", "setup-actions");
-    if (provider.status === "not_installed") {
-      actions.append(setupButton("安全接入", "primary", () => changeSetup(provider.provider, "install")));
-    } else if (provider.status === "needs_reinstall") {
-      actions.append(setupButton("检查后重新安装", "primary", () => changeSetup(provider.provider, "install")));
-    } else if (provider.canRepair) {
-      actions.append(setupButton("修复二进制", "primary", () => changeSetup(provider.provider, "repair")));
-    } else if (["needs_trust", "installed_unverified", "connected"].includes(provider.status)) {
-      actions.append(setupButton("刷新状态", "primary", loadSetup));
-      actions.append(setupButton("移除接入", "ghost", () => changeSetup(provider.provider, "uninstall")));
-    } else {
-      actions.append(setupButton("暂不可操作", "ghost", () => {}, true));
-    }
-    card.append(actions);
     ui.setupProviders.append(card);
   }
-  const needsAttention = (setupState.providers || []).some((provider) => provider.status !== "connected");
-  ui.setupTrigger.classList.toggle("needs-attention", needsAttention);
+  renderSetupHeader();
 }
 
 function openSetup() {
+  ui.actRealmWorkspace.hidden = true;
+  ui.settingsOverlay.hidden = true;
   ui.setupOverlay.hidden = false;
   ui.setupClose.focus();
+  void loadSetup();
 }
 
 function closeSetup() {
   ui.setupOverlay.hidden = true;
-  sessionStorage.setItem("actrealm.setupSeen", "1");
+  ui.actRealmWorkspace.hidden = false;
   ui.setupTrigger.focus();
 }
 
 async function loadSetup() {
+  if (setupLoading) return;
+  setupLoading = true;
   try {
     setupState = await api("/api/v1/setup");
+    setupLoaded = true;
+    lastSetupAt = Date.now();
     renderSetup();
+    renderOnboardingState();
   } catch (error) {
     showToast(`接入状态读取失败：${error.message}`);
+  } finally {
+    setupLoading = false;
   }
 }
 
@@ -293,7 +436,10 @@ async function changeSetup(provider, action) {
         enhancedCodexActivity: Boolean(settingsState.codexEnhancedActivity),
       }),
     });
+    setupLoaded = true;
+    lastSetupAt = Date.now();
     renderSetup();
+    renderOnboardingState();
     showToast(action === "uninstall" ? `${providerName(provider)} 接入已移除` : `${providerName(provider)} 配置已安全写入`);
   } catch (error) {
     showToast(`接入操作失败：${error.detail || error.message}`);
@@ -303,7 +449,18 @@ async function changeSetup(provider, action) {
   }
 }
 
+function renderOnboardingState() {
+  document.body.classList.toggle("first-run", isFirstRun());
+  renderSetupHeader();
+  lastAttentionRenderSignature = undefined;
+  lastQuotaRenderSignature = undefined;
+  renderAttention();
+  renderSessions();
+  renderQuota();
+}
+
 function openSettings() {
+  ui.setupOverlay.hidden = true;
   ui.actRealmWorkspace.hidden = true;
   ui.settingsOverlay.hidden = false;
   renderMetrics();
@@ -808,7 +965,9 @@ function renderAttention() {
   ui.attentionList.replaceChildren();
   updateAttentionTimes();
   if (!items.length) {
-    ui.attentionList.append(emptyState("✓", "全部处理完毕", "新的授权、问题、完成或错误会实时进入 OUTBOX。"));
+    ui.attentionList.append(isFirstRun()
+      ? emptyState("⌑", "还没有需要处理的事项", "连接 Agent 后，审批、提问和完成确认会出现在这里。")
+      : emptyState("✓", "全部处理完毕", "新的授权、问题、完成或错误会实时进入 OUTBOX。"));
     return;
   }
   currentAttention = Math.min(currentAttention, items.length - 1);
@@ -1399,9 +1558,14 @@ function renderSessions() {
     selectedSessionId = undefined;
     sessionActivityRefs.clear();
     sessionRenderSignatures.clear();
-    if (!ui.sessionList.querySelector(".session-empty")) {
-      const empty = emptyState("✓", "当前没有活跃任务", "这里只保留运行中、待处理或最近 30 分钟内的任务。");
+    const emptyKind = isFirstRun() ? "onboarding" : "regular";
+    const currentEmpty = ui.sessionList.querySelector(".session-empty");
+    if (!currentEmpty || currentEmpty.dataset.emptyKind !== emptyKind) {
+      const empty = isFirstRun()
+        ? onboardingTaskEmpty()
+        : emptyState("✓", "当前没有活跃任务", "这里只保留运行中、待处理或最近 30 分钟内的任务。");
       empty.classList.add("session-empty");
+      empty.dataset.emptyKind = emptyKind;
       ui.sessionList.replaceChildren(empty);
     }
     return;
@@ -1494,6 +1658,11 @@ function updateQuotaTimes() {
 function renderQuota() {
   lastQuotaRenderSignature = quotaRenderSignature();
   ui.quotaList.replaceChildren();
+  if (isFirstRun()) {
+    ui.quotaSyncTime.textContent = "最近同步 · 等待 Agent 接入";
+    ui.quotaList.append(onboardingQuotaState());
+    return;
+  }
   const slots = quotaSlots();
   const latestCapture = Math.max(0, ...slots.map((quota) => Number(quota.capturedAt || 0)));
   ui.quotaSyncTime.textContent = latestCapture
@@ -1691,13 +1860,20 @@ async function bootstrap() {
 }
 
 async function loadSnapshot() {
+  const previousEventCount = Number(snapshot.stats?.eventCount || 0);
   try {
-    render(await api("/api/v1/snapshot"));
+    const nextSnapshot = await api("/api/v1/snapshot");
+    render(nextSnapshot);
+    setConnected(true);
     lastSnapshotAt = Date.now();
+    if (Number(nextSnapshot.stats?.eventCount || 0) !== previousEventCount) scheduleSetupRefresh();
   } catch (error) {
     if (String(error.message) === "UNAUTHORIZED" && await bootstrap()) {
-      render(await api("/api/v1/snapshot"));
+      const nextSnapshot = await api("/api/v1/snapshot");
+      render(nextSnapshot);
+      setConnected(true);
       lastSnapshotAt = Date.now();
+      if (Number(nextSnapshot.stats?.eventCount || 0) !== previousEventCount) scheduleSetupRefresh();
       return;
     }
     throw error;
@@ -1705,12 +1881,16 @@ async function loadSnapshot() {
 }
 
 function setConnected(connected) {
+  const changed = runtimeConnected !== connected;
+  runtimeConnected = connected;
   document.body.classList.toggle("disconnected", !connected);
   ui.runtimeState.classList.toggle("online", connected);
   ui.runtimeLabel.textContent = connected ? "Live · 本地" : "正在重连";
   ui.runtimeFooterLabel.textContent = connected ? "Runtime · 本机在线" : "Runtime · 正在重连";
   ui.runtimeSettingsLabel.textContent = connected ? "本机 Runtime 在线" : "本机 Runtime 正在重连";
+  ui.setupRefresh.disabled = !connected;
   ui.offlineBanner.hidden = connected;
+  if (changed && setupLoaded && !ui.setupOverlay.hidden) renderSetup();
 }
 
 function scheduleSetupRefresh() {
@@ -1988,11 +2168,9 @@ ui.undoButton.addEventListener("click", () => {
   if (undoCommandId) undoCommand(undoCommandId);
 });
 ui.setupTrigger.addEventListener("click", openSetup);
+ui.agentStatusTrigger.addEventListener("click", openSetup);
 ui.setupClose.addEventListener("click", closeSetup);
 ui.setupRefresh.addEventListener("click", loadSetup);
-ui.setupOverlay.addEventListener("click", (event) => {
-  if (event.target === ui.setupOverlay) closeSetup();
-});
 ui.settingsTrigger.addEventListener("click", openSettings);
 ui.settingsClose.addEventListener("click", closeSettings);
 ui.settingsOverlay.addEventListener("click", (event) => {
@@ -2084,6 +2262,7 @@ function resumeLiveView() {
   updateLiveTimes();
   maintainLiveConnection();
   if (!socket || socket.readyState === WebSocket.CLOSED) connectSocket();
+  if (!setupLoaded || Date.now() - lastSetupAt >= SETUP_FOCUS_REFRESH_AFTER_MS) void loadSetup();
 }
 
 document.addEventListener("visibilitychange", () => {
@@ -2109,5 +2288,7 @@ window.setInterval(maintainLiveConnection, 5000);
   } catch (error) {
     ui.attentionList.replaceChildren(emptyState("!", "无法连接本地 Runtime", "请从 actrealm serve 输出的一次性地址打开控制面板。"));
     showToast(`连接失败：${error.message}`);
+  } finally {
+    document.body.classList.remove("app-booting");
   }
 })();

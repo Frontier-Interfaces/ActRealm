@@ -7,7 +7,8 @@ Source branch: `agent/v1-full`
 Current functional baseline: M14 plus the post-M14 live-state and controlled
 Runtime-recovery refinements on `agent/v1-full`. A subsequent usage/OAuth
 hardening candidate has passed its automated/resource gates and awaits exact
-local installation and user acceptance.
+local installation and user acceptance. A subsequent first-run/setup-center
+candidate is implemented and awaits full gates plus local visual acceptance.
 
 This file is the short, current source of truth. The
 [implementation plan](WIDGET_V1_PLAN.md),
@@ -42,6 +43,17 @@ provide the detailed requirements and evidence.
   release build, language contract, and two-minute resource gate pass; exact
   local-candidate installation and user acceptance are still pending. See the
   [verification record](POST_M14_USAGE_OAUTH_HARDENING.md).
+- **Post-M14 first-run/setup candidate:** adds one truthful empty first-run
+  workspace and a unified Claude/Codex setup center backed by the existing
+  authenticated setup API. Unsupported Provider placeholders are omitted,
+  Codex trust remains user-controlled, and the GitHub guide is linked from the
+  interface. The isolated 300-second preview and board 6/7 visual acceptance
+  passed on 2026-07-20. The exact stable helper matches the release SHA-256;
+  Hook manifests, Codex feature/trust, helper execution, and private Socket
+  permissions pass Doctor. Fresh real Provider events, remaining local gates,
+  and push remain open; the user explicitly authorized the local candidate
+  commit on 2026-07-20 with those limitations preserved. See the
+  [verification record](POST_M14_FIRST_RUN_ONBOARDING.md).
 - **Latest merged-tree gates:** 161 Rust workspace tests and 30 macOS client
   tests passed, with two explicit/manual Rust tests ignored; zero-warning
   Clippy, format, JavaScript syntax, release build, five-round native request
@@ -79,6 +91,7 @@ provide the detailed requirements and evidence.
 | M14 | Live usage, context, price, and OAuth quota | Complete; exact release installed and accepted locally | [M14](M14_USAGE_CONTEXT_QUOTA.md) |
 | Post-M14 | Stable live rendering and controlled Runtime recovery | Implemented; merged with the ActRealm identity baseline | [verification](POST_M14_REALTIME_RECOVERY.md) |
 | Post-M14 | Usage, pricing, and OAuth hardening | Full automated/resource gates pass; exact local installation and user acceptance pending | [verification](POST_M14_USAGE_OAUTH_HARDENING.md) |
+| Post-M14 | First-run workspace and Agent setup center | Visual acceptance passed; real-Provider install/function gates pending | [verification](POST_M14_FIRST_RUN_ONBOARDING.md) |
 
 M5 is a release-qualification track, not the chronological end of feature
 development. Later functional milestones may be implemented while M5's

@@ -28,6 +28,40 @@ fn preview_paths(root: &std::path::Path) -> InstallPaths {
     }
 }
 
+fn preview_seconds() -> u64 {
+    env::var("ACTREALM_PREVIEW_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (10..=600).contains(value))
+        .unwrap_or(120)
+}
+
+/// Starts an isolated empty Runtime so the real first-run and setup UI can be
+/// visually inspected without changing the user's installed Hook files.
+#[test]
+#[ignore = "manual first-run browser preview"]
+fn first_run_onboarding_preview() {
+    let root = env::temp_dir().join(format!(
+        "actrealm-first-run-preview-{}-{}",
+        std::process::id(),
+        Uuid::now_v7()
+    ));
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let api = ApiServer::start(
+        store,
+        WaiterRegistry::default(),
+        ApiServerConfig {
+            install_paths: Some(preview_paths(&root)),
+            enable_codex_connector: false,
+            ..ApiServerConfig::default()
+        },
+    )
+    .unwrap();
+    println!("ACTREALM_FIRST_RUN_PREVIEW_URL={}", api.bootstrap_url());
+    thread::sleep(Duration::from_secs(preview_seconds()));
+    drop(api);
+}
+
 /// Starts an isolated, seeded control panel for manual browser QA.
 ///
 /// Run with `ACTREALM_PREVIEW_SECONDS=180 cargo test -p actrealm-server
@@ -160,11 +194,6 @@ fn seeded_m10_m12_control_panel_preview() {
         ));
     });
     println!("ACTREALM_PREVIEW_URL={}", api.bootstrap_url());
-    let seconds = env::var("ACTREALM_PREVIEW_SECONDS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| (10..=600).contains(value))
-        .unwrap_or(120);
-    thread::sleep(Duration::from_secs(seconds));
+    thread::sleep(Duration::from_secs(preview_seconds()));
     drop(api);
 }

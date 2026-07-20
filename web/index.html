@@ -7,7 +7,7 @@
     <title>ActRealm</title>
     <link rel="stylesheet" href="/app.css">
   </head>
-  <body>
+  <body class="app-booting">
     <div class="ambient" aria-hidden="true"></div>
 
     <div class="offline-banner" id="offline-banner" hidden>
@@ -18,8 +18,15 @@
       <header class="window-toolbar">
         <span class="signal-bars brand-signal" aria-hidden="true"><i></i><i></i><i></i></span>
         <strong>ActRealm</strong>
+        <button class="agent-connection-state" id="agent-status-trigger" type="button" aria-label="打开 Agent 接入中心">
+          <span class="agent-status-dot" aria-hidden="true"></span>
+          <span id="agent-status-label">正在检测 Agent</span>
+        </button>
         <div class="toolbar-spacer"></div>
         <div class="toolbar-actions">
+          <button class="toolbar-action setup-toolbar-action" id="setup-trigger" type="button">
+            <span aria-hidden="true">＋</span><span id="setup-trigger-label">连接 Agent</span>
+          </button>
           <button class="toolbar-action" id="settings-trigger" type="button" aria-label="打开通知与数据">
             <span aria-hidden="true">♢</span>通知与数据
           </button>
@@ -82,6 +89,34 @@
         </section>
       </div>
     </main>
+
+    <section class="setup-page" id="setup-overlay" hidden aria-labelledby="setup-title">
+      <header class="setup-page-heading">
+        <button class="back-button" id="setup-close" type="button" aria-label="返回 ActRealm 工作区">←</button>
+        <div>
+          <p class="settings-kicker">AGENT SETUP</p>
+          <h2 id="setup-title">在一处管理所有 Agent</h2>
+          <p>接入状态由本机实时检测；配置写入前自动备份，不需要 ActRealm 账号。</p>
+        </div>
+        <span class="local-pill"><i></i>本机 · 不发送遥测</span>
+      </header>
+
+      <section class="setup-glass">
+        <div class="setup-overview">
+          <div>
+            <strong>Claude 与 Codex</strong>
+            <p>安全接入、真实事件验证和 Codex 信任检查都在这里完成。</p>
+          </div>
+          <div class="setup-summary" id="setup-summary" aria-live="polite"></div>
+        </div>
+        <div class="setup-provider-list" id="setup-providers" aria-live="polite"></div>
+        <footer class="setup-footer">
+          <span><i></i>只展示真实能力；配置冲突时停止写入，不会静默覆盖。</span>
+          <a href="https://github.com/Frontier-Interfaces/ActRealm/blob/agent/v1-full/docs/USER_GUIDE_zh-CN.md" target="_blank" rel="noopener noreferrer">查看接入指南</a>
+          <button id="setup-refresh" type="button">刷新状态</button>
+        </footer>
+      </section>
+    </section>
 
     <section class="settings-page" id="settings-overlay" hidden aria-labelledby="settings-title">
       <header class="settings-page-heading">
@@ -204,10 +239,6 @@
       </div>
     </section>
 
-    <button class="legacy-only" id="setup-trigger" type="button">接入设置</button>
-    <div class="legacy-only" id="setup-overlay" hidden>
-      <section><button id="setup-close" type="button">关闭</button><div id="setup-providers"></div><button id="setup-refresh" type="button">刷新</button></section>
-    </div>
     <div class="legacy-only" id="session-detail-overlay" hidden>
       <section><button id="session-detail-close" type="button">关闭</button><h2 id="session-detail-title">任务详情</h2><div id="session-detail-body"></div><button id="session-detail-jump" type="button">跳转</button></section>
     </div>

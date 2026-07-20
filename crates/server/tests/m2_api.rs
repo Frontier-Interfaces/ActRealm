@@ -215,6 +215,8 @@ fn embedded_ui_contract_is_small_honest_and_complete() {
     assert!(toolbar.contains("id=\"settings-trigger\""));
     assert!(toolbar.contains("id=\"menu-clock\""));
     assert!(toolbar.contains("id=\"runtime-state\""));
+    assert!(toolbar.contains("id=\"agent-status-trigger\""));
+    assert!(toolbar.contains("id=\"setup-trigger\""));
     assert!(!INDEX_HTML.contains("台前调度"));
     assert!(!INDEX_HTML.contains("HUD 胶囊"));
     assert!(!INDEX_HTML.contains("系统通知"));
@@ -259,6 +261,19 @@ fn embedded_ui_contract_is_small_honest_and_complete() {
     assert!(APP_JS.contains("providerIcon(provider.provider)"));
     assert!(APP_JS.contains("provider_missing"));
     assert!(APP_JS.contains("打开终端并运行内置 Codex"));
+    assert!(INDEX_HTML.contains("id=\"setup-overlay\""));
+    assert!(INDEX_HTML.contains("在一处管理所有 Agent"));
+    assert!(INDEX_HTML
+        .contains("Frontier-Interfaces/ActRealm/blob/agent/v1-full/docs/USER_GUIDE_zh-CN.md"));
+    assert!(APP_JS.contains("setupState.firstRun"));
+    assert!(APP_JS.contains("onboardingTaskEmpty"));
+    assert!(APP_JS.contains("navigator.clipboard.writeText(command)"));
+    assert!(APP_JS.contains("/api/v1/setup"));
+    assert!(APP_CSS.contains("setup-provider-row"));
+    assert!(APP_CSS.contains("onboarding-task-empty"));
+    assert!(!INDEX_HTML.contains("Kimi"));
+    assert!(!INDEX_HTML.contains("即将支持"));
+    assert!(!APP_JS.contains("actrealm.setupSeen"));
     assert!(APP_JS.contains("/assets/claude.png"));
     assert!(APP_JS.contains("/assets/codex.png"));
     assert!(!include_bytes!("../../../web/assets/claude.png").is_empty());

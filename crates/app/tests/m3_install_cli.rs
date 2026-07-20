@@ -463,8 +463,17 @@ fn onboarding_api_uses_the_installer_and_requires_a_post_install_real_event() {
         .unwrap();
     let mut stdout = BufReader::new(runtime.stdout.take().unwrap());
     let mut control_line = String::new();
-    stdout.read_line(&mut control_line).unwrap();
-    assert!(control_line.starts_with("ActRealm control panel: http://"));
+    let control_bytes = stdout.read_line(&mut control_line).unwrap();
+    if !control_line.starts_with("ActRealm control panel: http://") {
+        runtime.stdout = Some(stdout.into_inner());
+        let _ = runtime.kill();
+        let output = runtime.wait_with_output().unwrap();
+        panic!(
+            "runtime did not print its control URL (read {control_bytes} bytes)\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     let url = control_line
         .trim()
         .strip_prefix("ActRealm control panel: ")
