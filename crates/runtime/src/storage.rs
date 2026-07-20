@@ -20,10 +20,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const MAX_TASK_TITLE_CHARS: usize = 64;
 const PROVIDER_TITLE_REFRESH_INTERVAL_MS: u64 = 2_000;
 const PROVIDER_TITLE_ACTIVE_WINDOW_MS: u64 = 30 * 60 * 1_000;
+const CODEX_INTERNAL_PROMPT_PREFIXES: [&str; 2] = [
+    "# Overview Generate 0 to 3 hyperpersonalized suggestions",
+    "You are an expert at upholding safety and compliance standards",
+];
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum StoreError {
@@ -128,6 +132,7 @@ impl CommandState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestResult {
     pub inserted: bool,
+    pub suppressed: bool,
     pub session_id: String,
     pub attention_id: Option<String>,
     pub kind: EventKind,
@@ -437,8 +442,8 @@ impl RuntimeStore {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let path = path.into();
         prepare_database_file(&path)?;
-        let connection = Connection::open(&path).map_err(storage_error)?;
-        initialize(&connection)?;
+        let mut connection = Connection::open(&path).map_err(storage_error)?;
+        initialize(&mut connection)?;
         let (sender, receiver) = mpsc::channel();
         let writer = thread::Builder::new()
             .name("actrealm-sqlite-writer".to_owned())
@@ -882,6 +887,10 @@ fn upsert_session_usages(
 ) -> Result<(), StoreError> {
     let transaction = connection.transaction().map_err(storage_error)?;
     for record in records {
+        if is_ignored_provider_session(&transaction, &record.provider, &record.provider_session_id)?
+        {
+            continue;
+        }
         upsert_session_usage_row(&transaction, record)?;
     }
     transaction.commit().map_err(storage_error)
@@ -1245,8 +1254,8 @@ fn reset_database(connection: &mut Connection, path: &Path) -> Result<(), StoreE
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => {
-                let reopened = Connection::open(path).map_err(storage_error)?;
-                initialize(&reopened)?;
+                let mut reopened = Connection::open(path).map_err(storage_error)?;
+                initialize(&mut reopened)?;
                 *connection = reopened;
                 return Err(StoreError::Storage(format!(
                     "failed to remove {}: {error}",
@@ -1256,8 +1265,8 @@ fn reset_database(connection: &mut Connection, path: &Path) -> Result<(), StoreE
         }
     }
     prepare_database_file(path)?;
-    let fresh = Connection::open(path).map_err(storage_error)?;
-    initialize(&fresh)?;
+    let mut fresh = Connection::open(path).map_err(storage_error)?;
+    initialize(&mut fresh)?;
     *connection = fresh;
     Ok(())
 }
@@ -1289,7 +1298,7 @@ fn prepare_database_file(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn initialize(connection: &Connection) -> Result<(), StoreError> {
+fn initialize(connection: &mut Connection) -> Result<(), StoreError> {
     connection
         .execute_batch(
             r#"
@@ -1394,6 +1403,13 @@ fn initialize(connection: &Connection) -> Result<(), StoreError> {
               captured_at INTEGER NOT NULL,
               PRIMARY KEY(provider, provider_session_id)
             );
+            CREATE TABLE IF NOT EXISTS ignored_provider_sessions (
+              provider TEXT NOT NULL,
+              provider_session_id TEXT NOT NULL,
+              ignored_at INTEGER NOT NULL,
+              reason TEXT NOT NULL,
+              PRIMARY KEY(provider, provider_session_id)
+            );
             CREATE TABLE IF NOT EXISTS metrics_daily (
               day TEXT PRIMARY KEY,
               approval_requests INTEGER DEFAULT 0,
@@ -1420,6 +1436,7 @@ fn initialize(connection: &Connection) -> Result<(), StoreError> {
     ensure_session_usage_columns(connection)?;
     ensure_session_usage_model_column(connection)?;
     ensure_session_locator_columns(connection)?;
+    suppress_existing_codex_internal_sessions(connection)?;
     connection
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(storage_error)?;
@@ -1540,6 +1557,34 @@ fn ingest_transaction(
     let parsed = parse_hook(request.provider, request.raw.clone())
         .map_err(|error| StoreError::Provider(error.to_string()))?;
     let transaction = connection.transaction().map_err(storage_error)?;
+    let provider = request.provider.to_string();
+    if is_ignored_provider_session(&transaction, &provider, &parsed.provider_session_id)? {
+        return Ok(IngestResult {
+            inserted: false,
+            suppressed: true,
+            session_id: parsed.provider_session_id,
+            attention_id: None,
+            kind: parsed.kind,
+            resolved_request_ids: Vec::new(),
+        });
+    }
+    if is_codex_internal_background_prompt(&request, &parsed) {
+        suppress_provider_session(
+            &transaction,
+            &provider,
+            &parsed.provider_session_id,
+            request.received_at,
+        )?;
+        transaction.commit().map_err(storage_error)?;
+        return Ok(IngestResult {
+            inserted: false,
+            suppressed: true,
+            session_id: parsed.provider_session_id,
+            attention_id: None,
+            kind: parsed.kind,
+            resolved_request_ids: Vec::new(),
+        });
+    }
     if let Some(session_id) = transaction
         .query_row(
             "SELECT session_id FROM events WHERE id = ?1",
@@ -1551,6 +1596,7 @@ fn ingest_transaction(
     {
         return Ok(IngestResult {
             inserted: false,
+            suppressed: false,
             session_id,
             attention_id: request
                 .request_id
@@ -1569,7 +1615,6 @@ fn ingest_transaction(
         parsed.cwd.as_deref(),
     );
     let (token_total, context_window_tokens) = normalized_token_usage(&request.raw);
-    let provider = request.provider.to_string();
     let existing = transaction
         .query_row(
             "SELECT id, exec_state, approval_owner, activity, last_event_at FROM sessions
@@ -1997,11 +2042,186 @@ fn ingest_transaction(
     transaction.commit().map_err(storage_error)?;
     Ok(IngestResult {
         inserted: true,
+        suppressed: false,
         session_id,
         attention_id,
         kind: parsed.kind,
         resolved_request_ids,
     })
+}
+
+fn is_ignored_provider_session(
+    connection: &Connection,
+    provider: &str,
+    provider_session_id: &str,
+) -> Result<bool, StoreError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM ignored_provider_sessions
+               WHERE provider = ?1 AND provider_session_id = ?2
+             )",
+            params![provider, provider_session_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(storage_error)
+}
+
+fn is_codex_internal_background_prompt(
+    request: &BridgeRequest,
+    parsed: &actrealm_providers::ParsedHookEvent,
+) -> bool {
+    if request.provider != Provider::Codex
+        || parsed.kind != EventKind::PromptSubmitted
+        || parsed.cwd.as_deref() != Some("/")
+    {
+        return false;
+    }
+    let Some(term) = request.term.as_ref() else {
+        return false;
+    };
+    let bundle_id = term.bundle_id.as_deref().unwrap_or_default();
+    if term.surface.as_deref() != Some("codex_app")
+        && !bundle_id.eq_ignore_ascii_case("com.openai.codex")
+    {
+        return false;
+    }
+    let Some(prompt) = request
+        .raw
+        .get("prompt")
+        .or_else(|| request.raw.get("user_prompt"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let normalized = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    matches_codex_internal_prompt(&normalized)
+}
+
+fn matches_codex_internal_prompt(prompt: &str) -> bool {
+    CODEX_INTERNAL_PROMPT_PREFIXES
+        .iter()
+        .any(|prefix| prompt.starts_with(prefix))
+}
+
+fn suppress_existing_codex_internal_sessions(
+    connection: &mut Connection,
+) -> Result<(), StoreError> {
+    let candidates = {
+        let mut statement = connection
+            .prepare(
+                "SELECT provider_session_id, title, last_event_at FROM sessions
+                 WHERE provider = 'codex' AND cwd = '/'
+                   AND (term_surface = 'codex_app' OR lower(term_bundle_id) = 'com.openai.codex')
+                   AND title IS NOT NULL",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(storage_error)?
+            .filter_map(|row| match row {
+                Ok((provider_session_id, title, last_event_at))
+                    if matches_codex_internal_prompt(&title) =>
+                {
+                    Some(Ok((provider_session_id, last_event_at)))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+        rows
+    };
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let transaction = connection.transaction().map_err(storage_error)?;
+    for (provider_session_id, last_event_at) in candidates {
+        suppress_provider_session(
+            &transaction,
+            "codex",
+            &provider_session_id,
+            from_i64(last_event_at),
+        )?;
+    }
+    transaction.commit().map_err(storage_error)
+}
+
+fn suppress_provider_session(
+    transaction: &Transaction<'_>,
+    provider: &str,
+    provider_session_id: &str,
+    ignored_at: u64,
+) -> Result<(), StoreError> {
+    let existing = transaction
+        .query_row(
+            "SELECT id, started_at FROM sessions
+             WHERE provider = ?1 AND provider_session_id = ?2",
+            params![provider, provider_session_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(storage_error)?;
+    transaction
+        .execute(
+            "INSERT INTO ignored_provider_sessions(
+               provider, provider_session_id, ignored_at, reason
+             ) VALUES (?1, ?2, ?3, 'codex_internal_background_prompt')
+             ON CONFLICT(provider, provider_session_id) DO NOTHING",
+            params![provider, provider_session_id, to_i64(ignored_at)],
+        )
+        .map_err(storage_error)?;
+    transaction
+        .execute(
+            "DELETE FROM session_usage
+             WHERE provider = ?1 AND provider_session_id = ?2",
+            params![provider, provider_session_id],
+        )
+        .map_err(storage_error)?;
+
+    let Some((session_id, started_at)) = existing else {
+        return Ok(());
+    };
+    transaction
+        .execute(
+            "DELETE FROM commands WHERE attention_id IN (
+               SELECT id FROM attention_items WHERE session_id = ?1
+             )",
+            [&session_id],
+        )
+        .map_err(storage_error)?;
+    for table in [
+        "attention_items",
+        "events",
+        "session_tasks",
+        "session_subagents",
+        "turns",
+    ] {
+        transaction
+            .execute(
+                &format!("DELETE FROM {table} WHERE session_id = ?1"),
+                [&session_id],
+            )
+            .map_err(storage_error)?;
+    }
+    transaction
+        .execute("DELETE FROM sessions WHERE id = ?1", [&session_id])
+        .map_err(storage_error)?;
+    transaction
+        .execute(
+            "UPDATE metrics_daily
+             SET sessions_observed = MAX(sessions_observed - 1, 0)
+             WHERE day = ?1",
+            [metric_day(from_i64(started_at))],
+        )
+        .map_err(storage_error)?;
+    Ok(())
 }
 
 fn claim_transaction(
