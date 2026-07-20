@@ -117,7 +117,7 @@ fn existing_v1_database_adds_task_titles_without_losing_sessions() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        8
+        9
     );
     let usage_columns = connection
         .prepare("PRAGMA table_info(session_usage)")
@@ -127,6 +127,181 @@ fn existing_v1_database_adds_task_titles_without_losing_sessions() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert!(usage_columns.iter().any(|column| column == "model"));
+    drop(connection);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn codex_internal_background_sessions_are_discarded_without_visibility_state() {
+    fn codex_app_event(
+        event: &str,
+        session_id: &str,
+        prompt: Option<&str>,
+        at: u64,
+    ) -> BridgeRequest {
+        let mut raw = json!({
+            "hook_event_name": event,
+            "session_id": session_id,
+            "cwd": "/",
+            "model": "gpt-test"
+        });
+        if let Some(prompt) = prompt {
+            raw["prompt"] = Value::String(prompt.to_owned());
+        }
+        if event == "PreToolUse" {
+            raw["tool_name"] = Value::String("Read".to_owned());
+        }
+        let mut request = BridgeRequest::from_hook_at(Provider::Codex, raw, at);
+        request.term = Some(TermContext {
+            app: None,
+            session_id: None,
+            tty: None,
+            title: None,
+            bundle_id: Some("com.openai.codex".to_owned()),
+            surface: Some("codex_app".to_owned()),
+            provider_pid: Some(42),
+        });
+        request
+    }
+
+    let root = temp_root("codex-internal-background");
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("data.sqlite");
+    let overview_session = "019f7eb6-6f5c-7240-bffa-feef46eaaf69";
+    let store = RuntimeStore::open(&database).unwrap();
+
+    let started = store
+        .ingest(codex_app_event(
+            "SessionStart",
+            overview_session,
+            None,
+            1_000,
+        ))
+        .unwrap();
+    assert!(started.inserted);
+    assert!(!started.suppressed);
+    assert_eq!(store.snapshot().unwrap().metrics.sessions_observed, 1);
+
+    let overview = store
+        .ingest(codex_app_event(
+            "UserPromptSubmit",
+            overview_session,
+            Some("# Overview\nGenerate 0 to 3 hyperpersonalized suggestions for what to do next"),
+            1_001,
+        ))
+        .unwrap();
+    assert!(!overview.inserted);
+    assert!(overview.suppressed);
+    let snapshot = store.snapshot().unwrap();
+    assert!(snapshot.sessions.is_empty());
+    assert_eq!(snapshot.event_count, 0);
+    assert_eq!(snapshot.metrics.sessions_observed, 0);
+
+    let tool = store
+        .ingest(codex_app_event("PreToolUse", overview_session, None, 1_002))
+        .unwrap();
+    assert!(tool.suppressed);
+    drop(store);
+
+    let store = RuntimeStore::open(&database).unwrap();
+    let stop = store
+        .ingest(codex_app_event("Stop", overview_session, None, 1_003))
+        .unwrap();
+    assert!(stop.suppressed);
+    assert!(store.snapshot().unwrap().sessions.is_empty());
+
+    let safety_session = "019f7eb8-d444-7f42-bd55-3ceffa0ae86b";
+    store
+        .ingest(codex_app_event("SessionStart", safety_session, None, 2_000))
+        .unwrap();
+    let safety = store
+        .ingest(codex_app_event(
+            "UserPromptSubmit",
+            safety_session,
+            Some("You are an expert at upholding safety and compliance standards for tool calls"),
+            2_001,
+        ))
+        .unwrap();
+    assert!(safety.suppressed);
+
+    let real_session = "real-codex-app-root-session";
+    let real = store
+        .ingest(codex_app_event(
+            "UserPromptSubmit",
+            real_session,
+            Some("Help me inspect the current project"),
+            3_000,
+        ))
+        .unwrap();
+    assert!(real.inserted);
+    assert!(!real.suppressed);
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.sessions.len(), 1);
+    assert_eq!(snapshot.sessions[0].provider_session_id, real_session);
+    assert_eq!(snapshot.metrics.sessions_observed, 1);
+    drop(store);
+
+    let connection = Connection::open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM ignored_provider_sessions",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'visibility'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    connection
+        .execute(
+            "INSERT INTO sessions(
+               id, provider, provider_session_id, cwd, title,
+               term_bundle_id, term_surface, exec_state, started_at, last_event_at
+             ) VALUES (
+               'legacy-internal-id', 'codex', 'legacy-internal-session', '/',
+               '# Overview Generate 0 to 3 hyperpersonalized suggestions for what to do next',
+               'com.openai.codex', 'codex_app', 'response_finished', 4000, 4100
+             )",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE metrics_daily
+             SET sessions_observed = sessions_observed + 1",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = RuntimeStore::open(&database).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.sessions.len(), 1);
+    assert_eq!(snapshot.sessions[0].provider_session_id, real_session);
+    assert_eq!(snapshot.metrics.sessions_observed, 1);
+    drop(store);
+
+    let connection = Connection::open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM ignored_provider_sessions",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        3
+    );
     drop(connection);
     fs::remove_dir_all(root).unwrap();
 }

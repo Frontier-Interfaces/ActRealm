@@ -7,8 +7,10 @@ Source branch: `agent/v1-full`
 Current functional baseline: M14 plus the post-M14 live-state and controlled
 Runtime-recovery refinements on `agent/v1-full`. A subsequent usage/OAuth
 hardening candidate has passed its automated/resource gates and awaits exact
-local installation and user acceptance. A subsequent first-run/setup-center
-candidate is implemented and awaits full gates plus local visual acceptance.
+local installation and user acceptance. The first-run/setup-center candidate
+has passed visual acceptance and its original exact-helper installation. The
+company-branch Codex internal-session filter is now merged locally, with the
+schema 9 synchronized tree passing its Rust and resource gates.
 
 This file is the short, current source of truth. The
 [implementation plan](WIDGET_V1_PLAN.md),
@@ -48,18 +50,33 @@ provide the detailed requirements and evidence.
   authenticated setup API. Unsupported Provider placeholders are omitted,
   Codex trust remains user-controlled, and the GitHub guide is linked from the
   interface. The isolated 300-second preview and board 6/7 visual acceptance
-  passed on 2026-07-20. The exact stable helper matches the release SHA-256;
-  Hook manifests, Codex feature/trust, helper execution, and private Socket
-  permissions pass Doctor. Fresh real Provider events, remaining local gates,
-  and push remain open; the user explicitly authorized the local candidate
-  commit on 2026-07-20 with those limitations preserved. See the
+  passed on 2026-07-20. The stable helper matched that first-run candidate at
+  acceptance time. After the company sync, the installed helper remains
+  `340bf2f5...d429` while the synchronized release is `d70d2ea8...935b`, so the
+  latest binary is not installed. Current Doctor still passes Hook manifests,
+  helper execution, the canonical Codex feature, private Socket permissions,
+  and silent fail-open, but reports Codex trust review and fresh real Claude/
+  Codex events as pending. Push also remains open. See the
   [verification record](POST_M14_FIRST_RUN_ONBOARDING.md).
-- **Latest merged-tree gates:** 161 Rust workspace tests and 30 macOS client
-  tests passed, with two explicit/manual Rust tests ignored; zero-warning
-  Clippy, format, JavaScript syntax, release build, five-round native request
-  replay, five consecutive controlled Runtime restarts, and the two-minute
-  resource gate passed. The current sample recorded 0.000% average idle CPU
-  and 6,128 KiB maximum Runtime RSS.
+- **Post-M14 Codex internal-session filtering:** synced from company branch
+  commit `43a268d`. Known Codex App overview-suggestion and safety-review
+  background sessions are discarded at Runtime ingest; an already-created
+  provisional row, its local metric, related events/Attention/usage, and later
+  lifecycle are removed without adding a fake visibility state. Ordinary user
+  sessions remain visible and suppressed waiters fail open. Schema advances to
+  9. The exact synchronized tree passes the focused regression, 177-test Rust
+  suite, zero-warning Clippy, release build, language contract, and two-minute
+  resource gate. Latest-binary installation and macOS Swift rerun remain open.
+  See the
+  [verification record](POST_M14_CODEX_INTERNAL_SESSION_FILTERING.md).
+- **Latest synchronized-tree gates:** 177 Rust tests passed, with three
+  explicitly manual/resource tests ignored in the ordinary workspace run;
+  zero-warning Clippy, format, JavaScript syntax, release build, language
+  contract, focused schema-9 regression, and the explicit two-minute resource
+  gate passed. The resource sample recorded 0.000% average idle CPU and 6,272
+  KiB maximum Runtime RSS. The current macOS Swift rerun was blocked before any
+  test assertion by SwiftPM `sandbox_apply: Operation not permitted`; the prior
+  30-test result is not represented as a test of this synchronized tree.
 - **M13 real-Provider acceptance:** still pending. The milestone was committed
   and pushed at the user's direction before this final manual confirmation.
 - **Final v1 release:** not yet declared. The required continuous 48-hour
@@ -92,6 +109,7 @@ provide the detailed requirements and evidence.
 | Post-M14 | Stable live rendering and controlled Runtime recovery | Implemented; merged with the ActRealm identity baseline | [verification](POST_M14_REALTIME_RECOVERY.md) |
 | Post-M14 | Usage, pricing, and OAuth hardening | Full automated/resource gates pass; exact local installation and user acceptance pending | [verification](POST_M14_USAGE_OAUTH_HARDENING.md) |
 | Post-M14 | First-run workspace and Agent setup center | Visual acceptance passed; real-Provider install/function gates pending | [verification](POST_M14_FIRST_RUN_ONBOARDING.md) |
+| Post-M14 | Codex internal-session filtering | Synchronized Rust/resource gates pass; latest installation and macOS Swift rerun pending | [verification](POST_M14_CODEX_INTERNAL_SESSION_FILTERING.md) |
 
 M5 is a release-qualification track, not the chronological end of feature
 development. Later functional milestones may be implemented while M5's

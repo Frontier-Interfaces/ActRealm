@@ -346,22 +346,50 @@ without making the final v1 release complete.
       cleanly in the user's ordinary terminal on 2026-07-20.
 - [x] JavaScript syntax, embedded UI contract, format, zero-warning Clippy,
       full Rust workspace suite, release build, and language contract pass.
-- [ ] macOS Swift and two-minute Runtime resource gates pass in an ordinary
-      local terminal; the managed Codex sandbox rejected SwiftPM sandboxing and
-      Unix Socket bind before these gates could execute.
+- [x] The explicit two-minute Runtime resource gate passes on the synchronized
+      tree with 0.000% average idle CPU and 6,272 KiB maximum Runtime RSS.
+- [ ] The macOS Swift suite passes on the synchronized tree in an ordinary
+      local terminal; the managed Codex sandbox rejected SwiftPM sandboxing
+      before any test assertion could run.
 - [x] Board 6 empty state and board 7 setup-center visual direction are
       accepted locally by the user on 2026-07-20.
 - [ ] Board 7 real Claude/Codex detection, install, trust, refresh, repair, and
       uninstall behavior is accepted on the exact installed candidate.
-- [x] The installed stable helper exactly matches the release candidate
-      SHA-256; Claude/Codex Hook manifests, helper execution, canonical Codex
-      feature, Codex trust hashes, and private Socket permissions pass Doctor.
+- [x] The installed stable helper exactly matched the first-run candidate
+      SHA-256 at its local acceptance point.
+- [ ] The post-sync release is installed and Doctor passes Codex trust plus
+      real-event checks. The installed helper is still `340bf2f5...d429`, the
+      synchronized release is `d70d2ea8...935b`, and current Doctor requests a
+      new Codex Hook review.
 - [ ] Fresh Claude and Codex sessions each deliver a real post-install event
       and appear as connected in the setup center.
 - [x] The user explicitly authorized the local candidate commit on 2026-07-20
       with the remaining real-event and local resource gates still recorded as
       open.
 - [ ] Push is separately authorized by the user.
+
+### Post-M14 - Codex internal-session filtering
+
+- [x] Filtering requires Codex provider, Codex App surface/bundle identity,
+      root working directory, PromptSubmitted kind, and a version-tested
+      overview/safety internal-prompt prefix.
+- [x] A normal Codex App user prompt from `/` remains a visible user session.
+- [x] Once identified, the provisional session, events, Attention, commands,
+      tasks, subagents, turns, usage, and matching session metric are removed.
+- [x] The ignored Provider session ID persists across Runtime restart so later
+      lifecycle and usage cannot recreate a ghost task.
+- [x] Suppressed Hook/Connector waiters are released fail-open and never become
+      an ActRealm-controlled approval.
+- [x] Schema 9 migrates existing matching internal sessions transactionally and
+      does not add a generic session visibility state.
+- [x] The complete synchronized tree passes JavaScript syntax, format,
+      zero-warning Clippy, 177 Rust tests, release build, language contract,
+      the focused schema-9 regression, and the two-minute resource gate.
+- [ ] The macOS Swift suite passes on the synchronized tree; SwiftPM was
+      blocked before test execution by the managed environment's
+      `sandbox_apply: Operation not permitted`.
+- [x] The verified merge commit is created locally.
+- [ ] Push is separately performed by the user.
 
 ## Publishing rule
 

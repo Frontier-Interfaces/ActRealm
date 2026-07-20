@@ -30,6 +30,21 @@ suite, release build, and board 6/7 visual acceptance pass. Exact real-Provider
 events and remaining local gates stay open. The user authorized the local
 candidate commit on 2026-07-20; push remains separately gated.
 
+### Post-M14 - Codex internal-session filtering
+
+- Discards Codex App overview-suggestion and safety-review background sessions
+  at Runtime ingest instead of storing or displaying them as Agent tasks.
+- Removes the provisional `SessionStart` row and metric when a later prompt
+  identifies an internal session, then suppresses its remaining lifecycle
+  across Runtime restarts without adding a session visibility state.
+
+The synchronized tree passes JavaScript syntax, format, zero-warning Clippy,
+177 Rust tests, release build, the ActRealm language contract, the focused
+schema-9 regression, and the two-minute resource gate. Three explicitly manual
+or resource tests remain ignored in the ordinary workspace run. The macOS
+Swift suite could not start in the managed environment because SwiftPM's own
+`sandbox-exec` was rejected; the latest release binary is not yet installed.
+
 ### Post-M14 - Usage, pricing, and OAuth hardening candidate
 
 - Adds a versioned per-model price registry with distinct `provider_estimate`

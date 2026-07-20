@@ -1,7 +1,8 @@
 # Post-M14 first-run workspace and Agent setup center
 
-Status: implemented candidate; board 6/7 visual acceptance passed, while exact
-real-Provider installation and remaining local gates are not yet complete.
+Status: implemented candidate; board 6/7 visual acceptance passed. The original
+candidate was installed exactly, while the later synchronized company build is
+not yet installed and fresh real-Provider evidence remains incomplete.
 
 Date: 2026-07-20
 
@@ -68,37 +69,43 @@ guide link, and absence of Kimi/“coming soon” placeholders.
 - JavaScript syntax and diff whitespace: passed.
 - Embedded UI contract: passed.
 - Rust format and workspace Clippy with `-D warnings`: passed.
-- Full Rust workspace suite: passed once with the manual preview/resource tests
-  ignored as designed.
+- Full synchronized Rust workspace suite: `177 passed; 0 failed; 3 ignored`;
+  the ignored entries are explicit manual preview/resource tests.
 - Workspace release build and ActRealm language contract: passed.
 - macOS Swift suite: not executed in the managed Codex sandbox because
   SwiftPM's own `sandbox-exec` was rejected with `sandbox_apply: Operation not
   permitted`; no Swift test assertion ran.
-- Two-minute Runtime resource gate and the repeated setup gate: not accepted in
-  the managed sandbox. Reproduction reached Runtime startup and failed before
-  the first product assertion because Unix Socket bind returned
-  `Operation not permitted (os error 1)`.
+- Two-minute Runtime resource gate: passed after the company-branch sync with
+  0.000% average idle CPU and 6,272 KiB maximum Runtime RSS. The repeated setup
+  gate remains open in an ordinary local terminal.
 - Isolated first-run preview harness: passed for 300 seconds in the user's
   ordinary terminal on 2026-07-20 (`1 passed; 0 failed`). This proves the
   temporary-path preview server starts and exits cleanly; visual and button
   acceptance remain separate.
 - Board 6/7 visual acceptance: passed by the user on 2026-07-20 against the
-  isolated preview candidate. The release binary prepared for the next real
-  installation gate has SHA-256
+  isolated preview candidate. That accepted pre-sync release binary had
+  SHA-256
   `340bf2f5d0fd36fd9cc085caf85de8d435d11437f04ad13fad6b7e2104c2d429`.
-- Exact-candidate installation: the stable helper and release binary both have
-  SHA-256 `340bf2f5d0fd36fd9cc085caf85de8d435d11437f04ad13fad6b7e2104c2d429`.
-  Read-only Doctor evidence reports Claude's 17 managed handlers, Codex's 6
-  managed handlers, executable helper, canonical Codex Hooks feature, complete
-  trusted hashes, private Runtime Socket permissions, and silent offline
-  pass-through as passing. Fresh Claude/Codex real events remain pending.
+- Exact first-run-candidate installation: the stable helper and pre-sync
+  release binary both had SHA-256
+  `340bf2f5d0fd36fd9cc085caf85de8d435d11437f04ad13fad6b7e2104c2d429`.
+  The synchronized release is now
+  `d70d2ea89d6d63115e0657194128ee8e9ca78df3e2cd095fc3028605ccce935b`
+  and has not been installed. Current read-only Doctor still passes Claude's
+  17 managed handlers, Codex's 6 managed handlers, executable helper,
+  canonical Codex Hooks feature, private Runtime Socket permissions, and
+  silent offline pass-through. It now reports Codex Hook review and fresh
+  Claude/Codex real events as pending.
 - The managed Codex environment could not complete Doctor's Socket round trip
   (`Operation not permitted`), matching its known Unix Socket restriction. The
   user's open page and fresh Provider events are the remaining authoritative
   local Runtime evidence.
 
-The last two items must be rerun in the user's ordinary terminal. The candidate
-must not be described as fully gated until they pass there.
+The synchronized binary installation, Codex trust review, fresh real Provider
+events, repeated setup gate, Runtime Doctor round trip, and macOS Swift suite
+must still be completed in the user's ordinary environment. The synchronized
+candidate must not be described as fully installed or fully accepted until
+those checks pass.
 
 ## Isolated visual preview
 

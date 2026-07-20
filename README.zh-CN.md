@@ -48,6 +48,8 @@ ActRealm 用四条原则组织这个闭环：
   完成保留备份的接入、修复、刷新和移除；Codex 信任仍由用户在官方界面亲自完成；
 - **统一任务总览**：集中显示 Provider 状态、当前活动、等待时间、问题、授权请求、
   完成状态和额度信息；
+- **Codex 内部会话过滤**：在 Runtime 接入层移除已确认的 App 概览建议/安全审查
+  后台会话，同时保留普通用户会话、fail-open 语义和真实聚合指标；
 - **能力感知的审批闭环**：在真实支持的场景中提供风险提示、允许、拒绝、交还原界面，
   并在决策正式提交前保留 3 秒撤回时间；
 - **诚实的任务返回能力**：明确报告当前能够达到的层级——精确 Codex 会话、匹配的
@@ -223,6 +225,7 @@ ActRealm 默认本地运行：
 - [Post-M14 实时状态与 Runtime 恢复验证](docs/POST_M14_REALTIME_RECOVERY.md)
 - [Post-M14 用量、价格与 OAuth 加固](docs/POST_M14_USAGE_OAUTH_HARDENING.md)
 - [Post-M14 首次进入与 Agent 接入中心](docs/POST_M14_FIRST_RUN_ONBOARDING.md)
+- [Post-M14 Codex 内部会话过滤](docs/POST_M14_CODEX_INTERNAL_SESSION_FILTERING.md)
 - [开发计划](docs/WIDGET_V1_PLAN.md)
 - [开发变更记录](CHANGELOG.md)
 - [第三方声明](THIRD_PARTY_NOTICES.md)

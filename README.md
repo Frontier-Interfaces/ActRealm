@@ -57,6 +57,9 @@ The current build includes:
   refresh, and uninstall actions, and keeps Codex trust user-controlled;
 - **one task overview** for Provider state, current activity, wait time,
   questions, approval requests, completion, and quota status;
+- **Codex internal-session filtering** that removes known App-generated
+  overview/safety background work at Runtime ingest while preserving ordinary
+  user sessions, fail-open behavior, and aggregate metrics truth;
 - **a capability-aware approval loop** with risk labels, allow/deny/pass-through
   where supported, and a three-second undo window before a decision commits;
 - **honest return-to-task behavior** that reports the best available level:
@@ -247,6 +250,7 @@ change how those tools handle data.
 - [Post-M14 live-state and Runtime-recovery evidence](docs/POST_M14_REALTIME_RECOVERY.md)
 - [Post-M14 usage, pricing, and OAuth hardening](docs/POST_M14_USAGE_OAUTH_HARDENING.md)
 - [Post-M14 first-run onboarding and setup center](docs/POST_M14_FIRST_RUN_ONBOARDING.md)
+- [Post-M14 Codex internal-session filtering](docs/POST_M14_CODEX_INTERNAL_SESSION_FILTERING.md)
 - [Development plan](docs/WIDGET_V1_PLAN.md)
 - [Development changelog](CHANGELOG.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
