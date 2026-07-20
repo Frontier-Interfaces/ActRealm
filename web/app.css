@@ -445,9 +445,20 @@ button { color: inherit; }
   font-weight: 700;
 }
 .runtime-actions .primary { border-color: rgba(0, 122, 255, .5); background: linear-gradient(180deg, #2f8fff, #007aff); box-shadow: 0 6px 16px rgba(0, 122, 255, .35); color: #fff; }
-.event-channel { grid-column: 1 / -1; display: flex; align-items: center; gap: 10px; padding-top: 12px; border-top: 1px solid rgba(0, 0, 0, .06); color: rgba(0, 0, 0, .42); font-size: 10px; }
+.event-channel { grid-column: 1 / -1; padding-top: 12px; border-top: 1px solid rgba(0, 0, 0, .06); color: rgba(0, 0, 0, .42); font-size: 10px; }
 .event-track { flex: 1; height: 3px; overflow: hidden; position: relative; border-radius: 99px; background: rgba(0, 0, 0, .06); }
 .event-track i { position: absolute; width: 26%; height: 100%; background: linear-gradient(90deg, transparent, #34c759, transparent); animation: track 2.6s linear infinite; }
+.monitor-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.monitor-heading > div { display: flex; align-items: baseline; gap: 8px; }
+.monitor-heading strong { color: rgba(0, 0, 0, .72); font-size: 11.5px; }
+.monitor-heading button { padding: 4px 10px; border: 1px solid rgba(0, 0, 0, .1); border-radius: 999px; background: rgba(255, 255, 255, .62); cursor: pointer; color: rgba(0, 0, 0, .58); font-size: 10px; font-weight: 700; }
+.runtime-monitor-grid { margin-top: 10px; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.monitor-item { min-width: 0; padding: 9px 10px; border: 1px solid rgba(255, 255, 255, .82); border-radius: 12px; background: rgba(255, 255, 255, .52); }
+.monitor-item span { display: block; color: rgba(0, 0, 0, .4); font-size: 9px; }
+.monitor-item strong { display: block; margin-top: 3px; overflow: hidden; color: rgba(0, 0, 0, .72); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.monitor-item strong.ready { color: #1e9e46; }
+.monitor-item strong.warning { color: #c87912; }
+.monitor-loading { grid-column: 1 / -1; padding: 10px; text-align: center; }
 
 .settings-section-heading, .metrics-heading > div { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; }
 .settings-section-heading h3, .metrics-heading h3 { margin: 0; font-size: 14px; }
@@ -547,6 +558,7 @@ button { color: inherit; }
   .glass-panel { min-height: 460px; }
   .runtime-card { grid-template-columns: auto 1fr; }
   .runtime-actions { grid-column: 1 / -1; }
+  .runtime-monitor-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .reminder-row, .retention-row { align-items: flex-start; flex-wrap: wrap; }
   .segmented-options { width: 100%; margin-left: 38px; }
   .metrics-summary { grid-template-columns: repeat(2, 1fr); }

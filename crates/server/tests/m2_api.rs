@@ -271,6 +271,56 @@ fn embedded_ui_contract_is_small_honest_and_complete() {
     assert!(APP_CSS.contains("settings-page"));
     assert!(APP_CSS.contains("reminder-row"));
     assert!(APP_JS.contains("/api/v1/runtime/restart"));
+    assert!(APP_JS.contains("/api/v1/runtime/status"));
+    assert!(APP_JS.contains("crypto.randomUUID()"));
+    assert!(APP_JS.contains("health.instanceId !== previousInstanceId"));
+    assert!(INDEX_HTML.contains("本机健康监控"));
+    assert!(INDEX_HTML.contains("重启 Runtime"));
+    assert!(!INDEX_HTML.contains("重连 Hook"));
+}
+
+#[test]
+fn health_monitor_is_authenticated_and_restart_input_is_strict() {
+    let (root, _store, _waiters, server) = start("runtime-health");
+    let address = server.address();
+    let origin = server.origin();
+
+    let public = request(address, "GET", "/api/v1/health", &[], None);
+    assert_eq!(public.status, 200);
+    assert_eq!(public.body["ok"], true);
+    assert!(Uuid::parse_str(public.body["instanceId"].as_str().unwrap()).is_ok());
+    assert_eq!(
+        request(address, "GET", "/api/v1/runtime/status", &[], None).status,
+        401
+    );
+
+    let (cookie, csrf) = authenticate(&server);
+    let status = request(
+        address,
+        "GET",
+        "/api/v1/runtime/status",
+        &[("Cookie", &cookie)],
+        None,
+    );
+    assert_eq!(status.status, 200);
+    assert_eq!(status.body["instanceId"], public.body["instanceId"]);
+    assert_eq!(status.body["pid"], std::process::id());
+    assert_eq!(status.body["api"]["status"], "ready");
+    assert_eq!(status.body["storage"]["status"], "ready");
+    assert_eq!(status.body["restart"]["count"], 0);
+
+    let invalid = request(
+        address,
+        "POST",
+        "/api/v1/runtime/restart",
+        &auth_headers(&origin, &cookie, &csrf),
+        Some(&json!({ "restartToken": "not-a-uuid" })),
+    );
+    assert_eq!(invalid.status, 400);
+    assert_eq!(invalid.body["error"]["code"], "INVALID_RESTART_TOKEN");
+
+    drop(server);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

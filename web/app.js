@@ -49,6 +49,8 @@ const ui = {
   runtimeMonitor: document.querySelector("#runtime-monitor"),
   runtimeRestart: document.querySelector("#runtime-restart"),
   runtimeMonitorDetails: document.querySelector("#runtime-monitor-details"),
+  runtimeMonitorGrid: document.querySelector("#runtime-monitor-grid"),
+  runtimeMonitorRefresh: document.querySelector("#runtime-monitor-refresh"),
   reminderRows: [...document.querySelectorAll(".reminder-row[data-rule]")],
   retentionOptions: [...document.querySelectorAll(".retention-options button")],
   wipeConfirmation: document.querySelector("#wipe-confirmation"),
@@ -105,6 +107,9 @@ let setupRefreshTimer;
 let lastSocketFrameAt = 0;
 let lastSnapshotAt = 0;
 let fallbackSnapshotInFlight = false;
+let restartInProgress = false;
+let runtimeMonitorInFlight = false;
+let lastRuntimeMonitorAt = 0;
 let hiddenSessions = JSON.parse(localStorage.getItem("flowAgentHiddenSessions") || "{}");
 const SESSION_VISIBLE_FOR_MS = 30 * 60 * 1000;
 const SOCKET_STALE_AFTER_MS = 25 * 1000;
@@ -1670,12 +1675,17 @@ async function recordUiMetric(event) {
   }
 }
 
-async function bootstrap() {
-  const token = new URLSearchParams(location.hash.slice(1)).get("bootstrap");
-  if (!token) return false;
+async function bootstrapWithToken(token) {
   const response = await api("/api/v1/bootstrap", { method: "POST", body: JSON.stringify({ token }) });
   csrfToken = response.csrfToken;
   sessionStorage.setItem("flowAgentCsrf", csrfToken);
+  return true;
+}
+
+async function bootstrap() {
+  const token = new URLSearchParams(location.hash.slice(1)).get("bootstrap");
+  if (!token) return false;
+  await bootstrapWithToken(token);
   history.replaceState(null, "", `${location.pathname}${location.search}`);
   return true;
 }
@@ -1712,7 +1722,7 @@ function scheduleSetupRefresh() {
 }
 
 function connectSocket() {
-  if (!csrfToken) return;
+  if (!csrfToken || restartInProgress) return;
   if (socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(socket.readyState)) return;
   window.clearTimeout(reconnectTimer);
   reconnectTimer = undefined;
@@ -1745,6 +1755,7 @@ function connectSocket() {
     if (socket !== currentSocket) return;
     socket = undefined;
     setConnected(false);
+    if (restartInProgress) return;
     reconnectTimer = window.setTimeout(connectSocket, reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 2, 10000);
   });
@@ -1764,7 +1775,7 @@ async function refreshSnapshotFallback() {
 }
 
 function maintainLiveConnection() {
-  if (document.visibilityState !== "visible") return;
+  if (document.visibilityState !== "visible" || restartInProgress) return;
   const now = Date.now();
   if (socket?.readyState === WebSocket.OPEN && now - lastSocketFrameAt > SOCKET_STALE_AFTER_MS) {
     socket.close();
@@ -1840,21 +1851,136 @@ function chooseRetention(value) {
   saveSettings();
 }
 
-async function restartRuntime() {
-  ui.runtimeRestart.disabled = true;
-  ui.runtimeRestart.textContent = "重启中…";
-  setConnected(false);
+function monitorItem(label, value, status = "") {
+  const item = element("div", "monitor-item");
+  item.append(element("span", "", label), element("strong", status, value));
+  return item;
+}
+
+function renderRuntimeMonitor(status) {
+  const hookStatus = {
+    ready: ["Hook 通道正常", "ready"],
+    insecure: ["Socket 权限异常", "warning"],
+    missing: ["Hook 通道缺失", "warning"],
+    invalid: ["Socket 类型异常", "warning"],
+    unavailable: ["Hook 通道不可用", "warning"],
+  }[status.hook?.status] || ["Hook 状态未知", "warning"];
+  const lastHook = status.hook?.lastEventAt
+    ? `${elapsedText(status.hook.lastEventAt)}前`
+    : "尚无真实事件";
+  const restartResult = status.restart?.lastResult === "recovered"
+    ? `已恢复 · ${status.restart.count} 次`
+    : "本次启动未重启";
+  ui.runtimeMonitorGrid.replaceChildren(
+    monitorItem("Runtime", `PID ${status.pid} · ${status.version}`, "ready"),
+    monitorItem("运行时间", elapsedText(status.startedAt)),
+    monitorItem("本地 API", status.api?.status === "ready" ? "在线" : "异常", status.api?.status === "ready" ? "ready" : "warning"),
+    monitorItem("WebSocket", `${status.websocket?.connections || 0} 个连接`, "ready"),
+    monitorItem(status.hook?.name || "bridge.sock", hookStatus[0], hookStatus[1]),
+    monitorItem("最近 Hook", lastHook),
+    monitorItem("任务 / 待处理", `${status.sessions?.active || 0} 活跃 · ${status.attention?.pending || 0} 待处理`),
+    monitorItem("SQLite / 重启", `${status.storage?.eventCount || 0} 事件 · ${restartResult}`, "ready"),
+  );
+}
+
+async function loadRuntimeMonitor() {
+  if (runtimeMonitorInFlight || ui.runtimeMonitorDetails.hidden) return;
+  runtimeMonitorInFlight = true;
+  ui.runtimeMonitorRefresh.disabled = true;
   try {
-    await api("/api/v1/runtime/restart", { method: "POST", body: "{}" });
-    await loadSnapshot();
-    setConnected(true);
-    showToast("Runtime 已重启 · bridge.sock 已重连");
+    renderRuntimeMonitor(await api("/api/v1/runtime/status"));
+    lastRuntimeMonitorAt = Date.now();
   } catch (error) {
-    setConnected(socket?.readyState === WebSocket.OPEN);
-    showToast(`Runtime 重启失败：${error.message}`);
+    ui.runtimeMonitorGrid.replaceChildren(element("span", "monitor-loading", `监控读取失败：${error.message}`));
+  } finally {
+    runtimeMonitorInFlight = false;
+    ui.runtimeMonitorRefresh.disabled = false;
+  }
+}
+
+async function readPublicHealth() {
+  const response = await fetch("/api/v1/health", { cache: "no-store", credentials: "same-origin" });
+  if (!response.ok) throw new Error(`HEALTH_${response.status}`);
+  return response.json();
+}
+
+async function waitForRuntimeRestart(previousInstanceId, restartToken) {
+  const deadline = Date.now() + 20000;
+  while (Date.now() < deadline) {
+    let health;
+    try {
+      health = await readPublicHealth();
+    } catch (_) {
+      // The old listener must disappear before the same port can be rebound.
+    }
+    if (health?.instanceId && health.instanceId !== previousInstanceId) {
+      csrfToken = undefined;
+      sessionStorage.removeItem("flowAgentCsrf");
+      await bootstrapWithToken(restartToken);
+      await loadSnapshot();
+      await loadSetup();
+      await loadSettings();
+      return;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 250));
+  }
+  throw new Error("RESTART_TIMEOUT");
+}
+
+async function restartRuntime() {
+  if (restartInProgress) return;
+  const waiting = openItems().filter((item) => item.kind === "approval" || item.kind === "native_approval").length;
+  if (waiting > 0 && !window.confirm(`当前有 ${waiting} 个请求正在等待。重启会安全放行这些请求并重新连接 Agent。`)) return;
+  restartInProgress = true;
+  ui.runtimeRestart.disabled = true;
+  ui.runtimeRestart.textContent = "正在保存状态…";
+  const restartToken = crypto.randomUUID();
+  try {
+    const previous = await readPublicHealth();
+    let accepted;
+    try {
+      accepted = await api("/api/v1/runtime/restart", {
+        method: "POST",
+        body: JSON.stringify({ restartToken }),
+      });
+    } catch (error) {
+      // The Runtime may close the old listener after accepting the command but
+      // before the HTTP response reaches the browser. The one-time token makes
+      // it safe to continue recovery; a rejected command still times out.
+      if (!(error instanceof TypeError)) throw error;
+      accepted = { previousInstanceId: previous.instanceId };
+    }
+    const previousInstanceId = accepted.previousInstanceId || previous.instanceId;
+    window.clearTimeout(reconnectTimer);
+    reconnectTimer = undefined;
+    if (socket) {
+      const previousSocket = socket;
+      socket = undefined;
+      previousSocket.close();
+    }
+    csrfToken = undefined;
+    sessionStorage.removeItem("flowAgentCsrf");
+    setConnected(false);
+    ui.runtimeLabel.textContent = "正在重启";
+    ui.runtimeFooterLabel.textContent = "Runtime · 正在恢复";
+    ui.runtimeSettingsLabel.textContent = "本机 Runtime 正在重启";
+    ui.runtimeRestart.textContent = "正在恢复连接…";
+    await waitForRuntimeRestart(previousInstanceId, restartToken);
+    restartInProgress = false;
+    reconnectDelay = 500;
+    connectSocket();
+    setConnected(true);
+    await loadRuntimeMonitor();
+    showToast("Runtime 已重启 · Hook 通道与任务状态已恢复");
+  } catch (error) {
+    restartInProgress = false;
+    setConnected(false);
+    showToast(error.message === "RESTART_TIMEOUT"
+      ? "Runtime 未能自动恢复，请在终端重新运行 serve --open"
+      : `Runtime 重启失败：${error.message}`);
   } finally {
     ui.runtimeRestart.disabled = false;
-    ui.runtimeRestart.textContent = "重启";
+    ui.runtimeRestart.textContent = "重启 Runtime";
   }
 }
 
@@ -1919,7 +2045,9 @@ for (const button of ui.retentionOptions) {
 ui.runtimeMonitor.addEventListener("click", () => {
   ui.runtimeMonitorDetails.hidden = !ui.runtimeMonitorDetails.hidden;
   ui.runtimeMonitor.textContent = ui.runtimeMonitorDetails.hidden ? "查看监控" : "收起监控";
+  if (!ui.runtimeMonitorDetails.hidden) void loadRuntimeMonitor();
 });
+ui.runtimeMonitorRefresh.addEventListener("click", loadRuntimeMonitor);
 ui.runtimeRestart.addEventListener("click", restartRuntime);
 ui.notificationClose.addEventListener("click", () => { ui.notificationBanner.hidden = true; });
 ui.notificationView.addEventListener("click", () => {
@@ -1945,6 +2073,11 @@ function updateLiveTimes() {
   updateSessionActivity();
   updateAttentionTimes();
   updateQuotaTimes();
+  if (!ui.settingsOverlay.hidden
+      && !ui.runtimeMonitorDetails.hidden
+      && Date.now() - lastRuntimeMonitorAt >= 2000) {
+    void loadRuntimeMonitor();
+  }
 }
 
 function resumeLiveView() {

@@ -28,9 +28,11 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path as FilePath, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -75,6 +77,9 @@ const CODEX_ICON: &[u8] = include_bytes!("../../../web/assets/codex.png");
 #[derive(Debug, Clone)]
 pub struct ApiServerConfig {
     pub bind: SocketAddr,
+    pub bootstrap_token: Option<String>,
+    pub runtime_started_at: u64,
+    pub restart_count: u32,
     pub commit_delay: Duration,
     pub snapshot_interval: Duration,
     pub heartbeat_interval: Duration,
@@ -89,6 +94,9 @@ impl Default for ApiServerConfig {
     fn default() -> Self {
         Self {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            bootstrap_token: None,
+            runtime_started_at: now_millis(),
+            restart_count: 0,
             commit_delay: Duration::from_secs(3),
             snapshot_interval: Duration::from_millis(100),
             heartbeat_interval: Duration::from_secs(10),
@@ -103,25 +111,43 @@ impl Default for ApiServerConfig {
 
 #[derive(Debug, Clone)]
 pub struct RuntimeRestartHandle {
-    sender: std_mpsc::Sender<std_mpsc::Sender<Result<(), String>>>,
+    sender: std_mpsc::Sender<RuntimeRestartRequest>,
     socket_path: PathBuf,
 }
 
+#[derive(Debug)]
+pub struct RuntimeRestartRequest {
+    pub bootstrap_token: String,
+    pub api_bind: SocketAddr,
+    response_sender: std_mpsc::Sender<Result<(), String>>,
+}
+
+impl RuntimeRestartRequest {
+    pub fn respond(self, result: Result<(), String>) {
+        let _ = self.response_sender.send(result);
+    }
+}
+
 impl RuntimeRestartHandle {
-    pub fn new(
-        sender: std_mpsc::Sender<std_mpsc::Sender<Result<(), String>>>,
-        socket_path: PathBuf,
-    ) -> Self {
+    pub fn new(sender: std_mpsc::Sender<RuntimeRestartRequest>, socket_path: PathBuf) -> Self {
         Self {
             sender,
             socket_path,
         }
     }
 
-    fn request(&self) -> Result<std_mpsc::Receiver<Result<(), String>>, String> {
+    fn request(
+        &self,
+        bootstrap_token: String,
+        api_bind: SocketAddr,
+    ) -> Result<std_mpsc::Receiver<Result<(), String>>, String> {
         let (response_sender, response_receiver) = std_mpsc::channel();
         self.sender
-            .send(response_sender)
+            .send(RuntimeRestartRequest {
+                bootstrap_token,
+                api_bind,
+                response_sender,
+            })
             .map_err(|_| "Runtime 控制通道不可用".to_owned())?;
         UnixStream::connect(&self.socket_path)
             .map_err(|error| format!("无法唤醒 bridge.sock：{error}"))?;
@@ -143,6 +169,7 @@ pub struct ApiServer {
     address: SocketAddr,
     bootstrap_token: String,
     shutdown: Option<oneshot::Sender<()>>,
+    shutdown_flag: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -161,7 +188,13 @@ impl ApiServer {
                 "Flow Agent API must bind to loopback",
             )));
         }
-        let bootstrap_token = Uuid::now_v7().to_string();
+        let bootstrap_token = config
+            .bootstrap_token
+            .clone()
+            .unwrap_or_else(|| Uuid::now_v7().to_string());
+        let instance_id = Uuid::now_v7().to_string();
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let websocket_connections = Arc::new(AtomicUsize::new(0));
         let install_paths = match config.install_paths.clone() {
             Some(paths) => paths,
             None => InstallPaths::discover()
@@ -208,6 +241,12 @@ impl ApiServer {
             })),
             expected_host: address.to_string(),
             expected_origin: format!("http://{address}"),
+            api_address: address,
+            instance_id,
+            runtime_started_at: config.runtime_started_at,
+            restart_count: config.restart_count,
+            websocket_connections,
+            shutdown_flag: shutdown_flag.clone(),
             commit_delay: config.commit_delay,
             snapshot_interval: config.snapshot_interval,
             heartbeat_interval: config.heartbeat_interval,
@@ -254,6 +293,7 @@ impl ApiServer {
             address,
             bootstrap_token,
             shutdown: Some(shutdown),
+            shutdown_flag,
             thread: Some(api_thread),
         })
     }
@@ -277,6 +317,7 @@ impl ApiServer {
 
 impl Drop for ApiServer {
     fn drop(&mut self) {
+        self.shutdown_flag.store(true, Ordering::Release);
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -293,6 +334,12 @@ struct AppState {
     auth: Arc<Mutex<AuthState>>,
     expected_host: String,
     expected_origin: String,
+    api_address: SocketAddr,
+    instance_id: String,
+    runtime_started_at: u64,
+    restart_count: u32,
+    websocket_connections: Arc<AtomicUsize>,
+    shutdown_flag: Arc<AtomicBool>,
     commit_delay: Duration,
     snapshot_interval: Duration,
     heartbeat_interval: Duration,
@@ -866,6 +913,7 @@ fn router(state: AppState) -> Router {
         .route("/assets/claude.png", get(claude_icon))
         .route("/assets/codex.png", get(codex_icon))
         .route("/api/v1/health", get(health))
+        .route("/api/v1/runtime/status", get(runtime_status))
         .route("/api/v1/runtime/restart", post(restart_runtime))
         .route("/api/v1/bootstrap", post(bootstrap))
         .route("/api/v1/snapshot", get(snapshot))
@@ -935,14 +983,134 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
     Json(json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
-        "protocolVersion": 1
+        "protocolVersion": 1,
+        "instanceId": state.instance_id,
     }))
     .into_response()
 }
 
-async fn restart_runtime(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn runtime_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&state, &headers) {
+        return api_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED");
+    }
+    let snapshot = match state.store.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return api_error_detail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "STORAGE_ERROR",
+                &error.to_string(),
+            )
+        }
+    };
+    let active_sessions = snapshot
+        .sessions
+        .iter()
+        .filter(|session| {
+            !matches!(
+                session.exec_state.as_str(),
+                "idle" | "response_finished" | "failed"
+            )
+        })
+        .count();
+    let pending_attention = snapshot
+        .attention
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.state.as_str(),
+                "open" | "committing" | "decision_sent" | "snoozed"
+            )
+        })
+        .count();
+    let last_hook_event_at = snapshot
+        .sessions
+        .iter()
+        .map(|session| session.last_event_at)
+        .max();
+    let waiter_count = state
+        .waiters
+        .active_request_ids()
+        .map(|ids| ids.len())
+        .unwrap_or_default();
+    let (bridge_status, bridge_name, bridge_private) = state
+        .runtime_restart
+        .as_ref()
+        .map(|handle| {
+            let name = handle
+                .socket_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("bridge.sock")
+                .to_owned();
+            match fs::symlink_metadata(&handle.socket_path) {
+                Ok(metadata) if metadata.file_type().is_socket() => {
+                    let private = metadata.permissions().mode() & 0o077 == 0;
+                    (if private { "ready" } else { "insecure" }, name, private)
+                }
+                Ok(_) => ("invalid", name, false),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => ("missing", name, false),
+                Err(_) => ("unavailable", name, false),
+            }
+        })
+        .unwrap_or(("unavailable", "bridge.sock".to_owned(), false));
+    Json(json!({
+        "schemaVersion": 1,
+        "instanceId": state.instance_id,
+        "pid": std::process::id(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "startedAt": state.runtime_started_at,
+        "uptimeMs": now_millis().saturating_sub(state.runtime_started_at),
+        "api": {
+            "status": "ready",
+            "address": state.api_address.to_string(),
+        },
+        "websocket": {
+            "status": "ready",
+            "connections": state.websocket_connections.load(Ordering::Acquire),
+        },
+        "hook": {
+            "status": bridge_status,
+            "name": bridge_name,
+            "private": bridge_private,
+            "lastEventAt": last_hook_event_at,
+        },
+        "sessions": {
+            "active": active_sessions,
+            "total": snapshot.sessions.len(),
+        },
+        "attention": {
+            "pending": pending_attention,
+            "waiters": waiter_count,
+        },
+        "storage": {
+            "status": "ready",
+            "eventCount": snapshot.event_count,
+        },
+        "restart": {
+            "count": state.restart_count,
+            "lastResult": if state.restart_count > 0 { "recovered" } else { "not_restarted" },
+        }
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RestartRuntimeRequest {
+    restart_token: String,
+}
+
+async fn restart_runtime(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RestartRuntimeRequest>,
+) -> Response {
     if !authorized_mutation(&state, &headers) {
         return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_MUTATION");
+    }
+    if Uuid::parse_str(&request.restart_token).is_err() {
+        return api_error(StatusCode::BAD_REQUEST, "INVALID_RESTART_TOKEN");
     }
     let Some(handle) = state.runtime_restart.as_ref() else {
         return api_error(
@@ -950,7 +1118,8 @@ async fn restart_runtime(State(state): State<AppState>, headers: HeaderMap) -> R
             "RUNTIME_RESTART_UNAVAILABLE",
         );
     };
-    let receiver = match handle.request() {
+    let bootstrap_token = request.restart_token;
+    let receiver = match handle.request(bootstrap_token.clone(), state.api_address) {
         Ok(receiver) => receiver,
         Err(error) => {
             return api_error_detail(
@@ -961,7 +1130,12 @@ async fn restart_runtime(State(state): State<AppState>, headers: HeaderMap) -> R
         }
     };
     match receiver.recv_timeout(Duration::from_secs(3)) {
-        Ok(Ok(())) => Json(json!({ "ok": true, "bridge": "restarted" })).into_response(),
+        Ok(Ok(())) => Json(json!({
+            "ok": true,
+            "restartToken": bootstrap_token,
+            "previousInstanceId": state.instance_id,
+        }))
+        .into_response(),
         Ok(Err(error)) => api_error_detail(
             StatusCode::INTERNAL_SERVER_ERROR,
             "RUNTIME_RESTART_FAILED",
@@ -2099,10 +2273,29 @@ async fn websocket(
         .into_response()
 }
 
+struct WebSocketConnectionGuard(Arc<AtomicUsize>);
+
+impl WebSocketConnectionGuard {
+    fn new(connections: Arc<AtomicUsize>) -> Self {
+        connections.fetch_add(1, Ordering::AcqRel);
+        Self(connections)
+    }
+}
+
+impl Drop for WebSocketConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 async fn websocket_loop(mut socket: WebSocket, state: AppState) {
+    let _connection = WebSocketConnectionGuard::new(state.websocket_connections.clone());
     let mut last_payload = String::new();
     let mut last_heartbeat = Instant::now();
-    while let Ok(snapshot) = snapshot_value(&state) {
+    while !state.shutdown_flag.load(Ordering::Acquire) {
+        let Ok(snapshot) = snapshot_value(&state) else {
+            break;
+        };
         let payload = json!({ "type": "snapshot", "snapshot": snapshot }).to_string();
         if payload != last_payload {
             if socket
@@ -2523,6 +2716,12 @@ mod tests {
             })),
             expected_host: "127.0.0.1:43111".to_owned(),
             expected_origin: "http://127.0.0.1:43111".to_owned(),
+            api_address: "127.0.0.1:43111".parse().unwrap(),
+            instance_id: "test-instance".to_owned(),
+            runtime_started_at: now_millis(),
+            restart_count: 0,
+            websocket_connections: Arc::new(AtomicUsize::new(0)),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
             commit_delay: Duration::from_secs(3),
             snapshot_interval: Duration::from_millis(250),
             heartbeat_interval: Duration::from_secs(10),

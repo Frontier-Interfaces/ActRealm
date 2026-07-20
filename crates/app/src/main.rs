@@ -15,14 +15,17 @@ use flow_agent_runtime::{
     default_database_path, ApprovalAction, DiagnosticCapture, EventSpool, RuntimeInstanceGuard,
     RuntimeStore, WaiterRegistry,
 };
-use flow_agent_server::{ApiServer, ApiServerConfig, RuntimeRestartHandle};
+use flow_agent_server::{ApiServer, ApiServerConfig, RuntimeRestartHandle, RuntimeRestartRequest};
 use flow_agent_usage::{capture_claude_statusline_usage, UsagePaths};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
-use std::os::unix::fs::FileTypeExt;
-use std::os::unix::fs::PermissionsExt;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
+use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{mpsc, Arc, Mutex};
@@ -54,6 +57,9 @@ enum Command {
         /// Open the one-time authenticated control panel in the default browser.
         #[arg(long)]
         open: bool,
+        /// Internal one-time state used to re-exec the Runtime on the same port.
+        #[arg(long, hide = true)]
+        restart_state: Option<PathBuf>,
     },
     /// Receive one provider hook payload from stdin and forward it to the runtime.
     Hook {
@@ -150,13 +156,53 @@ enum PromptInput {
     Closed,
 }
 
+#[derive(Debug, Clone)]
+struct ServeLaunch {
+    socket_path: PathBuf,
+    approval: ApprovalMode,
+    api_enabled: bool,
+    open: bool,
+    api_bind: SocketAddr,
+    bootstrap_token: Option<String>,
+    restart_count: u32,
+    restart_state_path: Option<PathBuf>,
+}
+
+enum ServeOutcome {
+    Stopped,
+    Restart(PathBuf),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RestartState {
+    schema_version: u32,
+    created_at: u64,
+    socket_path: PathBuf,
+    approval: String,
+    api_enabled: bool,
+    api_bind: SocketAddr,
+    bootstrap_token: String,
+    restart_count: u32,
+}
+
+const RESTART_STATE_MAX_BYTES: u64 = 16 * 1024;
+const RESTART_STATE_TTL_MS: u64 = 30_000;
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Serve {
             approval,
             socket,
             open,
-        } => serve(socket.unwrap_or_else(default_socket_path), approval, open),
+            restart_state,
+        } => {
+            let launch = load_serve_launch(socket, approval, open, restart_state)?;
+            match serve(launch)? {
+                ServeOutcome::Stopped => Ok(()),
+                ServeOutcome::Restart(state_path) => replace_runtime_process(&state_path),
+            }
+        }
         Command::Hook { provider, socket } => {
             // Hook failures must be silent and fail open. Parsing CLI arguments still
             // reports errors because malformed installation is an operator error.
@@ -1060,7 +1106,138 @@ fn ensure_provider_available(provider: HookProvider) -> Result<()> {
     Ok(())
 }
 
-fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()> {
+fn approval_mode_name(mode: ApprovalMode) -> &'static str {
+    match mode {
+        ApprovalMode::Widget => "widget",
+        ApprovalMode::Prompt => "prompt",
+        ApprovalMode::Allow => "allow",
+        ApprovalMode::Deny => "deny",
+        ApprovalMode::PassThrough => "pass-through",
+    }
+}
+
+fn parse_approval_mode(value: &str) -> Result<ApprovalMode> {
+    match value {
+        "widget" => Ok(ApprovalMode::Widget),
+        "prompt" => Ok(ApprovalMode::Prompt),
+        "allow" => Ok(ApprovalMode::Allow),
+        "deny" => Ok(ApprovalMode::Deny),
+        "pass-through" => Ok(ApprovalMode::PassThrough),
+        _ => anyhow::bail!("restart state contains an invalid approval mode"),
+    }
+}
+
+fn load_serve_launch(
+    socket: Option<PathBuf>,
+    approval: ApprovalMode,
+    open: bool,
+    restart_state_path: Option<PathBuf>,
+) -> Result<ServeLaunch> {
+    let Some(state_path) = restart_state_path else {
+        return Ok(ServeLaunch {
+            socket_path: socket.unwrap_or_else(default_socket_path),
+            approval,
+            api_enabled: approval == ApprovalMode::Widget || open,
+            open,
+            api_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            bootstrap_token: None,
+            restart_count: 0,
+            restart_state_path: None,
+        });
+    };
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&state_path)
+        .with_context(|| format!("failed to open restart state {}", state_path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect restart state {}", state_path.display()))?;
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.len() > RESTART_STATE_MAX_BYTES
+    {
+        anyhow::bail!("restart state is not a private bounded regular file");
+    }
+    let mut payload = Vec::new();
+    file.take(RESTART_STATE_MAX_BYTES + 1)
+        .read_to_end(&mut payload)
+        .context("failed to read restart state")?;
+    if payload.len() as u64 > RESTART_STATE_MAX_BYTES {
+        anyhow::bail!("restart state exceeds the size limit");
+    }
+    let state: RestartState =
+        serde_json::from_slice(&payload).context("failed to parse restart state")?;
+    let now = now_millis();
+    if state.schema_version != 1
+        || !state.api_enabled
+        || now.saturating_sub(state.created_at) > RESTART_STATE_TTL_MS
+        || state.created_at > now.saturating_add(5_000)
+        || !state.api_bind.ip().is_loopback()
+        || state.api_bind.port() == 0
+        || Uuid::parse_str(&state.bootstrap_token).is_err()
+    {
+        anyhow::bail!("restart state is invalid or expired");
+    }
+    Ok(ServeLaunch {
+        socket_path: state.socket_path,
+        approval: parse_approval_mode(&state.approval)?,
+        api_enabled: state.api_enabled,
+        open: false,
+        api_bind: state.api_bind,
+        bootstrap_token: Some(state.bootstrap_token),
+        restart_count: state.restart_count,
+        restart_state_path: Some(state_path),
+    })
+}
+
+fn write_restart_state(
+    paths: &RuntimePaths,
+    launch: &ServeLaunch,
+    bootstrap_token: &str,
+    api_bind: SocketAddr,
+) -> Result<PathBuf> {
+    let directory = paths
+        .lock
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("runtime lock has no parent directory"))?;
+    let state_path = directory.join(format!("restart-{}.json", Uuid::now_v7()));
+    let state = RestartState {
+        schema_version: 1,
+        created_at: now_millis(),
+        socket_path: launch.socket_path.clone(),
+        approval: approval_mode_name(launch.approval).to_owned(),
+        api_enabled: launch.api_enabled,
+        api_bind,
+        bootstrap_token: bootstrap_token.to_owned(),
+        restart_count: launch.restart_count.saturating_add(1),
+    };
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&state_path)
+        .with_context(|| format!("failed to create {}", state_path.display()))?;
+    serde_json::to_writer(&mut file, &state).context("failed to encode restart state")?;
+    file.sync_all().context("failed to sync restart state")?;
+    Ok(state_path)
+}
+
+fn replace_runtime_process(state_path: &Path) -> Result<()> {
+    let executable = std::env::current_exe().context("failed to locate Runtime executable")?;
+    let error = std::process::Command::new(executable)
+        .arg("serve")
+        .arg("--restart-state")
+        .arg(state_path)
+        .exec();
+    let _ = fs::remove_file(state_path);
+    Err(error).context("failed to replace Runtime process")
+}
+
+fn serve(launch: ServeLaunch) -> Result<ServeOutcome> {
+    let socket_path = launch.socket_path.clone();
+    let approval = launch.approval;
+    let open = launch.open;
     validate_socket_path(&socket_path).context("invalid runtime socket path")?;
     let paths = runtime_paths(&socket_path);
     let _instance = RuntimeInstanceGuard::acquire(&paths.lock)
@@ -1082,21 +1259,25 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()>
     store
         .reconcile_orphaned_approvals(Vec::new(), now_millis())
         .context("failed to reconcile stale approvals")?;
-    let diagnostics = DiagnosticCapture::new(paths.diagnostics);
+    let diagnostics = DiagnosticCapture::new(paths.diagnostics.clone());
     let _ = diagnostics.status(now_millis());
-    let spool = EventSpool::new(paths.spool);
+    let spool = EventSpool::new(paths.spool.clone());
     let _ = spool.drain(|request| store.ingest(request).is_ok());
-    let mut listener = BridgeListener::bind(&socket_path)
+    let listener = BridgeListener::bind(&socket_path)
         .with_context(|| format!("failed to bind {}", socket_path.display()))?;
     let waiters = WaiterRegistry::default();
-    let (restart_sender, restart_receiver) =
-        mpsc::channel::<mpsc::Sender<std::result::Result<(), String>>>();
-    let api = if approval == ApprovalMode::Widget || open {
+    let (restart_sender, restart_receiver) = mpsc::channel::<RuntimeRestartRequest>();
+    let runtime_started_at = now_millis();
+    let api = if launch.api_enabled {
         Some(
             ApiServer::start(
                 store.clone(),
                 waiters.clone(),
                 ApiServerConfig {
+                    bind: launch.api_bind,
+                    bootstrap_token: launch.bootstrap_token.clone(),
+                    runtime_started_at,
+                    restart_count: launch.restart_count,
                     commit_delay: commit_delay(),
                     enable_codex_connector: true,
                     enable_claude_oauth_quota: true,
@@ -1112,6 +1293,10 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()>
     } else {
         None
     };
+    if let Some(state_path) = launch.restart_state_path.as_ref() {
+        fs::remove_file(state_path)
+            .with_context(|| format!("failed to consume {}", state_path.display()))?;
+    }
     let mut runtime_output = io::stdout().lock();
     if let Some(api) = api.as_ref() {
         let _ = writeln!(
@@ -1152,30 +1337,27 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()>
         let Some(stream) = listener.incoming().next() else {
             break;
         };
-        if let Ok(response_sender) = restart_receiver.try_recv() {
+        if let Ok(request) = restart_receiver.try_recv() {
             drop(stream);
+            let state_path = match write_restart_state(
+                &paths,
+                &launch,
+                &request.bootstrap_token,
+                request.api_bind,
+            ) {
+                Ok(path) => path,
+                Err(error) => {
+                    request.respond(Err(error.to_string()));
+                    continue;
+                }
+            };
             for request_id in waiters.active_request_ids().unwrap_or_default() {
                 let _ = waiters.pass_through(request_id, "runtime_restart");
             }
             let _ = store.reconcile_orphaned_approvals(Vec::new(), now_millis());
-            drop(listener);
-            match BridgeListener::bind(&socket_path) {
-                Ok(restarted) => {
-                    listener = restarted;
-                    let _ = response_sender.send(Ok(()));
-                }
-                Err(error) => {
-                    let detail = error.to_string();
-                    let _ = response_sender.send(Err(detail.clone()));
-                    return Err(error).with_context(|| {
-                        format!(
-                            "failed to restart bridge at {}: {detail}",
-                            socket_path.display()
-                        )
-                    });
-                }
-            }
-            continue;
+            request.respond(Ok(()));
+            thread::sleep(Duration::from_millis(250));
+            return Ok(ServeOutcome::Restart(state_path));
         }
         let Ok(mut stream) = stream else { continue };
         let prompt_lock = Arc::clone(&prompt_lock);
@@ -1325,7 +1507,7 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()>
             }
         });
     }
-    Ok(())
+    Ok(ServeOutcome::Stopped)
 }
 
 fn prompt_input_channel() -> Arc<Mutex<mpsc::Receiver<PromptInput>>> {
@@ -1611,6 +1793,36 @@ fn now_millis() -> u64 {
 mod tests {
     use super::*;
 
+    fn restart_state_file(name: &str, created_at: u64, mode: u32) -> PathBuf {
+        let root = PathBuf::from("/tmp").join(format!(
+            "flow-agent-restart-state-{name}-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.json");
+        let state = RestartState {
+            schema_version: 1,
+            created_at,
+            socket_path: root.join("bridge.sock"),
+            approval: "widget".to_owned(),
+            api_enabled: true,
+            api_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 43121),
+            bootstrap_token: Uuid::now_v7().to_string(),
+            restart_count: 3,
+        };
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(mode)
+            .open(&path)
+            .unwrap();
+        serde_json::to_writer(&mut file, &state).unwrap();
+        file.sync_all().unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
     #[test]
     fn p0_permission_deadlines_allow_real_human_response_time() {
         assert_eq!(
@@ -1625,5 +1837,73 @@ mod tests {
             default_reply_timeout(Provider::Gemini),
             Duration::from_millis(200)
         );
+    }
+
+    #[test]
+    fn private_restart_state_restores_exact_runtime_contract() {
+        let opened = load_serve_launch(None, ApprovalMode::PassThrough, true, None).unwrap();
+        assert!(opened.api_enabled);
+        let path = restart_state_file("valid", now_millis(), 0o600);
+        let launch = load_serve_launch(None, ApprovalMode::Deny, true, Some(path.clone())).unwrap();
+        assert_eq!(launch.approval, ApprovalMode::Widget);
+        assert!(launch.api_enabled);
+        assert!(!launch.open);
+        assert_eq!(launch.api_bind.port(), 43121);
+        assert_eq!(launch.restart_count, 3);
+        assert!(launch.bootstrap_token.is_some());
+        assert_eq!(launch.restart_state_path.as_deref(), Some(path.as_path()));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn stale_or_public_restart_state_is_rejected() {
+        let public = restart_state_file("public", now_millis(), 0o644);
+        assert!(
+            load_serve_launch(None, ApprovalMode::Widget, false, Some(public.clone())).is_err()
+        );
+        fs::remove_dir_all(public.parent().unwrap()).unwrap();
+
+        let stale = restart_state_file(
+            "stale",
+            now_millis().saturating_sub(RESTART_STATE_TTL_MS + 1),
+            0o600,
+        );
+        assert!(load_serve_launch(None, ApprovalMode::Widget, false, Some(stale.clone())).is_err());
+        fs::remove_dir_all(stale.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn restart_state_never_changes_a_custom_socket_parent_mode() {
+        let root = PathBuf::from("/tmp").join(format!(
+            "flow-agent-restart-parent-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let socket = root.join("bridge.sock");
+        let paths = runtime_paths(&socket);
+        let launch = ServeLaunch {
+            socket_path: socket,
+            approval: ApprovalMode::Widget,
+            api_enabled: true,
+            open: false,
+            api_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 43121),
+            bootstrap_token: None,
+            restart_count: 0,
+            restart_state_path: None,
+        };
+        let state_path = write_restart_state(
+            &paths,
+            &launch,
+            &Uuid::now_v7().to_string(),
+            launch.api_bind,
+        )
+        .unwrap();
+        let parent_mode = fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        let state_mode = fs::metadata(&state_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(parent_mode, 0o755);
+        assert_eq!(state_mode, 0o600);
+        fs::remove_dir_all(root).unwrap();
     }
 }

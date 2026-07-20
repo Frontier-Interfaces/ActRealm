@@ -103,10 +103,16 @@
         </div>
         <div class="runtime-actions">
           <button id="runtime-monitor" type="button">查看监控</button>
-          <button class="primary" id="runtime-restart" type="button">重启</button>
+          <button class="primary" id="runtime-restart" type="button">重启 Runtime</button>
         </div>
         <div class="event-channel" id="runtime-monitor-details" hidden>
-          <strong>事件通道</strong><span class="event-track"><i></i></span><span>实时 · 无遥测</span>
+          <div class="monitor-heading">
+            <div><strong>本机健康监控</strong><span>实时读取，不发送遥测</span></div>
+            <button id="runtime-monitor-refresh" type="button">刷新</button>
+          </div>
+          <div class="runtime-monitor-grid" id="runtime-monitor-grid" aria-live="polite">
+            <span class="monitor-loading">正在读取 Runtime 状态…</span>
+          </div>
         </div>
       </section>
 
