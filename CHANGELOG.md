@@ -6,6 +6,14 @@ published a final v1 release; entries below describe development milestones on
 
 ## Unreleased - M14 accepted candidate
 
+### Post-M14 - Codex internal-session filtering
+
+- Discards Codex App overview-suggestion and safety-review background sessions
+  at Runtime ingest instead of storing or displaying them as Agent tasks.
+- Removes the provisional `SessionStart` row and metric when a later prompt
+  identifies an internal session, then suppresses its remaining lifecycle
+  across Runtime restarts without adding a session visibility state.
+
 ### Post-M14 - Live state and controlled Runtime recovery
 
 - Adds WebSocket heartbeats, stale-connection detection, bounded snapshot

@@ -712,10 +712,22 @@ fn handle_codex_server_request(
             return;
         }
     };
-    if store.ingest(bridge_request.clone()).is_err() {
-        let _ = waiters.pass_through(request_id, "runtime_error");
-        let _ = connector.respond_error(request.id, -32000, "ActRealm storage unavailable");
-        return;
+    match store.ingest(bridge_request.clone()) {
+        Ok(result) if result.suppressed => {
+            let _ = waiters.pass_through(request_id, "provider_internal");
+            let _ = connector.respond_error(
+                request.id,
+                -32001,
+                "Internal Codex session is not exposed to ActRealm",
+            );
+            return;
+        }
+        Ok(_) => {}
+        Err(_) => {
+            let _ = waiters.pass_through(request_id, "runtime_error");
+            let _ = connector.respond_error(request.id, -32000, "ActRealm storage unavailable");
+            return;
+        }
     }
     let managed = if let Ok(mut current) = state.lock() {
         current.managed.insert(thread_id.clone());

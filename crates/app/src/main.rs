@@ -1428,6 +1428,16 @@ fn serve(launch: ServeLaunch) -> Result<ServeOutcome> {
                     return;
                 }
             };
+            if ingest_result.suppressed {
+                if let Some(registration) = registration {
+                    let request_id = request.request_id.unwrap_or(request.id);
+                    let _ = waiters.pass_through(request_id, "provider_internal");
+                    if let Ok(response) = registration.ticket.recv_timeout(Duration::from_secs(1)) {
+                        let _ = BridgeListener::write_response(&mut stream, &response);
+                    }
+                }
+                return;
+            }
             for resolved_request_id in ingest_result.resolved_request_ids {
                 let _ = waiters.pass_through(resolved_request_id, "provider_handled");
             }
