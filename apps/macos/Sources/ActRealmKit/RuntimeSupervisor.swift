@@ -66,16 +66,50 @@ public final class RuntimeSupervisor: ObservableObject {
     /// The packaged helper inside the .app bundle, if present.
     public nonisolated static func bundledHelper() -> URL? {
         let bundle = Bundle.main
-        if let helper = bundle.url(forAuxiliaryExecutable: "actrealm"),
-           FileManager.default.isExecutableFile(atPath: helper.path) {
-            return helper
+        return resolveBundledHelper(
+            bundleURL: bundle.bundleURL,
+            mainExecutableURL: bundle.executableURL,
+            auxiliaryExecutableURL: bundle.url(forAuxiliaryExecutable: "actrealm")
+        )
+    }
+
+    nonisolated static func resolveBundledHelper(
+        bundleURL: URL,
+        mainExecutableURL: URL?,
+        auxiliaryExecutableURL: URL?,
+        fileManager: FileManager = .default
+    ) -> URL? {
+        let packagedHelper = bundleURL.appendingPathComponent("Contents/Helpers/actrealm")
+        if fileManager.isExecutableFile(atPath: packagedHelper.path) {
+            return packagedHelper
         }
-        let helpersDir = bundle.bundleURL
-            .appendingPathComponent("Contents/Helpers/actrealm")
-        if FileManager.default.isExecutableFile(atPath: helpersDir.path) {
-            return helpersDir
+
+        guard let auxiliaryExecutableURL,
+              fileManager.isExecutableFile(atPath: auxiliaryExecutableURL.path),
+              !refersToSameFile(auxiliaryExecutableURL, mainExecutableURL, fileManager: fileManager)
+        else { return nil }
+        return auxiliaryExecutableURL
+    }
+
+    private nonisolated static func refersToSameFile(
+        _ candidate: URL,
+        _ mainExecutable: URL?,
+        fileManager: FileManager
+    ) -> Bool {
+        guard let mainExecutable else { return false }
+        if candidate.standardizedFileURL == mainExecutable.standardizedFileURL {
+            return true
         }
-        return nil
+
+        guard let candidateAttributes = try? fileManager.attributesOfItem(atPath: candidate.path),
+              let mainAttributes = try? fileManager.attributesOfItem(atPath: mainExecutable.path),
+              let candidateDevice = candidateAttributes[.systemNumber] as? NSNumber,
+              let mainDevice = mainAttributes[.systemNumber] as? NSNumber,
+              let candidateFile = candidateAttributes[.systemFileNumber] as? NSNumber,
+              let mainFile = mainAttributes[.systemFileNumber] as? NSNumber
+        else { return false }
+
+        return candidateDevice == mainDevice && candidateFile == mainFile
     }
 
     /// Ensures a backend binary exists (bundled helper, or a cargo release
