@@ -5,7 +5,9 @@ Last reviewed: 2026-07-20
 Source branch: `agent/v1-full`
 
 Current functional baseline: M14 plus the post-M14 live-state and controlled
-Runtime-recovery refinements on `agent/v1-full`.
+Runtime-recovery refinements on `agent/v1-full`. A subsequent usage/OAuth
+hardening candidate has passed its automated/resource gates and awaits exact
+local installation and user acceptance.
 
 This file is the short, current source of truth. The
 [implementation plan](WIDGET_V1_PLAN.md),
@@ -33,6 +35,13 @@ provide the detailed requirements and evidence.
   sessions from SQLite, rotates browser authentication, and safely expires
   non-restorable reply waiters. See the
   [verification record](POST_M14_REALTIME_RECOVERY.md).
+- **Post-M14 usage/OAuth hardening candidate:** adds source-labelled Claude and
+  Codex computed prices, OAuth expiry preflight plus bounded official-CLI
+  delegation, fixed-first cached Keychain lookup, and a bounded incremental
+  transcript accumulator. The 172-test workspace suite, zero-warning Clippy,
+  release build, language contract, and two-minute resource gate pass; exact
+  local-candidate installation and user acceptance are still pending. See the
+  [verification record](POST_M14_USAGE_OAUTH_HARDENING.md).
 - **Latest merged-tree gates:** 161 Rust workspace tests and 30 macOS client
   tests passed, with two explicit/manual Rust tests ignored; zero-warning
   Clippy, format, JavaScript syntax, release build, five-round native request
@@ -69,6 +78,7 @@ provide the detailed requirements and evidence.
 | M13 | Provider-owned approval-state coordination | Code and automated gates complete; real-Provider acceptance pending | [M13](M13_PROVIDER_STATE_COORDINATION.md) |
 | M14 | Live usage, context, price, and OAuth quota | Complete; exact release installed and accepted locally | [M14](M14_USAGE_CONTEXT_QUOTA.md) |
 | Post-M14 | Stable live rendering and controlled Runtime recovery | Implemented; merged with the ActRealm identity baseline | [verification](POST_M14_REALTIME_RECOVERY.md) |
+| Post-M14 | Usage, pricing, and OAuth hardening | Full automated/resource gates pass; exact local installation and user acceptance pending | [verification](POST_M14_USAGE_OAUTH_HARDENING.md) |
 
 M5 is a release-qualification track, not the chronological end of feature
 development. Later functional milestones may be implemented while M5's

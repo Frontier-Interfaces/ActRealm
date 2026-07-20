@@ -21,6 +21,9 @@ and a safe path back to the work.
 > **Project status:** functional implementation is complete through M14 plus
 > post-M14 live-state and controlled Runtime-recovery refinements, but the
 > current source remains a local test candidate rather than a final v1 release.
+> A further usage/OAuth hardening change has passed its automated/resource
+> gates and still requires exact-candidate local installation and user
+> acceptance.
 > Real-Provider M13 acceptance and the continuous 48-hour Runtime stability
 > gate are still pending.
 
@@ -61,6 +64,10 @@ The current build includes:
 - **privacy-bounded live usage context** with cumulative Token, current-turn
   context occupancy, an explicitly labelled API-price estimate, and background
   Claude OAuth quota refresh with local fallback;
+- **bounded usage and credential resilience** with current-picker versus
+  historical per-source offline pricing, structured model fallback,
+  incremental transcript compaction, fixed-first Keychain lookup, and
+  official-CLI OAuth expiry recovery when a Claude CLI is available;
 - **an authenticated local control surface** backed by a single Rust Runtime,
   SQLite persistence, WebSocket updates, diagnostics, and local export;
 - **stable live updates and controlled recovery** with heartbeats, stale-channel
@@ -235,6 +242,7 @@ change how those tools handle data.
 - [Executable v1 acceptance contract](docs/V1_ACCEPTANCE.md)
 - [M14 live usage, context, price, and quota evidence](docs/M14_USAGE_CONTEXT_QUOTA.md)
 - [Post-M14 live-state and Runtime-recovery evidence](docs/POST_M14_REALTIME_RECOVERY.md)
+- [Post-M14 usage, pricing, and OAuth hardening](docs/POST_M14_USAGE_OAUTH_HARDENING.md)
 - [Development plan](docs/WIDGET_V1_PLAN.md)
 - [Development changelog](CHANGELOG.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)

@@ -8,6 +8,12 @@ M14 adds a privacy-bounded numeric telemetry layer for local Agent sessions. It
 does not persist prompts, assistant text, tool content, transcript paths, or
 Provider credentials.
 
+> Later refinement: OAuth expiry recovery, fixed-first Keychain lookup,
+> source-labelled offline pricing, and bounded incremental aggregation are
+> specified separately in
+> [Post-M14 usage, pricing, and OAuth hardening](POST_M14_USAGE_OAUTH_HARDENING.md).
+> This record retains the facts of the originally accepted M14 candidate.
+
 ## Delivered scope
 
 - Claude transcript JSONL is tailed incrementally. Streamed copies are

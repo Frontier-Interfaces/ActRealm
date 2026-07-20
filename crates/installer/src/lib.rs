@@ -88,7 +88,7 @@ impl ProviderAvailability {
 }
 
 pub fn discover_provider_availability(provider: HookProvider) -> ProviderAvailability {
-    let cli_path = find_executable_in_path(provider.as_str());
+    let cli_path = provider_cli_candidates(provider).into_iter().next();
     let mut desktop_app_path = None;
     let mut bundled_cli_path = None;
 
@@ -124,6 +124,43 @@ pub fn discover_provider_availability(provider: HookProvider) -> ProviderAvailab
         desktop_app_path,
         bundled_cli_path,
     }
+}
+
+/// Returns trusted, executable Provider CLI candidates in preference order.
+///
+/// GUI-launched applications often inherit a much smaller `PATH` than the
+/// user's shell. Keep the explicit environment overrides and common
+/// user-local install locations here so every ActRealm component uses the
+/// same discovery rules without invoking a shell.
+pub fn provider_cli_candidates(provider: HookProvider) -> Vec<PathBuf> {
+    let executable = provider.as_str();
+    let mut candidates = Vec::new();
+    let override_keys: &[&str] = match provider {
+        HookProvider::Claude => &["ACTREALM_CLAUDE_CLI", "CLAUDE_CLI_PATH", "CLAUDE_CODE_CLI"],
+        HookProvider::Codex => &["ACTREALM_CODEX_CLI", "CODEX_CLI_PATH"],
+    };
+    for key in override_keys {
+        if let Some(path) = env::var_os(key).map(PathBuf::from) {
+            push_executable_candidate(&mut candidates, path);
+        }
+    }
+    if let Some(paths) = env::var_os("PATH") {
+        for directory in env::split_paths(&paths) {
+            push_executable_candidate(&mut candidates, directory.join(executable));
+        }
+    }
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        push_executable_candidate(&mut candidates, home.join(".local/bin").join(executable));
+        if provider == HookProvider::Claude {
+            push_executable_candidate(&mut candidates, home.join(".claude/local").join(executable));
+        }
+    }
+    if env::var_os("ACTREALM_TEST_APPLICATIONS_PATH").is_none() {
+        for directory in ["/opt/homebrew/bin", "/usr/local/bin"] {
+            push_executable_candidate(&mut candidates, Path::new(directory).join(executable));
+        }
+    }
+    candidates
 }
 
 /// Returns whether the effective Codex profile delegates approvals to Codex's
@@ -164,13 +201,10 @@ pub fn codex_config_enables_auto_review(path: &Path) -> bool {
     })
 }
 
-fn find_executable_in_path(executable: &str) -> Option<PathBuf> {
-    env::var_os("PATH").and_then(|paths| {
-        env::split_paths(&paths).find_map(|directory| {
-            let candidate = directory.join(executable);
-            is_executable_file(&candidate).then_some(candidate)
-        })
-    })
+fn push_executable_candidate(candidates: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if is_executable_file(&candidate) && !candidates.contains(&candidate) {
+        candidates.push(candidate);
+    }
 }
 
 fn is_executable_file(path: &Path) -> bool {

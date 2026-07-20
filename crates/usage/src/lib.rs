@@ -5,13 +5,14 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -21,7 +22,8 @@ const MAX_JSONL_LINE_BYTES: u64 = 10 * 1_024 * 1_024;
 const MAX_DISCOVERED_FILES: usize = 512;
 const RECENT_FILE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
-const PRICING_SOURCE: &str = "embedded_official_snapshot_2026-07-18";
+const MAX_RECENT_CLAUDE_ENTRIES_PER_FILE: usize = 256;
+const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
@@ -42,6 +44,10 @@ pub enum UsageError {
 pub struct UsageRecord {
     pub provider: String,
     pub provider_session_id: String,
+    /// Structured Provider model identifier used for this usage sample. It is
+    /// metadata only; prompts and transcript paths are never retained here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -85,6 +91,7 @@ impl UsageRecord {
             };
         }
         replace_some!(input_tokens);
+        replace_some!(model);
         replace_some!(output_tokens);
         replace_some!(cache_read_tokens);
         replace_some!(cache_creation_tokens);
@@ -302,13 +309,120 @@ impl TokenEntry {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct TokenAccumulator {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_creation: u64,
+    entry_count: u64,
+    official_cost_count: u64,
+    official_cost_usd_micros: u64,
+    computed_cost_count: u64,
+    computed_cost_usd_micros: f64,
+}
+
+impl TokenAccumulator {
+    fn add_entry(&mut self, entry: &TokenEntry) {
+        self.input = self.input.saturating_add(entry.input);
+        self.output = self.output.saturating_add(entry.output);
+        self.cache_read = self.cache_read.saturating_add(entry.cache_read);
+        self.cache_creation = self.cache_creation.saturating_add(entry.cache_creation);
+        self.entry_count = self.entry_count.saturating_add(1);
+        let has_no_billable_tokens = entry.claude_total() == 0;
+        if let Some(cost) = entry.official_cost_usd_micros {
+            self.official_cost_count = self.official_cost_count.saturating_add(1);
+            self.official_cost_usd_micros = self.official_cost_usd_micros.saturating_add(cost);
+        } else if has_no_billable_tokens {
+            self.official_cost_count = self.official_cost_count.saturating_add(1);
+        }
+        if let Some(cost) = entry
+            .model
+            .as_deref()
+            .and_then(|model| claude_cost_micros_value(model, entry))
+        {
+            self.computed_cost_count = self.computed_cost_count.saturating_add(1);
+            self.computed_cost_usd_micros += cost;
+        } else if has_no_billable_tokens {
+            self.computed_cost_count = self.computed_cost_count.saturating_add(1);
+        }
+    }
+
+    fn remove_entry(&mut self, entry: &TokenEntry) {
+        self.input = self.input.saturating_sub(entry.input);
+        self.output = self.output.saturating_sub(entry.output);
+        self.cache_read = self.cache_read.saturating_sub(entry.cache_read);
+        self.cache_creation = self.cache_creation.saturating_sub(entry.cache_creation);
+        self.entry_count = self.entry_count.saturating_sub(1);
+        let has_no_billable_tokens = entry.claude_total() == 0;
+        if let Some(cost) = entry.official_cost_usd_micros {
+            self.official_cost_count = self.official_cost_count.saturating_sub(1);
+            self.official_cost_usd_micros = self.official_cost_usd_micros.saturating_sub(cost);
+        } else if has_no_billable_tokens {
+            self.official_cost_count = self.official_cost_count.saturating_sub(1);
+        }
+        if let Some(cost) = entry
+            .model
+            .as_deref()
+            .and_then(|model| claude_cost_micros_value(model, entry))
+        {
+            self.computed_cost_count = self.computed_cost_count.saturating_sub(1);
+            self.computed_cost_usd_micros = (self.computed_cost_usd_micros - cost).max(0.0);
+        } else if has_no_billable_tokens {
+            self.computed_cost_count = self.computed_cost_count.saturating_sub(1);
+        }
+    }
+
+    fn add_accumulator(&mut self, other: &Self) {
+        self.input = self.input.saturating_add(other.input);
+        self.output = self.output.saturating_add(other.output);
+        self.cache_read = self.cache_read.saturating_add(other.cache_read);
+        self.cache_creation = self.cache_creation.saturating_add(other.cache_creation);
+        self.entry_count = self.entry_count.saturating_add(other.entry_count);
+        self.official_cost_count = self
+            .official_cost_count
+            .saturating_add(other.official_cost_count);
+        self.official_cost_usd_micros = self
+            .official_cost_usd_micros
+            .saturating_add(other.official_cost_usd_micros);
+        self.computed_cost_count = self
+            .computed_cost_count
+            .saturating_add(other.computed_cost_count);
+        self.computed_cost_usd_micros += other.computed_cost_usd_micros;
+    }
+
+    fn official_cost(&self) -> Option<u64> {
+        (self.entry_count > 0 && self.official_cost_count == self.entry_count)
+            .then_some(self.official_cost_usd_micros)
+    }
+
+    fn computed_cost(&self) -> Option<u64> {
+        (self.entry_count > 0
+            && self.computed_cost_count == self.entry_count
+            && self.computed_cost_usd_micros.is_finite()
+            && self.computed_cost_usd_micros >= 0.0
+            && self.computed_cost_usd_micros <= u64::MAX as f64)
+            .then(|| self.computed_cost_usd_micros.round() as u64)
+    }
+
+    fn token_total(&self) -> u64 {
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_creation)
+    }
+}
+
 #[derive(Debug)]
 struct ClaudeFileState {
     offset: u64,
     size: u64,
     modified: SystemTime,
     session_id: Option<String>,
+    compacted: TokenAccumulator,
+    recent: TokenAccumulator,
     entries: HashMap<String, TokenEntry>,
+    entry_order: VecDeque<String>,
     latest_key: Option<String>,
 }
 
@@ -319,7 +433,10 @@ impl Default for ClaudeFileState {
             size: 0,
             modified: UNIX_EPOCH,
             session_id: None,
+            compacted: TokenAccumulator::default(),
+            recent: TokenAccumulator::default(),
             entries: HashMap::new(),
+            entry_order: VecDeque::new(),
             latest_key: None,
         }
     }
@@ -344,6 +461,9 @@ struct CodexFileState {
     context_window: Option<u64>,
     cumulative: Option<CodexUsage>,
     last: Option<CodexUsage>,
+    computed_cost_usd_micros: f64,
+    computed_cost_complete: bool,
+    pricing_source: Option<String>,
 }
 
 impl Default for CodexFileState {
@@ -357,6 +477,9 @@ impl Default for CodexFileState {
             context_window: None,
             cumulative: None,
             last: None,
+            computed_cost_usd_micros: 0.0,
+            computed_cost_complete: true,
+            pricing_source: None,
         }
     }
 }
@@ -472,6 +595,8 @@ fn claude_records<'a>(
     states: impl Iterator<Item = &'a ClaudeFileState>,
     now_ms: u64,
 ) -> Vec<UsageRecord> {
+    let mut states = states.collect::<Vec<_>>();
+    states.sort_by_key(|state| state.modified);
     let mut grouped = HashMap::<String, ClaudeFileState>::new();
     for state in states {
         let Some(session_id) = state.session_id.as_ref() else {
@@ -480,24 +605,10 @@ fn claude_records<'a>(
         let group = grouped.entry(session_id.clone()).or_default();
         group.session_id = Some(session_id.clone());
         group.modified = group.modified.max(state.modified);
-        for (key, entry) in &state.entries {
-            let replace = group.entries.get(key).is_none_or(|previous| {
-                (previous.is_sidechain && !entry.is_sidechain)
-                    || previous.claude_total() <= entry.claude_total()
-            });
-            if replace {
-                group.entries.insert(key.clone(), entry.clone());
-            }
-            let latest = group.latest_key.as_ref().is_none_or(|previous_key| {
-                let previous = group.entries.get(previous_key);
-                let current = group.entries.get(key);
-                match (previous, current) {
-                    (Some(previous), Some(current)) => current.timestamp >= previous.timestamp,
-                    _ => true,
-                }
-            });
-            if latest {
-                group.latest_key = Some(key.clone());
+        group.compacted.add_accumulator(&state.compacted);
+        for key in &state.entry_order {
+            if let Some(entry) = state.entries.get(key) {
+                upsert_claude_entry(group, key.clone(), entry.clone());
             }
         }
     }
@@ -695,26 +806,61 @@ fn parse_claude_tail(path: &Path, state: &mut ClaudeFileState, size: u64) {
                 .unwrap_or_default()
                 .to_owned(),
         };
-        let should_replace = state.entries.get(&key).is_none_or(|previous| {
-            (previous.is_sidechain && !entry.is_sidechain)
-                || previous.claude_total() <= entry.claude_total()
-        });
-        if should_replace {
-            state.entries.insert(key.clone(), entry);
-        }
-        let is_latest = state.latest_key.as_ref().is_none_or(|previous_key| {
-            let previous = state.entries.get(previous_key);
-            let current = state.entries.get(&key);
-            match (previous, current) {
-                (Some(previous), Some(current)) => {
-                    current.timestamp >= previous.timestamp || key == *previous_key
-                }
-                _ => true,
+        upsert_claude_entry(state, key, entry);
+    }
+}
+
+fn upsert_claude_entry(state: &mut ClaudeFileState, key: String, entry: TokenEntry) {
+    let should_replace = state.entries.get(&key).is_none_or(|previous| {
+        (previous.is_sidechain && !entry.is_sidechain)
+            || previous.claude_total() <= entry.claude_total()
+    });
+    if !should_replace {
+        return;
+    }
+    let is_new = !state.entries.contains_key(&key);
+    if let Some(previous) = state.entries.insert(key.clone(), entry.clone()) {
+        state.recent.remove_entry(&previous);
+    }
+    state.recent.add_entry(&entry);
+    if is_new {
+        state.entry_order.push_back(key.clone());
+    }
+    let is_latest = state.latest_key.as_ref().is_none_or(|previous_key| {
+        let previous = state.entries.get(previous_key);
+        let current = state.entries.get(&key);
+        match (previous, current) {
+            (Some(previous), Some(current)) => {
+                current.timestamp >= previous.timestamp || key == *previous_key
             }
-        });
-        if is_latest {
-            state.latest_key = Some(key);
+            _ => true,
         }
+    });
+    if is_latest {
+        state.latest_key = Some(key);
+    }
+    compact_claude_entries(state);
+}
+
+fn compact_claude_entries(state: &mut ClaudeFileState) {
+    let mut latest_removed = false;
+    while state.entry_order.len() > MAX_RECENT_CLAUDE_ENTRIES_PER_FILE {
+        let Some(key) = state.entry_order.pop_front() else {
+            break;
+        };
+        if let Some(entry) = state.entries.remove(&key) {
+            state.recent.remove_entry(&entry);
+            state.compacted.add_entry(&entry);
+        }
+        latest_removed |= state.latest_key.as_deref() == Some(key.as_str());
+    }
+    if latest_removed {
+        state.latest_key = state
+            .entry_order
+            .iter()
+            .filter_map(|key| state.entries.get(key).map(|entry| (key, entry)))
+            .max_by(|(_, left), (_, right)| left.timestamp.cmp(&right.timestamp))
+            .map(|(key, _)| key.clone());
     }
 }
 
@@ -778,10 +924,24 @@ fn parse_codex_tail(path: &Path, state: &mut CodexFileState, size: u64) {
                     continue;
                 };
                 let previous = state.cumulative;
-                state.cumulative = info
+                let current = info
                     .get("total_token_usage")
                     .and_then(parse_codex_usage)
                     .or(state.cumulative);
+                if let Some(current) = current {
+                    let reset =
+                        previous.is_some_and(|previous| codex_usage_decreased(current, previous));
+                    if reset {
+                        state.computed_cost_usd_micros = 0.0;
+                        state.computed_cost_complete = true;
+                        state.pricing_source = None;
+                    }
+                    let cost_previous = if reset { None } else { previous };
+                    if let Some(delta) = codex_usage_delta(Some(current), cost_previous) {
+                        record_codex_cost(state, delta);
+                    }
+                    state.cumulative = Some(current);
+                }
                 state.last = info
                     .get("last_token_usage")
                     .and_then(parse_codex_usage)
@@ -850,30 +1010,52 @@ fn codex_usage_delta(
     })
 }
 
+fn codex_usage_decreased(current: CodexUsage, previous: CodexUsage) -> bool {
+    current.input < previous.input
+        || current.cached < previous.cached
+        || current.output < previous.output
+        || current.reasoning < previous.reasoning
+        || current.total < previous.total
+}
+
+fn record_codex_cost(state: &mut CodexFileState, delta: CodexUsage) {
+    if delta.input == 0 && delta.cached == 0 && delta.output == 0 {
+        return;
+    }
+    let Some(model) = state.model.as_deref() else {
+        state.computed_cost_complete = false;
+        return;
+    };
+    let Some(price) = model_pricing("codex", model) else {
+        state.computed_cost_complete = false;
+        return;
+    };
+    let Some(cost) = codex_cost_micros_value(model, delta) else {
+        state.computed_cost_complete = false;
+        return;
+    };
+    state.computed_cost_usd_micros += cost;
+    match state.pricing_source.as_deref() {
+        None => state.pricing_source = Some(price.source.clone()),
+        Some(source) if source == price.source => {}
+        Some("mixed_pricing_sources_2026-07-20") => {}
+        Some(_) => state.pricing_source = Some("mixed_pricing_sources_2026-07-20".to_owned()),
+    }
+}
+
 fn claude_record(state: &ClaudeFileState, now_ms: u64) -> Option<UsageRecord> {
     let session_id = state.session_id.clone()?;
-    if state.entries.is_empty() {
+    let mut aggregate = state.compacted.clone();
+    aggregate.add_accumulator(&state.recent);
+    if aggregate.entry_count == 0 {
         return None;
     }
-    let mut aggregate = TokenEntry::default();
-    for entry in state.entries.values() {
-        aggregate.input = aggregate.input.saturating_add(entry.input);
-        aggregate.output = aggregate.output.saturating_add(entry.output);
-        aggregate.cache_read = aggregate.cache_read.saturating_add(entry.cache_read);
-        aggregate.cache_creation = aggregate
-            .cache_creation
-            .saturating_add(entry.cache_creation);
-    }
     let latest = state
-        .latest_key
-        .as_ref()
-        .and_then(|key| state.entries.get(key));
-    let model = latest.and_then(|entry| entry.model.as_deref()).or_else(|| {
-        state
-            .entries
-            .values()
-            .find_map(|entry| entry.model.as_deref())
-    });
+        .entries
+        .values()
+        .filter(|entry| !is_synthetic_model(entry.model.as_deref()))
+        .max_by(|left, right| left.timestamp.cmp(&right.timestamp));
+    let model = latest.and_then(|entry| entry.model.as_deref());
     let context_used = latest.map(|entry| {
         entry.input.saturating_add(if entry.cache_read > 0 {
             entry.cache_read
@@ -883,36 +1065,35 @@ fn claude_record(state: &ClaudeFileState, now_ms: u64) -> Option<UsageRecord> {
     });
     let context_window = model.map(claude_context_window);
     let context_percent = percent(context_used, context_window);
-    let official_cost = state
-        .entries
-        .values()
-        .map(|entry| entry.official_cost_usd_micros)
-        .try_fold(0_u64, |total, cost| total.checked_add(cost?));
-    let cost =
-        official_cost.or_else(|| model.and_then(|model| claude_cost_micros(model, &aggregate)));
+    let official_cost = aggregate.official_cost();
+    let cost = official_cost.or_else(|| aggregate.computed_cost());
     let cost_kind = cost.map(|_| {
         if official_cost.is_some() {
             "provider_estimate".to_owned()
         } else {
-            "estimated_api_price".to_owned()
+            "computed".to_owned()
         }
     });
     let pricing_source = cost.map(|_| {
         if official_cost.is_some() {
             "claude_transcript_cost".to_owned()
         } else {
-            PRICING_SOURCE.to_owned()
+            model
+                .and_then(|model| model_pricing("claude", model))
+                .map(|price| price.source.clone())
+                .unwrap_or_else(|| pricing_snapshot().source.clone())
         }
     });
     Some(UsageRecord {
         provider: "claude".to_owned(),
         provider_session_id: session_id,
+        model: model.map(ToOwned::to_owned),
         input_tokens: Some(aggregate.input),
         output_tokens: Some(aggregate.output),
         cache_read_tokens: Some(aggregate.cache_read),
         cache_creation_tokens: Some(aggregate.cache_creation),
         reasoning_tokens: None,
-        token_total: Some(aggregate.claude_total()),
+        token_total: Some(aggregate.token_total()),
         last_turn_tokens: latest.map(TokenEntry::claude_total),
         context_used_tokens: context_used,
         context_window_tokens: context_window,
@@ -926,19 +1107,26 @@ fn claude_record(state: &ClaudeFileState, now_ms: u64) -> Option<UsageRecord> {
     })
 }
 
+fn is_synthetic_model(model: Option<&str>) -> bool {
+    model.is_some_and(|model| model.trim().eq_ignore_ascii_case("<synthetic>"))
+}
+
 fn codex_record(state: &CodexFileState, now_ms: u64) -> Option<UsageRecord> {
     let session_id = state.session_id.clone()?;
     let total = state.cumulative?;
     let last = state.last.unwrap_or_default();
     let context_used = (last.input > 0).then_some(last.input);
     let context_percent = percent(context_used, state.context_window);
-    let cost = state
-        .model
-        .as_deref()
-        .and_then(|model| codex_cost_micros(model, total));
+    let cost = (state.computed_cost_complete
+        && state.pricing_source.is_some()
+        && state.computed_cost_usd_micros.is_finite()
+        && state.computed_cost_usd_micros >= 0.0
+        && state.computed_cost_usd_micros <= u64::MAX as f64)
+        .then(|| state.computed_cost_usd_micros.round() as u64);
     Some(UsageRecord {
         provider: "codex".to_owned(),
         provider_session_id: session_id,
+        model: state.model.clone(),
         input_tokens: Some(total.input),
         output_tokens: Some(total.output),
         cache_read_tokens: Some(total.cached),
@@ -958,8 +1146,8 @@ fn codex_record(state: &CodexFileState, now_ms: u64) -> Option<UsageRecord> {
         context_window_tokens: state.context_window,
         context_used_percent: context_percent,
         estimated_cost_usd_micros: cost,
-        cost_kind: cost.map(|_| "estimated_api_price".to_owned()),
-        pricing_source: cost.map(|_| PRICING_SOURCE.to_owned()),
+        cost_kind: cost.map(|_| "computed".to_owned()),
+        pricing_source: cost.and_then(|_| state.pricing_source.clone()),
         usage_source: "codex_rollout".to_owned(),
         usage_quality: "official_local".to_owned(),
         captured_at: system_time_millis(state.modified).unwrap_or(now_ms),
@@ -991,6 +1179,7 @@ fn claude_context_window(model: &str) -> u64 {
         || model.contains("opus-4.8")
         || model.contains("sonnet-4-6")
         || model.contains("sonnet-4.6")
+        || model.contains("sonnet-5")
     {
         1_000_000
     } else {
@@ -998,7 +1187,26 @@ fn claude_context_window(model: &str) -> u64 {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Deserialize)]
+struct PricingSnapshot {
+    source: String,
+    models: Vec<ModelPrice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelPrice {
+    provider: String,
+    source: String,
+    id: String,
+    #[serde(default)]
+    aliases: Vec<String>,
+    input: f64,
+    output: f64,
+    cache_read: f64,
+    cache_create: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Price {
     input: f64,
     output: f64,
@@ -1006,76 +1214,90 @@ struct Price {
     cache_create: f64,
 }
 
-fn claude_price(model: &str) -> Option<Price> {
-    let model = model.to_ascii_lowercase();
-    if model.contains("fast") {
-        None
-    } else if model.contains("fable") || model.contains("mythos") {
-        Some(Price {
-            input: 10.0,
-            output: 50.0,
-            cache_read: 1.0,
-            cache_create: 12.5,
-        })
-    } else if model.contains("opus-4-6") || model.contains("opus-4.6") {
-        Some(Price {
-            input: 5.0,
-            output: 25.0,
-            cache_read: 0.5,
-            cache_create: 6.25,
-        })
-    } else if model.contains("opus") {
-        Some(Price {
-            input: 15.0,
-            output: 75.0,
-            cache_read: 1.5,
-            cache_create: 18.75,
-        })
-    } else if model.contains("sonnet") {
-        Some(Price {
-            input: 3.0,
-            output: 15.0,
-            cache_read: 0.3,
-            cache_create: 3.75,
-        })
-    } else if model.contains("haiku") {
-        Some(Price {
-            input: 1.0,
-            output: 5.0,
-            cache_read: 0.1,
-            cache_create: 1.25,
-        })
-    } else {
-        None
-    }
-}
-
-fn codex_price(model: &str) -> Option<Price> {
-    let model = model.to_ascii_lowercase();
-    let (input, output, cache_read) = if model.contains("gpt-5.6-sol") {
-        (5.0, 30.0, 0.5)
-    } else if model.contains("gpt-5.6-terra") || model.contains("gpt-5.4") {
-        (2.5, 15.0, 0.25)
-    } else if model.contains("gpt-5.6-luna") {
-        (1.0, 6.0, 0.1)
-    } else if model.contains("gpt-5.3") || model.contains("gpt-5.2-codex") {
-        (1.75, 14.0, 0.175)
-    } else if model.contains("gpt-5.2") || model.contains("gpt-5") {
-        (1.25, 10.0, 0.125)
-    } else {
-        return None;
-    };
-    Some(Price {
-        input,
-        output,
-        cache_read,
-        cache_create: 0.0,
+fn pricing_snapshot() -> &'static PricingSnapshot {
+    static SNAPSHOT: OnceLock<PricingSnapshot> = OnceLock::new();
+    SNAPSHOT.get_or_init(|| {
+        serde_json::from_str(PRICING_SNAPSHOT_JSON)
+            .expect("embedded usage pricing snapshot must be valid")
     })
 }
 
+fn claude_price(model: &str) -> Option<Price> {
+    model_price("claude", model)
+}
+
+fn codex_price(model: &str) -> Option<Price> {
+    model_price("codex", model)
+}
+
+fn model_price(provider: &str, model: &str) -> Option<Price> {
+    model_pricing(provider, model).map(|price| Price {
+        input: price.input,
+        output: price.output,
+        cache_read: price.cache_read,
+        cache_create: price.cache_create,
+    })
+}
+
+fn model_pricing(provider: &str, model: &str) -> Option<&'static ModelPrice> {
+    let candidates = normalized_model_candidates(model);
+    pricing_snapshot()
+        .models
+        .iter()
+        .filter(|price| price.provider == provider)
+        .find(|price| {
+            candidates.iter().any(|candidate| {
+                candidate == &price.id || price.aliases.iter().any(|alias| candidate == alias)
+            })
+        })
+}
+
+fn normalized_model_candidates(model: &str) -> Vec<String> {
+    let normalized = model.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized.contains("fast") {
+        return Vec::new();
+    }
+    let mut candidates = Vec::new();
+    push_model_candidate(&mut candidates, normalized.clone());
+    if let Some(last) = normalized.rsplit('/').next() {
+        push_model_candidate(&mut candidates, last.to_owned());
+    }
+    for prefix in ["anthropic--", "anthropic.", "openai--", "openai."] {
+        if let Some(value) = normalized.strip_prefix(prefix) {
+            push_model_candidate(&mut candidates, value.to_owned());
+        }
+    }
+    let snapshot = candidates.clone();
+    for candidate in snapshot {
+        if let Some((base, _)) = candidate.split_once(":thinking") {
+            push_model_candidate(&mut candidates, base.to_owned());
+        }
+        if let Some(base) = candidate.strip_suffix("-thinking") {
+            push_model_candidate(&mut candidates, base.to_owned());
+        }
+        if let Some(base) = candidate.strip_suffix("@default") {
+            push_model_candidate(&mut candidates, base.to_owned());
+        }
+    }
+    candidates
+}
+
+fn push_model_candidate(candidates: &mut Vec<String>, candidate: String) {
+    if !candidate.is_empty() && !candidates.contains(&candidate) {
+        candidates.push(candidate);
+    }
+}
+
+#[cfg(test)]
 fn claude_cost_micros(model: &str, usage: &TokenEntry) -> Option<u64> {
+    let micros = claude_cost_micros_value(model, usage)?;
+    (micros.is_finite() && micros >= 0.0 && micros <= u64::MAX as f64)
+        .then(|| micros.round() as u64)
+}
+
+fn claude_cost_micros_value(model: &str, usage: &TokenEntry) -> Option<f64> {
     let price = claude_price(model)?;
-    priced_cost_micros(
+    priced_cost_micros_value(
         usage.input,
         usage.output,
         usage.cache_read,
@@ -1084,9 +1306,16 @@ fn claude_cost_micros(model: &str, usage: &TokenEntry) -> Option<u64> {
     )
 }
 
+#[cfg(test)]
 fn codex_cost_micros(model: &str, usage: CodexUsage) -> Option<u64> {
+    let micros = codex_cost_micros_value(model, usage)?;
+    (micros.is_finite() && micros >= 0.0 && micros <= u64::MAX as f64)
+        .then(|| micros.round() as u64)
+}
+
+fn codex_cost_micros_value(model: &str, usage: CodexUsage) -> Option<f64> {
     let price = codex_price(model)?;
-    priced_cost_micros(
+    priced_cost_micros_value(
         usage.input.saturating_sub(usage.cached),
         usage.output,
         usage.cached,
@@ -1095,18 +1324,18 @@ fn codex_cost_micros(model: &str, usage: CodexUsage) -> Option<u64> {
     )
 }
 
-fn priced_cost_micros(
+fn priced_cost_micros_value(
     input: u64,
     output: u64,
     cache_read: u64,
     cache_create: u64,
     price: Price,
-) -> Option<u64> {
-    let dollars = input as f64 * price.input / 1_000_000.0
-        + output as f64 * price.output / 1_000_000.0
-        + cache_read as f64 * price.cache_read / 1_000_000.0
-        + cache_create as f64 * price.cache_create / 1_000_000.0;
-    dollars_to_micros(dollars)
+) -> Option<f64> {
+    let micros = input as f64 * price.input
+        + output as f64 * price.output
+        + cache_read as f64 * price.cache_read
+        + cache_create as f64 * price.cache_create;
+    (micros.is_finite() && micros >= 0.0).then_some(micros)
 }
 
 fn read_status_caches(cache_dir: &Path) -> Vec<UsageRecord> {
@@ -1294,6 +1523,7 @@ mod tests {
         let mut state = ClaudeFileState::default();
         parse_claude_tail(&path, &mut state, first.len() as u64);
         let record = claude_record(&state, 100).expect("record");
+        assert_eq!(record.model.as_deref(), Some("claude-sonnet-4"));
         assert_eq!(record.token_total, Some(180));
         assert_eq!(record.context_used_tokens, Some(120));
 
@@ -1340,13 +1570,247 @@ mod tests {
         let mut state = CodexFileState::default();
         parse_codex_tail(&path, &mut state, fixture.len() as u64);
         let record = codex_record(&state, 100).expect("record");
+        assert_eq!(record.model.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(record.token_total, Some(800));
         assert_eq!(record.cache_read_tokens, Some(400));
         assert_eq!(record.reasoning_tokens, Some(20));
         assert_eq!(record.last_turn_tokens, Some(300));
         assert_eq!(record.context_used_tokens, Some(250));
         assert_eq!(record.context_used_percent, Some(25));
+        assert_eq!(record.estimated_cost_usd_micros, Some(4_700));
+        assert_eq!(
+            record.pricing_source.as_deref(),
+            Some("openai_standard_2026-07-20")
+        );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_price_accumulates_each_model_delta_at_its_own_rate() {
+        let root = temp_dir("codex-model-change");
+        let path = root.join("rollout-session-model-change.jsonl");
+        let fixture = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session-model-change\"}}\n",
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.6-luna\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{",
+            "\"total_token_usage\":{\"input_tokens\":1000,\"output_tokens\":0,",
+            "\"total_tokens\":1000}}}}\n",
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.6-sol\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{",
+            "\"total_token_usage\":{\"input_tokens\":2000,\"output_tokens\":0,",
+            "\"total_tokens\":2000}}}}\n"
+        );
+        fs::write(&path, fixture).expect("write fixture");
+        let mut state = CodexFileState::default();
+        parse_codex_tail(&path, &mut state, fixture.len() as u64);
+        let record = codex_record(&state, 100).expect("record");
+        assert_eq!(record.estimated_cost_usd_micros, Some(6_000));
+        assert_eq!(
+            record.pricing_source.as_deref(),
+            Some("openai_standard_2026-07-20")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_usage_compacts_old_entries_without_changing_totals() {
+        let mut state = ClaudeFileState {
+            session_id: Some("long-session".to_owned()),
+            ..ClaudeFileState::default()
+        };
+        for index in 0..10_000 {
+            upsert_claude_entry(
+                &mut state,
+                format!("message-{index}"),
+                TokenEntry {
+                    model: Some("claude-sonnet-4-6".to_owned()),
+                    input: 1,
+                    output: 2,
+                    cache_read: 3,
+                    cache_creation: 4,
+                    timestamp: format!("{index:05}"),
+                    ..TokenEntry::default()
+                },
+            );
+        }
+        assert_eq!(state.entries.len(), MAX_RECENT_CLAUDE_ENTRIES_PER_FILE);
+        assert_eq!(state.entry_order.len(), MAX_RECENT_CLAUDE_ENTRIES_PER_FILE);
+        assert_eq!(state.compacted.entry_count, 9_744);
+        assert_eq!(state.recent.entry_count, 256);
+        let record = claude_record(&state, 100).expect("record");
+        assert_eq!(record.input_tokens, Some(10_000));
+        assert_eq!(record.output_tokens, Some(20_000));
+        assert_eq!(record.cache_read_tokens, Some(30_000));
+        assert_eq!(record.cache_creation_tokens, Some(40_000));
+        assert_eq!(record.token_total, Some(100_000));
+        assert_eq!(record.last_turn_tokens, Some(10));
+        assert_eq!(record.estimated_cost_usd_micros, Some(489_000));
+    }
+
+    #[test]
+    fn recent_claude_replacement_updates_the_incremental_accumulator() {
+        let mut state = ClaudeFileState {
+            session_id: Some("replacement-session".to_owned()),
+            ..ClaudeFileState::default()
+        };
+        upsert_claude_entry(
+            &mut state,
+            "message-1".to_owned(),
+            TokenEntry {
+                model: Some("claude-sonnet-4-6".to_owned()),
+                input: 100,
+                output: 5,
+                timestamp: "1".to_owned(),
+                ..TokenEntry::default()
+            },
+        );
+        upsert_claude_entry(
+            &mut state,
+            "message-1".to_owned(),
+            TokenEntry {
+                model: Some("claude-sonnet-4-6".to_owned()),
+                input: 100,
+                output: 50,
+                timestamp: "2".to_owned(),
+                ..TokenEntry::default()
+            },
+        );
+        let record = claude_record(&state, 100).expect("record");
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.recent.entry_count, 1);
+        assert_eq!(record.token_total, Some(150));
+        assert_eq!(record.estimated_cost_usd_micros, Some(1_050));
+    }
+
+    #[test]
+    fn pricing_snapshot_matches_aliases_but_not_unknown_future_models() {
+        assert_eq!(
+            claude_price("anthropic/claude-opus-4.6"),
+            Some(Price {
+                input: 5.0,
+                output: 25.0,
+                cache_read: 0.5,
+                cache_create: 6.25,
+            })
+        );
+        assert_eq!(
+            claude_price("claude-sonnet-4-6:thinking"),
+            claude_price("claude-sonnet-4-6")
+        );
+        assert_eq!(claude_price("claude-opus-4-9"), None);
+        assert!(claude_price("claude-3-opus-20240229").is_some());
+        assert!(claude_price("claude-mythos-5").is_some());
+        assert_eq!(claude_price("claude-mythos-preview"), None);
+        assert_eq!(
+            codex_price("openai/gpt-5.6-sol"),
+            codex_price("gpt-5.6-sol")
+        );
+        assert_eq!(
+            codex_price("gpt-5.2"),
+            Some(Price {
+                input: 1.75,
+                output: 14.0,
+                cache_read: 0.175,
+                cache_create: 0.0,
+            })
+        );
+        assert_eq!(codex_price("gpt-5.3"), None);
+        assert!(codex_price("gpt-5.3-codex").is_some());
+        assert_eq!(codex_price("gpt-5.6"), codex_price("gpt-5.6-sol"));
+        assert!(codex_price("gpt-5.5").is_some());
+        assert!(codex_price("gpt-5.4-mini").is_some());
+        assert_eq!(codex_price("gpt-5.7"), None);
+    }
+
+    #[test]
+    fn claude_sonnet_5_uses_dated_official_introductory_price() {
+        let price = model_pricing("claude", "claude-sonnet-5").expect("known model");
+        assert_eq!(price.source, "anthropic_intro_2026-07-20");
+        assert_eq!(
+            claude_price("claude-sonnet-5"),
+            Some(Price {
+                input: 2.0,
+                output: 10.0,
+                cache_read: 0.2,
+                cache_create: 2.5,
+            })
+        );
+
+        let usage = TokenEntry {
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_read: 1_000_000,
+            cache_creation: 1_000_000,
+            ..TokenEntry::default()
+        };
+        assert_eq!(
+            claude_cost_micros("claude-sonnet-5", &usage),
+            Some(14_700_000)
+        );
+    }
+
+    #[test]
+    fn zero_token_synthetic_entry_does_not_hide_known_model_cost() {
+        let mut state = ClaudeFileState {
+            session_id: Some("synthetic-session".to_owned()),
+            ..ClaudeFileState::default()
+        };
+        upsert_claude_entry(
+            &mut state,
+            "real-message".to_owned(),
+            TokenEntry {
+                model: Some("claude-sonnet-5".to_owned()),
+                input: 1_000_000,
+                timestamp: "1".to_owned(),
+                ..TokenEntry::default()
+            },
+        );
+        upsert_claude_entry(
+            &mut state,
+            "synthetic-message".to_owned(),
+            TokenEntry {
+                model: Some("<synthetic>".to_owned()),
+                timestamp: "2".to_owned(),
+                ..TokenEntry::default()
+            },
+        );
+
+        let record = claude_record(&state, 100).expect("record");
+        assert_eq!(record.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(record.estimated_cost_usd_micros, Some(2_000_000));
+        assert_eq!(record.cost_kind.as_deref(), Some("computed"));
+        assert_eq!(
+            record.pricing_source.as_deref(),
+            Some("anthropic_intro_2026-07-20")
+        );
+    }
+
+    #[test]
+    fn mixed_missing_official_cost_falls_back_to_complete_computed_cost() {
+        let mut state = ClaudeFileState {
+            session_id: Some("cost-session".to_owned()),
+            ..ClaudeFileState::default()
+        };
+        for (index, official_cost) in [Some(100), None].into_iter().enumerate() {
+            upsert_claude_entry(
+                &mut state,
+                format!("message-{index}"),
+                TokenEntry {
+                    model: Some("claude-haiku-4-5".to_owned()),
+                    input: 100,
+                    official_cost_usd_micros: official_cost,
+                    timestamp: index.to_string(),
+                    ..TokenEntry::default()
+                },
+            );
+        }
+        let record = claude_record(&state, 100).expect("record");
+        assert_eq!(record.estimated_cost_usd_micros, Some(200));
+        assert_eq!(record.cost_kind.as_deref(), Some("computed"));
+        assert_eq!(
+            record.pricing_source.as_deref(),
+            Some("anthropic_standard_2026-07-20")
+        );
     }
 
     #[test]
