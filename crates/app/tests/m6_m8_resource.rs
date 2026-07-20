@@ -5,14 +5,14 @@ use std::process::Command;
 #[ignore = "explicit release-candidate resource gate"]
 fn two_minute_release_candidate_resource_gate() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let binary = workspace.join("target/release/flow-agent");
+    let binary = workspace.join("target/release/actrealm");
     assert!(binary.is_file(), "release binary must be built first");
-    let report = std::env::temp_dir().join("flow-agent-m6-m8-resource.json");
+    let report = std::env::temp_dir().join("actrealm-m6-m8-resource.json");
     let output = Command::new(workspace.join("scripts/m5-resource-check.sh"))
         .arg(&binary)
         .current_dir(&workspace)
-        .env("FLOW_AGENT_RESOURCE_DURATION_SECONDS", "120")
-        .env("FLOW_AGENT_RESOURCE_REPORT", &report)
+        .env("ACTREALM_RESOURCE_DURATION_SECONDS", "120")
+        .env("ACTREALM_RESOURCE_REPORT", &report)
         .output()
         .expect("resource checker must start");
     assert!(

@@ -38,7 +38,7 @@ imply endorsement.
 The M14 local usage adapter was behaviorally compared with
 [ccusage](https://github.com/ccusage/ccusage). The dated embedded standard-tier
 price snapshot uses the same public Provider pricing inputs for recognized
-models. Flow Agent's Rust parser, persistence, and UI implementation are
+models. ActRealm's Rust parser, persistence, and UI implementation are
 independent.
 
 ccusage is licensed under the MIT License:

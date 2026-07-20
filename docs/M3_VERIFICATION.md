@@ -6,7 +6,7 @@ review of the exact first-run screen at the 1600x600 target size.
 M3 delivers the Claude/Codex installer, first-run onboarding, Codex trust
 guidance, structured doctor report, post-install real-event verification, and
 fact-based Agent activity required by `WIDGET_V1_PLAN.md` v1.1. Tests use
-isolated `HOME`, `CODEX_HOME`, and `FLOW_AGENT_HOME` roots. They did not install
+isolated `HOME`, `CODEX_HOME`, and `ACTREALM_HOME` roots. They did not install
 or remove entries in the developer's real provider configuration.
 
 ## Current provider contract review

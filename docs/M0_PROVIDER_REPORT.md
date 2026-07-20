@@ -20,7 +20,7 @@ the fixture metadata records which fields were replaced.
 
 ## Integration boundary
 
-Flow Agent v1 is an External Hook Control integration. It observes provider
+ActRealm v1 is an External Hook Control integration. It observes provider
 events and may answer one `PermissionRequest` with allow or deny. It does not
 own the provider process, conversation, tool execution, native permission
 policy, or other hooks. It therefore does not claim reply, cancel, interrupt,
@@ -28,7 +28,7 @@ steer, queue, or managed-session semantics.
 
 A directive written to the provider is `decision_sent`, not confirmed. Only a
 later provider event can confirm progress. Codex can run several hooks for the
-same event; a denial from any hook wins, so a Flow Agent allow cannot be shown
+same event; a denial from any hook wins, so a ActRealm allow cannot be shown
 as confirmed until subsequent provider evidence arrives.
 
 Permission requests are never persisted for replay. Runtime absence, protocol
@@ -43,14 +43,14 @@ production reference review recorded in `REFERENCE_REVIEW.md`.
   command ran and the session stopped normally.
 - Claude deny: the terminal reported “Denied by PermissionRequest hook”; the
   command did not execute.
-- Claude pass-through: Flow Agent returned no directive and the native Claude
+- Claude pass-through: ActRealm returned no directive and the native Claude
   approval dialog appeared and remained usable.
 - Codex allow: PermissionRequest was followed by PostToolUse and Stop.
 - Codex deny: the terminal reported the hook as blocked; no PostToolUse was
   emitted and Stop reported that the command did not execute.
-- Codex pass-through: Flow Agent returned no directive; the native Codex dialog
+- Codex pass-through: ActRealm returned no directive; the native Codex dialog
   appeared, and native “No” produced no PostToolUse.
-- Codex trust: continuing without trust emitted no Flow Agent events. After the
+- Codex trust: continuing without trust emitted no ActRealm events. After the
   exact project hook command was inspected and trusted in `/hooks`, the same
   probe emitted the complete lifecycle.
 

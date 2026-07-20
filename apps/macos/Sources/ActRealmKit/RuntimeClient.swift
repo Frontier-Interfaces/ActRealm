@@ -7,7 +7,7 @@ public enum RuntimeClientError: Error, Sendable {
     case requestFailed(Int)
 }
 
-/// Talks to a single running `flow-agent` backend: performs the one-time
+/// Talks to a single running `actrealm` backend: performs the one-time
 /// bootstrap handshake, keeps the live snapshot up to date over the
 /// WebSocket feed, and sends attention-queue commands.
 @MainActor
@@ -179,7 +179,7 @@ public final class RuntimeClient: ObservableObject {
             guard let wsURL = components.url else { return }
 
             var request = URLRequest(url: wsURL)
-            request.setValue("flow_agent_session=\(cookie)", forHTTPHeaderField: "Cookie")
+            request.setValue("actrealm_session=\(cookie)", forHTTPHeaderField: "Cookie")
             request.setValue(originValue(for: baseURL), forHTTPHeaderField: "Origin")
             let task = session.webSocketTask(with: request)
             webSocketTask = task
@@ -227,11 +227,11 @@ public final class RuntimeClient: ObservableObject {
         guard let baseURL, let cookie = sessionCookie else { throw RuntimeClientError.notConnected }
         var request = URLRequest(url: baseURL.appendingPathComponent(path))
         request.httpMethod = method
-        request.setValue("flow_agent_session=\(cookie)", forHTTPHeaderField: "Cookie")
+        request.setValue("actrealm_session=\(cookie)", forHTTPHeaderField: "Cookie")
         if mutating {
             guard let csrfToken else { throw RuntimeClientError.notConnected }
             request.setValue(originValue(for: baseURL), forHTTPHeaderField: "Origin")
-            request.setValue(csrfToken, forHTTPHeaderField: "x-flow-agent-csrf")
+            request.setValue(csrfToken, forHTTPHeaderField: "x-actrealm-csrf")
         }
         return request
     }
@@ -259,8 +259,8 @@ public final class RuntimeClient: ObservableObject {
             else { continue }
             for part in valueString.split(separator: ";") {
                 let trimmed = part.trimmingCharacters(in: .whitespaces)
-                if trimmed.hasPrefix("flow_agent_session=") {
-                    return String(trimmed.dropFirst("flow_agent_session=".count))
+                if trimmed.hasPrefix("actrealm_session=") {
+                    return String(trimmed.dropFirst("actrealm_session=".count))
                 }
             }
         }

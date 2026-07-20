@@ -1,4 +1,4 @@
-use flow_agent_core::{BridgeRequest, BridgeResponse, Decision, Provider, ReplyPayload};
+use actrealm_core::{BridgeRequest, BridgeResponse, Decision, Provider, ReplyPayload};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -686,7 +686,7 @@ fn bounded_text(value: Option<&Value>, max_chars: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flow_agent_core::{BridgeRequest, Provider, ReplyAction};
+    use actrealm_core::{BridgeRequest, Provider, ReplyAction};
     use serde_json::json;
 
     #[test]

@@ -32,7 +32,7 @@ public enum BridgeStatus: Equatable, Sendable {
 public enum ForegroundArrivalStrategy: String, CaseIterable, Codable, Sendable, Hashable {
     case immediate
     case remind
-    case actRoom
+    case actRealmWorkspace
 }
 
 /// Optional per-provider override. `defaultRule` follows the global arrival
@@ -41,7 +41,7 @@ public enum ForegroundAgentRule: String, CaseIterable, Codable, Sendable, Hashab
     case defaultRule
     case immediate
     case remind
-    case actRoom
+    case actRealmWorkspace
 }
 
 /// Durable settings edited by the 台前调度 management page. Keeping the
@@ -52,7 +52,7 @@ public struct ForegroundSchedulingSettings: Codable, Equatable, Sendable {
     public var closesAfterAcceptance: Bool
     public var strategy: ForegroundArrivalStrategy
     public var reminderSeconds: Int
-    public var returnsToActRoom: Bool
+    public var returnsToActRealmWorkspace: Bool
     public var acceptanceSeconds: Int
     public var codexRule: ForegroundAgentRule
     public var claudeRule: ForegroundAgentRule
@@ -62,7 +62,7 @@ public struct ForegroundSchedulingSettings: Codable, Equatable, Sendable {
         closesAfterAcceptance: Bool = true,
         strategy: ForegroundArrivalStrategy = .remind,
         reminderSeconds: Int = 10,
-        returnsToActRoom: Bool = true,
+        returnsToActRealmWorkspace: Bool = true,
         acceptanceSeconds: Int = 10,
         codexRule: ForegroundAgentRule = .defaultRule,
         claudeRule: ForegroundAgentRule = .immediate
@@ -71,7 +71,7 @@ public struct ForegroundSchedulingSettings: Codable, Equatable, Sendable {
         self.closesAfterAcceptance = closesAfterAcceptance
         self.strategy = strategy
         self.reminderSeconds = reminderSeconds
-        self.returnsToActRoom = returnsToActRoom
+        self.returnsToActRealmWorkspace = returnsToActRealmWorkspace
         self.acceptanceSeconds = acceptanceSeconds
         self.codexRule = codexRule
         self.claudeRule = claudeRule
@@ -84,7 +84,7 @@ public enum ForegroundDispatchPhase: Equatable, Sendable {
     case reminding
     case opening
     case awaitingWorkspace
-    case returnedToActRoom
+    case returnedToActRealmWorkspace
 }
 
 /// One live arrival moving through the policy selected on the 台前调度 page.
@@ -119,16 +119,16 @@ public struct ForegroundDispatchState: Identifiable, Equatable, Sendable {
 }
 
 public struct ForegroundWorkspaceStatus: Equatable, Sendable {
-    public var isActRoomReady: Bool
+    public var isActRealmWorkspaceReady: Bool
     public var isAgentAvailable: Bool
     public var isSchedulingWorkspaceActive: Bool
 
     public init(
-        isActRoomReady: Bool = true,
+        isActRealmWorkspaceReady: Bool = true,
         isAgentAvailable: Bool = true,
         isSchedulingWorkspaceActive: Bool = false
     ) {
-        self.isActRoomReady = isActRoomReady
+        self.isActRealmWorkspaceReady = isActRealmWorkspaceReady
         self.isAgentAvailable = isAgentAvailable
         self.isSchedulingWorkspaceActive = isSchedulingWorkspaceActive
     }
@@ -173,9 +173,9 @@ public final class AppModel: ObservableObject {
     public let supervisor: RuntimeSupervisor
     public let client: RuntimeClient
 
-    private static let policyKey = "flowAgent.approvalPolicy"
-    private static let dismissedTasksKey = "flowAgent.dismissedTaskVersions"
-    private static let foregroundSchedulingKey = "flowAgent.foregroundScheduling"
+    private static let policyKey = "actrealm.approvalPolicy"
+    private static let dismissedTasksKey = "actrealm.dismissedTaskVersions"
+    private static let foregroundSchedulingKey = "actrealm.foregroundScheduling"
     private let defaults: UserDefaults
     private var cancellables: Set<AnyCancellable> = []
     private var ticker: Task<Void, Never>?
@@ -190,7 +190,7 @@ public final class AppModel: ObservableObject {
     public init(
         repoPath: URL? = nil,
         defaults: UserDefaults = .standard,
-        demo: Bool = ProcessInfo.processInfo.environment["FLOW_DEMO"] == "1"
+        demo: Bool = ProcessInfo.processInfo.environment["ACTREALM_DEMO"] == "1"
     ) {
         self.defaults = defaults
         self.isDemo = demo
@@ -514,7 +514,7 @@ public final class AppModel: ObservableObject {
     }
 
     public func effectiveForegroundStrategy(for provider: ProviderKind?) -> ForegroundArrivalStrategy {
-        guard foregroundScheduling.isEnabled else { return .actRoom }
+        guard foregroundScheduling.isEnabled else { return .actRealmWorkspace }
         let rule: ForegroundAgentRule
         switch provider {
         case .codex: rule = foregroundScheduling.codexRule
@@ -525,7 +525,7 @@ public final class AppModel: ObservableObject {
         case .defaultRule: return foregroundScheduling.strategy
         case .immediate: return .immediate
         case .remind: return .remind
-        case .actRoom: return .actRoom
+        case .actRealmWorkspace: return .actRealmWorkspace
         }
     }
 
@@ -534,10 +534,10 @@ public final class AppModel: ObservableObject {
         beginOpening(dispatch, at: Date())
     }
 
-    public func keepForegroundTaskInActRoom() {
+    public func keepForegroundTaskInActRealmWorkspace() {
         guard foregroundDispatch != nil else { return }
         foregroundDispatch = nil
-        showToast("任务已留在 Act Room 待处理列表")
+        showToast("任务已留在 ActRealm 工作区的待处理列表")
     }
 
     /// Deterministic visual preview used by SnapshotTool. It never creates a
@@ -588,8 +588,8 @@ public final class AppModel: ObservableObject {
         guard foregroundDispatch == nil else { return }
 
         switch effectiveForegroundStrategy(for: provider) {
-        case .actRoom:
-            showToast("新任务已进入 Act Room 待处理列表")
+        case .actRealmWorkspace:
+            showToast("新任务已进入 ActRealm 工作区的待处理列表")
         case .immediate:
             foregroundDispatch = ForegroundDispatchState(
                 id: id,
@@ -619,7 +619,7 @@ public final class AppModel: ObservableObject {
         case .reminding:
             beginOpening(dispatch, at: date)
         case .opening:
-            guard foregroundScheduling.returnsToActRoom else {
+            guard foregroundScheduling.returnsToActRealmWorkspace else {
                 foregroundDispatch = nil
                 return
             }
@@ -640,12 +640,12 @@ public final class AppModel: ObservableObject {
                 provider: dispatch.provider,
                 title: dispatch.title,
                 taskTitle: dispatch.taskTitle,
-                phase: .returnedToActRoom,
+                phase: .returnedToActRealmWorkspace,
                 startedAt: date,
                 deadline: date.addingTimeInterval(1.4)
             )
             showToast(note)
-        case .returnedToActRoom:
+        case .returnedToActRealmWorkspace:
             foregroundDispatch = nil
         }
     }

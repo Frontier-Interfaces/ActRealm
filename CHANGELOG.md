@@ -1,10 +1,31 @@
 # Changelog
 
-All notable Flow Agent changes are recorded here. The project has not yet
+All notable ActRealm changes are recorded here. The project has not yet
 published a final v1 release; entries below describe development milestones on
 `agent/v1-full`, not released packages.
 
 ## Unreleased - M14 accepted candidate
+
+### Post-M14 - Live state and controlled Runtime recovery
+
+- Adds WebSocket heartbeats, stale-connection detection, bounded snapshot
+  fallback, and visibility-aware reconnect behavior so a visually open panel
+  does not silently stop receiving state.
+- Keeps task and Attention cards structurally stable: elapsed time and activity
+  text update in place, while unchanged rows are not recreated when a new
+  event arrives. This removes visible card jitter during active work.
+- Adds an authenticated local health monitor for the Runtime, API, WebSocket,
+  Hook socket, latest Hook event, active tasks, pending Attention, SQLite event
+  count, and restart history.
+- Adds one controlled `重启 Runtime` action. It safely releases active waiters,
+  re-execs the same binary on the same loopback port, recreates the Hook socket,
+  restores durable session state, rotates browser authentication, and reconnects
+  the page automatically.
+- Keeps crash/offline behavior truthful: the browser cannot relaunch a process
+  that is no longer running and falls back to the documented terminal command.
+
+This work is separate from M15, which remains reserved for managed Codex
+app-server approval methods.
 
 ### Post-M14 - Single-toolbar visual refinement
 
@@ -36,11 +57,11 @@ requires separate authorization.
 
 ### M13 - Provider-owned approval-state coordination
 
-- Detects Provider-owned Codex review and avoids creating a competing Flow
-  Agent waiter.
+- Detects Provider-owned Codex review and avoids creating a competing ActRealm
+  waiter.
 - Tracks native `request_permissions` and managed `waitingOnApproval` states.
 - Clears native waiting only on an explicit Provider resolution signal.
-- Distinguishes observation-only native approval from Flow-controlled approval
+- Distinguishes observation-only native approval from ActRealm-controlled approval
   in Attention, task state, notifications, and available actions.
 - Keeps approval outcome neutral when the Provider does not expose it.
 

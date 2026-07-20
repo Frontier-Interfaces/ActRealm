@@ -1,6 +1,6 @@
 //! Provider-specific hook parsing.
 
-use flow_agent_core::{EventKind, Provider};
+use actrealm_core::{EventKind, Provider};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;

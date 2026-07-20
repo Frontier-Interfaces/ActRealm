@@ -1,6 +1,6 @@
 # Security
 
-flow-agent processes local coding-agent events and permission decisions. Do
+ActRealm processes local coding-agent events and permission decisions. Do
 not include secrets, source files, raw transcripts, or personal survey data in
 bug reports.
 

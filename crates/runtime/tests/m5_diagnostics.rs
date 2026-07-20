@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
-use flow_agent_core::{BridgeRequest, Provider};
-use flow_agent_runtime::{DiagnosticCapture, MAX_DIAGNOSTIC_CAPTURE_BYTES};
+use actrealm_core::{BridgeRequest, Provider};
+use actrealm_runtime::{DiagnosticCapture, MAX_DIAGNOSTIC_CAPTURE_BYTES};
 use serde_json::json;
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -13,7 +13,7 @@ struct Root(PathBuf);
 impl Root {
     fn new(name: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
-            "flow-agent-m5-diagnostics-{name}-{}-{}",
+            "actrealm-m5-diagnostics-{name}-{}-{}",
             std::process::id(),
             Uuid::now_v7()
         ));

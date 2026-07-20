@@ -27,7 +27,7 @@ impl TestDir {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
         let path = PathBuf::from("/tmp").join(format!(
-            "flow-agent-install-cli-{name}-{}-{id}",
+            "actrealm-install-cli-{name}-{}-{id}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&path);
@@ -59,15 +59,15 @@ fn read_json(path: &Path) -> Value {
 fn command(root: &TestDir) -> Command {
     let home = root.0.join("home");
     let codex_home = root.0.join("alternate-codex-home");
-    let flow_home = root.0.join("flow-home");
+    let actrealm_home = root.0.join("actrealm-home");
     let fake_bin = root.0.join("fake-bin");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_flow-agent"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_actrealm"));
     command
         .env("HOME", home)
         .env("CODEX_HOME", codex_home)
-        .env("FLOW_AGENT_HOME", flow_home)
+        .env("ACTREALM_HOME", actrealm_home)
         .env(
-            "FLOW_AGENT_TEST_APPLICATIONS_PATH",
+            "ACTREALM_TEST_APPLICATIONS_PATH",
             root.0.join("applications"),
         )
         .env("PATH", fake_bin);
@@ -193,7 +193,7 @@ fn cli_all_installs_and_uninstalls_without_losing_user_hooks() {
     assert!(stdout.contains("run /hooks"));
     assert_eq!(read_json(&claude_path)["user"], "claude");
     assert_eq!(read_json(&codex_path)["user"], "codex");
-    assert!(root.0.join("flow-home/bin/flow-agent").exists());
+    assert!(root.0.join("actrealm-home/bin/actrealm").exists());
 
     let uninstalled = command(&root)
         .args(["uninstall-hooks", "all"])
@@ -206,7 +206,7 @@ fn cli_all_installs_and_uninstalls_without_losing_user_hooks() {
     );
     assert_eq!(read_json(&claude_path), claude_original);
     assert_eq!(read_json(&codex_path), codex_original);
-    assert!(!root.0.join("flow-home/bin/flow-agent").exists());
+    assert!(!root.0.join("actrealm-home/bin/actrealm").exists());
     assert_eq!(
         fs::read_to_string(codex_config).unwrap(),
         "[features]\nhooks = true\n\n[hooks.state]\n"
@@ -224,7 +224,7 @@ fn cli_refuses_to_create_configuration_for_a_missing_provider() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("claude client is not installed"));
     assert!(!root.0.join("home/.claude/settings.json").exists());
-    assert!(!root.0.join("flow-home/bin/flow-agent").exists());
+    assert!(!root.0.join("actrealm-home/bin/actrealm").exists());
 }
 
 #[test]
@@ -371,9 +371,9 @@ fn doctor_accepts_a_slow_but_healthy_provider_version_command() {
 fn overlong_socket_path_blocks_install_before_provider_configuration_is_touched() {
     let root = TestDir::new("overlong-socket");
     install_fake_provider(&root, "claude");
-    let long_flow_home = root.0.join("x".repeat(140));
+    let long_actrealm_home = root.0.join("x".repeat(140));
     let output = command(&root)
-        .env("FLOW_AGENT_HOME", &long_flow_home)
+        .env("ACTREALM_HOME", &long_actrealm_home)
         .args(["install-hooks", "claude"])
         .output()
         .unwrap();
@@ -383,7 +383,7 @@ fn overlong_socket_path_blocks_install_before_provider_configuration_is_touched(
     assert!(!root.0.join("home/.claude/settings.json").exists());
 
     let doctor = command(&root)
-        .env("FLOW_AGENT_HOME", &long_flow_home)
+        .env("ACTREALM_HOME", &long_actrealm_home)
         .args(["doctor", "--json"])
         .output()
         .unwrap();
@@ -404,7 +404,7 @@ fn doctor_runtime_probe_round_trips_without_creating_a_provider_event() {
     let root = TestDir::new("doctor-runtime");
     install_fake_provider(&root, "claude");
     install_fake_provider(&root, "codex");
-    let socket = root.0.join("flow-home/run/bridge.sock");
+    let socket = root.0.join("actrealm-home/run/bridge.sock");
     let mut runtime = command(&root)
         .args(["serve", "--approval", "widget"])
         .stdout(std::process::Stdio::piped())
@@ -464,10 +464,10 @@ fn onboarding_api_uses_the_installer_and_requires_a_post_install_real_event() {
     let mut stdout = BufReader::new(runtime.stdout.take().unwrap());
     let mut control_line = String::new();
     stdout.read_line(&mut control_line).unwrap();
-    assert!(control_line.starts_with("Flow Agent control panel: http://"));
+    assert!(control_line.starts_with("ActRealm control panel: http://"));
     let url = control_line
         .trim()
-        .strip_prefix("Flow Agent control panel: ")
+        .strip_prefix("ActRealm control panel: ")
         .unwrap();
     let (origin, bootstrap_token) = url.split_once("/#bootstrap=").unwrap();
     let address: SocketAddr = origin.strip_prefix("http://").unwrap().parse().unwrap();
@@ -521,7 +521,7 @@ fn onboarding_api_uses_the_installer_and_requires_a_post_install_real_event() {
         &[
             ("Origin", origin),
             ("Cookie", &cookie),
-            ("x-flow-agent-csrf", &csrf),
+            ("x-actrealm-csrf", &csrf),
             ("Content-Type", "application/json"),
         ],
         Some(&json!({"provider": "claude", "action": "install"})),
@@ -536,10 +536,10 @@ fn onboarding_api_uses_the_installer_and_requires_a_post_install_real_event() {
     assert_eq!(claude["status"], "installed_unverified");
     assert_eq!(claude["realEventVerified"], false);
 
-    let stable = root.0.join("flow-home/bin/flow-agent");
+    let stable = root.0.join("actrealm-home/bin/actrealm");
     let mut hook = Command::new(&stable)
         .args(["hook", "--provider", "claude"])
-        .env("FLOW_AGENT_HOME", root.0.join("flow-home"))
+        .env("ACTREALM_HOME", root.0.join("actrealm-home"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -599,7 +599,7 @@ fn onboarding_api_uses_the_installer_and_requires_a_post_install_real_event() {
         &[
             ("Origin", origin),
             ("Cookie", &cookie),
-            ("x-flow-agent-csrf", &csrf),
+            ("x-actrealm-csrf", &csrf),
             ("Content-Type", "application/json"),
         ],
         Some(&json!({"provider": "claude", "action": "uninstall"})),

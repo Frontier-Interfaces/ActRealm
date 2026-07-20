@@ -8,7 +8,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum InstanceError {
-    #[error("another Flow Agent runtime already owns {0}")]
+    #[error("another ActRealm runtime already owns {0}")]
     AlreadyRunning(PathBuf),
     #[error("runtime lock I/O failed: {0}")]
     Io(#[from] io::Error),

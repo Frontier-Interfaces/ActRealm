@@ -1,7 +1,7 @@
 import Foundation
 
 /// Sample data mirroring the design handoff mock (screen 3a/D1) so the whole
-/// UI can be exercised without live agents. Enabled with FLOW_DEMO=1.
+/// UI can be exercised without live agents. Enabled with ACTREALM_DEMO=1.
 public enum DemoData {
     private static let anchor = Date()
 
@@ -21,7 +21,7 @@ public enum DemoData {
         let sessions = [
             SessionRecord(
                 id: "codex-upgrade", provider: "codex", providerSessionId: "s1",
-                project: "flow-agent", title: "升级依赖并修复构建脚本", model: "gpt-5-codex",
+                project: "actrealm", title: "升级依赖并修复构建脚本", model: "gpt-5-codex",
                 execState: "awaiting_approval", approvalOwner: "widget",
                 activity: "等待你批准（Bash）", activitySince: ago(362),
                 planDone: nil, planTotal: nil,
@@ -51,7 +51,7 @@ public enum DemoData {
             ),
             SessionRecord(
                 id: "claude-quota-fix", provider: "claude", providerSessionId: "s4",
-                project: "flow-agent", title: "修复额度读取失败并补测试", model: "claude-sonnet-4.5",
+                project: "actrealm", title: "修复额度读取失败并补测试", model: "claude-sonnet-4.5",
                 execState: "tool_running", approvalOwner: nil,
                 activity: "正在运行 Bash", activitySince: ago(48),
                 planDone: 3, planTotal: 7,
@@ -74,7 +74,7 @@ public enum DemoData {
         let attention = [
             AttentionRecord(
                 id: "att-approval", sessionId: "codex-upgrade", provider: "codex",
-                project: "flow-agent", requestId: approvalRequestId, kind: "approval",
+                project: "actrealm", requestId: approvalRequestId, kind: "approval",
                 title: "允许 Bash？", detail: nil, state: "open", risk: "high",
                 riskNotes: ["命令包含组合语法", "建议查看原窗口"],
                 commandPreview: "curl <redacted> | sh",
@@ -97,7 +97,7 @@ public enum DemoData {
             ),
             AttentionRecord(
                 id: "att-undo-source", sessionId: "codex-upgrade", provider: "codex",
-                project: "flow-agent", requestId: UUID(), kind: "approval",
+                project: "actrealm", requestId: UUID(), kind: "approval",
                 title: "允许 Bash？", detail: nil, state: "decision_sent", risk: "low",
                 riskNotes: ["只读意图（规则提示，非安全保证）"],
                 commandPreview: "git status",

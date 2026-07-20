@@ -11,7 +11,7 @@ import Testing
         #expect(model.foregroundScheduling.closesAfterAcceptance)
         #expect(model.foregroundScheduling.strategy == .remind)
         #expect(model.foregroundScheduling.reminderSeconds == 10)
-        #expect(model.foregroundScheduling.returnsToActRoom)
+        #expect(model.foregroundScheduling.returnsToActRealmWorkspace)
         #expect(model.foregroundScheduling.acceptanceSeconds == 10)
         #expect(model.foregroundScheduling.codexRule == .defaultRule)
         #expect(model.foregroundScheduling.claudeRule == .immediate)
@@ -28,7 +28,7 @@ import Testing
             $0.strategy = .immediate
             $0.reminderSeconds = 18
             $0.acceptanceSeconds = 29
-            $0.codexRule = .actRoom
+            $0.codexRule = .actRealmWorkspace
         }
 
         #expect(first.foregroundScheduling.reminderSeconds == 10)
@@ -38,7 +38,7 @@ import Testing
         #expect(restored.foregroundScheduling.strategy == .immediate)
         #expect(restored.foregroundScheduling.reminderSeconds == 10)
         #expect(restored.foregroundScheduling.acceptanceSeconds == 30)
-        #expect(restored.foregroundScheduling.codexRule == .actRoom)
+        #expect(restored.foregroundScheduling.codexRule == .actRealmWorkspace)
     }
 
     @MainActor
@@ -63,7 +63,7 @@ import Testing
         #expect(model.foregroundDispatch?.phase == .awaitingWorkspace)
 
         model.advanceForegroundDispatch(at: start.addingTimeInterval(23))
-        #expect(model.foregroundDispatch?.phase == .returnedToActRoom)
+        #expect(model.foregroundDispatch?.phase == .returnedToActRealmWorkspace)
         #expect(model.foregroundReturnNotes["approval-1"] == "未检测到进入调度工作桌面，已返回")
 
         model.advanceForegroundDispatch(at: start.addingTimeInterval(25))
@@ -84,7 +84,7 @@ import Testing
         )
         #expect(model.foregroundDispatch?.phase == .opening)
 
-        model.keepForegroundTaskInActRoom()
+        model.keepForegroundTaskInActRealmWorkspace()
         #expect(model.foregroundDispatch == nil)
     }
 

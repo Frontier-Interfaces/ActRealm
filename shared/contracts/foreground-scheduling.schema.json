@@ -10,7 +10,7 @@
     "closesAfterAcceptance",
     "strategy",
     "reminderSeconds",
-    "returnsToActRoom",
+    "returnsToActRealmWorkspace",
     "acceptanceSeconds",
     "codexRule",
     "claudeRule"
@@ -32,7 +32,7 @@
       "$ref": "#/$defs/durationSeconds",
       "default": 10
     },
-    "returnsToActRoom": {
+    "returnsToActRealmWorkspace": {
       "type": "boolean",
       "default": true
     },
@@ -52,11 +52,11 @@
   "$defs": {
     "strategy": {
       "type": "string",
-      "enum": ["immediate", "remind", "actRoom"]
+      "enum": ["immediate", "remind", "actRealmWorkspace"]
     },
     "providerRule": {
       "type": "string",
-      "enum": ["defaultRule", "immediate", "remind", "actRoom"]
+      "enum": ["defaultRule", "immediate", "remind", "actRealmWorkspace"]
     },
     "durationSeconds": {
       "type": "integer",

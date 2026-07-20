@@ -8,7 +8,7 @@
   "hook_event_name": "PreToolUse",
   "tool_name": "Bash",
   "tool_input": {
-    "command": "printf flow-agent-probe",
+    "command": "printf actrealm-probe",
     "description": "Print a local probe marker"
   },
   "tool_use_id": "fixture-claude-tool-use"

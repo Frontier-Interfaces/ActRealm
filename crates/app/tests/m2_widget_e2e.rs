@@ -36,7 +36,7 @@ impl Drop for RuntimeGuard {
 
 fn temp_root() -> PathBuf {
     PathBuf::from("/tmp").join(format!(
-        "flow-agent-m2-e2e-{}-{}",
+        "actrealm-m2-e2e-{}-{}",
         std::process::id(),
         Uuid::now_v7()
     ))
@@ -156,10 +156,10 @@ fn wait_for_restarted_health(address: SocketAddr, previous_instance: &str) -> Va
 fn start_runtime(root: &Path) -> (RuntimeGuard, PathBuf, Auth) {
     fs::create_dir_all(root).unwrap();
     let socket = root.join("bridge.sock");
-    let mut runtime = Command::new(env!("CARGO_BIN_EXE_flow-agent"))
+    let mut runtime = Command::new(env!("CARGO_BIN_EXE_actrealm"))
         .args(["serve", "--socket", socket.to_str().unwrap()])
-        .env("FLOW_AGENT_COMMIT_DELAY_MS", "30")
-        .env("FLOW_AGENT_HOME", root.join("flow-home"))
+        .env("ACTREALM_COMMIT_DELAY_MS", "30")
+        .env("ACTREALM_HOME", root.join("actrealm-home"))
         .env("HOME", root.join("home"))
         .env("CODEX_HOME", root.join("codex-home"))
         .stdin(Stdio::null())
@@ -171,12 +171,12 @@ fn start_runtime(root: &Path) -> (RuntimeGuard, PathBuf, Auth) {
     let mut control_line = String::new();
     output.read_line(&mut control_line).unwrap();
     assert!(
-        control_line.starts_with("Flow Agent control panel: http://"),
+        control_line.starts_with("ActRealm control panel: http://"),
         "unexpected Runtime bootstrap line: {control_line:?}"
     );
     let url = control_line
         .trim()
-        .strip_prefix("Flow Agent control panel: ")
+        .strip_prefix("ActRealm control panel: ")
         .unwrap();
     let (origin, token) = url.split_once("/#bootstrap=").unwrap();
     let address: SocketAddr = origin.strip_prefix("http://").unwrap().parse().unwrap();
@@ -195,7 +195,7 @@ fn start_runtime(root: &Path) -> (RuntimeGuard, PathBuf, Auth) {
 }
 
 fn spawn_hook(socket: &Path, provider: &str, fixture: &str) -> Child {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_flow-agent"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_actrealm"))
         .args([
             "hook",
             "--provider",
@@ -203,7 +203,7 @@ fn spawn_hook(socket: &Path, provider: &str, fixture: &str) -> Child {
             "--socket",
             socket.to_str().unwrap(),
         ])
-        .env("FLOW_AGENT_HOOK_REPLY_TIMEOUT_MS", "2000")
+        .env("ACTREALM_HOOK_REPLY_TIMEOUT_MS", "2000")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -223,7 +223,7 @@ fn headers(auth: &Auth) -> [(&str, &str); 3] {
     [
         ("Origin", &auth.origin),
         ("Cookie", &auth.cookie),
-        ("X-Flow-Agent-CSRF", &auth.csrf),
+        ("X-ActRealm-CSRF", &auth.csrf),
     ]
 }
 

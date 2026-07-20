@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use flow_agent_core::MAX_HOOK_PAYLOAD_BYTES;
+use actrealm_core::MAX_HOOK_PAYLOAD_BYTES;
 use serde_json::Value;
 use std::fs;
 use std::io::Write;
@@ -16,7 +16,7 @@ struct Root(PathBuf);
 impl Root {
     fn new(name: &str) -> Self {
         let path = PathBuf::from("/tmp").join(format!(
-            "flow-agent-m5-security-{name}-{}-{}",
+            "actrealm-m5-security-{name}-{}-{}",
             std::process::id(),
             Uuid::now_v7()
         ));
@@ -25,10 +25,10 @@ impl Root {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_flow-agent"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_actrealm"));
         command
             .env("HOME", self.0.join("home"))
-            .env("FLOW_AGENT_HOME", self.0.join("flow-home"))
+            .env("ACTREALM_HOME", self.0.join("actrealm-home"))
             .env("CODEX_HOME", self.0.join("codex-home"));
         command
     }
@@ -78,7 +78,7 @@ fn diagnostic_cli_requires_explicit_bounded_enable_and_can_clear_everything() {
     assert!(status.status.success());
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["enabled"], false);
-    assert!(!root.0.join("flow-home/diagnostics").exists());
+    assert!(!root.0.join("actrealm-home/diagnostics").exists());
 
     let enabled = root
         .command()
@@ -88,7 +88,7 @@ fn diagnostic_cli_requires_explicit_bounded_enable_and_can_clear_everything() {
     assert!(enabled.status.success());
     let enabled: Value = serde_json::from_slice(&enabled.stdout).unwrap();
     assert_eq!(enabled["enabled"], true);
-    let config = root.0.join("flow-home/diagnostics/config.json");
+    let config = root.0.join("actrealm-home/diagnostics/config.json");
     assert_eq!(
         fs::metadata(config).unwrap().permissions().mode() & 0o777,
         0o600
@@ -100,7 +100,7 @@ fn diagnostic_cli_requires_explicit_bounded_enable_and_can_clear_everything() {
         .output()
         .unwrap();
     assert!(cleared.status.success());
-    assert!(!root.0.join("flow-home/diagnostics").exists());
+    assert!(!root.0.join("actrealm-home/diagnostics").exists());
 }
 
 #[test]
@@ -134,7 +134,7 @@ fn oversized_and_deep_hook_json_fail_open_without_spooling_or_output() {
     assert!(deep.status.success());
     assert!(deep.stdout.is_empty());
     assert!(deep.stderr.is_empty());
-    assert!(!root.0.join("flow-home/spool").exists());
+    assert!(!root.0.join("actrealm-home/spool").exists());
 }
 
 #[test]

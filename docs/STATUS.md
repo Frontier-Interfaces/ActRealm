@@ -1,10 +1,11 @@
-# Flow Agent current status
+# ActRealm current status
 
-Last reviewed: 2026-07-18
+Last reviewed: 2026-07-20
 
 Source branch: `agent/v1-full`
 
-Current M14 functional commit: `5a29d88`
+Current functional baseline: M14 plus the post-M14 live-state and controlled
+Runtime-recovery refinements on `agent/v1-full`.
 
 This file is the short, current source of truth. The
 [implementation plan](WIDGET_V1_PLAN.md),
@@ -23,17 +24,28 @@ provide the detailed requirements and evidence.
   traffic lights were removed; Notification & Data, local time, and Runtime
   state now share the single ActRealm toolbar. Focused checks and local visual
   acceptance passed on 2026-07-18; commit was authorized separately from push.
-- **Latest local gates:** 161 workspace tests passed, two explicit/manual
-  tests ignored; zero-warning Clippy, format, release build, five-round native
-  request replay, and the two-minute resource gate passed. M14's resource
-  sample recorded 0.000% average idle CPU and 6,016 KiB maximum Runtime RSS.
+- **Post-M14 live-state refinement:** WebSocket heartbeats, stale-channel
+  detection, snapshot fallback, stable in-place timer updates, and render
+  signatures keep Agent state current without rebuilding unchanged cards.
+- **Post-M14 Runtime recovery:** the settings page exposes authenticated local
+  health details and one controlled Runtime restart action. The process
+  re-execs on the same loopback port, recreates `bridge.sock`, restores durable
+  sessions from SQLite, rotates browser authentication, and safely expires
+  non-restorable reply waiters. See the
+  [verification record](POST_M14_REALTIME_RECOVERY.md).
+- **Latest merged-tree gates:** 161 Rust workspace tests and 30 macOS client
+  tests passed, with two explicit/manual Rust tests ignored; zero-warning
+  Clippy, format, JavaScript syntax, release build, five-round native request
+  replay, five consecutive controlled Runtime restarts, and the two-minute
+  resource gate passed. The current sample recorded 0.000% average idle CPU
+  and 6,128 KiB maximum Runtime RSS.
 - **M13 real-Provider acceptance:** still pending. The milestone was committed
   and pushed at the user's direction before this final manual confirmation.
 - **Final v1 release:** not yet declared. The required continuous 48-hour
   Runtime RSS soak remains unchecked.
 - **Default branch alignment:** the user separately approved the alignment on
   2026-07-17. `main` was fast-forwarded to the reviewed `agent/v1-full`
-  history without restarting Runtime, reinstalling Flow Agent, or touching the
+  history without restarting Runtime, reinstalling ActRealm, or touching the
   live data directory.
 - **Version/tag:** Cargo remains `0.1.0`; no release tag has been created.
 
@@ -56,6 +68,7 @@ provide the detailed requirements and evidence.
 | M12 | Codex Connector and restart recovery | Complete within the recorded boundary | [M10-M12](M10_M12_VERIFICATION.md) |
 | M13 | Provider-owned approval-state coordination | Code and automated gates complete; real-Provider acceptance pending | [M13](M13_PROVIDER_STATE_COORDINATION.md) |
 | M14 | Live usage, context, price, and OAuth quota | Complete; exact release installed and accepted locally | [M14](M14_USAGE_CONTEXT_QUOTA.md) |
+| Post-M14 | Stable live rendering and controlled Runtime recovery | Implemented; merged with the ActRealm identity baseline | [verification](POST_M14_REALTIME_RECOVERY.md) |
 
 M5 is a release-qualification track, not the chronological end of feature
 development. Later functional milestones may be implemented while M5's
@@ -64,7 +77,7 @@ complete.
 
 ## Capability boundary after M14
 
-Flow Agent can directly respond only when it owns a live, official reply
+ActRealm can directly respond only when it owns a live, official reply
 channel:
 
 - request-keyed Claude/Codex Hook `PermissionRequest` allow, deny, or
@@ -72,8 +85,8 @@ channel:
 - Claude `AskUserQuestion` and `Elicitation` Hook replies;
 - Codex app-server `item/tool/requestUserInput` after explicit managed attach.
 
-When Codex or Claude exposes an approval only in its own native interface, Flow
-Agent observes and synchronizes the waiting/resolved state. It must not show
+When Codex or Claude exposes an approval only in its own native interface,
+ActRealm observes and synchronizes the waiting/resolved state. It must not show
 fake allow/deny controls or infer whether the user approved, denied, or ran the
 command.
 

@@ -1,207 +1,250 @@
-# flow-agent
+# ActRealm
 
-Local-first attention surface for coding agents.
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-中文用户请从 [Flow Agent v1 中文使用教程](docs/USER_GUIDE_zh-CN.md) 开始。
+> Manage agents in one place. Bring the right task context forward.
 
-> **安装硬性前提：** 只克隆仓库或写入 Claude/Codex Hook 不算安装完成。
-> `flow-agent serve --open` 必须持续运行，Hook 才能连接本机 Runtime；浏览器必须由
-> 本次 `serve --open` 打开，不能复用上一次随机端口的旧页面。请按中文教程中的
-> [安装完成判定与 Agent 交接指令](docs/USER_GUIDE_zh-CN.md#21-安装完成判定硬性要求)
-> 执行并验收。
+ActRealm is an open agent operating layer for desktop. It brings task state,
+approval requests, usage limits, and human handoffs from Claude Code and Codex
+into one local control layer—so you can keep working while agents run, then
+return to the right context when judgment is required.
 
-Third-party asset attribution is recorded in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+ActRealm does not replace macOS or the underlying agent tools. It adds the task
+and control model that desktop agents need: visible state, explicit authority,
+and a safe path back to the work.
 
-## Native clients
+[Website](https://www.getactrealm.com) ·
+[中文使用教程](docs/USER_GUIDE_zh-CN.md) ·
+[Current status](docs/STATUS.md) ·
+[Native client architecture](docs/NATIVE_CLIENT_ARCHITECTURE.md)
 
-ActRealm keeps one local Rust Runtime and separate native clients for each
-desktop platform:
+> **Project status:** functional implementation is complete through M14 plus
+> post-M14 live-state and controlled Runtime-recovery refinements, but the
+> current source remains a local test candidate rather than a final v1 release.
+> Real-Provider M13 acceptance and the continuous 48-hour Runtime stability
+> gate are still pending.
 
-- `apps/macos/` contains the SwiftUI/AppKit client, including local foreground
-  scheduling, menu-bar UI, HUD, Runtime supervision, and packaging.
-- `apps/windows/` records the Windows client boundary and staged WinUI plan.
-- `shared/contracts/` contains platform-neutral settings and API contracts; UI
-  code is intentionally not shared across macOS and Windows.
+## A different operating model for agent work
 
-The native clients do not own Hooks, SQLite, or Provider reply state. Those
-remain in the Rust Runtime and are accessed through its authenticated loopback
-API and WebSocket. See [Native client architecture](docs/NATIVE_CLIENT_ARCHITECTURE.md).
+Traditional operating systems organize applications, windows, files, and
+device permissions. Agents introduce another unit of work: a task that can keep
+running, wait for input, request authority, and return with a result.
+
+ActRealm organizes that loop around four principles:
+
+1. **A task is the unit of work.** Claude Code, Codex, and future adapters keep
+   their own execution state and Provider-native behavior.
+2. **Agent work remains observable.** Running, waiting, blocked, and completed
+   tasks become visible local state instead of something you repeatedly hunt
+   for across windows.
+3. **Interruption matches risk.** Routine updates stay quiet; decisions carry
+   concise context; high-risk actions return you to the original interface for
+   verification.
+4. **People retain authority.** ActRealm only offers a direct action when the
+   Runtime owns a live, official reply channel. It never invents approval state.
+
+## What works today
+
+The current build includes:
+
+- **Claude Code and Codex integration** through local Hooks and an explicit,
+  version-gated Codex app-server Connector;
+- **one task overview** for Provider state, current activity, wait time,
+  questions, approval requests, completion, and quota status;
+- **a capability-aware approval loop** with risk labels, allow/deny/pass-through
+  where supported, and a three-second undo window before a decision commits;
+- **honest return-to-task behavior** that reports the best available level:
+  exact Codex conversation, matching Terminal/iTerm session, application only,
+  or unsupported;
+- **truthful degradation** when plan details, tool events, reply capability, or
+  quota readings are unavailable or stale;
+- **privacy-bounded live usage context** with cumulative Token, current-turn
+  context occupancy, an explicitly labelled API-price estimate, and background
+  Claude OAuth quota refresh with local fallback;
+- **an authenticated local control surface** backed by a single Rust Runtime,
+  SQLite persistence, WebSocket updates, diagnostics, and local export;
+- **stable live updates and controlled recovery** with heartbeats, stale-channel
+  fallback, in-place elapsed-time updates, a local health monitor, and a
+  one-button same-port Runtime restart;
+- **a native macOS client codebase** with menu-bar UI, HUD, Runtime supervision,
+  and experimental foreground scheduling.
+
+The product, Runtime executable, and CLI all use the name **ActRealm**
+(`actrealm` on the command line).
+
+## How the control loop works
+
+```mermaid
+flowchart LR
+    P["Claude Code / Codex"] -->|"Hooks or managed Connector"| R["Local Rust Runtime"]
+    R --> S["Sanitized task and attention state"]
+    S --> W["Authenticated web control surface"]
+    S --> M["Native macOS client"]
+    W --> H["Human review or decision"]
+    M --> H
+    H -->|"Only through a declared reply channel"| R
+    R -->|"Official Provider response"| P
+```
+
+The Rust Runtime is the single owner of Hooks, SQLite, sanitization, approval
+state, and Provider replies. Web and native clients consume the authenticated
+loopback API and WebSocket; they do not open the Runtime database directly.
+
+When an approval exists only inside a Provider's native interface, ActRealm
+shows the waiting state and guides you back to that interface. It does not show
+fake allow/deny controls or infer the eventual outcome.
+
+## Run the current build from source
+
+Requirements:
+
+- macOS;
+- Git;
+- Rust stable 1.85 or newer;
+- at least one local Provider: Claude Code CLI/Desktop or Codex CLI/Desktop.
+
+The active product implementation currently lives on `agent/v1-full`, so clone
+that branch explicitly:
+
+```bash
+git clone --branch agent/v1-full https://github.com/Frontier-Interfaces/ActRealm.git
+cd ActRealm
+cargo build --workspace --release
+```
+
+Install only the Provider integrations present on your machine:
+
+```bash
+./target/release/actrealm install-hooks claude
+./target/release/actrealm install-hooks codex --enhanced-codex-activity
+```
+
+Then keep the Runtime running in its own terminal:
+
+```bash
+./target/release/actrealm serve --open
+```
+
+`serve --open` starts the local Runtime, opens the authenticated control page on
+a random `127.0.0.1` port, and keeps the WebSocket/control loop alive. Do not
+reuse an old localhost URL after the process exits.
+
+Codex requires a separate user-controlled trust step: open a new local Codex
+session, run `/hooks`, inspect the exact commands, and trust them yourself.
+ActRealm never bypasses that review. After starting a fresh Provider session,
+verify the complete path from another terminal:
+
+```bash
+~/.actrealm/bin/actrealm doctor
+```
+
+Installation is complete only when the stable helper exists, the Runtime
+control loop is reachable, the selected Hooks are installed and trusted, and a
+real event from a new local Provider session reaches the UI. See the
+[Chinese installation guide](docs/USER_GUIDE_zh-CN.md) for the full acceptance
+checklist and recovery steps.
+
+## Native macOS client
+
+The SwiftUI/AppKit client lives in `apps/macos/` and packages the repository's
+Rust Runtime as `ActRealm.app/Contents/Helpers/actrealm`.
 
 ```bash
 apps/macos/Scripts/test.sh
 apps/macos/Scripts/package-app.sh
+open apps/macos/dist/ActRealm.app
 ```
 
-The committed `agent/v1-full` branch contains functional implementation through
-**M14**, including live session Token, current-context occupancy, estimated API
-price, and background Claude OAuth quota refresh;
-see the [current status](docs/STATUS.md) for the exact milestone, acceptance,
-branch, and release state. It remains a v1 test candidate because the separate
-48-hour Runtime stability gate has not passed. The branch provides the
-fail-open Hook bridge, persistent single-instance Runtime, authenticated localhost control
-panel, fixed three-module web UI, configurable safe task fields and detail
-drawer, direct Claude question forms, an explicit version-gated Codex
-app-server Connector with Thread recovery, safe Claude/Codex installer, first-run
-onboarding, structured diagnostics, honest quota adapters, notification
-settings, retention, aggregate metrics, export, and destructive local-data
-clearing:
+The current native UI uses Swift tools 6.2 and macOS 26 APIs. The generated app
+is ad-hoc signed for local development; a notarized public installer is not yet
+available.
 
-```bash
-cargo run -p flow-agent -- serve --open
-cargo run -p flow-agent -- install-hooks all
-cargo run -p flow-agent -- doctor
-cargo run -p flow-agent -- export
-cargo run -p flow-agent -- export-metrics
-cargo run -p flow-agent -- diagnostics status
-cargo run -p flow-agent -- hook --provider claude < fixture.json
+## Current boundaries and roadmap
+
+| Area | Status | Boundary |
+| --- | --- | --- |
+| Local Runtime and web control surface | Current test candidate | Functional through M14 plus live-state/recovery refinements; M13 real-Provider acceptance and the 48-hour soak remain open |
+| Claude Code and Codex | Current build | Local sessions only; direct actions depend on the actual reply channel |
+| Native macOS client | Testable source | Packaging works locally; foreground/window activation still needs broader manual acceptance |
+| Automatic ActRealm Workspace arrangement | Experimental | Requires macOS Accessibility permission and must fail without changing Runtime state |
+| ActRealm Review | In development | Planned test, diff, evidence, and checkpoint review; not part of the current build |
+| Gemini CLI adapter | In development | Not shipped as a current supported Provider |
+| Windows client | Roadmap | Runtime platform abstractions must land before the WinUI shell |
+| Public signed installer | Roadmap | No packaged M1 download is promised yet |
+
+Roadmap-tagged capabilities on the website are target experiences, not evidence
+of shipped behavior. The detailed implementation and release truth lives in
+[`docs/STATUS.md`](docs/STATUS.md).
+
+## Repository layout
+
+```text
+ActRealm/
+├── crates/             Rust Runtime, Provider adapters, server, and CLI
+├── web/                Embedded local web control surface
+├── apps/
+│   ├── macos/          SwiftUI/AppKit client
+│   └── windows/        Windows architecture plan
+├── shared/contracts/   Stable cross-platform client contracts
+├── fixtures/           Sanitized Provider Hook fixtures
+└── docs/               Status, acceptance, architecture, and verification
 ```
 
-`serve` defaults to `--approval widget`. The explicit `prompt`, `allow`,
-`deny`, and `pass-through` modes remain available for diagnostics and contract
-testing.
-
-Runtime data defaults to `~/.flow-agent`. Override it in tests or development
-with `FLOW_AGENT_HOME=/path/to/data`.
-
-`install-hooks` backs up existing configuration, preserves user and unknown
-fields, writes through a lock and atomic rename, and installs a stable helper
-at `~/.flow-agent/bin/flow-agent`. A global provider CLI is not required when
-Claude.app or ChatGPT/Codex.app is installed: the installer discovers the
-desktop app and, for Codex, exposes its bundled official executable for the
-manual trust review. Codex still requires a separate user-controlled trust
-step: start the discovered Codex executable, run `/hooks`, review the exact
-Flow Agent commands, and trust them. Flow Agent never edits Codex trust state
-or bypasses that review.
-
-```bash
-flow-agent install-hooks claude
-flow-agent install-hooks codex
-flow-agent install-hooks codex --enhanced-codex-activity
-flow-agent uninstall-hooks all
-flow-agent doctor --json
-```
-
-The onboarding UI uses the same installer implementation. It does not show
-"connected" until a real provider event arrives after installation. Doctor and
-automated tests do not modify the user's real Claude or Codex configuration.
-
-The settings panel can opt into the Claude status-line quota bridge. A custom
-`statusLine` is never silently replaced: the explicit **keep existing and
-enable** action stores the complete original object, delegates visible output
-to it, captures only the bounded quota fields, and restores it verbatim on
-uninstall. A newly created Claude cache invalidates an earlier unavailable
-snapshot immediately. Codex quota parsing is read-only and structurally
-validates the bounded `rate_limits` record instead of hard-coding an account
-period or patch version. The UI renders every valid window returned by the
-source (for example 5 hours, 7 days, 30 days, or a named extra allowance).
-Values older than 30 minutes remain visible as the last valid sample with their
-capture time; Flow Agent never turns age into a fabricated percentage.
-
-The M14 candidate can refresh Claude quota from Anthropic's first-party OAuth
-usage endpoint when an existing Claude credential is available. It runs in the
-background and falls back to the last StatusLine cache. Credentials stay in
-memory and are never written to SQLite, cache, logs, diagnostics, export, or
-process arguments. Session usage is read incrementally from local Claude and
-Codex records: cumulative Token, current-turn context, cache/reasoning
-breakdowns, and an explicitly labelled API-price estimate are shown only when a
-validated source exists. The estimate is not a subscription bill.
-
-Agent sessions use the Provider's own local conversation title as the visible
-main title: Claude's official `session_title` plus bounded `custom-title` /
-`ai-title` compatibility records, or Codex's latest `thread_name` from its
-bounded local session index. The privacy-bounded current question is the plain
-second line with no synthetic prefix, followed only by the current model when
-the Provider supplies one. Project, Provider name, title provenance, and Token
-figures are not mixed into these three visible title lines. Only the resolved
-title and its source are persisted; transcript content and paths never enter
-the browser snapshot. Metadata refreshes while recent sessions are visible and
-falls back honestly to the current-question summary when no Provider title is
-available. Sessions also show total turn time and current phase. Running state
-survives a Runtime restart; completed/idle sessions stay in the main list for
-30 minutes.
-Attention handled in the original Agent is reconciled automatically. Session
-rows expose one of four honest jump levels: exact Codex conversation, matching
-Terminal/iTerm session, application only, or unsupported. Local export contains
-the sanitized SQLite tables; destructive clear requires the exact confirmation
-`DELETE` and preserves Hook integration and backups.
-
-Approval UI is capability-specific. A request with a live Flow Agent reply
-channel can be allowed, denied, or passed through. A Provider-native approval
-observed through `request_permissions` or managed Thread status is shown only
-as an original-interface request: Flow Agent synchronizes waiting/resolved
-state and never invents allow/deny controls or an approval outcome.
-
-Aggregate metrics never leave the machine automatically. `export-metrics`
-creates a separate metrics-only JSON file containing daily counters and their
-definitions, without sessions, events, attention items, commands, projects, or
-paths. The settings panel shows the same factual counters.
-
-Temporary diagnostic capture is disabled by default. It records only fixed
-event categories, provider, capture time, whether a reply was required, and
-payload size. It never records raw Hook bodies, session identifiers, paths,
-prompts, commands, arguments, URLs, or tokens:
-
-```bash
-flow-agent diagnostics enable --minutes 10
-flow-agent diagnostics status
-flow-agent diagnostics clear
-```
-
-## v1 plan
-
-- [Current development and release status](docs/STATUS.md)
-- [Development changelog](CHANGELOG.md)
-- [Full v1.1 implementation plan](docs/WIDGET_V1_PLAN.md)
-- [Executable milestone acceptance](docs/V1_ACCEPTANCE.md)
-- [Open Vibe Island / CodeIsland reference decisions](docs/REFERENCE_REVIEW.md)
-- [M0 verification record](docs/M0_VERIFICATION.md)
-- [M1 verification record](docs/M1_VERIFICATION.md)
-- [M2 verification record](docs/M2_VERIFICATION.md)
-- [M3 verification record](docs/M3_VERIFICATION.md)
-- [M4 verification record](docs/M4_VERIFICATION.md)
-- [M5 verification record](docs/M5_VERIFICATION.md)
-- [M6 verification record](docs/M6_VERIFICATION.md)
-- [M7 verification record](docs/M7_VERIFICATION.md)
-- [M8 verification record](docs/M8_VERIFICATION.md)
-- [M9 verification record](docs/M9_VERIFICATION.md)
-- [M10-M12 verification record](docs/M10_M12_VERIFICATION.md)
-- [M13 Provider-state verification record](docs/M13_PROVIDER_STATE_COORDINATION.md)
-- [M14 live usage/context/quota verification record](docs/M14_USAGE_CONTEXT_QUOTA.md)
-- [v1.1 functional-correction record](docs/V1_1_FUNCTIONAL_CORRECTIONS.md)
+Native clients remain platform-specific. They share contracts and terminology,
+not UI code or a second copy of the Runtime.
 
 ## Local quality gate
+
+Before a milestone commit:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --offline -- -D warnings
 cargo test --workspace --offline
 cargo build --workspace --release --offline
+./scripts/check-actrealm-language.sh
 ./scripts/m0-e2e.sh
-./scripts/m5-resource-check.sh target/release/flow-agent
+./scripts/m5-resource-check.sh target/release/actrealm
+apps/macos/Scripts/test.sh
 ```
 
-The common suite currently covers 161 passing tests plus two explicit/manual
-tests ignored by default. It covers the provider path, SQLite Runtime, waiter, spool,
-single-instance, restart, duplicate-request, authenticated API, UI contract,
-safe install/uninstall, tri-state repair, onboarding, trust inspection, factual
-task progress, quota degradation, settings/data management, and half-close
-behavior. The E2E suites verify provider
-directives, widget control, pass-through, silent fail-open behavior when the
-Runtime is absent, and the post-install real-event verification boundary.
+Acceptance records are kept under `docs/` so implementation claims can be
+checked against tests, manual Provider evidence, and release gates.
 
-The short browser/resource measurements pass, but M5 release qualification is
-not complete until a continuous 48-hour Runtime RSS soak passes on the exact
-frozen release candidate. M13's real-Provider manual acceptance is also still
-pending. Until both are recorded, this branch must not be represented as a
-finished v1 release.
+## Privacy and trust
 
-## Privacy
+ActRealm is local-first:
 
-flow-agent is local-first and does not include telemetry or a cloud backend.
-Raw prompts, transcripts, source files, survey responses, and contact details
-must not be committed to this repository.
+- no ActRealm account;
+- no required cloud backend;
+- no telemetry or automatic metrics upload;
+- authenticated loopback-only control surfaces;
+- sanitized persistence and explicit local export;
+- raw prompts, transcripts, source files, URLs, tokens, and full paths excluded
+  from diagnostic capture.
+
+The underlying Claude Code, Codex, or future Provider still follows its own
+configuration and service terms. ActRealm's local-first boundary does not
+change how those tools handle data.
+
+## Documentation
+
+- [Current development and release status](docs/STATUS.md)
+- [Chinese installation and usage guide](docs/USER_GUIDE_zh-CN.md)
+- [Native macOS/Windows architecture](docs/NATIVE_CLIENT_ARCHITECTURE.md)
+- [Executable v1 acceptance contract](docs/V1_ACCEPTANCE.md)
+- [M14 live usage, context, price, and quota evidence](docs/M14_USAGE_CONTEXT_QUOTA.md)
+- [Post-M14 live-state and Runtime-recovery evidence](docs/POST_M14_REALTIME_RECOVERY.md)
+- [Development plan](docs/WIDGET_V1_PLAN.md)
+- [Development changelog](CHANGELOG.md)
+- [Third-party notices](THIRD_PARTY_NOTICES.md)
+
+## Contributing
+
+Issues and focused pull requests are welcome. Please preserve the local-first
+trust boundary, keep Provider capability claims evidence-based, and add or
+update compatibility tests whenever a Runtime contract changes.
 
 ## License
 
-MIT
+[MIT](LICENSE)

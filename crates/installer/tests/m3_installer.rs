@@ -1,4 +1,4 @@
-use flow_agent_installer::{
+use actrealm_installer::{
     BinaryHealth, CodexFeatureStatus, CodexTrustStatus, ConfigHealth, HookProvider, InstallIntent,
     InstallOptions, InstallPaths, Installer, InstallerError,
 };
@@ -18,7 +18,7 @@ impl TestDir {
     fn new(name: &str) -> Self {
         let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "flow-agent-installer-{name}-{}-{id}",
+            "actrealm-installer-{name}-{}-{id}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&path);
@@ -44,13 +44,13 @@ impl Fixture {
         let root = TestDir::new(name);
         let home = root.0.join("home");
         let paths = InstallPaths {
-            flow_home: root.0.join("flow-home"),
+            actrealm_home: root.0.join("actrealm-home"),
             claude_settings: home.join(".claude/settings.json"),
             codex_hooks: root.0.join("custom-codex/hooks.json"),
             codex_config: root.0.join("custom-codex/config.toml"),
         };
-        let source_binary = root.0.join("release/flow-agent");
-        write_file(&source_binary, b"test-flow-agent-binary", 0o700);
+        let source_binary = root.0.join("release/actrealm");
+        write_file(&source_binary, b"test-actrealm-binary", 0o700);
         Self {
             _root: root,
             paths,
@@ -97,7 +97,7 @@ fn user_claude_config() -> Value {
     })
 }
 
-fn flow_handlers<'a>(config: &'a Value, command_suffix: &str) -> Vec<&'a Value> {
+fn actrealm_handlers<'a>(config: &'a Value, command_suffix: &str) -> Vec<&'a Value> {
     let mut result = Vec::new();
     if let Some(hooks) = config.get("hooks").and_then(Value::as_object) {
         for groups in hooks.values().filter_map(Value::as_array) {
@@ -148,7 +148,7 @@ fn claude_install_backs_up_and_preserves_user_semantics() {
         installed["hooks"]["PreToolUse"][0],
         original["hooks"]["PreToolUse"][0]
     );
-    let handlers = flow_handlers(&installed, "hook --provider claude");
+    let handlers = actrealm_handlers(&installed, "hook --provider claude");
     assert_eq!(handlers.len(), 17);
     assert_eq!(
         installed["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"],
@@ -241,7 +241,10 @@ hash = "keep"
         installed["hooks"]["PermissionRequest"][0],
         original["hooks"]["PermissionRequest"][0]
     );
-    assert_eq!(flow_handlers(&installed, "hook --provider codex").len(), 4);
+    assert_eq!(
+        actrealm_handlers(&installed, "hook --provider codex").len(),
+        4
+    );
     assert!(installed["hooks"].get("PreToolUse").is_none());
     assert!(installed["hooks"].get("PostToolUse").is_none());
     assert_eq!(
@@ -250,7 +253,7 @@ hash = "keep"
     );
     assert_eq!(
         installed["hooks"]["PermissionRequest"][1]["hooks"][0]["statusMessage"],
-        "Waiting for Flow Agent approval"
+        "Waiting for ActRealm approval"
     );
     let toml = fs::read_to_string(&fixture.paths.codex_config).unwrap();
     assert!(toml.contains("existing:permission_request:0:0"));
@@ -274,7 +277,10 @@ fn enhanced_codex_activity_is_explicit_and_idempotent() {
     assert!(!second.binary_changed);
     assert_eq!(first_config, second_config);
     let installed = read_json(&fixture.paths.codex_hooks);
-    assert_eq!(flow_handlers(&installed, "hook --provider codex").len(), 6);
+    assert_eq!(
+        actrealm_handlers(&installed, "hook --provider codex").len(),
+        6
+    );
 }
 
 #[test]
@@ -447,7 +453,7 @@ fn concurrent_installs_are_serialized_and_leave_one_valid_definition_set() {
 
     let installed = read_json(&fixture.paths.claude_settings);
     assert_eq!(
-        flow_handlers(&installed, "hook --provider claude").len(),
+        actrealm_handlers(&installed, "hook --provider claude").len(),
         17
     );
     assert_eq!(
@@ -474,7 +480,7 @@ fn inspection_is_read_only_for_malformed_configuration() {
     assert!(inspection.config_error.is_some());
     assert_eq!(inspection.binary_health, BinaryHealth::Missing);
     assert_eq!(fs::read(&fixture.paths.claude_settings).unwrap(), malformed);
-    assert!(!fixture.paths.flow_home.join("backups").exists());
+    assert!(!fixture.paths.actrealm_home.join("backups").exists());
 }
 
 #[test]

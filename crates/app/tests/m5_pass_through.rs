@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use flow_agent_core::{BridgeRequest, BridgeResponse};
+use actrealm_core::{BridgeRequest, BridgeResponse};
 use serde_json::json;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -27,7 +27,7 @@ fn run_hook(path: &Path, timeout_ms: u64) -> Output {
         "tool_name":"Bash",
         "tool_input":{"command":"cargo test"}
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_flow-agent"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_actrealm"))
         .args([
             "hook",
             "--provider",
@@ -35,7 +35,7 @@ fn run_hook(path: &Path, timeout_ms: u64) -> Output {
             "--socket",
             path.to_str().unwrap(),
         ])
-        .env("FLOW_AGENT_HOOK_REPLY_TIMEOUT_MS", timeout_ms.to_string())
+        .env("ACTREALM_HOOK_REPLY_TIMEOUT_MS", timeout_ms.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

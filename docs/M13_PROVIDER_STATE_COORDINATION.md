@@ -11,17 +11,17 @@ v1 a final release.
 
 Two distinct Provider races produced the screenshots reported on 2026-07-17:
 
-1. Codex automatic review could decide a permission while Flow Agent's
+1. Codex automatic review could decide a permission while ActRealm's
    concurrent Hook still created a second blocking waiter. The panel therefore
    kept an obsolete approval and notification.
 2. Managed Codex conversations expose native approval through app-server
-   `ThreadStatus.activeFlags = ["waitingOnApproval"]`. Flow Agent stored this
+   `ThreadStatus.activeFlags = ["waitingOnApproval"]`. ActRealm stored this
    flag but did not project it into attention or session state, and its
    `thread/started` handler ignored the embedded Thread object.
 3. Real Codex Desktop 0.144.5 sessions also emitted an official Hook lifecycle
    around the native sheet: `PreToolUse(request_permissions)` while the sheet
    was visible, followed by `PostToolUse(request_permissions)` after the user
-   handled it. Flow Agent previously classified the first event as an ordinary
+   handled it. ActRealm previously classified the first event as an ordinary
    running tool and therefore showed `在跑` with no attention item.
 
 The implementation follows the reducer boundary used by open-vibe-island:
@@ -36,7 +36,7 @@ of the native sheet never proves approve, deny, or command execution.
   `_approvals_reviewer` detect `auto_review` and `guardian_subagent`.
 - The effective Codex profile in `config.toml` is a bounded, read-only fallback
   for builds that omit the reviewer field. A payload reviewer always wins.
-- Provider-owned approval is ingested as observation only: no Flow Agent
+- Provider-owned approval is ingested as observation only: no ActRealm
   waiter, no approval card, and no allow/deny directive.
 - Codex `PreToolUse(request_permissions)` is normalized as an observed native
   request. It creates a `native_approval` item with no `request_id`, so the UI
@@ -51,7 +51,7 @@ of the native sheet never proves approve, deny, or command execution.
   projects the session to `awaiting_approval` / `terminal` ownership.
 - A Hook approval already covering the same Session suppresses the synthetic
   native card, so the UI never shows duplicate approval items.
-- When managed native waiting clears, Flow Agent resolves both synthetic and competing
+- When managed native waiting clears, ActRealm resolves both synthetic and competing
   Hook approvals transactionally, cancels an unsent decision, releases the
   live Hook with pass-through, clears session ownership, and projects either
   `thinking` or `response_finished` from the authoritative Thread status.
@@ -61,9 +61,9 @@ of the native sheet never proves approve, deny, or command execution.
 - The active notification banner closes when its attention item is no longer
   open. An older result is not rendered beneath a different active item.
 - Native approval UI exposes only honest actions: `去 Agent 处理`, `待会提醒`,
-  and `忽略`; it never pretends that Flow Agent can answer a native-only prompt.
+  and `忽略`; it never pretends that ActRealm can answer a native-only prompt.
 - Wording is capability-specific: native items say `原界面请求批准 / 仅同步状态`;
-  replyable Hook items say `可在 Flow Agent 审批`.
+  replyable Hook items say `可在 ActRealm 审批`.
 
 ## Provider coverage
 
@@ -107,7 +107,7 @@ Exact-tree gates:
 | real Codex user acceptance | PENDING |
 
 The isolated browser replay verified that a native request renders as
-`原界面请求 / Flow Agent 仅同步状态`, exposes only `去 Agent 处理 / 待会提醒 /
+`原界面请求 / ActRealm 仅同步状态`, exposes only `去 Agent 处理 / 待会提醒 /
 忽略`, and disappears after the matching provider lifecycle closes. The task
 then shows the neutral activity `权限请求已在 Codex 原界面处理`; it never says
 approved, denied, or executed.
@@ -119,6 +119,6 @@ approved, denied, or executed.
   tag it, or use it to declare v1 complete until the installed candidate
   reproduces native waiting and native resolution against real Provider
   sessions and the user records the result.
-- Flow Agent does not infer the content or outcome of a native-only approval.
+- ActRealm does not infer the content or outcome of a native-only approval.
   It reports where the decision must be made and follows the Provider's
   authoritative waiting state.

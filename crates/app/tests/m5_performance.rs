@@ -26,13 +26,13 @@ fn wait_for(path: &Path) {
 #[test]
 fn nonblocking_hook_process_p95_is_below_50_ms() {
     let root = PathBuf::from("/tmp").join(format!(
-        "flow-agent-m5-hook-perf-{}-{}",
+        "actrealm-m5-hook-perf-{}-{}",
         std::process::id(),
         Uuid::now_v7()
     ));
     fs::create_dir_all(&root).unwrap();
     let socket = root.join("bridge.sock");
-    let mut runtime = Command::new(env!("CARGO_BIN_EXE_flow-agent"))
+    let mut runtime = Command::new(env!("CARGO_BIN_EXE_actrealm"))
         .args([
             "serve",
             "--approval",
@@ -54,7 +54,7 @@ fn nonblocking_hook_process_p95_is_below_50_ms() {
     .to_string();
     let run = || {
         let started = Instant::now();
-        let mut hook = Command::new(env!("CARGO_BIN_EXE_flow-agent"))
+        let mut hook = Command::new(env!("CARGO_BIN_EXE_actrealm"))
             .args([
                 "hook",
                 "--provider",

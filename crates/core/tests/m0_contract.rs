@@ -1,4 +1,4 @@
-use flow_agent_core::{
+use actrealm_core::{
     permission_deadline_ms, permission_directive, ApprovalOwner, BridgeRequest, BridgeResponse,
     Decision, EventKind, ExecState, PendingDecision, PendingDecisionState, Provider, ReplyAction,
     SessionProjection, CLAUDE_PERMISSION_DEADLINE_MS, CODEX_PERMISSION_DEADLINE_MS,
@@ -26,7 +26,7 @@ fn provider_permission_directives_are_exact_minimal_json() {
                     "hookEventName": "PermissionRequest",
                     "decision": {
                         "behavior": "deny",
-                        "message": "User denied via Flow Agent"
+                        "message": "User denied via ActRealm"
                     }
                 }
             }))

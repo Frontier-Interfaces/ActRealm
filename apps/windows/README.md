@@ -9,7 +9,7 @@ but no generated Visual Studio solution yet.
 - a typed Runtime client for the same authenticated loopback HTTP/WebSocket API
   used by macOS;
 - a Windows-only foreground scheduling executor behind a small interface;
-- the Rust `flow-agent` binary packaged as a signed helper once the Runtime's
+- the Rust `actrealm` binary packaged as a signed helper once the Runtime's
   Unix-specific bridge, file permissions, and installer paths are abstracted.
 
 Do not share SwiftUI/WinUI views or introduce a cross-platform UI framework.

@@ -1,5 +1,5 @@
 [package]
-name = "flow-agent-server"
+name = "actrealm-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,12 +7,12 @@ rust-version.workspace = true
 
 [dependencies]
 axum.workspace = true
-flow-agent-installer = { path = "../installer" }
-flow-agent-codex-connector = { path = "../codex-connector" }
-flow-agent-core = { path = "../core" }
-flow-agent-quota = { path = "../quota" }
-flow-agent-runtime = { path = "../runtime" }
-flow-agent-usage = { path = "../usage" }
+actrealm-installer = { path = "../installer" }
+actrealm-codex-connector = { path = "../codex-connector" }
+actrealm-core = { path = "../core" }
+actrealm-quota = { path = "../quota" }
+actrealm-runtime = { path = "../runtime" }
+actrealm-usage = { path = "../usage" }
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true

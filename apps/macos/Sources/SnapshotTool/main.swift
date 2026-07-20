@@ -167,7 +167,7 @@ Task { @MainActor in
         size: nil,
         to: "\(outDir)/hud-foreground-reminder-light.png"
     )
-    model.keepForegroundTaskInActRoom()
+    model.keepForegroundTaskInActRealmWorkspace()
 
     // Menu bar popover.
     for dark in [false, true] {

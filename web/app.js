@@ -1,7 +1,7 @@
 "use strict";
 
 const ui = {
-  actRoom: document.querySelector("#act-room"),
+  actRealmWorkspace: document.querySelector("#actrealm-workspace"),
   menuClock: document.querySelector("#menu-clock"),
   runtimeState: document.querySelector("#runtime-state"),
   runtimeLabel: document.querySelector("#runtime-label"),
@@ -69,7 +69,7 @@ const ui = {
   sessionDetailJump: document.querySelector("#session-detail-jump"),
 };
 
-let csrfToken = sessionStorage.getItem("flowAgentCsrf");
+let csrfToken = sessionStorage.getItem("actrealm.csrf");
 let snapshot = { sessions: [], attention: [], commands: [], quota: [], stats: {} };
 let currentAttention = 0;
 let socket;
@@ -110,7 +110,7 @@ let fallbackSnapshotInFlight = false;
 let restartInProgress = false;
 let runtimeMonitorInFlight = false;
 let lastRuntimeMonitorAt = 0;
-let hiddenSessions = JSON.parse(localStorage.getItem("flowAgentHiddenSessions") || "{}");
+let hiddenSessions = JSON.parse(localStorage.getItem("actrealm.hiddenSessions") || "{}");
 const SESSION_VISIBLE_FOR_MS = 30 * 60 * 1000;
 const SOCKET_STALE_AFTER_MS = 25 * 1000;
 const SNAPSHOT_FALLBACK_AFTER_MS = 15 * 1000;
@@ -190,12 +190,12 @@ function setupStatus(status) {
     not_installed: { label: "未接入", className: "muted", detail: "不会修改现有配置，点击后先备份再语义合并。" },
     provider_missing: { label: "未找到客户端", className: "error", detail: "请先安装这个 Agent 的桌面客户端或命令行程序。" },
     cli_missing: { label: "未找到客户端", className: "error", detail: "请先安装这个 Agent 的桌面客户端或命令行程序。" },
-    needs_trust: { label: "等待信任", className: "warning", detail: "打开 Codex，输入 /hooks，逐项检查并信任 Flow Agent。" },
+    needs_trust: { label: "等待信任", className: "warning", detail: "打开 Codex，输入 /hooks，逐项检查并信任 ActRealm。" },
     installed_unverified: { label: "等待验证", className: "warning", detail: "配置已经就绪。启动一次真实会话后才能确认接入。" },
     connected: { label: "已接入", className: "ready", detail: "已收到安装后的真实 Agent 事件，实时活动可以正常显示。" },
-    needs_reinstall: { label: "配置有变化", className: "error", detail: "发现不完整或被修改的 Flow Agent 条目；不会自动覆盖。" },
+    needs_reinstall: { label: "配置有变化", className: "error", detail: "发现不完整或被修改的 ActRealm 条目；不会自动覆盖。" },
     inline_conflict: { label: "配置冲突", className: "error", detail: "Codex 同时存在 inline Hook。请先保留一种同层配置形式。" },
-    error: { label: "配置无法解析", className: "error", detail: "为保护你的设置，Flow Agent 已拒绝改写。请先恢复或修正配置。" },
+    error: { label: "配置无法解析", className: "error", detail: "为保护你的设置，ActRealm 已拒绝改写。请先恢复或修正配置。" },
   }[status] || { label: status, className: "muted", detail: "状态暂时无法识别。" };
 }
 
@@ -267,7 +267,7 @@ function openSetup() {
 
 function closeSetup() {
   ui.setupOverlay.hidden = true;
-  sessionStorage.setItem("flowAgentSetupSeen", "1");
+  sessionStorage.setItem("actrealm.setupSeen", "1");
   ui.setupTrigger.focus();
 }
 
@@ -304,7 +304,7 @@ async function changeSetup(provider, action) {
 }
 
 function openSettings() {
-  ui.actRoom.hidden = true;
+  ui.actRealmWorkspace.hidden = true;
   ui.settingsOverlay.hidden = false;
   renderMetrics();
   ui.settingsClose.focus();
@@ -313,7 +313,7 @@ function openSettings() {
 
 function closeSettings() {
   ui.settingsOverlay.hidden = true;
-  ui.actRoom.hidden = false;
+  ui.actRealmWorkspace.hidden = false;
   ui.settingsTrigger.focus();
 }
 
@@ -488,7 +488,7 @@ async function exportLocalData() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = "flow-agent-export.json";
+    link.download = "actrealm-export.json";
     document.body.append(link);
     link.click();
     link.remove();
@@ -507,7 +507,7 @@ async function exportLocalMetrics() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = "flow-agent-metrics.json";
+    link.download = "actrealm-metrics.json";
     document.body.append(link);
     link.click();
     link.remove();
@@ -603,21 +603,21 @@ function attentionTitle(item) {
 function attentionContext(item) {
   if (item.kind === "native_approval") {
     return {
-      kicker: `${providerName(item.provider)} 原界面请求 · Flow Agent 仅同步状态`,
+      kicker: `${providerName(item.provider)} 原界面请求 · ActRealm 仅同步状态`,
       state: "等待原界面处理",
       notification: "原界面请求批准",
     };
   }
   if (item.kind === "approval") {
     return {
-      kicker: "可在 Flow Agent 审批 · 任务等待决定",
+      kicker: "可在 ActRealm 审批 · 任务等待决定",
       state: stateLabel(item.state),
-      notification: "可在 Flow Agent 审批",
+      notification: "可在 ActRealm 审批",
     };
   }
   if (item.kind === "question") {
     return {
-      kicker: "可在 Flow Agent 回答 · 任务等待输入",
+      kicker: "可在 ActRealm 回答 · 任务等待输入",
       state: stateLabel(item.state),
       notification: "等待回答",
     };
@@ -1110,7 +1110,7 @@ function openSessionDetail(session) {
     fields.has("environment") ? detailPair("运行环境", session.environment) : undefined,
     fields.has("jump") ? detailPair("跳转能力", session.jumpLabel) : undefined,
     fields.has("titleSource") ? detailPair("标题来源", session.providerTitleSource) : undefined,
-    fields.has("sessionId") ? detailPair("Flow Agent Session ID", session.id, "developer-value") : undefined,
+    fields.has("sessionId") ? detailPair("ActRealm Session ID", session.id, "developer-value") : undefined,
     fields.has("providerSessionId") ? detailPair("Provider Session ID", session.providerSessionId, "developer-value") : undefined,
     fields.has("providerTurnId") ? detailPair("Provider Turn ID", session.providerTurnId, "developer-value") : undefined,
     fields.has("lastEventAt") ? detailPair("最后事件", new Date(session.lastEventAt).toLocaleString()) : undefined,
@@ -1152,9 +1152,9 @@ function activityDisplay(session) {
     const text = waiting.kind === "native_approval"
       ? `${providerName(waiting.provider)} 正在请求批准，请回原界面处理`
       : waiting.kind === "approval"
-        ? "等待你在 Flow Agent 审批"
+        ? "等待你在 ActRealm 审批"
         : waiting.kind === "question"
-          ? "等待你在 Flow Agent 回答"
+          ? "等待你在 ActRealm 回答"
           : "等待你处理";
     return {
       className: "waiting",
@@ -1213,7 +1213,7 @@ function selectSession(sessionId) {
 
 async function jumpSession(session) {
   if (!session || session.jumpCapability === "unsupported") {
-    showToast("当前环境不支持跳转；Flow Agent 不会假装已经定位到原对话");
+    showToast("当前环境不支持跳转；ActRealm 不会假装已经定位到原对话");
     return;
   }
   try {
@@ -1237,7 +1237,7 @@ async function manageSession(session) {
       method: "POST",
       body: JSON.stringify({ action: "attach" }),
     });
-    showToast("Codex 对话已由 Flow Agent app-server Connector 接管");
+    showToast("Codex 对话已由 ActRealm app-server Connector 接管");
     await loadSnapshot();
   } catch (error) {
     showToast(`托管连接失败：${error.detail || error.message}`);
@@ -1273,7 +1273,7 @@ async function clearSessionFromList(session) {
   const results = await Promise.allSettled(related.map(dismissAttentionForTaskClear));
   const failed = results.filter((result) => result.status === "rejected").length;
   hiddenSessions[session.id] = Number(session.lastEventAt || Date.now());
-  localStorage.setItem("flowAgentHiddenSessions", JSON.stringify(hiddenSessions));
+  localStorage.setItem("actrealm.hiddenSessions", JSON.stringify(hiddenSessions));
   if (selectedSessionId === session.id) selectedSessionId = undefined;
   await loadSnapshot().catch(() => renderSessions());
   if (failed) {
@@ -1653,7 +1653,7 @@ function render(nextSnapshot) {
 async function api(path, options = {}) {
   const headers = new Headers(options.headers || {});
   if (options.body && !headers.has("content-type")) headers.set("content-type", "application/json");
-  if (csrfToken && options.method && options.method !== "GET") headers.set("x-flow-agent-csrf", csrfToken);
+  if (csrfToken && options.method && options.method !== "GET") headers.set("x-actrealm-csrf", csrfToken);
   const response = await fetch(path, { ...options, headers, credentials: "same-origin" });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -1678,7 +1678,7 @@ async function recordUiMetric(event) {
 async function bootstrapWithToken(token) {
   const response = await api("/api/v1/bootstrap", { method: "POST", body: JSON.stringify({ token }) });
   csrfToken = response.csrfToken;
-  sessionStorage.setItem("flowAgentCsrf", csrfToken);
+  sessionStorage.setItem("actrealm.csrf", csrfToken);
   return true;
 }
 
@@ -1915,7 +1915,7 @@ async function waitForRuntimeRestart(previousInstanceId, restartToken) {
     }
     if (health?.instanceId && health.instanceId !== previousInstanceId) {
       csrfToken = undefined;
-      sessionStorage.removeItem("flowAgentCsrf");
+      sessionStorage.removeItem("actrealm.csrf");
       await bootstrapWithToken(restartToken);
       await loadSnapshot();
       await loadSetup();
@@ -1959,7 +1959,7 @@ async function restartRuntime() {
       previousSocket.close();
     }
     csrfToken = undefined;
-    sessionStorage.removeItem("flowAgentCsrf");
+    sessionStorage.removeItem("actrealm.csrf");
     setConnected(false);
     ui.runtimeLabel.textContent = "正在重启";
     ui.runtimeFooterLabel.textContent = "Runtime · 正在恢复";
@@ -2107,7 +2107,7 @@ window.setInterval(maintainLiveConnection, 5000);
     notificationsPrimed = true;
     connectSocket();
   } catch (error) {
-    ui.attentionList.replaceChildren(emptyState("!", "无法连接本地 Runtime", "请从 flow-agent serve 输出的一次性地址打开控制面板。"));
+    ui.attentionList.replaceChildren(emptyState("!", "无法连接本地 Runtime", "请从 actrealm serve 输出的一次性地址打开控制面板。"));
     showToast(`连接失败：${error.message}`);
   }
 })();

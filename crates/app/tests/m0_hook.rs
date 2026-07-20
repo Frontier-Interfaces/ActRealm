@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use flow_agent_core::{BridgeRequest, BridgeResponse, Decision, ReplyPayload};
+use actrealm_core::{BridgeRequest, BridgeResponse, Decision, ReplyPayload};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
@@ -26,7 +26,7 @@ fn run_hook_with_env(
     timeout_ms: u64,
     environment: &[(&str, &str)],
 ) -> Vec<u8> {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_flow-agent"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_actrealm"));
     command
         .args([
             "hook",
@@ -35,7 +35,7 @@ fn run_hook_with_env(
             "--socket",
             path.to_str().unwrap(),
         ])
-        .env("FLOW_AGENT_HOOK_REPLY_TIMEOUT_MS", timeout_ms.to_string())
+        .env("ACTREALM_HOOK_REPLY_TIMEOUT_MS", timeout_ms.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -183,7 +183,7 @@ fn codex_auto_review_profile_config_is_used_when_the_hook_omits_the_reviewer() {
         assert_eq!(request.request_id, None);
     });
     let codex_home = std::env::temp_dir().join(format!(
-        "flow-agent-auto-review-config-{}",
+        "actrealm-auto-review-config-{}",
         std::process::id()
     ));
     fs::create_dir_all(&codex_home).unwrap();
@@ -331,7 +331,7 @@ fn deadline_and_socket_eof_both_fail_open() {
 #[test]
 fn prompt_decision_can_be_undone_without_reaching_provider() {
     let path = temp_socket("undo");
-    let mut runtime = Command::new(env!("CARGO_BIN_EXE_flow-agent"))
+    let mut runtime = Command::new(env!("CARGO_BIN_EXE_actrealm"))
         .args([
             "serve",
             "--approval",
@@ -339,7 +339,7 @@ fn prompt_decision_can_be_undone_without_reaching_provider() {
             "--socket",
             path.to_str().unwrap(),
         ])
-        .env("FLOW_AGENT_COMMIT_DELAY_MS", "250")
+        .env("ACTREALM_COMMIT_DELAY_MS", "250")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -376,15 +376,15 @@ fn prompt_decision_can_be_undone_without_reaching_provider() {
 
 #[test]
 fn skip_hooks_exits_before_parsing_provider_input() {
-    let output = Command::new(env!("CARGO_BIN_EXE_flow-agent"))
+    let output = Command::new(env!("CARGO_BIN_EXE_actrealm"))
         .args([
             "hook",
             "--provider",
             "codex",
             "--socket",
-            "/tmp/flow-agent-unused.sock",
+            "/tmp/actrealm-unused.sock",
         ])
-        .env("FLOW_AGENT_SKIP_HOOKS", "1")
+        .env("ACTREALM_SKIP_HOOKS", "1")
         .stdin(Stdio::null())
         .output()
         .unwrap();
@@ -396,13 +396,13 @@ fn skip_hooks_exits_before_parsing_provider_input() {
 #[test]
 fn stdin_that_never_closes_fails_open_within_its_own_budget() {
     let path = temp_socket("stdin-open");
-    let warmup = Command::new(env!("CARGO_BIN_EXE_flow-agent"))
+    let warmup = Command::new(env!("CARGO_BIN_EXE_actrealm"))
         .arg("--version")
         .output()
         .unwrap();
     assert!(warmup.status.success());
     let started = Instant::now();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_flow-agent"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_actrealm"))
         .args([
             "hook",
             "--provider",
@@ -410,7 +410,7 @@ fn stdin_that_never_closes_fails_open_within_its_own_budget() {
             "--socket",
             path.to_str().unwrap(),
         ])
-        .env("FLOW_AGENT_STDIN_TIMEOUT_MS", "40")
+        .env("ACTREALM_STDIN_TIMEOUT_MS", "40")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

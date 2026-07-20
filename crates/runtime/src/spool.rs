@@ -1,5 +1,5 @@
 use crate::fsutil::ensure_private_directory;
-use flow_agent_core::BridgeRequest;
+use actrealm_core::BridgeRequest;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -28,13 +28,13 @@ pub struct EventSpool {
 }
 
 pub fn default_spool_path() -> PathBuf {
-    if let Some(root) = env::var_os("FLOW_AGENT_HOME") {
+    if let Some(root) = env::var_os("ACTREALM_HOME") {
         return PathBuf::from(root).join("spool");
     }
     env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".flow-agent/spool")
+        .join(".actrealm/spool")
 }
 
 impl Default for EventSpool {

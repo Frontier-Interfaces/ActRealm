@@ -1,6 +1,6 @@
 # ActRealm for macOS
 
-Native SwiftUI/AppKit client for the local `flow-agent` Runtime.
+Native SwiftUI/AppKit client for the local `actrealm` Runtime.
 
 ## Responsibilities
 
@@ -8,7 +8,7 @@ Native SwiftUI/AppKit client for the local `flow-agent` Runtime.
 - supervise the bundled Runtime helper and connect through its authenticated
   loopback API and WebSocket;
 - execute macOS-only foreground scheduling through `NSWorkspace` and AppKit;
-- package one tested `flow-agent` binary inside `ActRealm.app`.
+- package one tested `actrealm` binary inside `ActRealm.app`.
 
 The client does not read SQLite or Provider configuration directly. Hooks,
 sanitization, approval state, persistence, and Provider replies remain owned by
@@ -27,8 +27,8 @@ The helper scripts prefer the installed macOS 26 SDK because the current UI
 uses that SDK's SwiftUI surface. Set `SDKROOT` explicitly to test another SDK.
 
 When run from source, `ActRealmApp` finds the Rust workspace at the monorepo
-root and builds `target/release/flow-agent` if needed. A packaged app always
-prefers its embedded `Contents/Helpers/flow-agent` helper.
+root and builds `target/release/actrealm` if needed. A packaged app always
+prefers its embedded `Contents/Helpers/actrealm` helper.
 
 ## Packaging
 

@@ -17,7 +17,7 @@ authorized commit/push on 2026-07-17.
 Targeted evidence:
 
 ```text
-cargo test -p flow-agent-server m10_display_settings_migrate_and_reject_fields_outside_the_safe_catalog --offline
+cargo test -p actrealm-server m10_display_settings_migrate_and_reject_fields_outside_the_safe_catalog --offline
 PASS
 node --check web/app.js
 PASS
@@ -45,7 +45,7 @@ Browser evidence:
 Targeted evidence:
 
 ```text
-cargo test -p flow-agent-core -p flow-agent-runtime -p flow-agent-server -p flow-agent --offline
+cargo test -p actrealm-core -p actrealm-runtime -p actrealm-server -p actrealm --offline
 PASS
 ```
 
@@ -63,7 +63,7 @@ PASS
 Targeted evidence:
 
 ```text
-cargo test -p flow-agent-codex-connector -p flow-agent-runtime -p flow-agent-server --offline
+cargo test -p actrealm-codex-connector -p actrealm-runtime -p actrealm-server --offline
 PASS
 ```
 
@@ -72,7 +72,7 @@ initialize, list, resume, a server-originated request, and the matching client
 response without network access.
 
 The current desktop-bundled Codex 0.144.5 executable also completed real
-private app-server initialization and `thread/list`; Flow Agent no longer calls
+private app-server initialization and `thread/list`; ActRealm no longer calls
 the standalone-install-only `app-server daemon start` command.
 
 ## Release evidence

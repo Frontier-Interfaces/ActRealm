@@ -10,7 +10,7 @@ Environment: macOS 26.5.2 (25F84), rustc 1.97.0, cargo 1.97.0.
 
 ## Delivered runtime core
 
-- `flow-agent-runtime` owns SQLite, the single writer thread, schema v1,
+- `actrealm-runtime` owns SQLite, the single writer thread, schema v1,
   transactional ingestion/commands, waiter registry, event spool, risk preview,
   liveness reconciliation, and the process lock.
 - SQLite is created with mode 0600, WAL, foreign keys, and a single writer.
@@ -20,7 +20,7 @@ Environment: macOS 26.5.2 (25F84), rustc 1.97.0, cargo 1.97.0.
 - Approval commands implement open → committing → decision_sent, three-second
   undo, immediate pass-through, stale-waiter rejection, and later evidence
   confirmation. Concurrent approve/deny/pass-through has exactly one winner.
-- Waiters are memory-only and keyed by Flow Agent request ID plus a provider
+- Waiters are memory-only and keyed by ActRealm request ID plus a provider
   correlation key and in-memory tool-input fingerprint. Exact duplicates pass
   the older waiter through; distinct commands in one turn remain independent.
 - Client write-side half-close remains a live response channel. Deadline,
@@ -64,7 +64,7 @@ single-instance socket preservation, and real Hook-to-Runtime persistence.
    M3 `doctor` requirement.
 4. The writer message enum placed full event envelopes inline. Envelopes are
    boxed to keep queue messages small.
-5. Recursive directory creation could leave an intermediate `~/.flow-agent`
+5. Recursive directory creation could leave an intermediate `~/.actrealm`
    directory governed by the user's umask. Newly created Runtime directories
    now use mode 0700 from their first filesystem operation; database, lock,
    spool files, and the socket remain 0600.

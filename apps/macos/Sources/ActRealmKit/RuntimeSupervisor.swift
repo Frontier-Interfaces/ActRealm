@@ -2,7 +2,7 @@ import Combine
 import Darwin
 import Foundation
 
-/// Locates the `flow-agent` Rust backend (bundled helper first, then a dev
+/// Locates the `actrealm` Rust backend (bundled helper first, then a dev
 /// checkout), supervises it as a child process, and extracts the one-time
 /// bootstrap URL/token it prints on startup so a `RuntimeClient` can hand
 /// off into an authenticated session.
@@ -66,12 +66,12 @@ public final class RuntimeSupervisor: ObservableObject {
     /// The packaged helper inside the .app bundle, if present.
     public nonisolated static func bundledHelper() -> URL? {
         let bundle = Bundle.main
-        if let helper = bundle.url(forAuxiliaryExecutable: "flow-agent"),
+        if let helper = bundle.url(forAuxiliaryExecutable: "actrealm"),
            FileManager.default.isExecutableFile(atPath: helper.path) {
             return helper
         }
         let helpersDir = bundle.bundleURL
-            .appendingPathComponent("Contents/Helpers/flow-agent")
+            .appendingPathComponent("Contents/Helpers/actrealm")
         if FileManager.default.isExecutableFile(atPath: helpersDir.path) {
             return helpersDir
         }
@@ -79,7 +79,7 @@ public final class RuntimeSupervisor: ObservableObject {
     }
 
     /// Ensures a backend binary exists (bundled helper, or a cargo release
-    /// build of the dev checkout), launches `flow-agent serve`, and invokes
+    /// build of the dev checkout), launches `actrealm serve`, and invokes
     /// `onBootstrap` exactly once with the base URL and one-time token
     /// parsed from its stdout.
     public func start(onBootstrap: @escaping (URL, String) -> Void) async {
@@ -93,15 +93,15 @@ public final class RuntimeSupervisor: ObservableObject {
         }
 
         guard let repoPath else {
-            state = .failed("app 内没有打包 flow-agent Helper，也未配置开发仓库路径")
+            state = .failed("app 内没有打包 actrealm Helper，也未配置开发仓库路径")
             return
         }
-        let binary = repoPath.appendingPathComponent("target/release/flow-agent")
+        let binary = repoPath.appendingPathComponent("target/release/actrealm")
         if !FileManager.default.fileExists(atPath: binary.path) {
             state = .buildingBackend
             let succeeded = await Self.buildRelease(repoPath: repoPath)
             guard succeeded else {
-                state = .failed("cargo build --release -p flow-agent failed")
+                state = .failed("cargo build --release -p actrealm failed")
                 return
             }
         }
@@ -119,7 +119,7 @@ public final class RuntimeSupervisor: ObservableObject {
 
     /// Restarts the app-managed Runtime. If an earlier copy of this app left
     /// its bundled helper holding `runtime.lock`, the lock owner is stopped
-    /// only after its executable path is verified as a known flow-agent path.
+    /// only after its executable path is verified as a known actrealm path.
     @discardableResult
     public func restart(onBootstrap: @escaping (URL, String) -> Void) async -> String? {
         state = .restarting
@@ -127,7 +127,7 @@ public final class RuntimeSupervisor: ObservableObject {
         refreshDiagnostics()
 
         if await bootOutOutdatedLaunchAgent() {
-            stdoutTail = String((stdoutTail + "已停止参数过期的 com.frontier.flow-agent LaunchAgent\n").suffix(4000))
+            stdoutTail = String((stdoutTail + "已停止参数过期的 com.frontier.actrealm.runtime LaunchAgent\n").suffix(4000))
         }
 
         if let process, process.isRunning {
@@ -165,7 +165,7 @@ public final class RuntimeSupervisor: ObservableObject {
         await withCheckedContinuation { continuation in
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            proc.arguments = ["cargo", "build", "--release", "-p", "flow-agent"]
+            proc.arguments = ["cargo", "build", "--release", "-p", "actrealm"]
             proc.currentDirectoryURL = repoPath
             proc.terminationHandler = { finished in
                 continuation.resume(returning: finished.terminationStatus == 0)
@@ -222,20 +222,20 @@ public final class RuntimeSupervisor: ObservableObject {
             process = proc
             refreshDiagnostics()
         } catch {
-            state = .failed("failed to launch flow-agent: \(error.localizedDescription)")
+            state = .failed("failed to launch actrealm: \(error.localizedDescription)")
             refreshDiagnostics()
         }
     }
 
     private nonisolated static func failureMessage(status: Int32, stderr: String) -> String {
         if stderr.contains("failed to acquire") && stderr.contains(".lock") {
-            return "另一个 flow-agent 实例已在运行（可先退出终端里的 serve）"
+            return "另一个 actrealm 实例已在运行（可先退出终端里的 serve）"
         }
         let tail = stderr
             .split(separator: "\n", omittingEmptySubsequences: true)
             .suffix(2)
             .joined(separator: " · ")
-        return tail.isEmpty ? "flow-agent 退出（状态码 \(status)）" : tail
+        return tail.isEmpty ? "actrealm 退出（状态码 \(status)）" : tail
     }
 
     private func ingest(_ data: Data) {
@@ -286,7 +286,7 @@ public final class RuntimeSupervisor: ObservableObject {
     private func resolvedHelper() -> URL? {
         if let bundled = Self.bundledHelper() { return bundled }
         guard let repoPath else { return nil }
-        return repoPath.appendingPathComponent("target/release/flow-agent")
+        return repoPath.appendingPathComponent("target/release/actrealm")
     }
 
     private func isExpectedRuntimePath(_ path: String?) -> Bool {
@@ -294,7 +294,7 @@ public final class RuntimeSupervisor: ObservableObject {
         var expected = [
             Self.installedHelperURL.path,
             Self.bundledHelper()?.path,
-            repoPath?.appendingPathComponent("target/release/flow-agent").path,
+            repoPath?.appendingPathComponent("target/release/actrealm").path,
         ].compactMap { $0 }
         if let process, process.executableURL?.path != nil {
             expected.append(process.executableURL!.path)
@@ -324,7 +324,7 @@ public final class RuntimeSupervisor: ObservableObject {
         return await withCheckedContinuation { continuation in
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-            proc.arguments = ["bootout", "gui/\(getuid())/com.frontier.flow-agent"]
+            proc.arguments = ["bootout", "gui/\(getuid())/com.frontier.actrealm.runtime"]
             proc.standardOutput = Pipe()
             proc.standardError = Pipe()
             proc.terminationHandler = { finished in
@@ -338,20 +338,20 @@ public final class RuntimeSupervisor: ObservableObject {
         }
     }
 
-    private nonisolated static var flowAgentHome: URL {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".flow-agent")
+    private nonisolated static var actRealmHome: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".actrealm")
     }
 
     private nonisolated static var runtimeLockURL: URL {
-        flowAgentHome.appendingPathComponent("run/runtime.lock")
+        actRealmHome.appendingPathComponent("run/runtime.lock")
     }
 
     private nonisolated static var bridgeSocketURL: URL {
-        flowAgentHome.appendingPathComponent("run/bridge.sock")
+        actRealmHome.appendingPathComponent("run/bridge.sock")
     }
 
     private nonisolated static var installedHelperURL: URL {
-        flowAgentHome.appendingPathComponent("bin/flow-agent")
+        actRealmHome.appendingPathComponent("bin/actrealm")
     }
 
     private nonisolated static func lockOwnerPID() -> Int32? {
@@ -375,7 +375,7 @@ public final class RuntimeSupervisor: ObservableObject {
 
     private nonisolated static func launchAgentWarning() -> String? {
         let plistURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/LaunchAgents/com.frontier.flow-agent.plist")
+            .appendingPathComponent("Library/LaunchAgents/com.frontier.actrealm.runtime.plist")
         guard let data = try? Data(contentsOf: plistURL),
               let plist = try? PropertyListSerialization.propertyList(from: data, format: nil),
               let dictionary = plist as? [String: Any],
@@ -387,9 +387,9 @@ public final class RuntimeSupervisor: ObservableObject {
         return nil
     }
 
-    /// Parses `Flow Agent control panel: http://127.0.0.1:<port>/#bootstrap=<token>`.
+    /// Parses `ActRealm control panel: http://127.0.0.1:<port>/#bootstrap=<token>`.
     public nonisolated static func parseBootstrapLine(_ line: String) -> (baseURL: URL, token: String)? {
-        guard let prefixRange = line.range(of: "Flow Agent control panel: ") else { return nil }
+        guard let prefixRange = line.range(of: "ActRealm control panel: ") else { return nil }
         let rest = line[prefixRange.upperBound...]
         guard let markerRange = rest.range(of: "/#bootstrap=") else { return nil }
         let baseURLString = String(rest[rest.startIndex..<markerRange.lowerBound])

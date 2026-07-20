@@ -1,11 +1,11 @@
 #!/bin/sh
 set -eu
 
-binary=${1:-target/release/flow-agent}
-duration=${FLOW_AGENT_RESOURCE_DURATION_SECONDS:-15}
-interval=${FLOW_AGENT_RESOURCE_INTERVAL_SECONDS:-1}
-report=${FLOW_AGENT_RESOURCE_REPORT:-/tmp/flow-agent-m5-resource-report.json}
-root=${TMPDIR:-/tmp}/flow-agent-m5-resource-$$
+binary=${1:-target/release/actrealm}
+duration=${ACTREALM_RESOURCE_DURATION_SECONDS:-15}
+interval=${ACTREALM_RESOURCE_INTERVAL_SECONDS:-1}
+report=${ACTREALM_RESOURCE_REPORT:-/tmp/actrealm-m5-resource-report.json}
+root=${TMPDIR:-/tmp}/actrealm-m5-resource-$$
 socket=$root/bridge.sock
 samples=$root/samples.txt
 
@@ -22,7 +22,7 @@ trap cleanup EXIT INT TERM
 
 HOME=$root/home \
 CODEX_HOME=$root/codex \
-FLOW_AGENT_HOME=$root/flow \
+ACTREALM_HOME=$root/actrealm \
 "$binary" serve --approval widget --socket "$socket" >"$root/runtime.log" 2>&1 &
 runtime_pid=$!
 

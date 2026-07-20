@@ -1,3 +1,17 @@
+use actrealm_codex_connector::{
+    parse_thread, CodexConnector, CodexThread, ConnectorChannels, ServerNotification, ServerRequest,
+};
+use actrealm_core::{BridgeRequest, Provider, ReplyAction, ReplyPayload};
+use actrealm_installer::{
+    discover_provider_availability, BinaryHealth, ClaudeStatuslineStatus, CodexTrustStatus,
+    ConfigHealth, HookProvider, InstallIntent, InstallOptions, InstallPaths, Installer,
+};
+use actrealm_quota::{QuotaCollector, QuotaEntry, QuotaPaths};
+use actrealm_runtime::{
+    ApprovalAction, AttentionAction, CommandState, MetricEvent, QuotaRecord, RuntimeStore,
+    SessionRecord, SessionUsageRecord, StoreError, WaiterError, WaiterRegistry,
+};
+use actrealm_usage::{UsageCollector, UsagePaths, UsageRecord};
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -8,20 +22,6 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use flow_agent_codex_connector::{
-    parse_thread, CodexConnector, CodexThread, ConnectorChannels, ServerNotification, ServerRequest,
-};
-use flow_agent_core::{BridgeRequest, Provider, ReplyAction, ReplyPayload};
-use flow_agent_installer::{
-    discover_provider_availability, BinaryHealth, ClaudeStatuslineStatus, CodexTrustStatus,
-    ConfigHealth, HookProvider, InstallIntent, InstallOptions, InstallPaths, Installer,
-};
-use flow_agent_quota::{QuotaCollector, QuotaEntry, QuotaPaths};
-use flow_agent_runtime::{
-    ApprovalAction, AttentionAction, CommandState, MetricEvent, QuotaRecord, RuntimeStore,
-    SessionRecord, SessionUsageRecord, StoreError, WaiterError, WaiterRegistry,
-};
-use flow_agent_usage::{UsageCollector, UsagePaths, UsageRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -40,8 +40,8 @@ use thiserror::Error;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-const SESSION_COOKIE: &str = "flow_agent_session";
-const CSRF_HEADER: &str = "x-flow-agent-csrf";
+const SESSION_COOKIE: &str = "actrealm_session";
+const CSRF_HEADER: &str = "x-actrealm-csrf";
 const SETTINGS_KEY: &str = "ui_settings";
 const MANAGED_CODEX_THREADS_KEY: &str = "managed_codex_threads";
 const MAX_MANAGED_CODEX_THREADS: usize = 32;
@@ -185,7 +185,7 @@ impl ApiServer {
         if !address.ip().is_loopback() {
             return Err(ApiServerError::Io(io::Error::new(
                 io::ErrorKind::AddrNotAvailable,
-                "Flow Agent API must bind to loopback",
+                "ActRealm API must bind to loopback",
             )));
         }
         let bootstrap_token = config
@@ -203,7 +203,7 @@ impl ApiServer {
         let source_binary =
             std::env::current_exe().map_err(|error| ApiServerError::Setup(error.to_string()))?;
         let quota_paths = QuotaPaths {
-            flow_home: install_paths.flow_home.clone(),
+            actrealm_home: install_paths.actrealm_home.clone(),
             codex_sessions: install_paths
                 .codex_config
                 .parent()
@@ -211,7 +211,7 @@ impl ApiServer {
                 .join("sessions"),
         };
         let mut usage_paths = UsagePaths::discover();
-        usage_paths.flow_home = install_paths.flow_home.clone();
+        usage_paths.actrealm_home = install_paths.actrealm_home.clone();
         let codex_home = install_paths
             .codex_config
             .parent()
@@ -221,11 +221,13 @@ impl ApiServer {
             codex_home.join("archived_sessions"),
         ];
         let data_paths = DataPaths {
-            cache: install_paths.flow_home.join("cache"),
-            spool: install_paths.flow_home.join("spool"),
-            diagnostics: install_paths.flow_home.join("diagnostics"),
+            cache: install_paths.actrealm_home.join("cache"),
+            spool: install_paths.actrealm_home.join("spool"),
+            diagnostics: install_paths.actrealm_home.join("diagnostics"),
         };
-        let codex_socket = install_paths.flow_home.join("run/codex-app-server.sock");
+        let codex_socket = install_paths
+            .actrealm_home
+            .join("run/codex-app-server.sock");
         let codex = if config.enable_codex_connector {
             CodexManager::start(store.clone(), waiters.clone(), &codex_socket)
         } else {
@@ -271,7 +273,7 @@ impl ApiServer {
         let router = router(state);
         let (shutdown, shutdown_receiver) = oneshot::channel();
         let api_thread = thread::Builder::new()
-            .name("flow-agent-api".to_owned())
+            .name("actrealm-api".to_owned())
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -689,11 +691,8 @@ fn handle_codex_server_request(
     request: ServerRequest,
 ) {
     if request.method != "item/tool/requestUserInput" {
-        let _ = connector.respond_error(
-            request.id,
-            -32601,
-            "Unsupported Flow Agent connector request",
-        );
+        let _ =
+            connector.respond_error(request.id, -32601, "Unsupported ActRealm connector request");
         return;
     }
     let Some(bridge_request) = BridgeRequest::codex_user_input_at(request.params, now_millis())
@@ -715,7 +714,7 @@ fn handle_codex_server_request(
     };
     if store.ingest(bridge_request.clone()).is_err() {
         let _ = waiters.pass_through(request_id, "runtime_error");
-        let _ = connector.respond_error(request.id, -32000, "Flow Agent storage unavailable");
+        let _ = connector.respond_error(request.id, -32000, "ActRealm storage unavailable");
         return;
     }
     let managed = if let Ok(mut current) = state.lock() {
@@ -1591,7 +1590,7 @@ fn settings_value(state: &AppState) -> Result<Value, String> {
             { "id": "control", "label": "控制能力", "level": "detailed" },
             { "id": "jump", "label": "跳转能力", "level": "detailed" },
             { "id": "titleSource", "label": "标题来源", "level": "developer" },
-            { "id": "sessionId", "label": "Flow Agent Session ID", "level": "developer" },
+            { "id": "sessionId", "label": "ActRealm Session ID", "level": "developer" },
             { "id": "providerSessionId", "label": "Provider Session ID", "level": "developer" },
             { "id": "providerTurnId", "label": "Provider Turn ID", "level": "developer" },
             { "id": "lastEventAt", "label": "最后事件时间", "level": "developer" }
@@ -1618,12 +1617,13 @@ async fn change_claude_bridge(
     if !authorized_mutation(&state, &headers) {
         return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_MUTATION");
     }
+    let claude_available = discover_provider_availability(HookProvider::Claude).is_available();
+    let existing_claude_config = state.installer.paths().claude_settings.exists();
     if matches!(request.action.as_str(), "install" | "wrap")
-        && discover_provider_availability(HookProvider::Claude)
-            .cli_path
-            .is_none()
+        && !claude_available
+        && !existing_claude_config
     {
-        return api_error(StatusCode::CONFLICT, "PROVIDER_CLI_REQUIRED");
+        return api_error(StatusCode::CONFLICT, "PROVIDER_INSTALL_REQUIRED");
     }
     let result = match request.action.as_str() {
         "install" => state.installer.install_claude_statusline().map(|_| ()),
@@ -1671,7 +1671,7 @@ async fn export_data(State(state): State<AppState>, headers: HeaderMap) -> Respo
             (CONTENT_TYPE, HeaderValue::from_static("application/json")),
             (
                 CONTENT_DISPOSITION,
-                HeaderValue::from_static("attachment; filename=flow-agent-export.json"),
+                HeaderValue::from_static("attachment; filename=actrealm-export.json"),
             ),
             (CACHE_CONTROL, HeaderValue::from_static("no-store")),
         ],
@@ -1697,7 +1697,7 @@ async fn export_metrics(State(state): State<AppState>, headers: HeaderMap) -> Re
             (CONTENT_TYPE, HeaderValue::from_static("application/json")),
             (
                 CONTENT_DISPOSITION,
-                HeaderValue::from_static("attachment; filename=flow-agent-metrics.json"),
+                HeaderValue::from_static("attachment; filename=actrealm-metrics.json"),
             ),
             (CACHE_CONTROL, HeaderValue::from_static("no-store")),
         ],
@@ -2149,11 +2149,11 @@ fn run_jump_target(target: &JumpTarget, session: &SessionRecord) -> io::Result<b
             .arg("-e")
             .arg(ITERM_JUMP_SCRIPT)
             .env(
-                "FLOW_AGENT_JUMP_SESSION",
+                "ACTREALM_JUMP_SESSION",
                 session.term_session_id.as_deref().unwrap_or_default(),
             )
             .env(
-                "FLOW_AGENT_JUMP_TTY",
+                "ACTREALM_JUMP_TTY",
                 session.term_tty.as_deref().unwrap_or_default(),
             )
             .status()?,
@@ -2161,7 +2161,7 @@ fn run_jump_target(target: &JumpTarget, session: &SessionRecord) -> io::Result<b
             .arg("-e")
             .arg(TERMINAL_JUMP_SCRIPT)
             .env(
-                "FLOW_AGENT_JUMP_TTY",
+                "ACTREALM_JUMP_TTY",
                 session.term_tty.as_deref().unwrap_or_default(),
             )
             .status()?,
@@ -2174,8 +2174,8 @@ fn run_jump_target(target: &JumpTarget, session: &SessionRecord) -> io::Result<b
 }
 
 const ITERM_JUMP_SCRIPT: &str = r#"
-set targetSession to system attribute "FLOW_AGENT_JUMP_SESSION"
-set targetTty to system attribute "FLOW_AGENT_JUMP_TTY"
+set targetSession to system attribute "ACTREALM_JUMP_SESSION"
+set targetTty to system attribute "ACTREALM_JUMP_TTY"
 tell application "iTerm2"
   repeat with candidateWindow in windows
     repeat with candidateTab in tabs of candidateWindow
@@ -2193,7 +2193,7 @@ error "target session not found"
 "#;
 
 const TERMINAL_JUMP_SCRIPT: &str = r#"
-set targetTty to system attribute "FLOW_AGENT_JUMP_TTY"
+set targetTty to system attribute "ACTREALM_JUMP_TTY"
 tell application "Terminal"
   repeat with candidateWindow in windows
     repeat with candidateTab in tabs of candidateWindow
@@ -2526,7 +2526,7 @@ fn spawn_oauth_quota_refresh(
 ) {
     let state_on_failure = quota_state.clone();
     let result = thread::Builder::new()
-        .name("flow-agent-claude-quota".to_owned())
+        .name("actrealm-claude-quota".to_owned())
         .spawn(move || {
             let now = now_millis();
             let mut collector = QuotaCollector::new(paths);
@@ -2672,7 +2672,7 @@ mod tests {
             .uri(uri)
             .header(HOST, "127.0.0.1:43111")
             .header(ORIGIN, "http://127.0.0.1:43111")
-            .header(COOKIE, "flow_agent_session=test-session")
+            .header(COOKIE, "actrealm_session=test-session")
             .header(CSRF_HEADER, "test-csrf")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(body.to_string()))
@@ -2688,17 +2688,17 @@ mod tests {
 
     fn test_state(store: RuntimeStore, root: &FilePath) -> AppState {
         let paths = InstallPaths {
-            flow_home: root.join("flow-home"),
+            actrealm_home: root.join("actrealm-home"),
             claude_settings: root.join("home/.claude/settings.json"),
             codex_hooks: root.join("codex/hooks.json"),
             codex_config: root.join("codex/config.toml"),
         };
         let quota_paths = QuotaPaths {
-            flow_home: paths.flow_home.clone(),
+            actrealm_home: paths.actrealm_home.clone(),
             codex_sessions: root.join("codex/sessions"),
         };
         let usage_paths = UsagePaths {
-            flow_home: paths.flow_home.clone(),
+            actrealm_home: paths.actrealm_home.clone(),
             claude_projects: vec![root.join("home/.claude/projects")],
             codex_sessions: vec![
                 root.join("codex/sessions"),
@@ -2740,9 +2740,9 @@ mod tests {
                 refreshed_at: None,
             })),
             data_paths: DataPaths {
-                cache: root.join("flow-home/cache"),
-                spool: root.join("flow-home/spool"),
-                diagnostics: root.join("flow-home/diagnostics"),
+                cache: root.join("actrealm-home/cache"),
+                spool: root.join("actrealm-home/spool"),
+                diagnostics: root.join("actrealm-home/diagnostics"),
             },
             codex,
             runtime_restart: None,
@@ -2752,7 +2752,7 @@ mod tests {
     #[test]
     fn jump_capabilities_map_only_to_targets_the_runtime_can_really_open() {
         let root = std::env::temp_dir().join(format!(
-            "flow-agent-server-jump-targets-{}-{}",
+            "actrealm-server-jump-targets-{}-{}",
             std::process::id(),
             Uuid::now_v7()
         ));
@@ -2760,9 +2760,9 @@ mod tests {
         let codex_id = Uuid::now_v7().to_string();
         let cases = [
             (
-                flow_agent_core::Provider::Codex,
+                actrealm_core::Provider::Codex,
                 codex_id.as_str(),
-                flow_agent_core::TermContext {
+                actrealm_core::TermContext {
                     app: None,
                     session_id: None,
                     tty: None,
@@ -2773,9 +2773,9 @@ mod tests {
                 },
             ),
             (
-                flow_agent_core::Provider::Claude,
+                actrealm_core::Provider::Claude,
                 "iterm-session",
-                flow_agent_core::TermContext {
+                actrealm_core::TermContext {
                     app: Some("iTerm.app".to_owned()),
                     session_id: Some("w0t0p0:ABC-123".to_owned()),
                     tty: None,
@@ -2786,9 +2786,9 @@ mod tests {
                 },
             ),
             (
-                flow_agent_core::Provider::Claude,
+                actrealm_core::Provider::Claude,
                 "claude-app-session",
-                flow_agent_core::TermContext {
+                actrealm_core::TermContext {
                     app: None,
                     session_id: None,
                     tty: None,
@@ -2800,7 +2800,7 @@ mod tests {
             ),
         ];
         for (provider, session_id, term) in cases {
-            let mut request = flow_agent_core::BridgeRequest::from_hook_at(
+            let mut request = actrealm_core::BridgeRequest::from_hook_at(
                 provider,
                 json!({
                     "hook_event_name":"UserPromptSubmit",
@@ -2845,7 +2845,7 @@ mod tests {
     #[test]
     fn auth_contract_rejects_missing_cookie_forged_origin_and_missing_csrf() {
         let root = std::env::temp_dir().join(format!(
-            "flow-agent-server-unit-{}-{}",
+            "actrealm-server-unit-{}-{}",
             std::process::id(),
             Uuid::now_v7()
         ));
@@ -2975,7 +2975,7 @@ mod tests {
     #[test]
     fn agent_list_keeps_recent_and_attention_sessions_but_hides_older_idle_history() {
         let root = std::env::temp_dir().join(format!(
-            "flow-agent-server-visible-sessions-{}-{}",
+            "actrealm-server-visible-sessions-{}-{}",
             std::process::id(),
             Uuid::now_v7()
         ));
@@ -3004,8 +3004,8 @@ mod tests {
                 now.saturating_sub(31 * 60 * 1_000),
             ),
         ] {
-            let request = flow_agent_core::BridgeRequest::from_hook_at(
-                flow_agent_core::Provider::Claude,
+            let request = actrealm_core::BridgeRequest::from_hook_at(
+                actrealm_core::Provider::Claude,
                 event,
                 at,
             );
@@ -3031,7 +3031,7 @@ mod tests {
     #[test]
     fn new_claude_cache_refreshes_immediately_after_an_unavailable_snapshot() {
         let root = std::env::temp_dir().join(format!(
-            "flow-agent-server-quota-cache-refresh-{}-{}",
+            "actrealm-server-quota-cache-refresh-{}-{}",
             std::process::id(),
             Uuid::now_v7()
         ));
@@ -3047,7 +3047,7 @@ mod tests {
             .all(|entry| entry["status"] == "unavailable"));
 
         let cache = state.quota.lock().unwrap().collector.paths().claude_cache();
-        flow_agent_quota::capture_claude_statusline(
+        actrealm_quota::capture_claude_statusline(
             br#"{"rate_limits":{"five_hour":{"used_percentage":2,"resets_at":1784193000},"seven_day":{"used_percentage":0,"resets_at":1784563200}}}"#,
             &cache,
             now_millis(),
@@ -3074,7 +3074,7 @@ mod tests {
     #[test]
     fn m4_settings_quota_export_and_clear_follow_the_authenticated_ui_path() {
         let root = std::env::temp_dir().join(format!(
-            "flow-agent-server-m4-{}-{}",
+            "actrealm-server-m4-{}-{}",
             std::process::id(),
             Uuid::now_v7()
         ));
@@ -3094,7 +3094,7 @@ mod tests {
         )
         .unwrap();
         let cache = state.quota.lock().unwrap().collector.paths().claude_cache();
-        flow_agent_quota::capture_claude_statusline(
+        actrealm_quota::capture_claude_statusline(
             br#"{"rate_limits":{"five_hour":{"used_percentage":25,"resets_at":1784140000}}}"#,
             &cache,
             now_millis(),
@@ -3180,14 +3180,15 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            assert_eq!(wrapped.status(), StatusCode::OK);
+            let wrapped_status = wrapped.status();
             let wrapped = json_body(wrapped).await;
+            assert_eq!(wrapped_status, StatusCode::OK, "{wrapped}");
             assert_eq!(wrapped["claudeQuotaBridge"]["status"], "installed");
             let wrapped_settings =
                 serde_json::from_slice::<Value>(&fs::read(&claude_settings).unwrap()).unwrap();
             assert_eq!(wrapped_settings["keep"], true);
             assert_eq!(
-                wrapped_settings["_flowAgentOriginalStatusLine"]["command"],
+                wrapped_settings["_actRealmOriginalStatusLine"]["command"],
                 "~/.claude/custom.sh"
             );
 
@@ -3199,7 +3200,7 @@ mod tests {
             assert_eq!(exported.status(), StatusCode::OK);
             assert_eq!(
                 exported.headers()[CONTENT_DISPOSITION],
-                "attachment; filename=flow-agent-export.json"
+                "attachment; filename=actrealm-export.json"
             );
             let exported = json_body(exported).await;
             assert_eq!(exported["tables"]["settings"].as_array().unwrap().len(), 1);
@@ -3238,7 +3239,7 @@ mod tests {
     #[test]
     fn corrupt_settings_block_reconfiguration_before_provider_files_are_touched() {
         let root = std::env::temp_dir().join(format!(
-            "flow-agent-server-m4-corrupt-{}-{}",
+            "actrealm-server-m4-corrupt-{}-{}",
             std::process::id(),
             Uuid::now_v7()
         ));
@@ -3291,7 +3292,7 @@ mod tests {
     #[test]
     fn m5_ui_metrics_are_authenticated_local_and_visible_in_snapshot_and_export() {
         let root = std::env::temp_dir().join(format!(
-            "flow-agent-server-m5-metrics-{}-{}",
+            "actrealm-server-m5-metrics-{}-{}",
             std::process::id(),
             Uuid::now_v7()
         ));
@@ -3349,7 +3350,7 @@ mod tests {
             assert_eq!(metrics_export.status(), StatusCode::OK);
             assert_eq!(
                 metrics_export.headers()[CONTENT_DISPOSITION],
-                "attachment; filename=flow-agent-metrics.json"
+                "attachment; filename=actrealm-metrics.json"
             );
             let metrics_export = json_body(metrics_export).await;
             assert_eq!(metrics_export["scope"], "metrics_only");
@@ -3365,7 +3366,7 @@ mod tests {
     #[test]
     fn m5_api_rejects_bodies_over_64_kib_before_deserialization() {
         let root = std::env::temp_dir().join(format!(
-            "flow-agent-server-m5-body-{}-{}",
+            "actrealm-server-m5-body-{}-{}",
             std::process::id(),
             Uuid::now_v7()
         ));
@@ -3434,7 +3435,7 @@ mod tests {
     #[test]
     fn interactive_question_is_ephemeral_answerable_and_removed_from_snapshot() {
         let root = std::env::temp_dir().join(format!(
-            "flow-agent-server-question-{}-{}",
+            "actrealm-server-question-{}-{}",
             std::process::id(),
             Uuid::now_v7()
         ));
@@ -3446,8 +3447,8 @@ mod tests {
             auth.session_token = Some("test-session".to_owned());
             auth.csrf_token = Some("test-csrf".to_owned());
         }
-        let request = flow_agent_core::BridgeRequest::from_hook_at(
-            flow_agent_core::Provider::Claude,
+        let request = actrealm_core::BridgeRequest::from_hook_at(
+            actrealm_core::Provider::Claude,
             json!({
                 "hook_event_name":"Elicitation",
                 "session_id":"question-session",
@@ -3491,7 +3492,7 @@ mod tests {
             .ticket
             .recv_timeout(Duration::from_millis(50))
             .unwrap();
-        assert_eq!(response.action, flow_agent_core::ReplyAction::Answer);
+        assert_eq!(response.action, actrealm_core::ReplyAction::Answer);
         let after = snapshot_value(&state).unwrap();
         assert!(after["attention"]
             .as_array()
@@ -3508,7 +3509,7 @@ mod tests {
     #[test]
     fn recovery_snapshot_distinguishes_observing_lost_and_managed_sessions() {
         let root = std::env::temp_dir().join(format!(
-            "flow-agent-server-recovery-{}-{}",
+            "actrealm-server-recovery-{}-{}",
             std::process::id(),
             Uuid::now_v7()
         ));
@@ -3517,8 +3518,8 @@ mod tests {
             ("live-external", std::process::id()),
             ("dead-external", u32::MAX - 1),
         ] {
-            let mut request = flow_agent_core::BridgeRequest::from_hook_at(
-                flow_agent_core::Provider::Claude,
+            let mut request = actrealm_core::BridgeRequest::from_hook_at(
+                actrealm_core::Provider::Claude,
                 json!({
                     "hook_event_name":"UserPromptSubmit",
                     "session_id":session,
@@ -3529,8 +3530,8 @@ mod tests {
             request.term.as_mut().unwrap().provider_pid = Some(pid);
             store.ingest(request).unwrap();
         }
-        let mut managed = flow_agent_core::BridgeRequest::from_hook_at(
-            flow_agent_core::Provider::Codex,
+        let mut managed = actrealm_core::BridgeRequest::from_hook_at(
+            actrealm_core::Provider::Codex,
             json!({
                 "hook_event_name":"UserPromptSubmit",
                 "session_id":"managed-thread",
@@ -3586,14 +3587,14 @@ mod tests {
     #[test]
     fn codex_native_waiting_flag_opens_and_resolves_attention() {
         let root = std::env::temp_dir().join(format!(
-            "flow-agent-server-native-approval-{}-{}",
+            "actrealm-server-native-approval-{}-{}",
             std::process::id(),
             Uuid::now_v7()
         ));
         let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
         store
-            .ingest(flow_agent_core::BridgeRequest::from_hook_at(
-                flow_agent_core::Provider::Codex,
+            .ingest(actrealm_core::BridgeRequest::from_hook_at(
+                actrealm_core::Provider::Codex,
                 json!({
                     "hook_event_name":"UserPromptSubmit",
                     "session_id":"thread-native",
@@ -3671,13 +3672,13 @@ mod tests {
     #[test]
     fn codex_native_resolution_releases_a_competing_hook_waiter() {
         let root = std::env::temp_dir().join(format!(
-            "flow-agent-server-hook-release-{}-{}",
+            "actrealm-server-hook-release-{}-{}",
             std::process::id(),
             Uuid::now_v7()
         ));
         let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
-        let request = flow_agent_core::BridgeRequest::from_hook_at(
-            flow_agent_core::Provider::Codex,
+        let request = actrealm_core::BridgeRequest::from_hook_at(
+            actrealm_core::Provider::Codex,
             json!({
                 "hook_event_name":"PermissionRequest",
                 "session_id":"thread-hook-release",

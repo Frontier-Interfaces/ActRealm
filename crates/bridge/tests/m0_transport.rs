@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
-use flow_agent_bridge::{unix_socket_path_limit, validate_socket_path, BridgeClient, BridgeError};
-use flow_agent_core::{BridgeRequest, BridgeResponse, Decision, Provider};
+use actrealm_bridge::{unix_socket_path_limit, validate_socket_path, BridgeClient, BridgeError};
+use actrealm_core::{BridgeRequest, BridgeResponse, Decision, Provider};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;

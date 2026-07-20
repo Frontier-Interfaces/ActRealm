@@ -121,7 +121,7 @@ public struct OutboxEntry: Identifiable, Equatable, Sendable {
 
     public var id: String { attention.id }
 
-    /// "Codex · flow-agent" source line.
+    /// "Codex · actrealm" source line.
     public var sourceLine: String {
         let name = provider?.displayName ?? attention.provider
         if let project = attention.project, !project.isEmpty {

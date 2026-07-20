@@ -1,4 +1,4 @@
-use flow_agent_core::Provider;
+use actrealm_core::Provider;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -320,7 +320,7 @@ mod tests {
     use uuid::Uuid;
 
     fn temp_file(name: &str) -> PathBuf {
-        let root = env::temp_dir().join(format!("flow-agent-title-{}", Uuid::now_v7()));
+        let root = env::temp_dir().join(format!("actrealm-title-{}", Uuid::now_v7()));
         fs::create_dir_all(&root).unwrap();
         root.join(name)
     }

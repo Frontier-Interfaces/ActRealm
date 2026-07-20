@@ -1,13 +1,13 @@
 [package]
-name = "flow-agent-runtime"
+name = "actrealm-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-flow-agent-core = { path = "../core" }
-flow-agent-providers = { path = "../providers" }
+actrealm-core = { path = "../core" }
+actrealm-providers = { path = "../providers" }
 libc.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
