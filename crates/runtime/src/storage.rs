@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const MAX_TASK_TITLE_CHARS: usize = 64;
 const PROVIDER_TITLE_REFRESH_INTERVAL_MS: u64 = 2_000;
 const PROVIDER_TITLE_ACTIVE_WINDOW_MS: u64 = 30 * 60 * 1_000;
@@ -295,6 +295,7 @@ pub struct QuotaRecord {
 pub struct SessionUsageRecord {
     pub provider: String,
     pub provider_session_id: String,
+    pub model: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cache_read_tokens: Option<u64>,
@@ -895,19 +896,27 @@ fn upsert_session_usage_row(
             "usage session identifier is invalid".to_owned(),
         ));
     }
+    if record.model.as_ref().is_some_and(|model| {
+        model.trim().is_empty() || model.len() > 128 || model.chars().any(char::is_control)
+    }) {
+        return Err(StoreError::Storage(
+            "usage model identifier is invalid".to_owned(),
+        ));
+    }
     connection
         .execute(
             "INSERT INTO session_usage(
-               provider, provider_session_id,
+               provider, provider_session_id, model,
                input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
                reasoning_tokens, token_total, last_turn_tokens, context_used_tokens,
                context_window_tokens, context_used_percent, estimated_cost_usd_micros,
                cost_kind, pricing_source, usage_source, usage_quality, captured_at
              ) VALUES (
                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-               ?14, ?15, ?16, ?17, ?18
+               ?14, ?15, ?16, ?17, ?18, ?19
              )
              ON CONFLICT(provider, provider_session_id) DO UPDATE SET
+               model = COALESCE(excluded.model, model),
                input_tokens = COALESCE(excluded.input_tokens, input_tokens),
                output_tokens = COALESCE(excluded.output_tokens, output_tokens),
                cache_read_tokens = COALESCE(excluded.cache_read_tokens, cache_read_tokens),
@@ -927,6 +936,7 @@ fn upsert_session_usage_row(
             params![
                 record.provider,
                 record.provider_session_id,
+                record.model,
                 record.input_tokens.map(to_i64),
                 record.output_tokens.map(to_i64),
                 record.cache_read_tokens.map(to_i64),
@@ -1372,6 +1382,7 @@ fn initialize(connection: &Connection) -> Result<(), StoreError> {
             CREATE TABLE IF NOT EXISTS session_usage (
               provider TEXT NOT NULL,
               provider_session_id TEXT NOT NULL,
+              model TEXT,
               input_tokens INTEGER, output_tokens INTEGER,
               cache_read_tokens INTEGER, cache_creation_tokens INTEGER,
               reasoning_tokens INTEGER, token_total INTEGER,
@@ -1407,6 +1418,7 @@ fn initialize(connection: &Connection) -> Result<(), StoreError> {
     ensure_session_title_column(connection)?;
     ensure_session_provider_title_columns(connection)?;
     ensure_session_usage_columns(connection)?;
+    ensure_session_usage_model_column(connection)?;
     ensure_session_locator_columns(connection)?;
     connection
         .pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -1471,6 +1483,23 @@ fn ensure_session_usage_columns(connection: &Connection) -> Result<(), StoreErro
                 )
                 .map_err(storage_error)?;
         }
+    }
+    Ok(())
+}
+
+fn ensure_session_usage_model_column(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(session_usage)")
+        .map_err(storage_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    if !columns.iter().any(|column| column == "model") {
+        connection
+            .execute("ALTER TABLE session_usage ADD COLUMN model TEXT", [])
+            .map_err(storage_error)?;
     }
     Ok(())
 }
@@ -2797,7 +2826,8 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
             .prepare(
                 "SELECT sessions.id, sessions.provider, sessions.provider_session_id,
                         sessions.project, sessions.title,
-                        sessions.provider_title, sessions.provider_title_source, sessions.model,
+                        sessions.provider_title, sessions.provider_title_source,
+                        COALESCE(sessions.model, usage.model),
                         sessions.exec_state, sessions.approval_owner,
                         sessions.activity, sessions.activity_since,
                         sessions.plan_done, sessions.plan_total,

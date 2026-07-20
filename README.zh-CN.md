@@ -18,6 +18,8 @@ ActRealm 不替代 macOS，也不替代底层 Agent 工具。它补上桌面 Age
 
 > **项目状态：** 功能实现已经推进到 M14，并包含后续的实时状态与 Runtime
 > 受控恢复优化，但当前源码仍是供本地测试的候选版本，不是最终 v1 Release。
+> 后续的用量与 OAuth 加固已经通过自动化及资源门禁，仍需精确安装候选版本并由
+> 用户本机验收。
 > M13 真实 Provider 验收和连续 48 小时 Runtime 稳定性门禁仍未完成。
 
 ## 为 Agent 工作建立新的操作模型
@@ -52,6 +54,9 @@ ActRealm 用四条原则组织这个闭环：
   明确显示不可用，而不是用推断补齐；
 - **受隐私边界约束的实时用量信息**：显示累计 Token、本轮上下文占用、明确标注的
   API 价格估算，并在后台刷新 Claude OAuth 额度；失败时保留本地有效值；
+- **有界的用量与凭据恢复**：区分当前可选与历史模型的来源标注离线价格、用
+  transcript/rollout 结构化模型补全任务卡、增量压缩 transcript、优先直查
+  Keychain 固定服务，并在存在 Claude CLI 时委托官方 CLI 恢复临近过期的 OAuth；
 - **经过身份验证的本地控制界面**：由单一 Rust Runtime 提供 SQLite 持久化、
   WebSocket 更新、诊断和本地导出；
 - **稳定实时刷新与受控恢复**：提供心跳、失活连接回退、原位时间更新、本机健康
@@ -214,6 +219,7 @@ ActRealm 默认本地运行：
 - [v1 可执行验收标准](docs/V1_ACCEPTANCE.md)
 - [M14 实时用量、上下文、价格与额度验证](docs/M14_USAGE_CONTEXT_QUOTA.md)
 - [Post-M14 实时状态与 Runtime 恢复验证](docs/POST_M14_REALTIME_RECOVERY.md)
+- [Post-M14 用量、价格与 OAuth 加固](docs/POST_M14_USAGE_OAUTH_HARDENING.md)
 - [开发计划](docs/WIDGET_V1_PLAN.md)
 - [开发变更记录](CHANGELOG.md)
 - [第三方声明](THIRD_PARTY_NOTICES.md)

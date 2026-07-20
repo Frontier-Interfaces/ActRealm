@@ -38,12 +38,42 @@ imply endorsement.
 The M14 local usage adapter was behaviorally compared with
 [ccusage](https://github.com/ccusage/ccusage). The dated embedded standard-tier
 price snapshot uses the same public Provider pricing inputs for recognized
-models. ActRealm's Rust parser, persistence, and UI implementation are
-independent.
+models. The legacy `gpt-5.2-codex` compatibility rate is retained as a clearly
+labelled `ccusage` fallback. ActRealm's Rust parser, persistence, and UI
+implementation are independent.
 
 ccusage is licensed under the MIT License:
 
 > Copyright (c) 2025 ryoppippi
+>
+> Permission is hereby granted, free of charge, to any person obtaining a copy
+> of this software and associated documentation files (the "Software"), to
+> deal in the Software without restriction, including without limitation the
+> rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+> sell copies of the Software, and to permit persons to whom the Software is
+> furnished to do so, subject to the following conditions:
+>
+> The above copyright notice and this permission notice shall be included in
+> all copies or substantial portions of the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+> IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+> FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+> AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+> LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+> OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+> SOFTWARE.
+
+## models.dev pricing data
+
+The embedded Claude price subset is derived from the public model catalog in
+[models.dev](https://github.com/anomalyco/models.dev), captured on 2026-07-20.
+The snapshot contains only model identifiers, aliases, and numeric token rates;
+ActRealm does not contact models.dev at Runtime.
+
+models.dev is licensed under the MIT License:
+
+> Copyright (c) 2025 models.dev
 >
 > Permission is hereby granted, free of charge, to any person obtaining a copy
 > of this software and associated documentation files (the "Software"), to

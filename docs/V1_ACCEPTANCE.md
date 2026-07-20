@@ -284,6 +284,40 @@ without making the final v1 release complete.
       consecutive controlled restarts, and the two-minute resource gate
       (0.000% average idle CPU; 6,128 KiB maximum Runtime RSS).
 
+### Post-M14 - usage, pricing, and OAuth hardening
+
+- [x] Claude and Codex sessions without Provider cost fields use an embedded,
+      dated per-model snapshot with separate `computed` and source labels;
+      unknown, ambiguous, future, and fast variants still omit price.
+- [x] Current desktop-picker coverage is explicit: Claude Fable 5,
+      Opus 4.8/4.7/4.6/3, Sonnet 5/4.6, and Haiku 4.5; Codex GPT-5.6
+      Sol/Terra/Luna and GPT-5.5. Older rollout prices are historical only.
+- [x] A structured transcript/rollout model can fill a missing session model
+      through schema 8 without overwriting an event-supplied model.
+- [x] Codex cached input is priced at the cache rate and removed from ordinary
+      input before calculation; Claude cache read/create remain separate.
+- [x] A Codex model change prices only the new cumulative delta at the newly
+      active model rate and does not reprice earlier session usage.
+- [x] Claude OAuth parsing recognizes expiry metadata and performs a bounded
+      preflight or 401 recovery through the official Claude CLI without
+      reading or retaining refresh tokens.
+- [x] OAuth subprocess execution is shell-free, output-free, time-bounded, and
+      cooldown-limited; a request retry requires an actually changed token.
+- [x] macOS credential lookup tries the fixed Claude Keychain service and a
+      cached successful locator before bounded service enumeration.
+- [x] Claude transcript aggregation uses incremental accumulators and retains
+      only a 256-entry correction window per file; a 10,000-entry regression
+      verifies exact totals and computed price after compaction.
+- [x] A zero-token Claude `<synthetic>` entry contributes zero cost and cannot
+      replace the real displayed model or suppress a complete estimate.
+- [x] Focused quota/usage tests and focused zero-warning Clippy pass.
+- [x] Full workspace format, zero-warning Clippy, 172 tests, release build,
+      language contract, and the 120-second resource gate pass on the exact
+      candidate; the resource sample records 0.000% idle CPU and 6,176 KiB
+      maximum Runtime RSS.
+- [ ] The exact tested release is installed and accepted locally by the user.
+- [ ] Commit and push are separately authorized by the user.
+
 ## Publishing rule
 
 Each milestone is implemented test-first. A test-candidate branch push requires

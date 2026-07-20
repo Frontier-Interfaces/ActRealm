@@ -2454,6 +2454,7 @@ fn runtime_usage_record(record: UsageRecord) -> SessionUsageRecord {
     SessionUsageRecord {
         provider: record.provider,
         provider_session_id: record.provider_session_id,
+        model: record.model,
         input_tokens: record.input_tokens,
         output_tokens: record.output_tokens,
         cache_read_tokens: record.cache_read_tokens,

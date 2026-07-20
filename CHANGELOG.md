@@ -6,6 +6,41 @@ published a final v1 release; entries below describe development milestones on
 
 ## Unreleased - M14 accepted candidate
 
+### Post-M14 - Usage, pricing, and OAuth hardening candidate
+
+- Adds a versioned per-model price registry with distinct `provider_estimate`
+  and `computed` kinds plus dated `models.dev`, OpenAI standard-price, and
+  compatibility-fallback source labels.
+- Expands computed price coverage to validated Claude and Codex models while
+  preserving exact cached-input/cache-write semantics and unknown-model
+  omission. Codex model changes price each cumulative delta at the model active
+  for that event instead of repricing earlier usage.
+- Separates current desktop-picker coverage from historical rollout support:
+  Claude's visible Fable/Opus/Sonnet/Haiku choices and Codex GPT-5.6 plus
+  GPT-5.5 use dated first-party rates; GPT-5.4 and older remain history-only.
+- Carries the structured transcript/rollout model into SQLite schema 8 and
+  uses it only when the Hook session model is absent, eliminating cards that
+  showed an unknown model beside a model-derived price.
+- Treats zero-token Claude `<synthetic>` rows as zero-cost metadata, so they
+  neither replace the real session model nor suppress a complete estimate.
+- Covers the locally observed `claude-sonnet-5` with Anthropic's dated
+  introductory API rate and cache multipliers; the source label makes the
+  promotion's August 31, 2026 boundary explicit rather than treating it as a
+  timeless price.
+- Parses Claude OAuth expiry metadata and delegates near-expiry/401 recovery to
+  one bounded official `claude auth status --json` invocation; ActRealm never
+  owns or persists refresh tokens.
+- Tries the fixed Claude Keychain service and a cached successful locator before
+  a size-bounded, five-minute-cached service enumeration fallback.
+- Replaces full-history Claude re-aggregation with O(1) accumulators and a
+  bounded 256-entry correction window. A 10,000-entry regression preserves
+  exact Token totals and computed price.
+
+Focused quota/usage tests, the 172-test workspace suite, zero-warning Clippy,
+release build, language contract, and the two-minute resource gate pass. Exact
+release installation, local user acceptance, commit, and push remain
+separately gated.
+
 ### Post-M14 - Live state and controlled Runtime recovery
 
 - Adds WebSocket heartbeats, stale-connection detection, bounded snapshot

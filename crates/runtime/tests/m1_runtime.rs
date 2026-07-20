@@ -71,6 +71,20 @@ fn existing_v1_database_adds_task_titles_without_losing_sessions() {
              INSERT INTO sessions(
                id, provider, provider_session_id, exec_state, started_at, last_event_at
              ) VALUES ('old-id', 'claude', 'old-session', 'idle', 1, 1);
+             CREATE TABLE session_usage (
+               provider TEXT NOT NULL,
+               provider_session_id TEXT NOT NULL,
+               input_tokens INTEGER, output_tokens INTEGER,
+               cache_read_tokens INTEGER, cache_creation_tokens INTEGER,
+               reasoning_tokens INTEGER, token_total INTEGER,
+               last_turn_tokens INTEGER, context_used_tokens INTEGER,
+               context_window_tokens INTEGER, context_used_percent INTEGER,
+               estimated_cost_usd_micros INTEGER,
+               cost_kind TEXT, pricing_source TEXT,
+               usage_source TEXT NOT NULL, usage_quality TEXT NOT NULL,
+               captured_at INTEGER NOT NULL,
+               PRIMARY KEY(provider, provider_session_id)
+             );
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -103,8 +117,16 @@ fn existing_v1_database_adds_task_titles_without_losing_sessions() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        7
+        8
     );
+    let usage_columns = connection
+        .prepare("PRAGMA table_info(session_usage)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(usage_columns.iter().any(|column| column == "model"));
     drop(connection);
     fs::remove_dir_all(root).unwrap();
 }
@@ -128,6 +150,7 @@ fn local_usage_snapshots_join_existing_sessions_without_prompt_content() {
         .upsert_session_usage(SessionUsageRecord {
             provider: "codex".to_owned(),
             provider_session_id: "usage-session".to_owned(),
+            model: Some("gpt-5.6-sol".to_owned()),
             input_tokens: Some(700),
             output_tokens: Some(100),
             cache_read_tokens: Some(400),
@@ -148,6 +171,7 @@ fn local_usage_snapshots_join_existing_sessions_without_prompt_content() {
         .unwrap();
     let session = store.snapshot().unwrap().sessions.remove(0);
     assert_eq!(session.token_total, Some(800));
+    assert_eq!(session.model.as_deref(), Some("gpt-5.6-sol"));
     assert_eq!(session.input_tokens, Some(700));
     assert_eq!(session.context_used_tokens, Some(250));
     assert_eq!(session.context_used_percent, Some(25));

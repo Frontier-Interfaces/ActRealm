@@ -1,5 +1,6 @@
 //! Privacy-bounded quota adapters with explicit schema and freshness gates.
 
+use actrealm_installer::{provider_cli_candidates, HookProvider};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
@@ -9,7 +10,10 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::UNIX_EPOCH;
+#[cfg(target_os = "macos")]
+use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use thiserror::Error;
 
 const CACHE_SCHEMA_VERSION: u32 = 1;
@@ -24,6 +28,13 @@ const MAX_ROLLOUT_FILES: usize = 256;
 const MAX_CREDENTIAL_BYTES: u64 = 256 * 1_024;
 const MAX_OAUTH_RESPONSE_BYTES: usize = 256 * 1_024;
 const OAUTH_RETRY_AFTER_MS: u64 = 60 * 1_000;
+const OAUTH_REFRESH_SKEW_MS: u64 = 4 * 60 * 1_000;
+const OAUTH_REFRESH_COOLDOWN_MS: u64 = 60 * 1_000;
+const OAUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(12);
+#[cfg(target_os = "macos")]
+const KEYCHAIN_SERVICE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+#[cfg(target_os = "macos")]
+const MAX_KEYCHAIN_DUMP_BYTES: usize = 4 * 1024 * 1024;
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
@@ -180,6 +191,7 @@ pub struct QuotaCollector {
     paths: QuotaPaths,
     oauth_credential: Option<OAuthCredential>,
     oauth_retry_after: u64,
+    oauth_refresh_after: u64,
 }
 
 impl QuotaCollector {
@@ -188,6 +200,7 @@ impl QuotaCollector {
             paths,
             oauth_credential: None,
             oauth_retry_after: 0,
+            oauth_refresh_after: 0,
         }
     }
 
@@ -213,19 +226,32 @@ impl QuotaCollector {
         if self.oauth_credential.is_none() {
             self.oauth_credential = read_oauth_credential();
         }
-        let credential = self
+        if self
             .oauth_credential
             .as_ref()
-            .ok_or(QuotaError::OAuthUnavailable)?;
-        let response = match fetch_oauth_usage(&credential.access_token) {
+            .is_some_and(|credential| credential.should_refresh(now_ms))
+        {
+            self.refresh_oauth_credential_from_provider(now_ms);
+        }
+        let access_token = self
+            .oauth_credential
+            .as_ref()
+            .ok_or(QuotaError::OAuthUnavailable)?
+            .access_token
+            .clone();
+        let response = match fetch_oauth_usage(&access_token) {
             Ok(response) => response,
             Err(OAuthFetchError::Unauthorized) => {
-                self.oauth_credential = read_oauth_credential();
-                let credential = self
+                self.refresh_oauth_credential_from_provider(now_ms);
+                let updated_token = self
                     .oauth_credential
                     .as_ref()
+                    .map(|credential| credential.access_token.clone())
                     .ok_or(QuotaError::OAuthUnavailable)?;
-                fetch_oauth_usage(&credential.access_token)
+                if updated_token == access_token {
+                    return Err(self.map_oauth_error(OAuthFetchError::Unauthorized, now_ms));
+                }
+                fetch_oauth_usage(&updated_token)
                     .map_err(|error| self.map_oauth_error(error, now_ms))?
             }
             Err(error) => return Err(self.map_oauth_error(error, now_ms)),
@@ -243,6 +269,16 @@ impl QuotaCollector {
             now_ms,
         )?;
         Ok(entries)
+    }
+
+    fn refresh_oauth_credential_from_provider(&mut self, now_ms: u64) {
+        if now_ms < self.oauth_refresh_after {
+            self.oauth_credential = read_oauth_credential();
+            return;
+        }
+        self.oauth_refresh_after = now_ms.saturating_add(OAUTH_REFRESH_COOLDOWN_MS);
+        let _ = refresh_oauth_via_claude_cli();
+        self.oauth_credential = read_oauth_credential();
     }
 
     fn map_oauth_error(&mut self, error: OAuthFetchError, now_ms: u64) -> QuotaError {
@@ -418,6 +454,14 @@ struct CacheWindow {
 #[derive(Debug, Clone)]
 struct OAuthCredential {
     access_token: String,
+    expires_at_ms: Option<u64>,
+}
+
+impl OAuthCredential {
+    fn should_refresh(&self, now_ms: u64) -> bool {
+        self.expires_at_ms
+            .is_some_and(|expires_at| expires_at <= now_ms.saturating_add(OAUTH_REFRESH_SKEW_MS))
+    }
 }
 
 #[derive(Debug)]
@@ -473,58 +517,159 @@ struct OAuthExtraUsage {
 
 fn read_oauth_credential() -> Option<OAuthCredential> {
     #[cfg(target_os = "macos")]
-    if let Some(credential) = read_keychain_oauth_credential() {
+    if let Some(credential) = read_known_keychain_oauth_credential() {
         return Some(credential);
     }
-    read_file_oauth_credential()
+    if let Some(credential) = read_file_oauth_credential() {
+        return Some(credential);
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(credential) = read_discovered_keychain_oauth_credential() {
+        return Some(credential);
+    }
+    None
 }
 
 #[cfg(target_os = "macos")]
-fn read_keychain_oauth_credential() -> Option<OAuthCredential> {
-    let mut services = vec!["Claude Code-credentials".to_owned()];
-    if let Ok(output) = Command::new("/usr/bin/security")
-        .args(["dump-keychain"])
-        .output()
-    {
-        let text = String::from_utf8_lossy(&output.stdout);
-        for line in text.lines() {
-            let mut remainder = line;
-            while let Some(start) = remainder.find("\"Claude Code-credentials") {
-                let candidate = &remainder[start + 1..];
-                let Some(end) = candidate.find('"') else {
-                    break;
-                };
-                let name = &candidate[..end];
-                if name.len() <= 128 && !services.iter().any(|service| service == name) {
-                    services.push(name.to_owned());
-                }
-                remainder = &candidate[end + 1..];
-            }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeychainLocator {
+    service: String,
+    account: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct KeychainLookupCache {
+    locator: Option<KeychainLocator>,
+    services: Vec<String>,
+    services_discovered_at: Option<Instant>,
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_lookup_cache() -> &'static Mutex<KeychainLookupCache> {
+    static CACHE: OnceLock<Mutex<KeychainLookupCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(KeychainLookupCache::default()))
+}
+
+#[cfg(target_os = "macos")]
+fn read_known_keychain_oauth_credential() -> Option<OAuthCredential> {
+    let cached = keychain_lookup_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .locator
+        .clone();
+    if let Some(locator) = cached {
+        if let Some(credential) = read_keychain_locator(&locator) {
+            return Some(credential);
         }
+        keychain_lookup_cache()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .locator = None;
     }
-    let username = env::var("USER").ok();
-    for service in services {
-        let mut accounts = vec![None, Some("unknown")];
-        if let Some(username) = username.as_deref() {
-            accounts.push(Some(username));
-        }
-        for account in accounts {
-            let mut command = Command::new("/usr/bin/security");
-            command.args(["find-generic-password", "-s", &service]);
-            if let Some(account) = account {
-                command.args(["-a", account]);
-            }
-            let Ok(output) = command.arg("-w").output() else {
-                continue;
-            };
-            if output.status.success() {
-                if let Some(credential) = parse_oauth_credential(&output.stdout) {
-                    return Some(credential);
-                }
+    try_keychain_service("Claude Code-credentials")
+}
+
+#[cfg(target_os = "macos")]
+fn read_discovered_keychain_oauth_credential() -> Option<OAuthCredential> {
+    for service in discovered_keychain_services() {
+        if service != "Claude Code-credentials" {
+            if let Some(credential) = try_keychain_service(&service) {
+                return Some(credential);
             }
         }
     }
     None
+}
+
+#[cfg(target_os = "macos")]
+fn try_keychain_service(service: &str) -> Option<OAuthCredential> {
+    let username = env::var("USER").ok();
+    let mut accounts = vec![Some("unknown".to_owned())];
+    if let Some(username) = username {
+        if username != "unknown" {
+            accounts.push(Some(username));
+        }
+    }
+    accounts.push(None);
+    for account in accounts {
+        let locator = KeychainLocator {
+            service: service.to_owned(),
+            account,
+        };
+        if let Some(credential) = read_keychain_locator(&locator) {
+            keychain_lookup_cache()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .locator = Some(locator);
+            return Some(credential);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn read_keychain_locator(locator: &KeychainLocator) -> Option<OAuthCredential> {
+    let mut command = Command::new("/usr/bin/security");
+    command.args(["find-generic-password", "-s", &locator.service]);
+    if let Some(account) = locator.account.as_deref() {
+        command.args(["-a", account]);
+    }
+    let output = command.arg("-w").output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_oauth_credential(&output.stdout))
+        .flatten()
+}
+
+#[cfg(target_os = "macos")]
+fn discovered_keychain_services() -> Vec<String> {
+    {
+        let cache = keychain_lookup_cache()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if cache
+            .services_discovered_at
+            .is_some_and(|discovered| discovered.elapsed() < KEYCHAIN_SERVICE_CACHE_TTL)
+        {
+            return cache.services.clone();
+        }
+    }
+    let services = Command::new("/usr/bin/security")
+        .args(["dump-keychain"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success() && output.stdout.len() <= MAX_KEYCHAIN_DUMP_BYTES)
+        .map(|output| parse_keychain_service_names(&output.stdout))
+        .unwrap_or_default();
+    let mut cache = keychain_lookup_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    cache.services = services.clone();
+    cache.services_discovered_at = Some(Instant::now());
+    services
+}
+
+#[cfg(target_os = "macos")]
+fn parse_keychain_service_names(bytes: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut services = Vec::new();
+    for line in text.lines() {
+        let mut remainder = line;
+        while let Some(start) = remainder.find("\"Claude Code-credentials") {
+            let candidate = &remainder[start + 1..];
+            let Some(end) = candidate.find('"') else {
+                break;
+            };
+            let name = &candidate[..end];
+            if name.len() <= 128 && !services.iter().any(|service| service == name) {
+                services.push(name.to_owned());
+            }
+            remainder = &candidate[end + 1..];
+        }
+    }
+    services
 }
 
 fn read_file_oauth_credential() -> Option<OAuthCredential> {
@@ -561,6 +706,11 @@ fn parse_oauth_credential(bytes: &[u8]) -> Option<OAuthCredential> {
         .pointer("/claudeAiOauth/accessToken")
         .or_else(|| value.pointer("/claudeAiOauth/access_token"))
         .and_then(Value::as_str)?;
+    let expires_at_ms = value
+        .pointer("/claudeAiOauth/expiresAt")
+        .or_else(|| value.pointer("/claudeAiOauth/expires_at"))
+        .and_then(value_epoch)
+        .map(normalize_epoch_millis);
     if token.is_empty()
         || token.len() > 16 * 1_024
         || !token
@@ -571,7 +721,63 @@ fn parse_oauth_credential(bytes: &[u8]) -> Option<OAuthCredential> {
     }
     Some(OAuthCredential {
         access_token: token.to_owned(),
+        expires_at_ms,
     })
+}
+
+fn value_epoch(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|value| value.try_into().ok()))
+        .or_else(|| {
+            value
+                .as_f64()
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .map(|value| value as u64)
+        })
+        .or_else(|| Value::as_str(value).and_then(|value| value.parse().ok()))
+}
+
+fn normalize_epoch_millis(value: u64) -> u64 {
+    if value > 10_000_000_000 {
+        value
+    } else {
+        value.saturating_mul(1_000)
+    }
+}
+
+fn refresh_oauth_via_claude_cli() -> bool {
+    provider_cli_candidates(HookProvider::Claude)
+        .into_iter()
+        .any(|candidate| run_claude_auth_status(&candidate, OAUTH_REFRESH_TIMEOUT))
+}
+
+fn run_claude_auth_status(executable: &Path, timeout: Duration) -> bool {
+    let mut child = match Command::new(executable)
+        .args(["auth", "status", "--json"])
+        .env("BROWSER", "true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if started.elapsed() < timeout => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 fn fetch_oauth_usage(token: &str) -> Result<OAuthUsageResponse, OAuthFetchError> {
@@ -1603,6 +1809,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(credential.access_token, "secret-token-value");
+        assert_eq!(credential.expires_at_ms, None);
         let root = root("oauth-cache");
         let cache = root.join("cache/claude-rl.json");
         let entries = vec![QuotaEntry::available_optional(
@@ -1622,5 +1829,54 @@ mod tests {
             parse_rfc3339_epoch("2026-07-18T10:00:00Z"),
             Some(1_784_368_800)
         );
+    }
+
+    #[test]
+    fn oauth_credentials_parse_expiry_and_refresh_before_deadline() {
+        let millis = parse_oauth_credential(
+            br#"{"claudeAiOauth":{"accessToken":"token","expiresAt":1900000000000}}"#,
+        )
+        .unwrap();
+        assert_eq!(millis.expires_at_ms, Some(1_900_000_000_000));
+        assert!(millis.should_refresh(1_900_000_000_000 - OAUTH_REFRESH_SKEW_MS));
+        assert!(!millis.should_refresh(1_900_000_000_000 - OAUTH_REFRESH_SKEW_MS - 1));
+
+        let seconds = parse_oauth_credential(
+            br#"{"claudeAiOauth":{"access_token":"token","expires_at":"1900000000"}}"#,
+        )
+        .unwrap();
+        assert_eq!(seconds.expires_at_ms, Some(1_900_000_000_000));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keychain_service_discovery_is_deduplicated_and_bounded_to_claude() {
+        let services = parse_keychain_service_names(
+            br#"
+              "svce"<blob>="unrelated"
+              "svce"<blob>="Claude Code-credentials"
+              "svce"<blob>="Claude Code-credentials-profile-a"
+              "svce"<blob>="Claude Code-credentials-profile-a"
+            "#,
+        );
+        assert_eq!(
+            services,
+            vec![
+                "Claude Code-credentials".to_owned(),
+                "Claude Code-credentials-profile-a".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_auth_status_runner_requires_a_successful_process() {
+        assert!(run_claude_auth_status(
+            Path::new("/usr/bin/true"),
+            Duration::from_secs(1)
+        ));
+        assert!(!run_claude_auth_status(
+            Path::new("/usr/bin/false"),
+            Duration::from_secs(1)
+        ));
     }
 }
