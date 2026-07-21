@@ -57,6 +57,9 @@ The current build includes:
   refresh, and uninstall actions, and keeps Codex trust user-controlled;
 - **one task overview** for Provider state, current activity, wait time,
   questions, approval requests, completion, and quota status;
+- **Provider-lifecycle projection** for structured Claude/Codex plans,
+  deterministic turn-completion Attention, Codex auto-review ownership, and
+  live Claude/Codex sub-Agent activity;
 - **Codex internal-session filtering** that removes known App-generated
   overview/safety background work at Runtime ingest while preserving ordinary
   user sessions, fail-open behavior, and aggregate metrics truth;

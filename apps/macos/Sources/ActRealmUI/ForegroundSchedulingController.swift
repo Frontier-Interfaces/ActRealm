@@ -133,6 +133,7 @@ public final class ForegroundSchedulingController: ObservableObject {
         case .codex: providerTokens = ["codex"]
         case .claude: providerTokens = ["claude"]
         case .gemini: providerTokens = ["gemini"]
+        case let .custom(value): providerTokens = [value]
         case nil: providerTokens = ["codex", "claude", "gemini", "cursor"]
         }
 

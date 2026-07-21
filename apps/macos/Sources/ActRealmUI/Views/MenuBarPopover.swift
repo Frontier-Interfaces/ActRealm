@@ -267,6 +267,7 @@ private struct CompactApprovalCard: View {
             case .claude: parts.append("no reply in 24h → fails open")
             case .codex: parts.append("no reply in 1h → fails open")
             case .gemini: parts.append("notify-only")
+            case .custom: parts.append("connector-defined")
             }
         }
         return parts.joined(separator: " · ")

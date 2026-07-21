@@ -2,13 +2,30 @@ import Foundation
 
 // MARK: - Provider identity
 
-public enum ProviderKind: String, CaseIterable, Sendable, Hashable {
+public enum ProviderKind: Sendable, Hashable {
     case claude
     case codex
     case gemini
+    case custom(String)
 
     public init?(record value: String) {
-        self.init(rawValue: value.lowercased())
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return nil }
+        switch normalized {
+        case "claude": self = .claude
+        case "codex": self = .codex
+        case "gemini": self = .gemini
+        default: self = .custom(normalized)
+        }
+    }
+
+    public var rawValue: String {
+        switch self {
+        case .claude: "claude"
+        case .codex: "codex"
+        case .gemini: "gemini"
+        case let .custom(value): value
+        }
     }
 
     public var displayName: String {
@@ -16,6 +33,7 @@ public enum ProviderKind: String, CaseIterable, Sendable, Hashable {
         case .claude: "Claude"
         case .codex: "Codex"
         case .gemini: "Gemini"
+        case let .custom(value): value.split(separator: "-").map(\.capitalized).joined(separator: " ")
         }
     }
 
@@ -25,6 +43,7 @@ public enum ProviderKind: String, CaseIterable, Sendable, Hashable {
         case .claude: "C"
         case .codex: "X"
         case .gemini: "G"
+        case let .custom(value): String(value.prefix(1)).uppercased()
         }
     }
 
@@ -34,6 +53,7 @@ public enum ProviderKind: String, CaseIterable, Sendable, Hashable {
         case .claude: "回复 ≤ 24h"
         case .codex: "回复 ≤ 1h"
         case .gemini: "仅通知 · 200ms"
+        case .custom: "由连接器能力决定"
         }
     }
 }
@@ -150,13 +170,7 @@ public struct OutboxEntry: Identifiable, Equatable, Sendable {
         self.provider = ProviderKind(record: attention.provider)
         self.taskTitle = sessionTitle
 
-        let providerName: String
-        switch ProviderKind(record: attention.provider) {
-        case .claude: providerName = "Claude"
-        case .codex: providerName = "Codex"
-        case .gemini: providerName = "Gemini"
-        case nil: providerName = attention.provider
-        }
+        let providerName = ProviderKind(record: attention.provider)?.displayName ?? attention.provider
         var tool: String?
         if attention.title.hasPrefix("允许 ") {
             let stripped = attention.title.dropFirst("允许 ".count)
@@ -557,8 +571,9 @@ public struct DerivedState: Equatable, Sendable {
         let quotaSlots = snapshot.quota.enumerated()
             .map { QuotaSlot(entry: $0.element, index: $0.offset) }
 
-        // Claude and Codex lanes remain visible before their first task;
-        // Gemini appears only after Runtime observes a session.
+        // Claude and Codex lanes remain visible before their first task. Any
+        // provider emitted by a future Runtime adapter receives its own lane
+        // without requiring another native UI release.
         var tasksByProvider: [ProviderKind: [LaneTask]] = [:]
         for session in snapshot.sessions {
             guard let provider = ProviderKind(record: session.provider) else { continue }
@@ -584,8 +599,8 @@ public struct DerivedState: Equatable, Sendable {
             }
         }
         var laneProviders: [ProviderKind] = [.claude, .codex]
-        if tasksByProvider[.gemini]?.isEmpty == false {
-            laneProviders.append(.gemini)
+        for provider in tasksByProvider.keys where !laneProviders.contains(provider) {
+            laneProviders.append(provider)
         }
         let lanes = laneProviders
             .map { provider in
@@ -640,13 +655,7 @@ public struct DerivedState: Equatable, Sendable {
                         attention: attention,
                         sessionTitle: sessionsById[attention.sessionId]?.title
                     )
-                    let providerName = entry.provider.map { kind -> String in
-                        switch kind {
-                        case .claude: "Claude"
-                        case .codex: "Codex"
-                        case .gemini: "Gemini"
-                        }
-                    } ?? attention.provider
+                    let providerName = entry.provider?.displayName ?? attention.provider
                     if let tool = entry.toolName {
                         let preview = attention.commandPreview.map { " \($0)" } ?? ""
                         subject = "\(providerName) 运行 \(tool)\(preview)"

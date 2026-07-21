@@ -310,12 +310,7 @@ public struct HUDCapsuleView: View {
     }
 
     private func providerName(_ provider: ProviderKind?) -> String {
-        switch provider {
-        case .codex: "Codex"
-        case .claude: "Claude"
-        case .gemini: "Gemini"
-        case nil: "Agent"
-        }
+        provider?.displayName ?? "Agent"
     }
 
     @ViewBuilder
@@ -400,12 +395,7 @@ public struct HUDCapsuleView: View {
     }
 
     private func providerName(_ entry: OutboxEntry) -> String {
-        switch entry.provider {
-        case .codex: "Codex"
-        case .claude: "Claude"
-        case .gemini: "Gemini"
-        case nil: "Agent"
-        }
+        entry.provider?.displayName ?? "Agent"
     }
 
     @ViewBuilder

@@ -812,7 +812,7 @@ private struct DisplaySettingsPage: View {
                 Section("显示档位") {
                     Picker("任务卡", selection: Binding(
                         get: { activePreset },
-                        set: applyPreset
+                        set: { profile in applyPreset(profile) }
                     )) {
                         Text("简洁").tag("concise")
                         Text("详细").tag("detailed")
@@ -824,7 +824,7 @@ private struct DisplaySettingsPage: View {
                 Section {
                     Toggle(isOn: Binding(
                         get: { model.uiSettings.displayProfile == "custom" },
-                        set: setCustom
+                        set: { enabled in setCustom(enabled) }
                     )) {
                         SettingsLabel("自定义字段", detail: "开启后可逐项编辑下方任务卡字段")
                     }

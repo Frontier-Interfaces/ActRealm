@@ -82,6 +82,10 @@ struct ProviderAvatar: View {
             bundleIdentifiers = []
             applicationPaths = []
             assetName = ""
+        case .custom:
+            bundleIdentifiers = []
+            applicationPaths = []
+            assetName = ""
         }
 
         for identifier in bundleIdentifiers {

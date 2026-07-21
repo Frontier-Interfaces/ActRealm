@@ -1659,8 +1659,12 @@ fn run_hook(provider: Provider, socket_path: PathBuf) -> Result<()> {
 }
 
 fn apply_codex_auto_review_fallback(provider: Provider, raw: &mut Value) {
+    let event_name = raw.get("hook_event_name").and_then(Value::as_str);
+    let permission_lifecycle = event_name == Some("PermissionRequest")
+        || (event_name == Some("PreToolUse")
+            && raw.get("tool_name").and_then(Value::as_str) == Some("request_permissions"));
     if provider != Provider::Codex
-        || raw.get("hook_event_name").and_then(Value::as_str) != Some("PermissionRequest")
+        || !permission_lifecycle
         || [
             "approvals_reviewer",
             "approvalsReviewer",

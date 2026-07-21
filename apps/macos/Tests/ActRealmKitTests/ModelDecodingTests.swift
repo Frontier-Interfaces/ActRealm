@@ -22,6 +22,15 @@ struct ModelDecodingTests {
               "activitySince": 1737000000000,
               "planDone": 2,
               "planTotal": 5,
+              "planSteps": [
+                {
+                  "id": "turn-1:0",
+                  "text": "Refactor connector",
+                  "detail": "Use official lifecycle events",
+                  "status": "in_progress",
+                  "source": "codex_turn_plan"
+                }
+              ],
               "inputTokens": 48000,
               "outputTokens": 1300,
               "turnStartedAt": 1737000000000,
@@ -33,6 +42,14 @@ struct ModelDecodingTests {
               "estimatedCostUsdMicros": 123456,
               "currentTool": "Edit",
               "activeSubagents": 2,
+              "subagents": [
+                {
+                  "id": "child-1",
+                  "agentType": "gpt-5.6-sol",
+                  "status": "running",
+                  "source": "codex_app_server"
+                }
+              ],
               "environment": "Terminal · zsh",
               "jumpCapability": "terminal",
               "jumpLabel": "返回 Terminal",
@@ -157,10 +174,13 @@ struct ModelDecodingTests {
         #expect(snapshot.sessions[0].providerSessionId == "abc123")
         #expect(snapshot.sessions[0].providerTitle == "Fix macOS parity")
         #expect(snapshot.sessions[0].planDone == 2)
+        #expect(snapshot.sessions[0].planSteps.first?.text == "Refactor connector")
+        #expect(snapshot.sessions[0].planSteps.first?.status == "in_progress")
         #expect(snapshot.sessions[0].totalTokens == 49_300)
         #expect(snapshot.sessions[0].contextWindowTokens == 258_400)
         #expect(snapshot.sessions[0].contextUsedPercent == 19)
         #expect(snapshot.sessions[0].estimatedCostUsdMicros == 123_456)
+        #expect(snapshot.sessions[0].subagents.first?.agentType == "gpt-5.6-sol")
         #expect(snapshot.sessions[0].controlCapability == "external_hook")
 
         #expect(snapshot.attention.count == 2)

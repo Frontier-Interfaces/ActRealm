@@ -2,6 +2,36 @@ import Foundation
 
 // MARK: - Runtime snapshot
 
+public struct PlanStepRecord: Codable, Identifiable, Equatable, Sendable {
+    public let id: String
+    public let text: String
+    public let detail: String?
+    public let status: String
+    public let source: String
+
+    public init(id: String, text: String, detail: String?, status: String, source: String) {
+        self.id = id
+        self.text = text
+        self.detail = detail
+        self.status = status
+        self.source = source
+    }
+}
+
+public struct SubagentRecord: Codable, Identifiable, Equatable, Sendable {
+    public let id: String
+    public let agentType: String?
+    public let status: String
+    public let source: String?
+
+    public init(id: String, agentType: String?, status: String, source: String?) {
+        self.id = id
+        self.agentType = agentType
+        self.status = status
+        self.source = source
+    }
+}
+
 public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
     public let id: String
     public let provider: String
@@ -17,6 +47,7 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
     public let activitySince: UInt64?
     public let planDone: UInt32?
     public let planTotal: UInt32?
+    public let planSteps: [PlanStepRecord]
     public let turnStartedAt: UInt64?
     public let turnEndedAt: UInt64?
     /// Runtime field name. `totalTokens` remains as a compatibility alias for
@@ -40,6 +71,7 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
     public let permissionMode: String?
     public let currentTool: String?
     public let activeSubagents: UInt32?
+    public let subagents: [SubagentRecord]
     public let providerTurnId: String?
     public let environment: String?
     public let jumpCapability: String?
@@ -67,6 +99,7 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
         activitySince: UInt64?,
         planDone: UInt32?,
         planTotal: UInt32?,
+        planSteps: [PlanStepRecord] = [],
         turnStartedAt: UInt64? = nil,
         turnEndedAt: UInt64? = nil,
         inputTokens: UInt64? = nil,
@@ -89,6 +122,7 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
         permissionMode: String? = nil,
         currentTool: String? = nil,
         activeSubagents: UInt32? = nil,
+        subagents: [SubagentRecord] = [],
         providerTurnId: String? = nil,
         environment: String? = nil,
         jumpCapability: String? = nil,
@@ -113,6 +147,7 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
         self.activitySince = activitySince
         self.planDone = planDone
         self.planTotal = planTotal
+        self.planSteps = planSteps
         self.turnStartedAt = turnStartedAt
         self.turnEndedAt = turnEndedAt
         self.tokenTotal = tokenTotal ?? totalTokens
@@ -134,6 +169,7 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
         self.permissionMode = permissionMode
         self.currentTool = currentTool
         self.activeSubagents = activeSubagents
+        self.subagents = subagents
         self.providerTurnId = providerTurnId
         self.environment = environment
         self.jumpCapability = jumpCapability
@@ -147,12 +183,12 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case id, provider, providerSessionId, project, title, providerTitle, providerTitleSource
-        case model, execState, approvalOwner, activity, activitySince, planDone, planTotal
+        case model, execState, approvalOwner, activity, activitySince, planDone, planTotal, planSteps
         case turnStartedAt, turnEndedAt, tokenTotal, contextWindowTokens
         case inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens, reasoningTokens
         case lastTurnTokens, contextUsedTokens, contextUsedPercent, estimatedCostUsdMicros
         case costKind, pricingSource, usageSource, usageQuality, usageCapturedAt
-        case permissionMode, currentTool, activeSubagents, providerTurnId, environment
+        case permissionMode, currentTool, activeSubagents, subagents, providerTurnId, environment
         case jumpCapability, jumpLabel, controlCapability, recoveryState, canManage
         case connectorThreadStatus, lastEventAt
     }
@@ -177,6 +213,7 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
         activitySince = try values.decodeIfPresent(UInt64.self, forKey: .activitySince)
         planDone = try values.decodeIfPresent(UInt32.self, forKey: .planDone)
         planTotal = try values.decodeIfPresent(UInt32.self, forKey: .planTotal)
+        planSteps = try values.decodeIfPresent([PlanStepRecord].self, forKey: .planSteps) ?? []
         turnStartedAt = try values.decodeIfPresent(UInt64.self, forKey: .turnStartedAt)
         turnEndedAt = try values.decodeIfPresent(UInt64.self, forKey: .turnEndedAt)
         let legacy = try decoder.container(keyedBy: LegacyCodingKeys.self)
@@ -200,6 +237,7 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
         permissionMode = try values.decodeIfPresent(String.self, forKey: .permissionMode)
         currentTool = try values.decodeIfPresent(String.self, forKey: .currentTool)
         activeSubagents = try values.decodeIfPresent(UInt32.self, forKey: .activeSubagents)
+        subagents = try values.decodeIfPresent([SubagentRecord].self, forKey: .subagents) ?? []
         providerTurnId = try values.decodeIfPresent(String.self, forKey: .providerTurnId)
         environment = try values.decodeIfPresent(String.self, forKey: .environment)
         jumpCapability = try values.decodeIfPresent(String.self, forKey: .jumpCapability)

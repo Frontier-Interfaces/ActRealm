@@ -373,6 +373,8 @@ struct CodexManagerState {
     resume_failed: HashSet<String>,
     native_waiting: HashMap<String, bool>,
     native_synced: HashSet<String>,
+    auto_reviewing: HashSet<String>,
+    auto_review_escalated: HashSet<String>,
 }
 
 struct QuotaState {
@@ -783,12 +785,178 @@ fn handle_codex_server_request(
     });
 }
 
+fn ingest_codex_provider_events(store: &RuntimeStore, notification: &ServerNotification) {
+    for request in codex_notification_events(notification, now_millis()) {
+        let _ = store.ingest(request);
+    }
+}
+
+fn codex_notification_events(
+    notification: &ServerNotification,
+    received_at: u64,
+) -> Vec<BridgeRequest> {
+    let Some(thread_id) = notification
+        .params
+        .get("threadId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            notification
+                .params
+                .get("thread")
+                .and_then(|thread| thread.get("id"))
+                .and_then(Value::as_str)
+        })
+    else {
+        return Vec::new();
+    };
+    let turn_id = notification
+        .params
+        .get("turnId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            notification
+                .params
+                .get("turn")
+                .and_then(|turn| turn.get("id"))
+                .and_then(Value::as_str)
+        });
+    let event_name = match notification.method.as_str() {
+        "turn/plan/updated" => Some("PlanUpdated"),
+        "item/autoApprovalReview/started" => Some("AutoApprovalReviewStarted"),
+        "item/autoApprovalReview/completed" => Some("AutoApprovalReviewCompleted"),
+        "turn/completed" => match notification
+            .params
+            .pointer("/turn/status")
+            .and_then(Value::as_str)
+        {
+            Some("completed") => Some("Stop"),
+            Some("interrupted") => Some("TurnInterrupted"),
+            Some("failed") => Some("StopFailure"),
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut requests = event_name
+        .map(|event_name| {
+            BridgeRequest::from_provider_event_at(
+                Provider::Codex,
+                event_name,
+                thread_id,
+                turn_id,
+                notification.params.clone(),
+                received_at,
+            )
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+    if matches!(
+        notification.method.as_str(),
+        "item/started" | "item/completed" | "turn/completed"
+    ) {
+        append_codex_subagent_events(
+            &mut requests,
+            thread_id,
+            turn_id,
+            &notification.params,
+            received_at,
+        );
+    }
+    requests
+}
+
+fn append_codex_subagent_events(
+    requests: &mut Vec<BridgeRequest>,
+    thread_id: &str,
+    turn_id: Option<&str>,
+    params: &Value,
+    received_at: u64,
+) {
+    let items = params
+        .get("item")
+        .into_iter()
+        .chain(
+            params
+                .get("turn")
+                .and_then(|turn| turn.get("items"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten(),
+        )
+        .collect::<Vec<_>>();
+    for item in items {
+        match item.get("type").and_then(Value::as_str) {
+            Some("collabAgentToolCall") => {
+                let model = item.get("model").and_then(Value::as_str);
+                let item_id = item.get("id").and_then(Value::as_str);
+                let Some(states) = item.get("agentsStates").and_then(Value::as_object) else {
+                    continue;
+                };
+                for (agent_id, state) in states {
+                    let status = state
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .or_else(|| state.as_str());
+                    let event_name = match status {
+                        Some("pendingInit" | "running") => "SubagentStart",
+                        Some("interrupted" | "completed" | "errored" | "shutdown" | "notFound") => {
+                            "SubagentStop"
+                        }
+                        _ => continue,
+                    };
+                    requests.push(BridgeRequest::from_provider_event_at(
+                        Provider::Codex,
+                        event_name,
+                        thread_id,
+                        turn_id,
+                        json!({
+                            "agent_id": agent_id,
+                            "agent_type": model.unwrap_or("codex_collab_agent"),
+                            "agent_status": status,
+                            "item_id": item_id,
+                            "source": "codex_app_server"
+                        }),
+                        received_at,
+                    ));
+                }
+            }
+            Some("subAgentActivity") => {
+                let Some(agent_id) = item.get("agentThreadId").and_then(Value::as_str) else {
+                    continue;
+                };
+                let kind = item.get("kind").and_then(Value::as_str);
+                let event_name = match kind {
+                    Some("started" | "interacted") => "SubagentStart",
+                    Some("interrupted") => "SubagentStop",
+                    _ => continue,
+                };
+                requests.push(BridgeRequest::from_provider_event_at(
+                    Provider::Codex,
+                    event_name,
+                    thread_id,
+                    turn_id,
+                    json!({
+                        "agent_id": agent_id,
+                        "agent_type": "codex_subagent",
+                        "agent_path": item.get("agentPath"),
+                        "agent_status": kind,
+                        "item_id": item.get("id"),
+                        "source": "codex_app_server"
+                    }),
+                    received_at,
+                ));
+            }
+            _ => {}
+        }
+    }
+}
+
 fn update_codex_notification(
     state: &Arc<Mutex<CodexManagerState>>,
     store: &RuntimeStore,
     waiters: &WaiterRegistry,
     notification: ServerNotification,
 ) {
+    ingest_codex_provider_events(store, &notification);
     let started_thread = (notification.method == "thread/started")
         .then(|| notification.params.get("thread").and_then(parse_thread))
         .flatten();
@@ -845,6 +1013,9 @@ fn update_codex_notification(
                     status: status.to_owned(),
                     active_flags: flags,
                     updated_at: None,
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox_mode: None,
                 });
         } else if matches!(
             notification.method.as_str(),
@@ -859,13 +1030,31 @@ fn update_codex_notification(
                 thread.status = "active".to_owned();
                 thread.active_flags.clear();
             }
+        } else if notification.method == "item/autoApprovalReview/started" {
+            current.auto_reviewing.insert(thread_id.clone());
+            current.auto_review_escalated.remove(&thread_id);
+        } else if notification.method == "item/autoApprovalReview/completed" {
+            current.auto_reviewing.remove(&thread_id);
+            let status = notification
+                .params
+                .pointer("/review/status")
+                .and_then(Value::as_str);
+            if matches!(status, Some("timedOut" | "aborted")) {
+                current.auto_review_escalated.insert(thread_id.clone());
+            } else {
+                current.auto_review_escalated.remove(&thread_id);
+            }
+        } else if notification.method == "thread/settings/updated" {
+            if let Some(thread) = current.threads.get_mut(&thread_id) {
+                update_codex_thread_settings(thread, &notification.params);
+            }
         } else {
             return;
         }
         let waiting = current
             .threads
             .get(&thread_id)
-            .is_some_and(thread_waiting_on_approval);
+            .is_some_and(|thread| thread_waiting_for_user_approval(&current, &thread_id, thread));
         let changed = current.native_waiting.insert(thread_id.clone(), waiting) != Some(waiting);
         if !changed && (!waiting || current.native_synced.contains(&thread_id)) {
             return;
@@ -880,11 +1069,58 @@ fn update_codex_notification(
 }
 
 fn thread_waiting_on_approval(thread: &CodexThread) -> bool {
+    thread_has_waiting_approval_flag(thread)
+        && !matches!(thread.approval_policy.as_deref(), Some("never"))
+        && !matches!(
+            thread.approvals_reviewer.as_deref(),
+            Some("auto_review" | "guardian_subagent")
+        )
+}
+
+fn thread_waiting_for_user_approval(
+    state: &CodexManagerState,
+    thread_id: &str,
+    thread: &CodexThread,
+) -> bool {
+    if !thread_has_waiting_approval_flag(thread) {
+        return false;
+    }
+    if state.auto_review_escalated.contains(thread_id) {
+        return true;
+    }
+    if state.auto_reviewing.contains(thread_id) {
+        return false;
+    }
+    thread_waiting_on_approval(thread)
+}
+
+fn thread_has_waiting_approval_flag(thread: &CodexThread) -> bool {
     thread.status == "active"
         && thread
             .active_flags
             .iter()
             .any(|flag| flag == "waitingOnApproval")
+}
+
+fn update_codex_thread_settings(thread: &mut CodexThread, params: &Value) {
+    let settings = params.get("settings").unwrap_or(params);
+    if let Some(value) = protocol_setting(settings.get("approvalPolicy")) {
+        thread.approval_policy = Some(value);
+    }
+    if let Some(value) = protocol_setting(settings.get("approvalsReviewer")) {
+        thread.approvals_reviewer = Some(value);
+    }
+    if let Some(value) = protocol_setting(settings.get("sandbox")) {
+        thread.sandbox_mode = Some(value);
+    }
+}
+
+fn protocol_setting(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    value
+        .as_str()
+        .or_else(|| value.get("type").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
 }
 
 fn sync_codex_native_attention(
@@ -3635,6 +3871,9 @@ mod tests {
                     status: "active".to_owned(),
                     active_flags: vec![],
                     updated_at: None,
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox_mode: None,
                 },
             )]),
             error: None,
@@ -3824,6 +4063,197 @@ mod tests {
         assert_eq!(resolved.sessions[0].exec_state, "thinking");
         assert_eq!(resolved.sessions[0].approval_owner, None);
 
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_connector_plan_completion_and_subagents_reach_runtime() {
+        let root = std::env::temp_dir().join(format!(
+            "actrealm-server-connector-events-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Codex,
+                json!({
+                    "hook_event_name":"UserPromptSubmit",
+                    "session_id":"connector-events",
+                    "turn_id":"turn-1",
+                    "prompt":"分析并验证"
+                }),
+                1_000,
+            ))
+            .unwrap();
+        let state = Arc::new(Mutex::new(CodexManagerState::default()));
+        let waiters = WaiterRegistry::default();
+
+        update_codex_notification(
+            &state,
+            &store,
+            &waiters,
+            ServerNotification {
+                method: "turn/plan/updated".to_owned(),
+                params: json!({
+                    "threadId":"connector-events",
+                    "turnId":"turn-1",
+                    "plan":[
+                        {"step":"分析", "status":"completed"},
+                        {"step":"验证", "status":"inProgress"}
+                    ],
+                    "explanation":"来自 Codex app-server"
+                }),
+            },
+        );
+        update_codex_notification(
+            &state,
+            &store,
+            &waiters,
+            ServerNotification {
+                method: "item/started".to_owned(),
+                params: json!({
+                    "threadId":"connector-events",
+                    "turnId":"turn-1",
+                    "item":{
+                        "type":"collabAgentToolCall",
+                        "id":"collab-1",
+                        "model":"gpt-5.6-sol",
+                        "agentsStates":{"child-1":{"status":"running"}}
+                    }
+                }),
+            },
+        );
+        let running = store.snapshot().unwrap();
+        assert_eq!(running.sessions[0].active_subagents, 1);
+        assert_eq!(
+            running.sessions[0].subagents[0].agent_type.as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            (
+                running.sessions[0].plan_done,
+                running.sessions[0].plan_total
+            ),
+            (Some(1), Some(2))
+        );
+        assert_eq!(running.sessions[0].plan_steps[1].text, "验证");
+
+        update_codex_notification(
+            &state,
+            &store,
+            &waiters,
+            ServerNotification {
+                method: "turn/completed".to_owned(),
+                params: json!({
+                    "threadId":"connector-events",
+                    "turn":{"id":"turn-1", "status":"completed", "items":[]}
+                }),
+            },
+        );
+        let completed = store.snapshot().unwrap();
+        assert_eq!(completed.sessions[0].exec_state, "response_finished");
+        assert_eq!(completed.sessions[0].active_subagents, 0);
+        assert!(completed
+            .attention
+            .iter()
+            .any(|item| item.kind == "completion" && item.state == "open"));
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_auto_review_and_full_access_do_not_impersonate_user_approval() {
+        let root = std::env::temp_dir().join(format!(
+            "actrealm-server-auto-review-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        for session in ["auto-review", "full-access"] {
+            store
+                .ingest(BridgeRequest::from_hook_at(
+                    Provider::Codex,
+                    json!({
+                        "hook_event_name":"UserPromptSubmit",
+                        "session_id":session,
+                        "turn_id":"turn-1",
+                        "prompt":"需要权限"
+                    }),
+                    1_000,
+                ))
+                .unwrap();
+        }
+        let state = Arc::new(Mutex::new(CodexManagerState::default()));
+        let waiters = WaiterRegistry::default();
+
+        update_codex_notification(
+            &state,
+            &store,
+            &waiters,
+            ServerNotification {
+                method: "item/autoApprovalReview/started".to_owned(),
+                params: json!({
+                    "threadId":"auto-review",
+                    "turnId":"turn-1",
+                    "reviewId":"review-1",
+                    "review":{"status":"inProgress"}
+                }),
+            },
+        );
+        update_codex_notification(
+            &state,
+            &store,
+            &waiters,
+            ServerNotification {
+                method: "thread/status/changed".to_owned(),
+                params: json!({
+                    "threadId":"auto-review",
+                    "status":{"type":"active", "activeFlags":["waitingOnApproval"]}
+                }),
+            },
+        );
+        update_codex_notification(
+            &state,
+            &store,
+            &waiters,
+            ServerNotification {
+                method: "thread/started".to_owned(),
+                params: json!({
+                    "thread":{
+                        "id":"full-access",
+                        "status":{"type":"active", "activeFlags":["waitingOnApproval"]},
+                        "approvalPolicy":"never"
+                    }
+                }),
+            },
+        );
+        let provider_owned = store.snapshot().unwrap();
+        assert!(!provider_owned
+            .attention
+            .iter()
+            .any(|item| { item.kind == "native_approval" && item.state == "open" }));
+
+        update_codex_notification(
+            &state,
+            &store,
+            &waiters,
+            ServerNotification {
+                method: "item/autoApprovalReview/completed".to_owned(),
+                params: json!({
+                    "threadId":"auto-review",
+                    "turnId":"turn-1",
+                    "reviewId":"review-1",
+                    "review":{"status":"timedOut"}
+                }),
+            },
+        );
+        let escalated = store.snapshot().unwrap();
+        assert!(escalated
+            .attention
+            .iter()
+            .any(|item| { item.kind == "native_approval" && item.state == "open" }));
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }

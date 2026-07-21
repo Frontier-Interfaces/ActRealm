@@ -1088,7 +1088,7 @@ public final class AppModel: ObservableObject {
         switch provider {
         case .codex: rule = foregroundScheduling.codexRule
         case .claude: rule = foregroundScheduling.claudeRule
-        case .gemini, nil: rule = .defaultRule
+        case .gemini, .custom, nil: rule = .defaultRule
         }
         switch rule {
         case .defaultRule: return foregroundScheduling.strategy

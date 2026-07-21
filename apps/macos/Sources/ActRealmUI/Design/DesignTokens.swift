@@ -92,6 +92,7 @@ enum DT {
         case .claude: Color(light: .rgba(192, 95, 46, 1), dark: .rgba(232, 146, 92, 1))
         case .codex: Color(light: .rgba(18, 131, 106, 1), dark: .rgba(67, 201, 162, 1))
         case .gemini: Color(light: .rgba(59, 110, 240, 1), dark: .rgba(122, 162, 255, 1))
+        case .custom: Color(light: .rgba(92, 92, 102, 1), dark: .rgba(174, 174, 178, 1))
         }
     }
 
@@ -100,6 +101,7 @@ enum DT {
         case .claude: Color(light: .rgba(217, 119, 72, 0.16), dark: .rgba(232, 146, 92, 0.2))
         case .codex: Color(light: .rgba(23, 160, 122, 0.13), dark: .rgba(67, 201, 162, 0.18))
         case .gemini: Color(light: .rgba(59, 110, 240, 0.12), dark: .rgba(122, 162, 255, 0.18))
+        case .custom: Color(lightWhite: 0.08, darkWhite: 0.12)
         }
     }
 
@@ -108,6 +110,7 @@ enum DT {
         case .claude: Color(light: .rgba(217, 119, 72, 0.4), dark: .rgba(232, 146, 92, 0.38))
         case .codex: Color(light: .rgba(23, 160, 122, 0.38), dark: .rgba(67, 201, 162, 0.35))
         case .gemini: Color(light: .rgba(59, 110, 240, 0.32), dark: .rgba(122, 162, 255, 0.35))
+        case .custom: Color(lightWhite: 0.2, darkWhite: 0.24)
         }
     }
 

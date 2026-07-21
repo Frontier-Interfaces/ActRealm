@@ -421,6 +421,32 @@ without making the final v1 release complete.
       matching SDK then exposes the missing `SwiftUIMacros` plugin.
 - [ ] The native UI is visually accepted and exercised against real Claude and
       Codex setup, question, quota, jump, and Connector states.
+
+### Post-M14 - Provider lifecycle projection
+
+- [x] Hook `Stop` and managed Codex `turn/completed` create one deduplicated
+      completion Attention for every successful foreground turn, including
+      analysis/read-only work; completion is independent of approval mode.
+- [x] Explicit background work delays completion, while failed/interrupted
+      turns close active sub-Agent records and emit factual error Attention.
+- [x] Codex auto-review/guardian and full-access ownership do not create a fake
+      user-approval card. A timed-out or aborted auto-review may surface native
+      approval only when the Thread still reports `waitingOnApproval`.
+- [x] Claude `TaskCreated/TaskCompleted` and managed Codex
+      `turn/plan/updated` persist bounded structured plan steps and factual
+      completion counts; missing events remain visibly unavailable.
+- [x] Claude Subagent Hooks and Codex `collabAgentToolCall` /
+      `subAgentActivity` events update active count, type, status, and source;
+      terminal turn events reconcile orphaned active children to zero.
+- [x] The native client creates lanes for future Runtime provider adapter names
+      rather than dropping unknown provider records. A new Provider still
+      requires a versioned Runtime adapter before it can emit trusted events.
+- [x] Claude AskUserQuestion/Elicitation and managed Codex requestUserInput
+      remain directly answerable in OUTBOX; external Hook-only Codex questions
+      do not claim a reply channel.
+- [x] Focused Runtime/server tests and all 45 macOS Swift tests pass.
+- [ ] A fresh Claude Code task and managed Codex task are visually accepted for
+      plan, sub-Agent, auto-review/escalation, direct question, and completion.
 - [ ] Commit and push are separately authorized by the user.
 
 ## Publishing rule
