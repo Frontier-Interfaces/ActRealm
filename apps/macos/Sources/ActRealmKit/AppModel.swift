@@ -1,24 +1,6 @@
 import Combine
 import Foundation
 
-/// Client-side approval policy shown in the toolbar segmented control.
-/// The Rust helper always runs in `--approval widget` mode; "Allow all" and
-/// "Deny all" auto-answer incoming requests through the same audited command
-/// path, so the 3-second undo window still applies.
-public enum ApprovalPolicy: String, CaseIterable, Sendable, Hashable {
-    case prompt
-    case allowAll
-    case denyAll
-
-    public var title: String {
-        switch self {
-        case .prompt: "Prompt"
-        case .allowAll: "Allow all"
-        case .denyAll: "Deny all"
-        }
-    }
-}
-
 public enum BridgeStatus: Equatable, Sendable {
     case listening
     case starting
@@ -44,6 +26,18 @@ public enum ForegroundAgentRule: String, CaseIterable, Codable, Sendable, Hashab
     case actRealmWorkspace
 }
 
+public struct ForegroundWorkspaceApp: Codable, Equatable, Sendable, Identifiable {
+    public let bundleIdentifier: String
+    public let name: String
+
+    public var id: String { bundleIdentifier }
+
+    public init(bundleIdentifier: String, name: String) {
+        self.bundleIdentifier = bundleIdentifier
+        self.name = name
+    }
+}
+
 /// Durable settings edited by the 台前调度 management page. Keeping the
 /// policy in ActRealmKit gives the Runtime integration one authoritative
 /// value instead of leaving behavior hidden inside view-local state.
@@ -56,6 +50,8 @@ public struct ForegroundSchedulingSettings: Codable, Equatable, Sendable {
     public var acceptanceSeconds: Int
     public var codexRule: ForegroundAgentRule
     public var claudeRule: ForegroundAgentRule
+    public var workspaceApps: [ForegroundWorkspaceApp]
+    public var workspaceBoundAt: Date?
 
     public init(
         isEnabled: Bool = true,
@@ -65,7 +61,9 @@ public struct ForegroundSchedulingSettings: Codable, Equatable, Sendable {
         returnsToActRealmWorkspace: Bool = true,
         acceptanceSeconds: Int = 10,
         codexRule: ForegroundAgentRule = .defaultRule,
-        claudeRule: ForegroundAgentRule = .immediate
+        claudeRule: ForegroundAgentRule = .immediate,
+        workspaceApps: [ForegroundWorkspaceApp] = [],
+        workspaceBoundAt: Date? = nil
     ) {
         self.isEnabled = isEnabled
         self.closesAfterAcceptance = closesAfterAcceptance
@@ -75,9 +73,59 @@ public struct ForegroundSchedulingSettings: Codable, Equatable, Sendable {
         self.acceptanceSeconds = acceptanceSeconds
         self.codexRule = codexRule
         self.claudeRule = claudeRule
+        self.workspaceApps = workspaceApps
+        self.workspaceBoundAt = workspaceBoundAt
     }
 
     public static let defaults = ForegroundSchedulingSettings()
+
+    private enum CodingKeys: String, CodingKey {
+        case isEnabled, closesAfterAcceptance, strategy, reminderSeconds
+        case returnsToActRealmWorkspace, acceptanceSeconds, codexRule, claudeRule
+        case workspaceApps, workspaceBoundAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        isEnabled = try values.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
+        closesAfterAcceptance = try values.decodeIfPresent(Bool.self, forKey: .closesAfterAcceptance) ?? true
+        strategy = try values.decodeIfPresent(ForegroundArrivalStrategy.self, forKey: .strategy) ?? .remind
+        reminderSeconds = try values.decodeIfPresent(Int.self, forKey: .reminderSeconds) ?? 10
+        returnsToActRealmWorkspace = try values.decodeIfPresent(Bool.self, forKey: .returnsToActRealmWorkspace) ?? true
+        acceptanceSeconds = try values.decodeIfPresent(Int.self, forKey: .acceptanceSeconds) ?? 10
+        codexRule = try values.decodeIfPresent(ForegroundAgentRule.self, forKey: .codexRule) ?? .defaultRule
+        claudeRule = try values.decodeIfPresent(ForegroundAgentRule.self, forKey: .claudeRule) ?? .immediate
+        workspaceApps = try values.decodeIfPresent([ForegroundWorkspaceApp].self, forKey: .workspaceApps) ?? []
+        workspaceBoundAt = try values.decodeIfPresent(Date.self, forKey: .workspaceBoundAt)
+    }
+}
+
+public enum HUDDisplayField: String, CaseIterable, Codable, Sendable, Hashable, Identifiable {
+    case provider
+    case event
+    case task
+    case project
+    case elapsed
+
+    public var id: Self { self }
+}
+
+public struct HUDSettings: Codable, Equatable, Sendable {
+    public var isEnabled: Bool
+    public var displaySeconds: Int
+    public var fields: [HUDDisplayField]
+
+    public init(
+        isEnabled: Bool = true,
+        displaySeconds: Int = 8,
+        fields: [HUDDisplayField] = [.provider, .event, .task, .elapsed]
+    ) {
+        self.isEnabled = isEnabled
+        self.displaySeconds = displaySeconds
+        self.fields = fields
+    }
+
+    public static let defaults = HUDSettings()
 }
 
 public enum ForegroundDispatchPhase: Equatable, Sendable {
@@ -149,10 +197,19 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var isHUDPreviewActive = false
     /// Ticks once per second so waiting timers and countdown rings advance.
     @Published public private(set) var now: Date = Date()
-
-    @Published public var approvalPolicy: ApprovalPolicy {
-        didSet { defaults.set(approvalPolicy.rawValue, forKey: Self.policyKey) }
-    }
+    @Published public private(set) var setupInfo: SetupInfo?
+    @Published public private(set) var uiSettings: UISettings = .defaults
+    @Published public private(set) var displayCatalog: [DisplayField] = []
+    @Published public private(set) var claudeQuotaBridge: ClaudeQuotaBridge?
+    @Published public private(set) var isSetupBusy = false
+    @Published public private(set) var isSettingsBusy = false
+    @Published public private(set) var eventUIP95Ms: UInt64?
+    /// Monotonic event observed by the AppKit shell to play the optional local
+    /// arrival sound without moving platform UI code into ActRealmKit.
+    @Published public private(set) var notificationPulse: UInt64 = 0
+    @Published public private(set) var hudSettings: HUDSettings
+    @Published public private(set) var hudArrivalID: String?
+    @Published public private(set) var hudArrivalDeadline: Date?
 
     /// Index of the approval card currently shown in the OUTBOX stack.
     @Published public var outboxPageIndex: Int = 0
@@ -168,23 +225,43 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var foregroundReturnNotes: [String: String] = [:]
     @Published public private(set) var foregroundSuppressedAttentionIDs: Set<String> = []
     @Published public private(set) var foregroundWorkspaceStatus = ForegroundWorkspaceStatus()
+    @Published public private(set) var isSelectingForegroundWorkspace = false
 
     public let isDemo: Bool
     public let supervisor: RuntimeSupervisor
     public let client: RuntimeClient
 
-    private static let policyKey = "actrealm.approvalPolicy"
+    public var isFirstRun: Bool { setupInfo?.firstRun == true }
+    public var connectedAgentCount: Int {
+        setupInfo?.providers.filter { $0.status == "connected" }.count ?? 0
+    }
+    public var pendingAgentSetupCount: Int {
+        setupInfo?.providers.filter {
+            !["connected", "not_installed", "provider_missing", "cli_missing"].contains($0.status)
+        }.count ?? 0
+    }
+
+    private static let legacyApprovalPolicyKey = "actrealm.approvalPolicy"
     private static let dismissedTasksKey = "actrealm.dismissedTaskVersions"
+    private static let foregroundTestDispatchID = "foreground-scheduling-test"
     private static let foregroundSchedulingKey = "actrealm.foregroundScheduling"
+    private static let hudSettingsKey = "actrealm.hudSettings"
     private let defaults: UserDefaults
     private var cancellables: Set<AnyCancellable> = []
     private var ticker: Task<Void, Never>?
-    private var autoDecided: Set<String> = []
     private var dismissedTaskVersions: [String: UInt64]
     private var toastTask: Task<Void, Never>?
     private var outboxHighlightTask: Task<Void, Never>?
     private var hudPreviewTask: Task<Void, Never>?
+    private var settingsSaveTask: Task<Void, Never>?
+    private var setupRefreshTask: Task<Void, Never>?
     private var seededForegroundArrivals = false
+    private var seededNotifications = false
+    private var lastSetupRefreshEventCount: UInt64 = 0
+    private var latestSnapshot: Snapshot = .empty
+    private var persistedUISettings: UISettings = .defaults
+    private var renderedEventCount: UInt64 = 0
+    private var eventUILatenciesMs: [UInt64] = []
     private var started = false
 
     public init(
@@ -202,15 +279,24 @@ public final class AppModel: ObservableObject {
         } else {
             self.foregroundScheduling = .defaults
         }
+        if !demo,
+           let data = defaults.data(forKey: Self.hudSettingsKey),
+           let settings = try? JSONDecoder().decode(HUDSettings.self, from: data)
+        {
+            self.hudSettings = settings
+        } else {
+            self.hudSettings = .defaults
+        }
+        self.hudArrivalID = nil
+        self.hudArrivalDeadline = nil
         self.foregroundDispatch = nil
         let supervisor = RuntimeSupervisor(repoPath: repoPath)
         self.supervisor = supervisor
         self.client = RuntimeClient()
-        // The interaction redesign intentionally removed the Prompt / Allow
-        // all / Deny all controls. Migrate any invisible legacy auto-policy
-        // back to Prompt so a request can actually reach OUTBOX and the HUD.
-        self.approvalPolicy = .prompt
-        defaults.set(ApprovalPolicy.prompt.rawValue, forKey: Self.policyKey)
+        // The Web/native shared interaction model has no global auto-approval
+        // mode. Remove the legacy native-only preference so it can never make
+        // an invisible decision after the old settings control disappeared.
+        defaults.removeObject(forKey: Self.legacyApprovalPolicyKey)
         self.dismissedTaskVersions = (defaults.dictionary(forKey: Self.dismissedTasksKey) ?? [:])
             .reduce(into: [:]) { result, pair in
                 if let value = pair.value as? NSNumber {
@@ -244,6 +330,8 @@ public final class AppModel: ObservableObject {
         toastTask?.cancel()
         outboxHighlightTask?.cancel()
         hudPreviewTask?.cancel()
+        settingsSaveTask?.cancel()
+        setupRefreshTask?.cancel()
     }
 
     // MARK: - Lifecycle
@@ -254,6 +342,11 @@ public final class AppModel: ObservableObject {
         startTicker()
         if isDemo {
             derived = DemoData.derivedState(now: now)
+            setupInfo = DemoData.setup
+            uiSettings = DemoData.settings.settings
+            persistedUISettings = DemoData.settings.settings
+            displayCatalog = DemoData.settings.displayCatalog
+            claudeQuotaBridge = DemoData.settings.claudeQuotaBridge
             bridgeStatus = .listening
             lastSyncAt = now
             return
@@ -263,7 +356,12 @@ public final class AppModel: ObservableObject {
         Task {
             supervisor.refreshDiagnostics()
             await supervisor.start { baseURL, token in
-                Task { await client.connect(baseURL: baseURL, token: token) }
+                Task {
+                    await client.connect(baseURL: baseURL, token: token)
+                    await self.refreshSetup()
+                    await self.refreshSettings()
+                    await client.recordMetric("app_opened")
+                }
             }
         }
     }
@@ -287,7 +385,11 @@ public final class AppModel: ObservableObject {
         Task {
             client.disconnect()
             let error = await supervisor.restart { baseURL, token in
-                Task { await client.connect(baseURL: baseURL, token: token) }
+                Task {
+                    await client.connect(baseURL: baseURL, token: token)
+                    await self.refreshSetup()
+                    await self.refreshSettings()
+                }
             }
             if let error {
                 runtimeActionMessage = error
@@ -313,6 +415,186 @@ public final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: - Shared Web/native control-surface state
+
+    public func refreshSetup() async {
+        guard !isDemo else { return }
+        if let setup = await client.fetchSetup() {
+            setupInfo = setup
+            apply(snapshot: latestSnapshot, emitArrivals: false)
+        }
+    }
+
+    @discardableResult
+    public func changeSetup(provider: String, action: String) async -> Bool {
+        guard !isDemo, !isSetupBusy else { return false }
+        isSetupBusy = true
+        defer { isSetupBusy = false }
+        let (updated, error) = await client.changeSetup(
+            provider: provider,
+            action: action,
+            enhancedCodexActivity: uiSettings.codexEnhancedActivity
+        )
+        if let updated {
+            setupInfo = updated
+            apply(snapshot: latestSnapshot, emitArrivals: false)
+            showToast(action == "uninstall"
+                ? "\(providerDisplayName(provider)) 接入已移除"
+                : "\(providerDisplayName(provider)) 配置已安全写入")
+            return true
+        }
+        showToast("接入操作失败：\(error ?? "未知错误")")
+        return false
+    }
+
+    public func refreshSettings() async {
+        guard !isDemo else { return }
+        guard let response = await client.fetchSettings() else { return }
+        acceptSettings(response)
+    }
+
+    /// Updates the local view immediately, then persists the complete Runtime
+    /// settings object. A short debounce keeps segmented controls responsive
+    /// while preserving the server's all-fields validation contract.
+    public func updateUISettings(_ update: (inout UISettings) -> Void) {
+        var next = uiSettings
+        update(&next)
+        guard next != uiSettings else { return }
+        uiSettings = next
+        apply(snapshot: latestSnapshot, emitArrivals: false)
+        settingsSaveTask?.cancel()
+        settingsSaveTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(180))
+            guard let self, !Task.isCancelled else { return }
+            await self.persistSettings(next)
+        }
+    }
+
+    private func persistSettings(_ settings: UISettings) async {
+        guard !isDemo else { return }
+        let previousCodexMode = persistedUISettings.codexEnhancedActivity
+        isSettingsBusy = true
+        defer { isSettingsBusy = false }
+        let (response, error) = await client.updateSettings(settings)
+        if let response {
+            acceptSettings(response)
+            if previousCodexMode != response.settings.codexEnhancedActivity {
+                showToast("Codex Hook 已更新，请在 Codex 中运行 /hooks 重新检查信任")
+                await refreshSetup()
+            } else {
+                showToast("设置已保存到本机")
+            }
+        } else {
+            showToast("设置保存失败：\(error ?? "未知错误")")
+            await refreshSettings()
+        }
+    }
+
+    private func acceptSettings(_ response: SettingsResponse) {
+        uiSettings = response.settings
+        persistedUISettings = response.settings
+        displayCatalog = response.displayCatalog
+        claudeQuotaBridge = response.claudeQuotaBridge
+        apply(snapshot: latestSnapshot, emitArrivals: false)
+    }
+
+    public func changeClaudeQuotaBridge(action: String) async {
+        guard !isDemo, !isSettingsBusy else { return }
+        isSettingsBusy = true
+        defer { isSettingsBusy = false }
+        let (response, error) = await client.changeClaudeQuotaBridge(action: action)
+        if let response {
+            acceptSettings(response)
+            await client.refreshSnapshot()
+            showToast(action == "uninstall"
+                ? "Claude 额度桥已关闭，原状态栏已恢复"
+                : "Claude 额度桥已开启，完成一次对话后会显示额度")
+        } else {
+            showToast("额度桥操作失败：\(error ?? "未知错误")")
+        }
+    }
+
+    public func exportLocalData(metricsOnly: Bool) async -> Data? {
+        let (data, error) = await client.exportData(metricsOnly: metricsOnly)
+        if data == nil { showToast("导出失败：\(error ?? "未知错误")") }
+        return data
+    }
+
+    @discardableResult
+    public func clearLocalData(confirmation: String) async -> Bool {
+        guard confirmation == "DELETE" else {
+            showToast("请输入 DELETE；没有删除任何数据")
+            return false
+        }
+        if let error = await client.clearData(confirmation: confirmation) {
+            showToast("清除失败：\(error)")
+            return false
+        }
+        await refreshSettings()
+        showToast("本地运行数据已彻底清除，Hook 接入保持不变")
+        return true
+    }
+
+    public func submitQuestion(
+        _ entry: OutboxEntry,
+        action: String,
+        answers: [String: JSONValue]? = nil
+    ) async -> Bool {
+        guard let requestId = entry.attention.requestId else {
+            showToast("这个问题没有可用的回复通道")
+            return false
+        }
+        if let error = await client.answerQuestion(
+            requestId: requestId,
+            action: action,
+            answers: answers
+        ) {
+            showToast("回答失败：\(error)")
+            return false
+        }
+        showToast(action == "native" ? "已交回 Agent 原界面回答" : "回答已安全发送给 Agent")
+        return true
+    }
+
+    public func jump(to task: LaneTask) async {
+        guard task.session.jumpCapability != "unsupported" else {
+            showToast("当前环境不支持跳转；ActRealm 不会假装已定位到原对话")
+            return
+        }
+        let (response, error) = await client.jumpSession(task.id)
+        if let response, response.success {
+            showToast(response.label)
+        } else {
+            showToast("跳转失败：\(error ?? "没有找到原窗口")")
+        }
+    }
+
+    public func jump(to entry: OutboxEntry) async {
+        guard let task = derived.agentTasks.first(where: { $0.id == entry.attention.sessionId }) else {
+            revealSession(for: entry)
+            showToast("已定位对应任务；当前没有可验证的原窗口跳转信息")
+            return
+        }
+        await jump(to: task)
+    }
+
+    public func manage(_ task: LaneTask) async {
+        guard task.session.canManage == true else { return }
+        if let error = await client.manageSession(task.id) {
+            showToast("托管连接失败：\(error)")
+        } else {
+            showToast("Codex 对话已由 ActRealm app-server Connector 接管")
+        }
+    }
+
+    private func providerDisplayName(_ provider: String) -> String {
+        switch provider {
+        case "claude": "Claude"
+        case "codex": "Codex"
+        default: provider
+        }
+    }
+
     private func startTicker() {
         ticker?.cancel()
         ticker = Task { [weak self] in
@@ -321,6 +603,10 @@ public final class AppModel: ObservableObject {
                 guard let self else { return }
                 self.now = Date()
                 self.advanceForegroundDispatch(at: self.now)
+                if let deadline = self.hudArrivalDeadline, self.now >= deadline {
+                    self.hudArrivalID = nil
+                    self.hudArrivalDeadline = nil
+                }
                 if self.isDemo {
                     self.derived = DemoData.derivedState(now: self.now)
                 }
@@ -330,19 +616,39 @@ public final class AppModel: ObservableObject {
 
     // MARK: - Snapshot handling
 
-    private func apply(snapshot: Snapshot) {
-        let next = DerivedState.derive(from: snapshot)
+    private func apply(snapshot: Snapshot, emitArrivals: Bool = true) {
+        latestSnapshot = snapshot
+        let allowedAttentionIDs = Set(snapshot.attention.filter {
+            uiSettings.notificationRules.mode(for: $0.kind) != .ignore
+        }.map(\.id))
+        // Until setup is resolved, and whenever both supported Providers are
+        // genuinely unconfigured, do not flash restored/history rows as a
+        // current workspace. This mirrors Web's first-run render contract.
+        let complete = setupInfo == nil || setupInfo?.firstRun == true
+            ? DerivedState.empty
+            : DerivedState.derive(from: snapshot)
+        // Reminder rules control presentation, not Runtime truth. An ignored
+        // approval still keeps its task in the waiting state, matching Web.
+        let next = DerivedState(
+            outbox: complete.outbox.filter { allowedAttentionIDs.contains($0.id) },
+            lanes: complete.lanes,
+            quotaSlots: complete.quotaSlots,
+            pendingDecision: complete.pendingDecision
+        )
         let nextOpenIDs = Set(next.openOutbox.map(\.id))
         foregroundReturnNotes = foregroundReturnNotes.filter { nextOpenIDs.contains($0.key) }
         foregroundSuppressedAttentionIDs.formIntersection(nextOpenIDs)
-        if let dispatch = foregroundDispatch, !nextOpenIDs.contains(dispatch.id) {
+        if let dispatch = foregroundDispatch,
+           dispatch.id != Self.foregroundTestDispatchID,
+           !nextOpenIDs.contains(dispatch.id)
+        {
             foregroundDispatch = nil
         }
 
-        if seededForegroundArrivals {
+        if emitArrivals, seededForegroundArrivals {
             let previousIDs = Set(derived.openOutbox.map(\.id))
             let arrivals = next.openOutbox
-                .filter { !previousIDs.contains($0.id) }
+                .filter { $0.state == .open && !previousIDs.contains($0.id) }
                 .sorted { $0.createdAt < $1.createdAt }
             for arrival in arrivals {
                 receiveForegroundArrival(
@@ -352,14 +658,51 @@ public final class AppModel: ObservableObject {
                     taskTitle: arrival.taskTitle
                 )
             }
-        } else {
+            if hudSettings.isEnabled, let arrival = arrivals.last {
+                hudArrivalID = arrival.id
+                hudArrivalDeadline = Date().addingTimeInterval(TimeInterval(hudSettings.displaySeconds))
+            }
+            if seededNotifications, uiSettings.soundEnabled, !arrivals.isEmpty {
+                notificationPulse &+= 1
+            }
+        } else if emitArrivals {
             seededForegroundArrivals = true
         }
+        if emitArrivals { seededNotifications = true }
 
         derived = next
-        lastSyncAt = Date()
+        if emitArrivals { lastSyncAt = Date() }
+        if emitArrivals, snapshot.stats.eventCount > renderedEventCount {
+            let latestEventAt = snapshot.sessions.map(\.lastEventAt).max() ?? 0
+            let currentMillis = UInt64(max(0, Date().timeIntervalSince1970 * 1000))
+            if latestEventAt > 0, currentMillis >= latestEventAt {
+                let latency = currentMillis - latestEventAt
+                if latency <= 10_000 {
+                    eventUILatenciesMs.append(latency)
+                    if eventUILatenciesMs.count > 100 {
+                        eventUILatenciesMs.removeFirst(eventUILatenciesMs.count - 100)
+                    }
+                    let sorted = eventUILatenciesMs.sorted()
+                    let index = max(0, Int(ceil(Double(sorted.count) * 0.95)) - 1)
+                    eventUIP95Ms = sorted[index]
+                }
+            }
+            renderedEventCount = snapshot.stats.eventCount
+        }
         clampOutboxPage()
-        autoDecideIfNeeded()
+        if snapshot.stats.eventCount != lastSetupRefreshEventCount {
+            lastSetupRefreshEventCount = snapshot.stats.eventCount
+            scheduleSetupRefresh()
+        }
+    }
+
+    private func scheduleSetupRefresh() {
+        setupRefreshTask?.cancel()
+        setupRefreshTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(500))
+            guard let self, !Task.isCancelled else { return }
+            await self.refreshSetup()
+        }
     }
 
     private func updateBridgeStatus(
@@ -385,19 +728,6 @@ public final class AppModel: ObservableObject {
         let count = derived.openOutbox.count
         if outboxPageIndex >= count {
             outboxPageIndex = max(0, count - 1)
-        }
-    }
-
-    /// Allow all / Deny all: answer fresh approval requests automatically,
-    /// once per attention item, through the normal command path.
-    private func autoDecideIfNeeded() {
-        guard approvalPolicy != .prompt, !isDemo else { return }
-        let action: AttentionAction = approvalPolicy == .allowAll ? .approve : .deny
-        for entry in derived.openOutbox
-        where entry.kind == .approval && entry.state == .open && !autoDecided.contains(entry.id) {
-            autoDecided.insert(entry.id)
-            let requestId = entry.attention.requestId
-            Task { await client.send(action: action, attentionId: entry.id, requestId: requestId) }
         }
     }
 
@@ -455,18 +785,20 @@ public final class AppModel: ObservableObject {
         expandedTaskId = task.session.id
     }
 
-    /// Clearing a row is a reversible presentation action, not deletion of
-    /// local history. A newer event for the same session makes it visible
-    /// again. Pending or running work cannot be hidden accidentally.
+    /// Matches the Web task-clear behavior: hand questions back to the Agent,
+    /// dismiss other related presentation items, then hide this session
+    /// version. Any later Runtime event makes it visible again.
     public func dismissTask(_ task: LaneTask) {
-        guard task.openOutboxCount == 0 else {
-            revealOutbox(for: task)
-            showToast("请先处理这个任务的 OUTBOX 事项")
-            return
-        }
-        guard task.status != .running && task.status != .waiting else {
-            showToast("正在运行的任务不能移除")
-            return
+        Task { await clearTask(task) }
+    }
+
+    private func clearTask(_ task: LaneTask) async {
+        let related = derived.openOutbox.filter { $0.attention.sessionId == task.id }
+        var failed = 0
+        if !isDemo {
+            for entry in related {
+                if await client.dismissAttention(entry.attention) != nil { failed += 1 }
+            }
         }
         dismissedTaskVersions[task.id] = task.session.lastEventAt
         defaults.set(
@@ -475,7 +807,13 @@ public final class AppModel: ObservableObject {
         )
         if expandedTaskId == task.id { expandedTaskId = nil }
         if pinnedSessionId == task.id { pinnedSessionId = nil }
-        showToast("已从列表移除；有新活动时会自动恢复")
+        if failed > 0 {
+            showToast("任务已清除；\(failed) 项仍需在 OUTBOX 或 Agent 原界面处理")
+        } else if !related.isEmpty {
+            showToast("任务已清除，并交还 \(related.count) 项待处理事项")
+        } else {
+            showToast("已从列表移除；有新活动时会自动恢复")
+        }
     }
 
     public func isTaskDismissed(_ task: LaneTask) -> Bool {
@@ -507,6 +845,54 @@ public final class AppModel: ObservableObject {
         foregroundScheduling = settings
         guard !isDemo, let data = try? JSONEncoder().encode(settings) else { return }
         defaults.set(data, forKey: Self.foregroundSchedulingKey)
+    }
+
+    public func beginForegroundWorkspaceSelection() {
+        isSelectingForegroundWorkspace = true
+    }
+
+    public func cancelForegroundWorkspaceSelection() {
+        isSelectingForegroundWorkspace = false
+    }
+
+    public func bindForegroundWorkspace(apps: [ForegroundWorkspaceApp]) {
+        guard !apps.isEmpty else {
+            showToast("当前桌面没有可绑定的协作应用")
+            return
+        }
+        updateForegroundScheduling {
+            $0.workspaceApps = apps
+            $0.workspaceBoundAt = Date()
+        }
+        isSelectingForegroundWorkspace = false
+        showToast("协作桌面已绑定")
+    }
+
+    public func clearForegroundWorkspaceBinding() {
+        updateForegroundScheduling {
+            $0.workspaceApps = []
+            $0.workspaceBoundAt = nil
+        }
+        showToast("协作桌面绑定已清除")
+    }
+
+    public func updateHUDSettings(_ update: (inout HUDSettings) -> Void) {
+        var settings = hudSettings
+        update(&settings)
+        settings.displaySeconds = Self.supportedHUDSeconds(settings.displaySeconds)
+        settings.fields = HUDDisplayField.allCases.filter { settings.fields.contains($0) }
+        guard settings != hudSettings else { return }
+        hudSettings = settings
+        if !settings.isEnabled {
+            hudArrivalID = nil
+            hudArrivalDeadline = nil
+        }
+        guard !isDemo, let data = try? JSONEncoder().encode(settings) else { return }
+        defaults.set(data, forKey: Self.hudSettingsKey)
+    }
+
+    private static func supportedHUDSeconds(_ seconds: Int) -> Int {
+        [5, 8, 12, 20].min(by: { abs($0 - seconds) < abs($1 - seconds) }) ?? 8
     }
 
     private static func supportedSeconds(_ seconds: Int) -> Int {
@@ -544,13 +930,19 @@ public final class AppModel: ObservableObject {
     /// Runtime attention item or sends a provider command.
     public func previewForegroundScheduling() {
         guard isDemo else { return }
+        testForegroundScheduling()
+    }
+
+    /// Exercises the complete AppKit scheduling path without creating a
+    /// Runtime attention item or sending a provider command.
+    public func testForegroundScheduling() {
         foregroundDispatch = nil
         receiveForegroundArrival(
-            id: "foreground-preview",
-            provider: .codex,
-            title: "Codex 想运行 Bash，等你批准",
-            taskTitle: "升级依赖并修复构建脚本",
-            at: now
+            id: Self.foregroundTestDispatchID,
+            provider: .claude,
+            title: "台前调度测试",
+            taskTitle: "验证协作桌面切换与接收",
+            at: Date()
         )
     }
 
@@ -584,13 +976,17 @@ public final class AppModel: ObservableObject {
         taskTitle: String?,
         at date: Date = Date()
     ) {
-        foregroundSuppressedAttentionIDs.insert(id)
         guard foregroundDispatch == nil else { return }
 
         switch effectiveForegroundStrategy(for: provider) {
         case .actRealmWorkspace:
             showToast("新任务已进入 ActRealm 工作区的待处理列表")
         case .immediate:
+            guard !foregroundScheduling.workspaceApps.isEmpty else {
+                showToast("新任务已进入待处理列表；绑定协作桌面后可自动打开")
+                return
+            }
+            foregroundSuppressedAttentionIDs.insert(id)
             foregroundDispatch = ForegroundDispatchState(
                 id: id,
                 provider: provider,
@@ -601,6 +997,11 @@ public final class AppModel: ObservableObject {
                 deadline: date.addingTimeInterval(1.2)
             )
         case .remind:
+            guard !foregroundScheduling.workspaceApps.isEmpty else {
+                showToast("新任务已进入待处理列表；绑定协作桌面后可自动打开")
+                return
+            }
+            foregroundSuppressedAttentionIDs.insert(id)
             foregroundDispatch = ForegroundDispatchState(
                 id: id,
                 provider: provider,
@@ -667,8 +1068,9 @@ public final class AppModel: ObservableObject {
     public func previewHUD() {
         isHUDPreviewActive = true
         hudPreviewTask?.cancel()
+        let seconds = hudSettings.displaySeconds
         hudPreviewTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(8))
+            try? await Task.sleep(for: .seconds(seconds))
             guard !Task.isCancelled else { return }
             self?.isHUDPreviewActive = false
         }

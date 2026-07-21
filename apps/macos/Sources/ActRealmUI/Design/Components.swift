@@ -1,3 +1,4 @@
+import AppKit
 import ActRealmKit
 import SwiftUI
 
@@ -42,15 +43,66 @@ struct ProviderAvatar: View {
     var size: CGFloat = 24
 
     var body: some View {
-        Circle()
-            .fill(DT.providerBg(kind))
-            .overlay(Circle().strokeBorder(DT.providerStroke(kind), lineWidth: 1))
-            .overlay(
-                Text(kind.avatarLetter)
-                    .font(.system(size: size * 0.42, weight: .heavy))
+        Group {
+            if let icon = providerIcon {
+                Image(nsImage: icon)
+                    .resizable()
+                    .interpolation(.high)
+            } else {
+                Image(systemName: "app.dashed")
+                    .resizable()
+                    .scaledToFit()
+                    .padding(size * 0.2)
                     .foregroundStyle(DT.providerText(kind))
-            )
+                    .background(DT.providerBg(kind))
+            }
+        }
             .frame(width: size, height: size)
+            .clipShape(RoundedRectangle(cornerRadius: size * 0.23, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: size * 0.23, style: .continuous)
+                    .strokeBorder(DT.providerStroke(kind).opacity(0.65), lineWidth: 0.75)
+            )
+    }
+
+    private var providerIcon: NSImage? {
+        let bundleIdentifiers: [String]
+        let applicationPaths: [String]
+        let assetName: String
+        switch kind {
+        case .claude:
+            bundleIdentifiers = ["com.anthropic.claudefordesktop"]
+            applicationPaths = ["/Applications/Claude.app"]
+            assetName = "claude.png"
+        case .codex:
+            bundleIdentifiers = ["com.openai.codex", "com.openai.chat"]
+            applicationPaths = ["/Applications/Codex.app"]
+            assetName = "codex.png"
+        case .gemini:
+            bundleIdentifiers = []
+            applicationPaths = []
+            assetName = ""
+        }
+
+        for identifier in bundleIdentifiers {
+            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier) {
+                return NSWorkspace.shared.icon(forFile: url.path)
+            }
+        }
+        for path in applicationPaths where FileManager.default.fileExists(atPath: path) {
+            return NSWorkspace.shared.icon(forFile: path)
+        }
+        guard !assetName.isEmpty else { return nil }
+        if let packaged = Bundle.main.resourceURL?
+            .appendingPathComponent("ProviderIcons", isDirectory: true)
+            .appendingPathComponent(assetName),
+           let image = NSImage(contentsOf: packaged)
+        {
+            return image
+        }
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<6 { root.deleteLastPathComponent() }
+        return NSImage(contentsOf: root.appendingPathComponent("web/assets/\(assetName)"))
     }
 }
 
@@ -121,7 +173,7 @@ extension Chip.Tone {
 
     static func forOutboxKind(_ kind: OutboxKind) -> Chip.Tone {
         switch kind {
-        case .approval: .amber
+        case .approval, .nativeApproval: .amber
         case .question: .blue
         case .error: .red
         case .completion: .green

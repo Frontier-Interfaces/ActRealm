@@ -3,9 +3,10 @@ import ActRealmKit
 import ActRealmUI
 import SwiftUI
 
-/// Offscreen renderer: captures every screen of the app with demo data so
-/// the UI can be verified against the design handoff without screen
-/// recording permissions.
+/// Offscreen renderer: captures screens that support SwiftUI ImageRenderer
+/// with demo data so they can be verified without screen recording
+/// permissions. NavigationSplitView-based settings are checked in the hosted
+/// packaged app because SwiftUI does not render that container offscreen.
 
 @MainActor
 func writePNG(_ image: NSImage, to path: String, scale: CGFloat) {
@@ -127,6 +128,32 @@ Task { @MainActor in
         to: "\(outDir)/main-expanded-light.png"
     )
 
+    model.outboxPageIndex = 1
+    render(
+        Backdrop(dark: false) {
+            MainWindowView()
+                .environmentObject(model)
+                .frame(width: 1536, height: 980)
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .padding(40)
+        },
+        size: CGSize(width: 1616, height: 1060),
+        to: "\(outDir)/interactive-question-light.png"
+    )
+    model.outboxPageIndex = 0
+
+    render(
+        Backdrop(dark: false) {
+            MainWindowView(initialPage: .agentSetup)
+                .environmentObject(model)
+                .frame(width: 1536, height: 980)
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .padding(40)
+        },
+        size: CGSize(width: 1616, height: 1060),
+        to: "\(outDir)/agent-setup-light.png"
+    )
+
     // Foreground scheduling management page. The taller viewport captures the
     // full reference layout in one QA artifact while the shipped window keeps
     // the page scrollable at normal desktop sizes.
@@ -187,19 +214,6 @@ Task { @MainActor in
             to: "\(outDir)/\(name).png"
         )
     }
-
-    // Settings.
-    render(
-        Backdrop(dark: false) {
-            SettingsView()
-                .environmentObject(model)
-                .background(Color.white.opacity(0.6))
-                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-                .padding(30)
-        },
-        size: nil,
-        to: "\(outDir)/settings-light.png"
-    )
 
     // Runtime monitor sheet.
     render(

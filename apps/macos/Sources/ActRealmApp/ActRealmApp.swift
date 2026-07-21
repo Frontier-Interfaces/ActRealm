@@ -31,12 +31,17 @@ struct ActRealmApp: App {
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
                     model.shutdown()
                 }
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                    Task { await model.refreshSetup() }
+                }
         }
         .defaultSize(width: 1440, height: 820)
+        .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentMinSize)
         .windowBackgroundDragBehavior(.enabled)
         .commands {
             CommandGroup(replacing: .newItem) {}
+            SettingsWindowCommands()
         }
 
         MenuBarExtra {
@@ -48,10 +53,13 @@ struct ActRealmApp: App {
         }
         .menuBarExtraStyle(.window)
 
-        Settings {
+        Window("设置", id: "settings") {
             SettingsView()
                 .environmentObject(model)
         }
+        .defaultSize(width: 920, height: 660)
+        .windowStyle(.hiddenTitleBar)
+        .windowResizability(.contentSize)
     }
 
     /// Dev fallback: the monorepo's Runtime workspace. Packaged builds use the
@@ -62,5 +70,16 @@ struct ActRealmApp: App {
             .deletingLastPathComponent() // Sources/
             .deletingLastPathComponent() // macos/
             .deletingLastPathComponent() // apps/
+    }
+}
+
+private struct SettingsWindowCommands: Commands {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some Commands {
+        CommandGroup(replacing: .appSettings) {
+            Button("设置…") { openWindow(id: "settings") }
+                .keyboardShortcut(",", modifiers: .command)
+        }
     }
 }

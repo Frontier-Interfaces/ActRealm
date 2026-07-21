@@ -18,6 +18,16 @@ import Testing
     }
 
     @MainActor
+    @Test func legacyInvisibleAutoApprovalPreferenceIsRemoved() {
+        let defaults = isolatedDefaults()
+        defaults.set("allowAll", forKey: "actrealm.approvalPolicy")
+
+        _ = AppModel(defaults: defaults, demo: false)
+
+        #expect(defaults.object(forKey: "actrealm.approvalPolicy") == nil)
+    }
+
+    @MainActor
     @Test func editsPersistAndDurationsStayOnSupportedValues() {
         let suite = "ForegroundSchedulingTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -45,11 +55,12 @@ import Testing
     @Test func liveArrivalMovesThroughReminderOpenWaitAndReturn() {
         let model = AppModel(defaults: isolatedDefaults(), demo: true)
         let start = Date(timeIntervalSince1970: 1_000)
+        bindWorkspace(model)
 
         model.receiveForegroundArrival(
             id: "approval-1",
             provider: .codex,
-            title: "Codex 想运行 Bash，等你批准",
+            title: "Codex 请求运行 Bash，等待批准",
             taskTitle: "修复构建",
             at: start
         )
@@ -73,13 +84,14 @@ import Testing
     @MainActor
     @Test func providerOverrideAndManualReceiveAreApplied() {
         let model = AppModel(defaults: isolatedDefaults(), demo: true)
+        bindWorkspace(model)
         #expect(model.effectiveForegroundStrategy(for: .claude) == .immediate)
         #expect(model.effectiveForegroundStrategy(for: .codex) == .remind)
 
         model.receiveForegroundArrival(
             id: "question-1",
             provider: .claude,
-            title: "Claude 有一个问题需要你回答",
+            title: "Claude 发出一个待回答问题",
             taskTitle: nil
         )
         #expect(model.foregroundDispatch?.phase == .opening)
@@ -92,6 +104,7 @@ import Testing
     @Test func enteringSchedulingWorkspaceStopsReturnAndHonorsAutoClose() {
         let model = AppModel(defaults: isolatedDefaults(), demo: true)
         let start = Date(timeIntervalSince1970: 2_000)
+        bindWorkspace(model)
         model.receiveForegroundArrival(
             id: "approval-accepted",
             provider: .codex,
@@ -107,6 +120,50 @@ import Testing
         #expect(model.foregroundDispatch == nil)
         #expect(!model.foregroundScheduling.isEnabled)
         #expect(model.foregroundReturnNotes["approval-accepted"] == nil)
+    }
+
+    @MainActor
+    @Test func unboundWorkspaceKeepsArrivalInListAndDoesNotSuppressHUD() {
+        let model = AppModel(defaults: isolatedDefaults(), demo: true)
+
+        model.receiveForegroundArrival(
+            id: "approval-unbound",
+            provider: .codex,
+            title: "等待批准",
+            taskTitle: nil
+        )
+
+        #expect(model.foregroundDispatch == nil)
+        #expect(!model.isForegroundHUDSuppressed(for: "approval-unbound"))
+        #expect(model.toastMessage?.contains("绑定协作桌面") == true)
+    }
+
+    @MainActor
+    @Test func workspaceBindingAndHUDSettingsPersist() {
+        let suite = "ForegroundSchedulingTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let first = AppModel(defaults: defaults, demo: false)
+
+        first.bindForegroundWorkspace(apps: [
+            ForegroundWorkspaceApp(bundleIdentifier: "com.example.agent", name: "Agent")
+        ])
+        first.updateHUDSettings {
+            $0.displaySeconds = 19
+            $0.fields = [.event, .project]
+        }
+
+        let restored = AppModel(defaults: defaults, demo: false)
+        #expect(restored.foregroundScheduling.workspaceApps.map(\.bundleIdentifier) == ["com.example.agent"])
+        #expect(restored.hudSettings.displaySeconds == 20)
+        #expect(restored.hudSettings.fields == [.event, .project])
+    }
+
+    @MainActor
+    private func bindWorkspace(_ model: AppModel) {
+        model.bindForegroundWorkspace(apps: [
+            ForegroundWorkspaceApp(bundleIdentifier: "com.example.agent", name: "Agent")
+        ])
     }
 
     private func isolatedDefaults() -> UserDefaults {

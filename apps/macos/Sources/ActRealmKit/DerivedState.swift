@@ -11,7 +11,13 @@ public enum ProviderKind: String, CaseIterable, Sendable, Hashable {
         self.init(rawValue: value.lowercased())
     }
 
-    public var displayName: String { rawValue }
+    public var displayName: String {
+        switch self {
+        case .claude: "Claude"
+        case .codex: "Codex"
+        case .gemini: "Gemini"
+        }
+    }
 
     /// Single-letter avatar badge used across the design ("C" / "X" / "G").
     public var avatarLetter: String {
@@ -64,6 +70,7 @@ public enum RiskLevel: String, Sendable {
 
 public enum OutboxKind: String, Sendable {
     case approval
+    case nativeApproval = "native_approval"
     case question
     case error
     case completion
@@ -75,6 +82,7 @@ public enum OutboxKind: String, Sendable {
     public var badgeText: String {
         switch self {
         case .approval: "等待批准"
+        case .nativeApproval: "原界面批准"
         case .question: "提问"
         case .error: "出错"
         case .completion: "完成"
@@ -85,7 +93,7 @@ public enum OutboxKind: String, Sendable {
     var sortRank: Int {
         switch self {
         case .error: 0
-        case .approval: 1
+        case .approval, .nativeApproval: 1
         case .question: 2
         case .completion: 3
         }
@@ -112,7 +120,7 @@ public struct OutboxEntry: Identifiable, Equatable, Sendable {
     public let provider: ProviderKind?
     /// Tool category parsed from the runtime title "允许 Bash？" → "Bash".
     public let toolName: String?
-    /// Headline like "Codex 想运行 Bash，等你批准".
+    /// Headline like "Codex 请求运行 Bash，等待批准".
     public let actionTitle: String
     /// Task title of the owning session, if known.
     public let taskTitle: String?
@@ -161,12 +169,16 @@ public struct OutboxEntry: Identifiable, Equatable, Sendable {
         switch OutboxKind(record: attention.kind) {
         case .approval:
             if let tool {
-                self.actionTitle = "\(providerName) 想运行 \(tool)，等你批准"
+                self.actionTitle = "\(providerName) 请求运行 \(tool)，等待批准"
             } else {
-                self.actionTitle = "\(providerName) 请求一次操作，等你批准"
+                self.actionTitle = "\(providerName) 请求一次操作，等待批准"
             }
+        case .nativeApproval:
+            self.actionTitle = attention.title.isEmpty
+                ? "\(providerName) 等待在原界面批准"
+                : attention.title
         case .question:
-            self.actionTitle = "\(providerName) 有一个问题需要你回答"
+            self.actionTitle = "\(providerName) 发出一个待回答问题"
         case .error:
             self.actionTitle = "任务运行失败，需要检查"
         case .completion:
@@ -188,7 +200,7 @@ public enum LaneTaskStatus: Sendable, Equatable {
 
     public var badgeText: String {
         switch self {
-        case .waiting: "等你"
+        case .waiting: "等待"
         case .running: "在跑"
         case .failed: "出错"
         case .done: "完成"
@@ -212,12 +224,17 @@ public struct LaneTask: Identifiable, Equatable, Sendable {
     public let session: SessionRecord
     public let status: LaneTaskStatus
     public let openOutboxCount: Int
+    /// Includes snoozed presentation items so an older session remains in the
+    /// recent task list without incorrectly looking blocked.
+    public let hasVisibleAttention: Bool
     public let oldestOpenOutboxAt: Date?
     public let firstOpenOutboxId: String?
+    public let primaryAttentionKind: OutboxKind?
 
     public var id: String { session.id }
 
     public var title: String {
+        if let title = session.providerTitle, !title.isEmpty { return title }
         if let title = session.title, !title.isEmpty { return title }
         if let project = session.project, !project.isEmpty { return project }
         return "未命名任务"
@@ -240,24 +257,45 @@ public struct LaneTask: Identifiable, Equatable, Sendable {
     /// the provider. This intentionally stays nil for Claude transcripts that
     /// contain usage but no verifiable model window.
     public var contextUsageFraction: Double? {
-        guard let used = inputTokens, let window = contextWindowTokens, window > 0 else { return nil }
+        if let percent = session.contextUsedPercent {
+            return max(0, min(1, Double(percent) / 100))
+        }
+        guard let used = session.contextUsedTokens,
+              let window = contextWindowTokens,
+              window > 0
+        else { return nil }
         return max(0, min(1, Double(used) / Double(window)))
     }
+
+    public var contextUsedTokens: UInt64? { session.contextUsedTokens }
+    public var estimatedCostUsdMicros: UInt64? { session.estimatedCostUsdMicros }
+    public var lastTurnTokens: UInt64? { session.lastTurnTokens }
+    public var turnStartedAt: Date? { session.turnStartedAt.map(ZhFormat.date(fromMillis:)) }
+    public var turnEndedAt: Date? { session.turnEndedAt.map(ZhFormat.date(fromMillis:)) }
 
     public var planProgress: (done: Int, total: Int)? {
         guard let done = session.planDone, let total = session.planTotal, total > 0 else { return nil }
         return (Int(done), Int(total))
     }
 
-    init(session: SessionRecord, openAttention: [AttentionRecord]) {
+    init(
+        session: SessionRecord,
+        openAttention: [AttentionRecord],
+        visibleAttention: [AttentionRecord]? = nil
+    ) {
         self.session = session
         self.openOutboxCount = openAttention.count
+        self.hasVisibleAttention = !(visibleAttention ?? openAttention).isEmpty
         self.oldestOpenOutboxAt = openAttention.map(\.createdAt).min().map(ZhFormat.date(fromMillis:))
         self.firstOpenOutboxId = openAttention
             .min(by: { $0.createdAt < $1.createdAt })?.id
+        self.primaryAttentionKind = openAttention
+            .min(by: { $0.createdAt < $1.createdAt })
+            .map { OutboxKind(record: $0.kind) }
 
-        let waitingKinds: Set<String> = ["approval", "question"]
+        let waitingKinds: Set<String> = ["approval", "native_approval", "question"]
         let hasBlockingAttention = openAttention.contains { waitingKinds.contains($0.kind) }
+        let hasCompletionAttention = openAttention.contains { $0.kind == "completion" }
         switch session.execState {
         case "awaiting_approval":
             self.status = .waiting
@@ -266,9 +304,9 @@ public struct LaneTask: Identifiable, Equatable, Sendable {
         case "failed":
             self.status = .failed
         case "response_finished":
-            self.status = hasBlockingAttention ? .waiting : .done
+            self.status = (hasBlockingAttention || hasCompletionAttention) ? .waiting : .done
         default:
-            self.status = hasBlockingAttention ? .waiting : .idle
+            self.status = (hasBlockingAttention || hasCompletionAttention) ? .waiting : .idle
         }
     }
 }
@@ -299,33 +337,29 @@ public struct Lane: Identifiable, Equatable, Sendable {
 
 // MARK: - Quota
 
-public enum QuotaSlotID: String, CaseIterable, Sendable {
-    case claude5h
-    case claude7d
-    case codexWeek
+public struct QuotaSlotID: Hashable, Sendable {
+    public let rawValue: String
+    public let provider: ProviderKind
 
-    public var provider: ProviderKind {
-        switch self {
-        case .claude5h, .claude7d: .claude
-        case .codexWeek: .codex
-        }
+    public init(rawValue: String, provider: ProviderKind) {
+        self.rawValue = rawValue
+        self.provider = provider
     }
 
-    var providerKey: String { provider.rawValue }
+    public static let claude5h = QuotaSlotID(rawValue: "claude5h", provider: .claude)
+    public static let claude7d = QuotaSlotID(rawValue: "claude7d", provider: .claude)
+    public static let codexWeek = QuotaSlotID(rawValue: "codexWeek", provider: .codex)
 
-    var windowKey: String {
-        switch self {
-        case .claude5h: "5h"
-        case .claude7d: "7d"
-        case .codexWeek: "week"
-        }
-    }
-
-    public var title: String {
-        switch self {
-        case .claude5h: "5 小时额度"
-        case .claude7d: "7 天额度"
-        case .codexWeek: "本周额度"
+    static func make(entry: QuotaEntry, index: Int) -> QuotaSlotID {
+        switch (entry.provider, entry.window) {
+        case ("claude", "5h"): .claude5h
+        case ("claude", "7d"): .claude7d
+        case ("codex", "week"): .codexWeek
+        default:
+            QuotaSlotID(
+                rawValue: "\(entry.provider):\(entry.limitId ?? entry.window):\(index)",
+                provider: ProviderKind(record: entry.provider) ?? .codex
+            )
         }
     }
 }
@@ -338,6 +372,10 @@ public struct QuotaSlot: Identifiable, Equatable, Sendable {
     }
 
     public let slot: QuotaSlotID
+    public let title: String
+    public let source: String
+    public let planType: String?
+    public let windowMinutes: UInt64?
     public let availability: Availability
 
     public var id: String { slot.rawValue }
@@ -348,14 +386,16 @@ public struct QuotaSlot: Identifiable, Equatable, Sendable {
         return false
     }
 
-    init(slot: QuotaSlotID, entry: QuotaEntry?) {
-        self.slot = slot
-        guard let entry else {
-            self.availability = .unavailable(reason: "暂时没有可验证的额度数据")
-            return
-        }
+    init(entry: QuotaEntry, index: Int) {
+        self.slot = QuotaSlotID.make(entry: entry, index: index)
+        self.title = Self.windowTitle(entry)
+        self.source = entry.source
+        self.planType = entry.planType
+        self.windowMinutes = entry.windowMinutes
         let remaining = entry.remainingPct ?? entry.usedPct.map { 100 - $0 }
-        let resetsAt = entry.resetsAt.map(ZhFormat.date(fromMillis:))
+        // Quota reset timestamps are epoch seconds; capture/event timestamps
+        // elsewhere in the Runtime contract are milliseconds.
+        let resetsAt = entry.resetsAt.map { Date(timeIntervalSince1970: TimeInterval($0)) }
         let capturedAt = entry.capturedAt.map(ZhFormat.date(fromMillis:))
         switch entry.status {
         case "available" where remaining != nil:
@@ -372,6 +412,23 @@ public struct QuotaSlot: Identifiable, Equatable, Sendable {
             )
         default:
             self.availability = .unavailable(reason: entry.reason)
+        }
+    }
+
+    private static func windowTitle(_ entry: QuotaEntry) -> String {
+        if let name = entry.limitName, !name.isEmpty { return name }
+        if let minutes = entry.windowMinutes, minutes > 0 {
+            if minutes.isMultiple(of: 43_200) { return "\(minutes / 43_200) 个月" }
+            if minutes.isMultiple(of: 10_080) { return "\(minutes / 10_080) 周" }
+            if minutes.isMultiple(of: 1_440) { return "\(minutes / 1_440) 天" }
+            if minutes.isMultiple(of: 60) { return "\(minutes / 60) 小时" }
+            return "\(minutes) 分钟"
+        }
+        switch entry.window {
+        case "5h": return "5 小时"
+        case "7d": return "7 天"
+        case "week": return "本周"
+        default: return entry.window.replacingOccurrences(of: "_", with: " ")
         }
     }
 }
@@ -410,7 +467,10 @@ public struct DerivedState: Equatable, Sendable {
     public let pendingDecision: PendingDecision?
 
     public var openOutbox: [OutboxEntry] {
-        outbox.filter { $0.state == .open || $0.state == .snoozed }
+        outbox.filter {
+            $0.state == .open || $0.state == .committing
+                || $0.state == .decisionSent
+        }
     }
 
     public var highRiskOpenCount: Int {
@@ -461,7 +521,13 @@ public struct DerivedState: Equatable, Sendable {
         let visibleStates: Set<String> = ["open", "committing", "decision_sent", "snoozed"]
         let outbox = snapshot.attention
             .filter { visibleStates.contains($0.state) }
-            .map { OutboxEntry(attention: $0, sessionTitle: sessionsById[$0.sessionId]?.title) }
+            .map {
+                let session = sessionsById[$0.sessionId]
+                return OutboxEntry(
+                    attention: $0,
+                    sessionTitle: session?.providerTitle ?? session?.title
+                )
+            }
             .sorted {
                 if $0.kind.sortRank != $1.kind.sortRank {
                     return $0.kind.sortRank < $1.kind.sortRank
@@ -469,28 +535,38 @@ public struct DerivedState: Equatable, Sendable {
                 return $0.createdAt < $1.createdAt
             }
 
-        // Attention grouped per session for lane badges.
+        // Web keeps snoozed items associated with the session list but removes
+        // them from its blocking/pending calculation until Runtime reopens
+        // them. Preserve that distinction in the native projection.
+        var visibleAttentionBySession: [String: [AttentionRecord]] = [:]
+        for item in snapshot.attention
+        where ["open", "committing", "decision_sent", "snoozed"].contains(item.state) {
+            visibleAttentionBySession[item.sessionId, default: []].append(item)
+        }
+
+        // Pending Attention grouped per session for lane badges.
         var openAttentionBySession: [String: [AttentionRecord]] = [:]
-        for item in snapshot.attention where item.state == "open" || item.state == "snoozed" {
+        for item in snapshot.attention
+        where ["open", "committing", "decision_sent"].contains(item.state) {
             openAttentionBySession[item.sessionId, default: []].append(item)
         }
 
-        // Quota: three fixed slots, never merged, never invented (spec §4.2).
-        let quotaSlots = QuotaSlotID.allCases.map { slot in
-            QuotaSlot(
-                slot: slot,
-                entry: snapshot.quota.first {
-                    $0.provider == slot.providerKey && $0.window == slot.windowKey
-                }
-            )
-        }
+        // Render every validated Runtime window. M14 may add scoped model and
+        // extra-usage windows, so the native client must not collapse them to
+        // the three pre-M14 placeholders.
+        let quotaSlots = snapshot.quota.enumerated()
+            .map { QuotaSlot(entry: $0.element, index: $0.offset) }
 
-        // LANES: claude and codex lanes always exist (they carry the fixed
-        // quota slots); gemini only appears when it has sessions.
+        // Claude and Codex lanes remain visible before their first task;
+        // Gemini appears only after Runtime observes a session.
         var tasksByProvider: [ProviderKind: [LaneTask]] = [:]
         for session in snapshot.sessions {
             guard let provider = ProviderKind(record: session.provider) else { continue }
-            let task = LaneTask(session: session, openAttention: openAttentionBySession[session.id] ?? [])
+            let task = LaneTask(
+                session: session,
+                openAttention: openAttentionBySession[session.id] ?? [],
+                visibleAttention: visibleAttentionBySession[session.id] ?? []
+            )
             tasksByProvider[provider, default: []].append(task)
         }
         for provider in tasksByProvider.keys {
@@ -547,7 +623,17 @@ public struct DerivedState: Equatable, Sendable {
                     return nil
                 }
                 guard let action = AttentionAction(rawValue: command.action) else { return nil }
-                let verb = action == .approve ? "已允许" : (action == .deny ? "已拒绝" : "已交回")
+                let isUndoable: Bool
+                if case .undoable = phase { isUndoable = true } else { isUndoable = false }
+                let verb: String
+                switch (action, isUndoable) {
+                case (.approve, true): verb = "将允许"
+                case (.deny, true): verb = "将拒绝"
+                case (.passThrough, true): verb = "将交回"
+                case (.approve, false): verb = "已允许"
+                case (.deny, false): verb = "已拒绝"
+                default: verb = "已交回"
+                }
                 var subject = "该操作"
                 if let attention = attentionById[command.attentionId] {
                     let entry = OutboxEntry(

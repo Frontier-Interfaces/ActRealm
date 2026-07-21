@@ -1458,9 +1458,9 @@ impl UiSettings {
         }
         if !matches!(
             self.display_profile.as_str(),
-            "concise" | "detailed" | "developer"
+            "concise" | "detailed" | "developer" | "custom"
         ) {
-            return Err("displayProfile must be concise, detailed, or developer");
+            return Err("displayProfile must be concise, detailed, developer, or custom");
         }
         if self.task_card_fields.len() > TASK_CARD_DISPLAY_FIELDS.len() {
             return Err("taskCardFields contains too many fields");
@@ -1587,20 +1587,20 @@ fn settings_value(state: &AppState) -> Result<Value, String> {
     Ok(json!({
         "settings": settings,
         "displayCatalog": [
-            { "id": "project", "label": "项目名", "level": "detailed" },
-            { "id": "task", "label": "任务内容", "level": "concise" },
+            { "id": "project", "label": "项目", "level": "detailed" },
+            { "id": "task", "label": "任务摘要", "level": "concise" },
             { "id": "model", "label": "模型", "level": "detailed" },
-            { "id": "activity", "label": "实时状态与本轮时间", "level": "concise" },
+            { "id": "activity", "label": "实时状态", "level": "concise" },
             { "id": "plan", "label": "计划进度", "level": "detailed" },
-            { "id": "tokens", "label": "会话 Token 与估算价格", "level": "detailed" },
+            { "id": "tokens", "label": "Token 与估算 API 价格", "level": "detailed" },
             { "id": "context", "label": "上下文占用", "level": "detailed" },
             { "id": "tool", "label": "当前工具", "level": "detailed" },
             { "id": "permissionMode", "label": "权限模式", "level": "detailed" },
             { "id": "subagents", "label": "运行中的子 Agent", "level": "detailed" },
             { "id": "environment", "label": "运行环境", "level": "detailed" },
             { "id": "recovery", "label": "恢复状态", "level": "detailed" },
-            { "id": "control", "label": "控制能力", "level": "detailed" },
-            { "id": "jump", "label": "跳转能力", "level": "detailed" },
+            { "id": "control", "label": "托管能力", "level": "detailed" },
+            { "id": "jump", "label": "打开应用", "level": "detailed" },
             { "id": "titleSource", "label": "标题来源", "level": "developer" },
             { "id": "sessionId", "label": "ActRealm Session ID", "level": "developer" },
             { "id": "providerSessionId", "label": "Provider Session ID", "level": "developer" },
@@ -3369,7 +3369,7 @@ mod tests {
             assert_eq!(metrics_export["scope"], "metrics_only");
             assert!(metrics_export.get("tables").is_none());
         });
-        assert!(INDEX_HTML.contains("我的使用统计"));
+        assert!(INDEX_HTML.contains("使用统计"));
         assert!(INDEX_HTML.contains("导出统计"));
         assert!(APP_JS.contains("widgetApprovals"));
         assert!(APP_JS.contains("banner_shown"));
@@ -3427,6 +3427,13 @@ mod tests {
         assert_eq!(legacy.display_profile, "detailed");
         assert!(legacy.task_card_fields.contains(&"activity".to_owned()));
         legacy.validate().unwrap();
+
+        let custom = UiSettings {
+            display_profile: "custom".to_owned(),
+            task_card_fields: vec!["project".to_owned(), "activity".to_owned()],
+            ..UiSettings::default()
+        };
+        custom.validate().unwrap();
 
         for unsafe_field in ["raw", "payload", "fullCommand", "transcript"] {
             let unsafe_settings = UiSettings {

@@ -69,6 +69,15 @@ provide the detailed requirements and evidence.
   resource gate. Latest-binary installation and macOS Swift rerun remain open.
   See the
   [verification record](POST_M14_CODEX_INTERNAL_SESSION_FILTERING.md).
+- **Post-M14 macOS/Web parity candidate:** the native macOS client now consumes
+  the setup, settings, question, session-control, quota, export, clear-data,
+  and metrics contracts already used by Web. It adds the unified Agent setup
+  center, real interactive-question forms, dynamic session/usage/quota fields,
+  and matching local controls while retaining macOS-only foreground
+  scheduling. The isolated ActRealmKit suite passes 39 tests. Full SwiftUI
+  compilation and visual acceptance remain open because the installed Command
+  Line Tools do not include `SwiftUIMacros`; see the
+  [verification record](POST_M14_MACOS_WEB_PARITY.md).
 - **Latest synchronized-tree gates:** 177 Rust tests passed, with three
   explicitly manual/resource tests ignored in the ordinary workspace run;
   zero-warning Clippy, format, JavaScript syntax, release build, language
@@ -110,6 +119,7 @@ provide the detailed requirements and evidence.
 | Post-M14 | Usage, pricing, and OAuth hardening | Full automated/resource gates pass; exact local installation and user acceptance pending | [verification](POST_M14_USAGE_OAUTH_HARDENING.md) |
 | Post-M14 | First-run workspace and Agent setup center | Visual acceptance passed; real-Provider install/function gates pending | [verification](POST_M14_FIRST_RUN_ONBOARDING.md) |
 | Post-M14 | Codex internal-session filtering | Synchronized Rust/resource gates pass; latest installation and macOS Swift rerun pending | [verification](POST_M14_CODEX_INTERNAL_SESSION_FILTERING.md) |
+| Post-M14 | macOS/Web feature parity | Native source and focused Kit tests complete; full SwiftUI build and visual/real-Provider acceptance pending | [verification](POST_M14_MACOS_WEB_PARITY.md) |
 
 M5 is a release-qualification track, not the chronological end of feature
 development. Later functional milestones may be implemented while M5's

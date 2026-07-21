@@ -21,6 +21,18 @@ public final class HUDPanelController {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.updateVisibility() }
             .store(in: &cancellables)
+        model.$hudArrivalID
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateVisibility() }
+            .store(in: &cancellables)
+        model.$hudSettings
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateVisibility() }
+            .store(in: &cancellables)
+        model.$now
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateVisibility() }
+            .store(in: &cancellables)
         model.$foregroundDispatch
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.updateVisibility() }
@@ -36,11 +48,9 @@ public final class HUDPanelController {
     private var shouldShow: Bool {
         model.isHUDPreviewActive
             || model.foregroundDispatch != nil
-            || model.derived.openOutbox.contains {
-                $0.kind == .approval
-                    && $0.state == .open
-                    && !model.isForegroundHUDSuppressed(for: $0.id)
-            }
+            || (model.hudSettings.isEnabled
+                && model.hudArrivalID != nil
+                && (model.hudArrivalDeadline ?? .distantPast) > model.now)
     }
 
     private func updateVisibility() {
@@ -105,17 +115,14 @@ public struct HUDCapsuleView: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.snapshotRendering) private var snapshotRendering
 
-    private var approval: OutboxEntry? {
-        if let live = model.derived.openOutbox.first(where: {
-            $0.kind == .approval
-                && $0.state == .open
-                && !model.isForegroundHUDSuppressed(for: $0.id)
-        }) {
+    private var notification: OutboxEntry? {
+        if let id = model.hudArrivalID,
+           let live = model.derived.openOutbox.first(where: { $0.id == id }) {
             return live
         }
         guard model.isHUDPreviewActive else { return nil }
         return DemoData.derivedState(now: model.now).openOutbox.first {
-            $0.kind == .approval && $0.state == .open
+            $0.state == .open
         }
     }
 
@@ -140,8 +147,8 @@ public struct HUDCapsuleView: View {
                 Text(dispatchHint(dispatch))
                     .font(.system(size: 10))
                     .foregroundStyle(DT.textFaint)
-            } else if let entry = approval {
-                let content = approvalContent(entry)
+            } else if let entry = notification {
+                let content = notificationContent(entry)
                     .padding(.horizontal, 15)
                     .padding(.vertical, 11)
 
@@ -156,7 +163,7 @@ public struct HUDCapsuleView: View {
                 .compositingGroup()
                 .shadow(color: Color(red: 40 / 255, green: 60 / 255, blue: 120 / 255).opacity(0.30), radius: 30, y: 12)
 
-                Text("可直接 ✓ 允许 · 稍后自动收进 OUTBOX")
+                Text(entry.kind == .approval ? "可直接允许或拒绝 · 事项保留在待处理列表" : "事项已进入待处理列表")
                     .font(.system(size: 10))
                     .foregroundStyle(DT.textFaint)
             }
@@ -178,7 +185,7 @@ public struct HUDCapsuleView: View {
                         .font(.system(size: 12.5, weight: .bold))
                         .foregroundStyle(DT.textStrong)
                         .lineLimit(1)
-                    Text(dispatch.taskTitle.map { "任务：\($0)" } ?? "任务需要你处理")
+                    Text(dispatch.taskTitle.map { "任务：\($0)" } ?? "任务需要处理")
                         .font(DT.body(10.5))
                         .foregroundStyle(DT.textWeak)
                         .lineLimit(1)
@@ -207,10 +214,10 @@ public struct HUDCapsuleView: View {
             HStack(spacing: 12) {
                 dispatchRing(dispatch, color: DT.greenDot)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("等待你进入此工作桌面 · \(remainingSeconds(dispatch)) 秒")
+                    Text("等待进入协作桌面 · \(remainingSeconds(dispatch)) 秒")
                         .font(.system(size: 12.5, weight: .bold))
                         .foregroundStyle(DT.textStrong)
-                    Text("鼠标进入调度工作桌面后，自动返回倒计时会停止")
+                    Text("协作应用出现在当前桌面后，自动返回倒计时会停止")
                         .font(DT.body(10.5))
                         .foregroundStyle(DT.textWeak)
                 }
@@ -273,48 +280,84 @@ public struct HUDCapsuleView: View {
     }
 
     @ViewBuilder
-    private func approvalContent(_ entry: OutboxEntry) -> some View {
+    private func notificationContent(_ entry: OutboxEntry) -> some View {
         HStack(spacing: 13) {
-            replyWindowRing(entry)
+            if model.hudSettings.fields.contains(.provider) {
+                ProviderAvatar(kind: entry.provider ?? .codex, size: 38)
+            } else if model.hudSettings.fields.contains(.elapsed), entry.kind == .approval {
+                replyWindowRing(entry)
+            }
             VStack(alignment: .leading, spacing: 2) {
-                Text("\(providerName(entry)) 想运行 \(entry.toolName ?? "操作") \(entry.attention.commandPreview ?? "")")
+                Text(headline(entry))
                     .font(.system(size: 12.5, weight: .bold))
                     .foregroundStyle(DT.textStrong)
                     .lineLimit(1)
-                Text("刚刚")
-                    .font(DT.body(10.5))
-                    .foregroundStyle(DT.textWeak)
+                if !detailParts(entry).isEmpty {
+                    Text(detailParts(entry).joined(separator: " · "))
+                        .font(DT.body(10.5))
+                        .foregroundStyle(DT.textWeak)
+                        .lineLimit(1)
+                }
             }
             .frame(maxWidth: 520, alignment: .leading)
 
-            Button {
-                model.deny(entry)
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundStyle(DT.redText)
-                    .frame(width: 36, height: 36)
-                    .background(Circle().fill(DT.redBg))
-                    .overlay(Circle().strokeBorder(DT.redStroke, lineWidth: 1))
-                    .contentShape(Circle())
-            }
-            .buttonStyle(.plain)
-            .help("拒绝")
+            if entry.kind == .approval {
+                Button {
+                    model.deny(entry)
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(DT.redText)
+                        .frame(width: 36, height: 36)
+                        .background(Circle().fill(DT.redBg))
+                        .overlay(Circle().strokeBorder(DT.redStroke, lineWidth: 1))
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .help("拒绝")
 
-            Button {
-                model.approve(entry)
-            } label: {
-                Image(systemName: "checkmark")
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundStyle(.white)
-                    .frame(width: 36, height: 36)
-                    .background(Circle().fill(DT.primaryGradient))
-                    .contentShape(Circle())
+                Button {
+                    model.approve(entry)
+                } label: {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 36, height: 36)
+                        .background(Circle().fill(DT.primaryGradient))
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .shadow(color: DT.blue.opacity(0.4), radius: 8, y: 4)
+                .help("允许（3 秒内可撤回）")
             }
-            .buttonStyle(.plain)
-            .shadow(color: DT.blue.opacity(0.4), radius: 8, y: 4)
-            .help("允许（3 秒内可撤回）")
         }
+    }
+
+    private func headline(_ entry: OutboxEntry) -> String {
+        if model.hudSettings.fields.contains(.event) { return entry.actionTitle }
+        if model.hudSettings.fields.contains(.task), let task = entry.taskTitle { return task }
+        return "ActRealm 通知"
+    }
+
+    private func detailParts(_ entry: OutboxEntry) -> [String] {
+        var parts: [String] = []
+        if model.hudSettings.fields.contains(.provider), entry.provider != nil {
+            parts.append(providerName(entry))
+        }
+        if model.hudSettings.fields.contains(.task),
+           let task = entry.taskTitle,
+           task != headline(entry) {
+            parts.append(task)
+        }
+        if model.hudSettings.fields.contains(.project),
+           let project = entry.attention.project,
+           !project.isEmpty {
+            parts.append(project)
+        }
+        if model.hudSettings.fields.contains(.elapsed) {
+            parts.append(ZhFormat.relativeAgo(model.now.timeIntervalSince(entry.createdAt)))
+        }
+        return parts
     }
 
     private func providerName(_ entry: OutboxEntry) -> String {
