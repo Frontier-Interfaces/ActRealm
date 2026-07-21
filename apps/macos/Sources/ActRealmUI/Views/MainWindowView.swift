@@ -72,6 +72,17 @@ public struct MainWindowView: View {
             idealHeight: 820,
             maxHeight: .infinity
         )
+        .background {
+            GeometryReader { proxy in
+                Color.clear
+                    .onAppear {
+                        model.updateMainWindowSize(proxy.size)
+                    }
+                    .onChange(of: proxy.size) { _, size in
+                        model.updateMainWindowSize(size)
+                    }
+            }
+        }
         .modifier(WindowGlassBackground())
         .ignoresSafeArea(.container, edges: .top)
         .overlay(alignment: .bottom) {
@@ -81,11 +92,6 @@ public struct MainWindowView: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                     .allowsHitTesting(false)
             }
-        }
-        .overlay(alignment: .bottomTrailing) {
-            RuntimeLiveStatus()
-                .padding(.trailing, 18)
-                .padding(.bottom, 10)
         }
         .animation(.easeOut(duration: 0.22), value: model.toastMessage)
         .animation(.easeOut(duration: 0.25), value: page)
@@ -183,44 +189,6 @@ private struct IntegratedWindowHeader: View {
         case .starting: "服务启动中"
         case .absent: "服务未连接"
         case .listening: ""
-        }
-    }
-}
-
-private struct RuntimeLiveStatus: View {
-    @EnvironmentObject private var model: AppModel
-
-    var body: some View {
-        HStack(spacing: 7) {
-            StatusDot(color: color, size: 6, glow: model.bridgeStatus.isListening)
-            Text(status)
-                .font(.system(size: 9.5, weight: .semibold))
-            Text("·")
-                .foregroundStyle(DT.textFaint)
-            Text("同步 \(model.lastSyncAt.map(ZhFormat.syncClock) ?? "—")")
-                .font(.system(size: 9.5))
-        }
-        .foregroundStyle(DT.textWeak)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
-        .background(DT.cardMedium, in: Capsule())
-        .overlay(Capsule().strokeBorder(DT.neutralBadgeStroke, lineWidth: 1))
-        .allowsHitTesting(false)
-    }
-
-    private var status: String {
-        switch model.bridgeStatus {
-        case .listening: "Runtime 在线"
-        case .starting: "Runtime 启动中"
-        case .absent: "Runtime 未连接"
-        }
-    }
-
-    private var color: Color {
-        switch model.bridgeStatus {
-        case .listening: DT.greenDot
-        case .starting: DT.amberDot
-        case .absent: DT.redText
         }
     }
 }

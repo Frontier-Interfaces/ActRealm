@@ -115,6 +115,16 @@ enum DT {
 
     static let cardStrong = Color(
         light: NSColor(white: 1, alpha: 0.78), dark: .rgba(30, 32, 42, 0.72))
+    /// Exact fill used by the three primary lanes. Unlike applying opacity to
+    /// `cardStrong`, this makes the slider endpoints literal: 0 is clear and
+    /// 1 is fully opaque in both appearances.
+    static func mainLaneFill(opacity: Double) -> Color {
+        let alpha = CGFloat(min(1, max(0, opacity)))
+        return Color(
+            light: NSColor(white: 1, alpha: alpha),
+            dark: .rgba(30, 32, 42, alpha)
+        )
+    }
     static let cardMedium = Color(
         light: NSColor(white: 1, alpha: 0.62), dark: .rgba(30, 32, 42, 0.55))
     static let cardSoft = Color(

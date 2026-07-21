@@ -3,12 +3,28 @@ import ActRealmKit
 import Combine
 import SwiftUI
 
+public struct WorkspaceDisplayOption: Identifiable, Equatable, Sendable {
+    public let id: UInt32
+    public let name: String
+    public let isPrimary: Bool
+
+    public init(id: UInt32, name: String, isPrimary: Bool) {
+        self.id = id
+        self.name = name
+        self.isPrimary = isPrimary
+    }
+
+    public var label: String { isPrimary ? "\(name)（主显示器）" : name }
+}
+
 /// Executes the AppKit half of 台前调度: foregrounding a matching Agent app,
 /// observing active Space changes, and returning the ActRealm Workspace window after an
 /// unaccepted dispatch. ActRealmKit remains responsible for policy/timers.
 @MainActor
 public final class ForegroundSchedulingController: ObservableObject {
     @Published private(set) var visibleWorkspaceApps: [ForegroundWorkspaceApp] = []
+    @Published private(set) var availableWorkspaceDisplays: [WorkspaceDisplayOption] = []
+    @Published private(set) var selectedWorkspaceDisplayID: UInt32?
 
     private let model: AppModel
     private var cancellables: Set<AnyCancellable> = []
@@ -52,8 +68,17 @@ public final class ForegroundSchedulingController: ObservableObject {
                 .store(in: &cancellables)
         }
 
+        NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.refreshWorkspaceDisplays()
+                self?.refreshVisibleWorkspaceApps()
+            }
+            .store(in: &cancellables)
+
         Task { @MainActor [weak self] in
             await Task.yield()
+            self?.refreshWorkspaceDisplays()
             self?.refreshWorkspaceStatus()
         }
     }
@@ -150,12 +175,15 @@ public final class ForegroundSchedulingController: ObservableObject {
     private var isBoundWorkspaceActive: Bool {
         let bound = Set(model.foregroundScheduling.workspaceApps.map(\.bundleIdentifier))
         guard !bound.isEmpty else { return false }
-        let visible = Set(visibleApplications().map(\.bundleIdentifier))
+        let visible = Set(visibleApplications(
+            on: resolvedBoundDisplayID
+        ).map(\.bundleIdentifier))
         let requiredMatches = max(1, Int(ceil(Double(bound.count) * 0.5)))
         return bound.intersection(visible).count >= requiredMatches
     }
 
     private func presentWorkspaceSelection() {
+        refreshWorkspaceDisplays()
         refreshVisibleWorkspaceApps()
         let panel = ensureWorkspaceSelectionPanel()
         positionWorkspaceSelectionPanel(panel)
@@ -178,7 +206,7 @@ public final class ForegroundSchedulingController: ObservableObject {
     private func ensureWorkspaceSelectionPanel() -> NSPanel {
         if let workspaceSelectionPanel { return workspaceSelectionPanel }
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 270),
+            contentRect: NSRect(x: 0, y: 0, width: 540, height: 330),
             styleMask: [.titled],
             backing: .buffered,
             defer: true
@@ -198,7 +226,9 @@ public final class ForegroundSchedulingController: ObservableObject {
     }
 
     private func positionWorkspaceSelectionPanel(_ panel: NSPanel) {
-        guard let screen = NSScreen.main else { return }
+        guard let screen = selectedWorkspaceDisplayID.flatMap(screen(with:))
+            ?? NSScreen.main
+        else { return }
         let frame = screen.visibleFrame
         panel.setFrameOrigin(NSPoint(
             x: frame.midX - panel.frame.width / 2,
@@ -207,17 +237,67 @@ public final class ForegroundSchedulingController: ObservableObject {
     }
 
     fileprivate func refreshVisibleWorkspaceApps() {
-        visibleWorkspaceApps = visibleApplications()
+        visibleWorkspaceApps = visibleApplications(on: selectedWorkspaceDisplayID)
         refreshWorkspaceStatus()
+    }
+
+    fileprivate func selectWorkspaceDisplay(_ displayID: UInt32) {
+        guard availableWorkspaceDisplays.contains(where: { $0.id == displayID }) else { return }
+        selectedWorkspaceDisplayID = displayID
+        refreshVisibleWorkspaceApps()
+        if let panel = workspaceSelectionPanel, panel.isVisible {
+            positionWorkspaceSelectionPanel(panel)
+        }
     }
 
     private func confirmWorkspaceSelection() {
         refreshVisibleWorkspaceApps()
-        model.bindForegroundWorkspace(apps: visibleWorkspaceApps)
+        let display = availableWorkspaceDisplays.first { $0.id == selectedWorkspaceDisplayID }
+        model.bindForegroundWorkspace(
+            apps: visibleWorkspaceApps,
+            displayID: display?.id,
+            displayName: display?.name
+        )
         refreshWorkspaceStatus()
     }
 
-    private func visibleApplications() -> [ForegroundWorkspaceApp] {
+    private func refreshWorkspaceDisplays() {
+        availableWorkspaceDisplays = NSScreen.screens.compactMap { screen in
+            guard let id = displayID(for: screen) else { return nil }
+            return WorkspaceDisplayOption(
+                id: id,
+                name: screen.localizedName,
+                isPrimary: screen.frame.origin == .zero
+            )
+        }
+
+        let availableIDs = Set(availableWorkspaceDisplays.map(\.id))
+        if let selectedWorkspaceDisplayID, availableIDs.contains(selectedWorkspaceDisplayID) {
+            return
+        }
+        if let persisted = model.foregroundScheduling.workspaceDisplayID,
+           availableIDs.contains(persisted)
+        {
+            selectedWorkspaceDisplayID = persisted
+            return
+        }
+        if let persistedName = model.foregroundScheduling.workspaceDisplayName,
+           let matchingDisplay = availableWorkspaceDisplays.first(where: {
+               $0.name == persistedName
+           })
+        {
+            selectedWorkspaceDisplayID = matchingDisplay.id
+            return
+        }
+        let pointer = NSEvent.mouseLocation
+        selectedWorkspaceDisplayID = NSScreen.screens
+            .first(where: { $0.frame.contains(pointer) })
+            .flatMap(displayID(for:))
+            ?? NSScreen.main.flatMap(displayID(for:))
+            ?? availableWorkspaceDisplays.first?.id
+    }
+
+    private func visibleApplications(on displayID: UInt32?) -> [ForegroundWorkspaceApp] {
         guard let windows = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements],
             kCGNullWindowID
@@ -227,6 +307,7 @@ public final class ForegroundSchedulingController: ObservableObject {
         var applications: [String: ForegroundWorkspaceApp] = [:]
         for window in windows {
             guard (window[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+                  isWindow(window, visibleOn: displayID),
                   let pidValue = window[kCGWindowOwnerPID as String] as? NSNumber,
                   let application = NSRunningApplication(processIdentifier: pid_t(pidValue.intValue)),
                   application.activationPolicy == .regular,
@@ -244,6 +325,39 @@ public final class ForegroundSchedulingController: ObservableObject {
         return applications.values.sorted {
             $0.name.localizedStandardCompare($1.name) == .orderedAscending
         }
+    }
+
+    private func isWindow(_ window: [String: Any], visibleOn displayID: UInt32?) -> Bool {
+        guard let displayID else { return true }
+        guard let boundsDictionary = window[kCGWindowBounds as String] as? NSDictionary,
+              let windowBounds = CGRect(
+                dictionaryRepresentation: boundsDictionary as CFDictionary
+              )
+        else { return false }
+        let intersection = windowBounds.intersection(CGDisplayBounds(displayID))
+        return !intersection.isNull && intersection.width > 1 && intersection.height > 1
+    }
+
+    private func displayID(for screen: NSScreen) -> UInt32? {
+        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?
+            .uint32Value
+    }
+
+    private func screen(with displayID: UInt32) -> NSScreen? {
+        NSScreen.screens.first { self.displayID(for: $0) == displayID }
+    }
+
+    private var resolvedBoundDisplayID: UInt32? {
+        if let storedID = model.foregroundScheduling.workspaceDisplayID,
+           availableWorkspaceDisplays.contains(where: { $0.id == storedID })
+        {
+            return storedID
+        }
+        guard let storedName = model.foregroundScheduling.workspaceDisplayName else {
+            return model.foregroundScheduling.workspaceDisplayID
+        }
+        return availableWorkspaceDisplays.first(where: { $0.name == storedName })?.id
+            ?? model.foregroundScheduling.workspaceDisplayID
     }
 
     private var actRealmWorkspaceWindow: NSWindow? {
@@ -268,7 +382,21 @@ private struct WorkspaceSelectionPanelView: View {
                     .foregroundStyle(.secondary)
             }
 
-            GroupBox("当前桌面的应用") {
+            if controller.availableWorkspaceDisplays.count > 1,
+               let selectedDisplayID = controller.selectedWorkspaceDisplayID
+            {
+                Picker("识别显示器", selection: Binding(
+                    get: { selectedDisplayID },
+                    set: { controller.selectWorkspaceDisplay($0) }
+                )) {
+                    ForEach(controller.availableWorkspaceDisplays) { display in
+                        Text(display.label).tag(display.id)
+                    }
+                }
+                .pickerStyle(.menu)
+            }
+
+            GroupBox("所选显示器当前桌面的应用") {
                 if controller.visibleWorkspaceApps.isEmpty {
                     Text("未检测到可绑定的应用窗口")
                         .foregroundStyle(.secondary)
@@ -289,7 +417,7 @@ private struct WorkspaceSelectionPanelView: View {
                 }
             }
 
-            Text("窗口会跟随虚拟桌面显示；完成切换后再确认绑定。")
+            Text("可选择内建或外接显示器。切换该显示器的虚拟桌面后，点击“重新检测”再绑定。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -303,6 +431,6 @@ private struct WorkspaceSelectionPanelView: View {
             }
         }
         .padding(22)
-        .frame(width: 520, height: 270)
+        .frame(width: 540, height: 330)
     }
 }

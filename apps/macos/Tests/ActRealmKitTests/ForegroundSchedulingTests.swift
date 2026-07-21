@@ -145,9 +145,13 @@ import Testing
         defer { defaults.removePersistentDomain(forName: suite) }
         let first = AppModel(defaults: defaults, demo: false)
 
-        first.bindForegroundWorkspace(apps: [
-            ForegroundWorkspaceApp(bundleIdentifier: "com.example.agent", name: "Agent")
-        ])
+        first.bindForegroundWorkspace(
+            apps: [
+                ForegroundWorkspaceApp(bundleIdentifier: "com.example.agent", name: "Agent")
+            ],
+            displayID: 42,
+            displayName: "Studio Display"
+        )
         first.updateHUDSettings {
             $0.displaySeconds = 19
             $0.fields = [.event, .project]
@@ -155,8 +159,71 @@ import Testing
 
         let restored = AppModel(defaults: defaults, demo: false)
         #expect(restored.foregroundScheduling.workspaceApps.map(\.bundleIdentifier) == ["com.example.agent"])
+        #expect(restored.foregroundScheduling.workspaceDisplayID == 42)
+        #expect(restored.foregroundScheduling.workspaceDisplayName == "Studio Display")
         #expect(restored.hudSettings.displaySeconds == 20)
         #expect(restored.hudSettings.fields == [.event, .project])
+    }
+
+    @MainActor
+    @Test func customThemeImageIsCopiedPersistedAndReset() throws {
+        let suite = "ForegroundSchedulingTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ActRealmThemeTests-\(UUID().uuidString)", isDirectory: true)
+        let themeDirectory = root.appendingPathComponent("Theme", isDirectory: true)
+        let source = root.appendingPathComponent("source.png")
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: root)
+        }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let bytes = Data([0x89, 0x50, 0x4E, 0x47])
+        try bytes.write(to: source)
+
+        let first = AppModel(
+            defaults: defaults,
+            themeDirectory: themeDirectory,
+            demo: false
+        )
+        try first.importThemeBackground(from: source, kind: .animatedImage)
+        first.updateThemeSettings { $0.laneOpacity = 0.68 }
+        let copiedURL = try #require(first.themeBackgroundURL)
+        #expect(copiedURL != source)
+        #expect(FileManager.default.fileExists(atPath: copiedURL.path))
+        #expect(try Data(contentsOf: copiedURL) == bytes)
+
+        let restored = AppModel(
+            defaults: defaults,
+            themeDirectory: themeDirectory,
+            demo: false
+        )
+        #expect(restored.themeBackgroundURL == copiedURL)
+        #expect(restored.themeSettings.backgroundKind == .animatedImage)
+        #expect(restored.themeSettings.laneOpacity == 0.68)
+        restored.resetThemeBackground()
+        #expect(restored.themeBackgroundURL == nil)
+        #expect(restored.themeSettings.backgroundKind == .image)
+        #expect(restored.themeSettings.laneOpacity == 0.68)
+        #expect(!FileManager.default.fileExists(atPath: copiedURL.path))
+    }
+
+    @MainActor
+    @Test func legacyThemeSettingsGainDynamicDefaultsAndOpacityIsClamped() throws {
+        let legacy = Data(#"{"customBackgroundPath":null}"#.utf8)
+        let decoded = try JSONDecoder().decode(AppThemeSettings.self, from: legacy)
+        #expect(decoded.backgroundKind == .image)
+        #expect(decoded.laneOpacity == 0.55)
+
+        let oldTransparency = Data(#"{"laneTransparency":0.68}"#.utf8)
+        let migrated = try JSONDecoder().decode(AppThemeSettings.self, from: oldTransparency)
+        #expect(abs(migrated.laneOpacity - 0.32) < 0.0001)
+
+        let model = AppModel(defaults: isolatedDefaults(), demo: false)
+        model.updateThemeSettings { $0.laneOpacity = 2 }
+        #expect(model.themeSettings.laneOpacity == 1)
+        model.updateThemeSettings { $0.laneOpacity = -1 }
+        #expect(model.themeSettings.laneOpacity == 0)
     }
 
     @MainActor

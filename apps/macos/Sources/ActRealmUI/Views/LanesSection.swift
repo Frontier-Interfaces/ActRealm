@@ -55,8 +55,7 @@ struct AgentTasksSection: View {
         }
         .padding(16)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .liquidGlassSurface(
-            tint: DT.cardSoft.opacity(0.18),
+        .mainLaneSurface(
             radius: 24,
             stroke: DT.hairline,
             shadow: DT.cardShadow.opacity(0.8),
@@ -580,11 +579,13 @@ struct QuotaSection: View {
                     .scrollBounceBehavior(.basedOnSize)
             }
 
+            Spacer(minLength: 8)
+            RuntimeLiveStatus()
+                .padding(.top, 10)
         }
         .padding(16)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .liquidGlassSurface(
-            tint: DT.cardSoft.opacity(0.18),
+        .mainLaneSurface(
             radius: 24,
             stroke: DT.hairline,
             shadow: DT.cardShadow.opacity(0.8),
@@ -600,6 +601,47 @@ struct QuotaSection: View {
             }
         }
         .padding(.top, 11)
+    }
+}
+
+private struct RuntimeLiveStatus: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Rectangle()
+                .fill(DT.separator)
+                .frame(height: 1)
+
+            HStack(spacing: 7) {
+                StatusDot(color: color, size: 6, glow: model.bridgeStatus.isListening)
+                Text(status)
+                    .font(.system(size: 10.5, weight: .semibold))
+            }
+
+            Text("最近同步 · \(model.lastSyncAt.map(ZhFormat.syncClock) ?? "—")")
+                .font(.system(size: 9.5))
+                .padding(.leading, 1)
+        }
+        .foregroundStyle(DT.textWeak)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .allowsHitTesting(false)
+    }
+
+    private var status: String {
+        switch model.bridgeStatus {
+        case .listening: "Runtime · 本机在线"
+        case .starting: "Runtime · 本机启动中"
+        case .absent: "Runtime · 本机未连接"
+        }
+    }
+
+    private var color: Color {
+        switch model.bridgeStatus {
+        case .listening: DT.greenDot
+        case .starting: DT.amberDot
+        case .absent: DT.redText
+        }
     }
 }
 

@@ -301,6 +301,60 @@ struct LiquidGlassSurface: ViewModifier {
     }
 }
 
+/// The three primary workspace lanes use the user-selected theme
+/// transparency instead of the fixed regular-glass fill used by other cards.
+struct MainLaneSurface: ViewModifier {
+    @EnvironmentObject private var model: AppModel
+
+    var radius: CGFloat
+    var stroke: Color
+    var shadow: Color
+    var shadowRadius: CGFloat
+    var shadowY: CGFloat
+
+    func body(content: Content) -> some View {
+        content.modifier(ThemedLaneSurface(
+            opacity: model.themeSettings.laneOpacity,
+            radius: radius,
+            stroke: stroke,
+            shadow: shadow,
+            shadowRadius: shadowRadius,
+            shadowY: shadowY
+        ))
+    }
+}
+
+/// Shared by the real workspace lanes and Settings preview. Liquid Glass is
+/// present throughout the adjustable range, while the literal 0% endpoint
+/// deliberately removes the glass layer so the surface is fully transparent.
+struct ThemedLaneSurface: ViewModifier {
+    @Environment(\.snapshotRendering) private var snapshotRendering
+
+    var opacity: Double
+    var radius: CGFloat
+    var stroke: Color
+    var shadow: Color
+    var shadowRadius: CGFloat
+    var shadowY: CGFloat
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
+        let clampedOpacity = min(1, max(0, opacity))
+
+        Group {
+            if snapshotRendering || clampedOpacity == 0 {
+                content.background(shape.fill(DT.mainLaneFill(opacity: clampedOpacity)))
+            } else {
+                content
+                    .background(shape.fill(DT.mainLaneFill(opacity: clampedOpacity)))
+                    .glassEffect(.clear, in: shape)
+            }
+        }
+        .overlay(shape.strokeBorder(stroke, lineWidth: 1))
+        .shadow(color: shadow.opacity(clampedOpacity), radius: shadowRadius, y: shadowY)
+    }
+}
+
 // MARK: - Glass sheet card
 
 /// Translucent sheet laid on the glassy window, following the prototype's
@@ -374,6 +428,22 @@ extension View {
         ))
     }
 
+    func mainLaneSurface(
+        radius: CGFloat = DT.radiusLane,
+        stroke: Color = DT.hairline,
+        shadow: Color = .clear,
+        shadowRadius: CGFloat = 0,
+        shadowY: CGFloat = 0
+    ) -> some View {
+        modifier(MainLaneSurface(
+            radius: radius,
+            stroke: stroke,
+            shadow: shadow,
+            shadowRadius: shadowRadius,
+            shadowY: shadowY
+        ))
+    }
+
     /// Hover brightening used across cards/rows (~6% per the handoff).
     func hoverBrightens() -> some View {
         modifier(HoverBrighten())
@@ -424,30 +494,82 @@ struct WindowGlass: NSViewRepresentable {
     }
 }
 
+/// Loads a persisted custom background once per selected URL instead of
+/// decoding it again on every one-second AppModel update.
+struct AppThemeImage: View {
+    let url: URL
+    @State private var image: NSImage?
+
+    var body: some View {
+        GeometryReader { proxy in
+            if let image {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: proxy.size.width, height: proxy.size.height)
+                    .clipped()
+            }
+        }
+        .task(id: url) {
+            image = NSImage(contentsOf: url)
+        }
+    }
+}
+
 struct WindowGlassBackground: ViewModifier {
+    @EnvironmentObject private var model: AppModel
     @Environment(\.snapshotRendering) private var snapshotRendering
 
     func body(content: Content) -> some View {
         content
             .background(
                 ZStack {
-                    if !snapshotRendering {
+                    if let url = model.themeBackgroundURL {
+                        AppThemeBackdrop(
+                            url: url,
+                            kind: model.themeSettings.backgroundKind
+                        )
+                    } else if !snapshotRendering {
                         WindowGlass()
+                        AppThemeTint()
                     } else {
                         Rectangle().fill(.ultraThinMaterial)
+                        AppThemeTint()
                     }
-                    LinearGradient(
-                        colors: [
-                            DT.logoTint.opacity(0.055),
-                            Color.clear,
-                            DT.greenDot.opacity(0.035),
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
                 }
                 .ignoresSafeArea()
             )
+    }
+}
+
+/// The exact custom-background stack shared by the main window and the theme
+/// preview, so crop, material, and tint cannot drift between the two.
+struct AppThemeBackdrop: View {
+    let url: URL
+    let kind: ThemeBackgroundKind
+
+    var body: some View {
+        ZStack {
+            AppThemeMediaView(url: url, kind: kind)
+            Rectangle()
+                .fill(.ultraThinMaterial)
+                .opacity(0.58)
+            AppThemeTint()
+        }
+    }
+}
+
+private struct AppThemeTint: View {
+    var body: some View {
+        LinearGradient(
+            colors: [
+                DT.logoTint.opacity(0.055),
+                Color.clear,
+                DT.greenDot.opacity(0.035),
+            ],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
     }
 }
 

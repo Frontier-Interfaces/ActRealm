@@ -198,6 +198,15 @@ public struct ForegroundSchedulingView: View {
                 } else {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack(spacing: 8) {
+                            if let displayName = settings.workspaceDisplayName {
+                                Label(displayName, systemImage: "display")
+                                    .font(.system(size: 10.5, weight: .bold))
+                                    .foregroundStyle(DT.blueText)
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 4)
+                                    .background(DT.blueBg, in: Capsule())
+                                    .overlay(Capsule().strokeBorder(DT.blueBadgeStroke, lineWidth: 1))
+                            }
                             ForEach(settings.workspaceApps) { application in
                                 Text(application.name)
                                     .font(.system(size: 10.5, weight: .semibold))
@@ -782,20 +791,45 @@ private struct TokenFlow: View {
 }
 
 private struct FlowTrack: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.snapshotRendering) private var snapshotRendering
+
     var body: some View {
-        ZStack(alignment: .leading) {
-            Capsule().fill(DT.neutralChipBg)
-            LinearGradient(
-                colors: [.clear, DT.logoTint, .clear],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
-            .frame(width: 74)
-            .offset(x: 32)
+        TimelineView(.animation(
+            minimumInterval: 1 / 30,
+            paused: reduceMotion || snapshotRendering
+        )) { timeline in
+            GeometryReader { proxy in
+                let glowWidth = min(84, max(54, proxy.size.width * 0.24))
+                let phase = flowPhase(at: timeline.date)
+
+                ZStack(alignment: .leading) {
+                    Capsule().fill(DT.neutralChipBg)
+                    LinearGradient(
+                        colors: [.clear, DT.logoTint.opacity(0.45), DT.logoTint, .clear],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                    .frame(width: glowWidth)
+                    .offset(
+                        x: -glowWidth
+                            + (proxy.size.width + glowWidth) * phase
+                    )
+                }
+            }
         }
         .frame(maxWidth: .infinity)
         .frame(height: 3)
         .clipShape(Capsule())
+    }
+
+    private func flowPhase(at date: Date) -> CGFloat {
+        if reduceMotion || snapshotRendering { return 0.42 }
+        let duration = 1.75
+        return CGFloat(
+            date.timeIntervalSinceReferenceDate
+                .truncatingRemainder(dividingBy: duration) / duration
+        )
     }
 }
 

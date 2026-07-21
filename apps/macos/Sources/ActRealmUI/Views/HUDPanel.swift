@@ -9,6 +9,7 @@ import SwiftUI
 public final class HUDPanelController {
     private let model: AppModel
     private var panel: NSPanel?
+    private var dragStartOrigin: NSPoint?
     private var cancellables: Set<AnyCancellable> = []
 
     public init(model: AppModel) {
@@ -57,15 +58,17 @@ public final class HUDPanelController {
         if shouldShow {
             presentPanel()
         } else {
+            dragStartOrigin = nil
             panel?.orderOut(nil)
         }
     }
 
     private func presentPanel() {
         let panel = ensurePanel()
-        panel.setContentSize(panel.contentView?.fittingSize ?? NSSize(width: 560, height: 76))
-        position(panel)
-        if !panel.isVisible {
+        let wasVisible = panel.isVisible
+        fitPanel(panel, preservingCenter: wasVisible)
+        if !wasVisible {
+            positionAtScreenCenter(panel)
             panel.orderFrontRegardless()
         }
     }
@@ -83,34 +86,78 @@ public final class HUDPanelController {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = false
-        panel.isMovableByWindowBackground = true
+        panel.isMovable = true
+        panel.isMovableByWindowBackground = false
         panel.hidesOnDeactivate = false
         panel.becomesKeyOnlyIfNeeded = true
 
-        let host = NSHostingView(rootView: HUDCapsuleView().environmentObject(model))
+        let host = NSHostingView(
+            rootView: HUDCapsuleView(
+                onDragChanged: { [weak self] translation in
+                    self?.movePanel(by: translation)
+                },
+                onDragEnded: { [weak self] in
+                    self?.dragStartOrigin = nil
+                }
+            )
+            .environmentObject(model)
+        )
         host.sizingOptions = [.preferredContentSize]
         panel.contentView = host
         self.panel = panel
         return panel
     }
 
-    private func position(_ panel: NSPanel) {
-        guard let screen = NSScreen.main else { return }
+    private func fitPanel(_ panel: NSPanel, preservingCenter: Bool) {
+        let center = NSPoint(x: panel.frame.midX, y: panel.frame.midY)
         panel.setContentSize(panel.contentView?.fittingSize ?? NSSize(width: 560, height: 76))
+        guard preservingCenter else { return }
+        panel.setFrameOrigin(NSPoint(
+            x: center.x - panel.frame.width / 2,
+            y: center.y - panel.frame.height / 2
+        ))
+    }
+
+    private func positionAtScreenCenter(_ panel: NSPanel) {
+        let pointer = NSEvent.mouseLocation
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(pointer) })
+            ?? NSScreen.main
+        else { return }
         let frame = screen.visibleFrame
         let size = panel.frame.size
         let origin = NSPoint(
             x: frame.midX - size.width / 2,
-            y: frame.maxY - size.height - 14
+            y: frame.midY - size.height / 2
         )
         panel.setFrameOrigin(origin)
+    }
+
+    private func movePanel(by translation: CGSize) {
+        guard let panel else { return }
+        if dragStartOrigin == nil {
+            dragStartOrigin = panel.frame.origin
+        }
+        guard let dragStartOrigin else { return }
+        panel.setFrameOrigin(NSPoint(
+            x: dragStartOrigin.x + translation.width,
+            y: dragStartOrigin.y - translation.height
+        ))
     }
 }
 
 // MARK: - Capsule content
 
 public struct HUDCapsuleView: View {
-    public init() {}
+    private let onDragChanged: ((CGSize) -> Void)?
+    private let onDragEnded: (() -> Void)?
+
+    public init(
+        onDragChanged: ((CGSize) -> Void)? = nil,
+        onDragEnded: (() -> Void)? = nil
+    ) {
+        self.onDragChanged = onDragChanged
+        self.onDragEnded = onDragEnded
+    }
 
     @EnvironmentObject var model: AppModel
     @Environment(\.snapshotRendering) private var snapshotRendering
@@ -133,16 +180,9 @@ public struct HUDCapsuleView: View {
                     .padding(.horizontal, 15)
                     .padding(.vertical, 11)
 
-                Group {
-                    if snapshotRendering {
-                        content.background(DT.cardStrong.opacity(0.62), in: Capsule())
-                    } else {
-                        content.glassEffect(.regular, in: .capsule)
-                    }
+                HUDCapsuleSurface(snapshotRendering: snapshotRendering) {
+                    content
                 }
-                .overlay(Capsule().strokeBorder(Color.white.opacity(0.8), lineWidth: 1))
-                .compositingGroup()
-                .shadow(color: Color(red: 40 / 255, green: 60 / 255, blue: 120 / 255).opacity(0.30), radius: 30, y: 12)
 
                 Text(dispatchHint(dispatch))
                     .font(.system(size: 10))
@@ -152,16 +192,9 @@ public struct HUDCapsuleView: View {
                     .padding(.horizontal, 15)
                     .padding(.vertical, 11)
 
-                Group {
-                    if snapshotRendering {
-                        content.background(DT.cardStrong.opacity(0.62), in: Capsule())
-                    } else {
-                        content.glassEffect(.regular, in: .capsule)
-                    }
+                HUDCapsuleSurface(snapshotRendering: snapshotRendering) {
+                    content
                 }
-                .overlay(Capsule().strokeBorder(Color.white.opacity(0.8), lineWidth: 1))
-                .compositingGroup()
-                .shadow(color: Color(red: 40 / 255, green: 60 / 255, blue: 120 / 255).opacity(0.30), radius: 30, y: 12)
 
                 Text(entry.kind == .approval ? "可直接允许或拒绝 · 事项保留在待处理列表" : "事项已进入待处理列表")
                     .font(.system(size: 10))
@@ -170,6 +203,12 @@ public struct HUDCapsuleView: View {
         }
         .padding(14)
         .fixedSize()
+        .contentShape(Rectangle())
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 3)
+                .onChanged { onDragChanged?($0.translation) }
+                .onEnded { _ in onDragEnded?() }
+        )
     }
 
     // MARK: Approval
@@ -429,5 +468,30 @@ public struct HUDCapsuleView: View {
             Button("撤回") { model.undoPendingDecision() }
                 .buttonStyle(PillButtonStyle(rank: .secondary, fontSize: 12, horizontalPadding: 16))
         }
+    }
+}
+
+private struct HUDCapsuleSurface<Content: View>: View {
+    let snapshotRendering: Bool
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        ZStack {
+            Capsule()
+                .fill(DT.cardStrong.opacity(snapshotRendering ? 0.62 : 0.12))
+                .shadow(
+                    color: Color(red: 40 / 255, green: 60 / 255, blue: 120 / 255)
+                        .opacity(0.28),
+                    radius: 24,
+                    y: 10
+                )
+
+            if snapshotRendering {
+                content.background(DT.cardStrong.opacity(0.62), in: Capsule())
+            } else {
+                content.glassEffect(.regular, in: .capsule)
+            }
+        }
+        .overlay(Capsule().strokeBorder(Color.white.opacity(0.8), lineWidth: 1))
     }
 }

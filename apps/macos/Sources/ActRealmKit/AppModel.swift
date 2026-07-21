@@ -52,6 +52,8 @@ public struct ForegroundSchedulingSettings: Codable, Equatable, Sendable {
     public var claudeRule: ForegroundAgentRule
     public var workspaceApps: [ForegroundWorkspaceApp]
     public var workspaceBoundAt: Date?
+    public var workspaceDisplayID: UInt32?
+    public var workspaceDisplayName: String?
 
     public init(
         isEnabled: Bool = true,
@@ -63,7 +65,9 @@ public struct ForegroundSchedulingSettings: Codable, Equatable, Sendable {
         codexRule: ForegroundAgentRule = .defaultRule,
         claudeRule: ForegroundAgentRule = .immediate,
         workspaceApps: [ForegroundWorkspaceApp] = [],
-        workspaceBoundAt: Date? = nil
+        workspaceBoundAt: Date? = nil,
+        workspaceDisplayID: UInt32? = nil,
+        workspaceDisplayName: String? = nil
     ) {
         self.isEnabled = isEnabled
         self.closesAfterAcceptance = closesAfterAcceptance
@@ -75,6 +79,8 @@ public struct ForegroundSchedulingSettings: Codable, Equatable, Sendable {
         self.claudeRule = claudeRule
         self.workspaceApps = workspaceApps
         self.workspaceBoundAt = workspaceBoundAt
+        self.workspaceDisplayID = workspaceDisplayID
+        self.workspaceDisplayName = workspaceDisplayName
     }
 
     public static let defaults = ForegroundSchedulingSettings()
@@ -82,7 +88,7 @@ public struct ForegroundSchedulingSettings: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case isEnabled, closesAfterAcceptance, strategy, reminderSeconds
         case returnsToActRealmWorkspace, acceptanceSeconds, codexRule, claudeRule
-        case workspaceApps, workspaceBoundAt
+        case workspaceApps, workspaceBoundAt, workspaceDisplayID, workspaceDisplayName
     }
 
     public init(from decoder: Decoder) throws {
@@ -97,6 +103,8 @@ public struct ForegroundSchedulingSettings: Codable, Equatable, Sendable {
         claudeRule = try values.decodeIfPresent(ForegroundAgentRule.self, forKey: .claudeRule) ?? .immediate
         workspaceApps = try values.decodeIfPresent([ForegroundWorkspaceApp].self, forKey: .workspaceApps) ?? []
         workspaceBoundAt = try values.decodeIfPresent(Date.self, forKey: .workspaceBoundAt)
+        workspaceDisplayID = try values.decodeIfPresent(UInt32.self, forKey: .workspaceDisplayID)
+        workspaceDisplayName = try values.decodeIfPresent(String.self, forKey: .workspaceDisplayName)
     }
 }
 
@@ -126,6 +134,67 @@ public struct HUDSettings: Codable, Equatable, Sendable {
     }
 
     public static let defaults = HUDSettings()
+}
+
+/// macOS-only visual preference. Selected media is copied into ActRealm's
+/// Application Support directory so the background remains available after
+/// the original file is moved or temporary picker access ends.
+public enum ThemeBackgroundKind: String, Codable, Equatable, Sendable {
+    case image
+    case animatedImage
+    case video
+}
+
+public struct AppThemeSettings: Codable, Equatable, Sendable {
+    public var customBackgroundPath: String?
+    public var backgroundKind: ThemeBackgroundKind
+    /// 0 is completely transparent; 1 is completely opaque.
+    public var laneOpacity: Double
+
+    public init(
+        customBackgroundPath: String? = nil,
+        backgroundKind: ThemeBackgroundKind = .image,
+        laneOpacity: Double = 0.55
+    ) {
+        self.customBackgroundPath = customBackgroundPath
+        self.backgroundKind = backgroundKind
+        self.laneOpacity = laneOpacity
+    }
+
+    public static let defaults = AppThemeSettings()
+
+    private enum CodingKeys: String, CodingKey {
+        case customBackgroundPath, backgroundKind, laneOpacity, laneTransparency
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        customBackgroundPath = try values.decodeIfPresent(
+            String.self,
+            forKey: .customBackgroundPath
+        )
+        backgroundKind = try values.decodeIfPresent(
+            ThemeBackgroundKind.self,
+            forKey: .backgroundKind
+        ) ?? .image
+        if let opacity = try values.decodeIfPresent(Double.self, forKey: .laneOpacity) {
+            laneOpacity = opacity
+        } else if let legacyTransparency = try values.decodeIfPresent(
+            Double.self,
+            forKey: .laneTransparency
+        ) {
+            laneOpacity = 1 - legacyTransparency
+        } else {
+            laneOpacity = 0.55
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encodeIfPresent(customBackgroundPath, forKey: .customBackgroundPath)
+        try values.encode(backgroundKind, forKey: .backgroundKind)
+        try values.encode(laneOpacity, forKey: .laneOpacity)
+    }
 }
 
 public enum ForegroundDispatchPhase: Equatable, Sendable {
@@ -210,6 +279,10 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var hudSettings: HUDSettings
     @Published public private(set) var hudArrivalID: String?
     @Published public private(set) var hudArrivalDeadline: Date?
+    @Published public private(set) var themeSettings: AppThemeSettings
+    /// Live main-window aspect ratio used by Settings to preview the same
+    /// scaled-to-fill crop the user will see in the workspace.
+    @Published public private(set) var mainWindowAspectRatio = 1440.0 / 820.0
 
     /// Index of the approval card currently shown in the OUTBOX stack.
     @Published public var outboxPageIndex: Int = 0
@@ -246,7 +319,9 @@ public final class AppModel: ObservableObject {
     private static let foregroundTestDispatchID = "foreground-scheduling-test"
     private static let foregroundSchedulingKey = "actrealm.foregroundScheduling"
     private static let hudSettingsKey = "actrealm.hudSettings"
+    private static let themeSettingsKey = "actrealm.themeSettings"
     private let defaults: UserDefaults
+    private let themeDirectory: URL
     private var cancellables: Set<AnyCancellable> = []
     private var ticker: Task<Void, Never>?
     private var dismissedTaskVersions: [String: UInt64]
@@ -267,9 +342,13 @@ public final class AppModel: ObservableObject {
     public init(
         repoPath: URL? = nil,
         defaults: UserDefaults = .standard,
+        themeDirectory: URL? = nil,
         demo: Bool = ProcessInfo.processInfo.environment["ACTREALM_DEMO"] == "1"
     ) {
         self.defaults = defaults
+        self.themeDirectory = themeDirectory
+            ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("ActRealm/Theme", isDirectory: true)
         self.isDemo = demo
         if !demo,
            let data = defaults.data(forKey: Self.foregroundSchedulingKey),
@@ -286,6 +365,21 @@ public final class AppModel: ObservableObject {
             self.hudSettings = settings
         } else {
             self.hudSettings = .defaults
+        }
+        if !demo,
+           let data = defaults.data(forKey: Self.themeSettingsKey),
+           var settings = try? JSONDecoder().decode(AppThemeSettings.self, from: data)
+        {
+            if let path = settings.customBackgroundPath,
+               !FileManager.default.fileExists(atPath: path)
+            {
+                settings.customBackgroundPath = nil
+                settings.backgroundKind = .image
+            }
+            settings.laneOpacity = Self.clampedLaneOpacity(settings.laneOpacity)
+            self.themeSettings = settings
+        } else {
+            self.themeSettings = .defaults
         }
         self.hudArrivalID = nil
         self.hudArrivalDeadline = nil
@@ -856,6 +950,14 @@ public final class AppModel: ObservableObject {
     }
 
     public func bindForegroundWorkspace(apps: [ForegroundWorkspaceApp]) {
+        bindForegroundWorkspace(apps: apps, displayID: nil, displayName: nil)
+    }
+
+    public func bindForegroundWorkspace(
+        apps: [ForegroundWorkspaceApp],
+        displayID: UInt32?,
+        displayName: String?
+    ) {
         guard !apps.isEmpty else {
             showToast("当前桌面没有可绑定的协作应用")
             return
@@ -863,6 +965,8 @@ public final class AppModel: ObservableObject {
         updateForegroundScheduling {
             $0.workspaceApps = apps
             $0.workspaceBoundAt = Date()
+            $0.workspaceDisplayID = displayID
+            $0.workspaceDisplayName = displayName
         }
         isSelectingForegroundWorkspace = false
         showToast("协作桌面已绑定")
@@ -872,8 +976,87 @@ public final class AppModel: ObservableObject {
         updateForegroundScheduling {
             $0.workspaceApps = []
             $0.workspaceBoundAt = nil
+            $0.workspaceDisplayID = nil
+            $0.workspaceDisplayName = nil
         }
         showToast("协作桌面绑定已清除")
+    }
+
+    public var themeBackgroundURL: URL? {
+        guard let path = themeSettings.customBackgroundPath,
+              FileManager.default.fileExists(atPath: path)
+        else { return nil }
+        return URL(fileURLWithPath: path)
+    }
+
+    public func importThemeBackground(
+        from sourceURL: URL,
+        kind: ThemeBackgroundKind
+    ) throws {
+        let hasScopedAccess = sourceURL.startAccessingSecurityScopedResource()
+        defer {
+            if hasScopedAccess { sourceURL.stopAccessingSecurityScopedResource() }
+        }
+
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(
+            at: themeDirectory,
+            withIntermediateDirectories: true
+        )
+        let sourceExtension = sourceURL.pathExtension.lowercased()
+        let safeExtension = sourceExtension.isEmpty ? "image" : sourceExtension
+        let destination = themeDirectory.appendingPathComponent(
+            "background-\(UUID().uuidString).\(safeExtension)"
+        )
+        try fileManager.copyItem(at: sourceURL, to: destination)
+
+        let previousURL = themeBackgroundURL
+        themeSettings.customBackgroundPath = destination.path
+        themeSettings.backgroundKind = kind
+        persistThemeSettings()
+        if let previousURL,
+           previousURL.standardizedFileURL.deletingLastPathComponent()
+            == themeDirectory.standardizedFileURL
+        {
+            try? fileManager.removeItem(at: previousURL)
+        }
+    }
+
+    public func resetThemeBackground() {
+        if let currentURL = themeBackgroundURL,
+           currentURL.standardizedFileURL.deletingLastPathComponent()
+            == themeDirectory.standardizedFileURL
+        {
+            try? FileManager.default.removeItem(at: currentURL)
+        }
+        themeSettings.customBackgroundPath = nil
+        themeSettings.backgroundKind = .image
+        persistThemeSettings()
+    }
+
+    public func updateThemeSettings(_ update: (inout AppThemeSettings) -> Void) {
+        var settings = themeSettings
+        update(&settings)
+        settings.laneOpacity = Self.clampedLaneOpacity(settings.laneOpacity)
+        guard settings != themeSettings else { return }
+        themeSettings = settings
+        persistThemeSettings()
+    }
+
+    public func updateMainWindowSize(_ size: CGSize) {
+        guard size.width > 0, size.height > 0 else { return }
+        let ratio = Double(size.width / size.height)
+        guard abs(ratio - mainWindowAspectRatio) > 0.001 else { return }
+        mainWindowAspectRatio = ratio
+    }
+
+    private static func clampedLaneOpacity(_ value: Double) -> Double {
+        min(1, max(0, value))
+    }
+
+    private func persistThemeSettings() {
+        guard !isDemo, let data = try? JSONEncoder().encode(themeSettings) else { return }
+        defaults.set(data, forKey: Self.themeSettingsKey)
     }
 
     public func updateHUDSettings(_ update: (inout HUDSettings) -> Void) {

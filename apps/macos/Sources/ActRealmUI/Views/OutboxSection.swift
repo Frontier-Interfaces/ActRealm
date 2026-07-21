@@ -54,8 +54,7 @@ struct OutboxSection: View {
         }
         .padding(16)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .liquidGlassSurface(
-            tint: DT.cardSoft.opacity(0.18),
+        .mainLaneSurface(
             radius: 24,
             stroke: DT.hairline,
             shadow: DT.cardShadow.opacity(0.8),

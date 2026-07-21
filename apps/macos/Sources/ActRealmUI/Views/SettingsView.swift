@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import ActRealmKit
 import SwiftUI
 import UniformTypeIdentifiers
@@ -7,6 +8,7 @@ public enum SettingsSection: String, CaseIterable, Hashable, Identifiable, Senda
     case general
     case agents
     case notifications
+    case theme
     case display
     case data
 
@@ -17,6 +19,7 @@ public enum SettingsSection: String, CaseIterable, Hashable, Identifiable, Senda
         case .general: "通用"
         case .agents: "Agent"
         case .notifications: "通知"
+        case .theme: "主题"
         case .display: "显示"
         case .data: "数据"
         }
@@ -65,6 +68,8 @@ public struct SettingsView: View {
             AgentSettingsPage()
         case .notifications:
             NotificationSettingsPage()
+        case .theme:
+            ThemeSettingsPage()
         case .display:
             DisplaySettingsPage()
         case .data:
@@ -424,7 +429,7 @@ private struct NotificationSettingsPage: View {
                         get: { model.hudSettings.isEnabled },
                         set: { enabled in model.updateHUDSettings { $0.isEnabled = enabled } }
                     )) {
-                        SettingsLabel("显示 HUD 胶囊", detail: "新事件到达时在当前桌面顶部显示")
+                        SettingsLabel("显示 HUD 胶囊", detail: "新事件到达时在当前屏幕中央显示，可自由拖动")
                     }
 
                     Picker(selection: Binding(
@@ -528,6 +533,257 @@ private struct NotificationSettingsPage: View {
         .toggleStyle(.checkbox)
     }
 
+}
+
+private struct ThemeSettingsPage: View {
+    @EnvironmentObject private var model: AppModel
+    @State private var importError: String?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            SettingsPageHeader(
+                title: "主题",
+                subtitle: "用自己的图片更换 ActRealm 工作区背景。"
+            )
+            Form {
+                Section {
+                    ThemeLanePreview(
+                        backgroundURL: model.themeBackgroundURL,
+                        backgroundKind: model.themeSettings.backgroundKind,
+                        laneOpacity: model.themeSettings.laneOpacity
+                    )
+                    .frame(maxWidth: .infinity)
+                    .aspectRatio(model.mainWindowAspectRatio, contentMode: .fit)
+                    .frame(maxHeight: 320)
+                    .clipped()
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.28), lineWidth: 1)
+                    )
+
+                    HStack {
+                        SettingsLabel(
+                            "工作区背景",
+                            detail: hasCustomBackground
+                                ? "\(backgroundKindLabel)已复制到 ActRealm 的本地应用数据目录"
+                                : "正在使用默认玻璃背景"
+                        )
+                        Spacer()
+                        if hasCustomBackground {
+                            Button("恢复默认", role: .destructive) {
+                                model.resetThemeBackground()
+                            }
+                        }
+                        Button("选择图片 / GIF / 视频…", action: chooseBackground)
+                            .buttonStyle(.borderedProminent)
+                    }
+                } header: {
+                    Text("背景图片")
+                } footer: {
+                    Text("支持静态图片、GIF、MP4、MOV 等 macOS 可读取格式。GIF 与视频会静音自动循环；文件只保存在本机。")
+                }
+
+                Section {
+                    LabeledContent {
+                        Text("\(Int((model.themeSettings.laneOpacity * 100).rounded()))%")
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    } label: {
+                        SettingsLabel("三栏不透明度", detail: "同时调整 OUTBOX、AGENT TASKS 与 QUOTA")
+                    }
+
+                    Slider(
+                        value: Binding(
+                            get: { model.themeSettings.laneOpacity },
+                            set: { value in
+                                model.updateThemeSettings { $0.laneOpacity = value }
+                            }
+                        ),
+                        in: 0...1
+                    ) {
+                        Text("三栏不透明度")
+                    } minimumValueLabel: {
+                        Text("0% 透明")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } maximumValueLabel: {
+                        Text("100% 不透明")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("三栏外观")
+                } footer: {
+                    Text("0% 为完全透明，100% 为完全不透明。上方预览会按主窗口当前比例实时显示最终叠加效果。")
+                }
+            }
+            .formStyle(.grouped)
+            .scrollContentBackground(.hidden)
+        }
+        .alert(
+            "无法使用这张图片",
+            isPresented: Binding(
+                get: { importError != nil },
+                set: { if !$0 { importError = nil } }
+            )
+        ) {
+            Button("好", role: .cancel) { importError = nil }
+        } message: {
+            Text(importError ?? "请选择另一张图片。")
+        }
+    }
+
+    private var hasCustomBackground: Bool { model.themeBackgroundURL != nil }
+
+    private var backgroundKindLabel: String {
+        switch model.themeSettings.backgroundKind {
+        case .image: "静态图片"
+        case .animatedImage: "GIF"
+        case .video: "循环视频"
+        }
+    }
+
+    private func chooseBackground() {
+        let panel = NSOpenPanel()
+        panel.title = "选择 ActRealm 背景"
+        panel.prompt = "使用背景"
+        panel.allowedContentTypes = [.image, .movie]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task {
+            await importBackground(from: url)
+        }
+    }
+
+    @MainActor
+    private func importBackground(from url: URL) async {
+        let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
+        let kind: ThemeBackgroundKind
+        if contentType?.conforms(to: .movie) == true {
+            kind = .video
+        } else if url.pathExtension.lowercased() == "gif" {
+            kind = .animatedImage
+        } else {
+            kind = .image
+        }
+
+        let hasScopedAccess = url.startAccessingSecurityScopedResource()
+        defer {
+            if hasScopedAccess { url.stopAccessingSecurityScopedResource() }
+        }
+
+        do {
+            switch kind {
+            case .video:
+                let asset = AVURLAsset(url: url)
+                guard try await asset.load(.isPlayable) else {
+                    importError = "视频无法播放，请选择 MP4、MOV 或其他 macOS 支持的视频。"
+                    return
+                }
+            case .image, .animatedImage:
+                guard NSImage(contentsOf: url) != nil else {
+                    importError = "图片无法解码，请选择 PNG、JPEG、HEIC 或 GIF。"
+                    return
+                }
+            }
+            try model.importThemeBackground(from: url, kind: kind)
+        } catch {
+            importError = error.localizedDescription
+        }
+    }
+}
+
+private struct ThemeLanePreview: View {
+    let backgroundURL: URL?
+    let backgroundKind: ThemeBackgroundKind
+    let laneOpacity: Double
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack {
+                background
+
+                HStack(spacing: 8) {
+                    previewLane(title: "OUTBOX", rows: 2)
+                        .frame(width: max(80, (proxy.size.width - 16) * 0.28))
+                    previewLane(title: "AGENT TASKS", rows: 3)
+                        .frame(maxWidth: .infinity)
+                    previewLane(title: "QUOTA", rows: 2)
+                        .frame(width: max(80, (proxy.size.width - 16) * 0.24))
+                }
+                .padding(14)
+            }
+        }
+        .background(Color(nsColor: .controlBackgroundColor))
+        .overlay(alignment: .topTrailing) {
+            Text(backgroundLabel)
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(Color.black.opacity(0.42), in: Capsule())
+                .padding(9)
+        }
+    }
+
+    @ViewBuilder
+    private var background: some View {
+        if let backgroundURL {
+            AppThemeBackdrop(url: backgroundURL, kind: backgroundKind)
+        } else {
+            LinearGradient(
+                colors: [
+                    DT.logoTint.opacity(0.55),
+                    Color(red: 0.96, green: 0.9, blue: 0.72),
+                    DT.greenDot.opacity(0.28),
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        }
+    }
+
+    private func previewLane(title: String, rows: Int) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(title)
+                .font(.system(size: 9.5, weight: .heavy))
+                .foregroundStyle(DT.textPrimary)
+            ForEach(0..<rows, id: \.self) { row in
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(DT.cardStrong.opacity(0.72))
+                    .frame(height: row == 0 ? 34 : 22)
+                    .overlay(alignment: .leading) {
+                        Capsule()
+                            .fill(row == 0 ? DT.logoTint.opacity(0.5) : DT.textFaint.opacity(0.18))
+                            .frame(width: row == 0 ? 42 : 58, height: 4)
+                            .padding(.leading, 8)
+                    }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .frame(maxHeight: .infinity, alignment: .topLeading)
+        .modifier(ThemedLaneSurface(
+            opacity: laneOpacity,
+            radius: 13,
+            stroke: Color.white.opacity(0.55),
+            shadow: .clear,
+            shadowRadius: 0,
+            shadowY: 0
+        ))
+    }
+
+    private var backgroundLabel: String {
+        guard backgroundURL != nil else { return "默认背景" }
+        switch backgroundKind {
+        case .image: return "静态图片"
+        case .animatedImage: return "GIF 循环"
+        case .video: return "视频循环 · 静音"
+        }
+    }
 }
 
 private struct DisplaySettingsPage: View {
