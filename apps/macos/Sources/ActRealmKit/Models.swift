@@ -597,6 +597,7 @@ public struct UISettings: Codable, Equatable, Sendable {
     public var retentionDays: UInt32
     public var displayProfile: String
     public var taskCardFields: [String]
+    public var displayFieldsVersion: UInt32?
 
     public init(
         notificationRules: NotificationRules = NotificationRules(),
@@ -606,9 +607,10 @@ public struct UISettings: Codable, Equatable, Sendable {
         retentionDays: UInt32 = 90,
         displayProfile: String = "detailed",
         taskCardFields: [String] = [
-            "project", "task", "model", "activity", "plan", "tokens", "context",
+            "project", "task", "model", "activity", "plan", "tokens", "cost", "context",
             "tool", "subagents", "environment", "recovery", "control", "jump",
-        ]
+        ],
+        displayFieldsVersion: UInt32? = 2
     ) {
         self.notificationRules = notificationRules
         self.soundEnabled = soundEnabled
@@ -617,6 +619,7 @@ public struct UISettings: Codable, Equatable, Sendable {
         self.retentionDays = retentionDays
         self.displayProfile = displayProfile
         self.taskCardFields = taskCardFields
+        self.displayFieldsVersion = displayFieldsVersion
     }
 
     public static let defaults = UISettings()

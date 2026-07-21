@@ -536,11 +536,11 @@ private struct DisplaySettingsPage: View {
     private let presets: [String: [String]] = [
         "concise": ["project", "task", "activity"],
         "detailed": [
-            "project", "task", "model", "activity", "plan", "tokens", "context",
+            "project", "task", "model", "activity", "plan", "tokens", "cost", "context",
             "tool", "subagents", "environment", "recovery", "control", "jump",
         ],
         "developer": [
-            "project", "task", "model", "activity", "plan", "tokens", "context",
+            "project", "task", "model", "activity", "plan", "tokens", "cost", "context",
             "tool", "permissionMode", "subagents", "environment", "recovery", "control",
             "jump", "titleSource", "sessionId", "providerSessionId", "providerTurnId", "lastEventAt",
         ],

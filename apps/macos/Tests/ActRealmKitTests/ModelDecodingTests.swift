@@ -205,6 +205,9 @@ struct ModelDecodingTests {
 
     @Test func settingsEncodeTheCompleteRuntimeContract() throws {
         var settings = UISettings.defaults
+        #expect(settings.taskCardFields.contains("tokens"))
+        #expect(settings.taskCardFields.contains("cost"))
+        #expect(settings.displayFieldsVersion == 2)
         settings.notificationRules.question = .ignore
         settings.providerMuted.codex = true
         settings.retentionDays = 180
@@ -219,6 +222,21 @@ struct ModelDecodingTests {
         #expect(muted["codex"] as? Bool == true)
         #expect(object["retentionDays"] as? Int == 180)
         #expect(object["taskCardFields"] as? [String] == ["task", "providerTurnId"])
+    }
+
+    @Test func tokenAndEstimatedCostFieldsEncodeIndependently() throws {
+        var settings = UISettings.defaults
+        settings.displayProfile = "custom"
+        settings.taskCardFields = ["tokens"]
+
+        let tokenData = try JSONEncoder().encode(settings)
+        let tokenObject = try #require(try JSONSerialization.jsonObject(with: tokenData) as? [String: Any])
+        #expect(tokenObject["taskCardFields"] as? [String] == ["tokens"])
+
+        settings.taskCardFields = ["cost"]
+        let costData = try JSONEncoder().encode(settings)
+        let costObject = try #require(try JSONSerialization.jsonObject(with: costData) as? [String: Any])
+        #expect(costObject["taskCardFields"] as? [String] == ["cost"])
     }
 
     private var emptySnapshotJSON: String {

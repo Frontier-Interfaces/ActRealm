@@ -274,7 +274,8 @@ private struct TaskRow: View {
 
     @ViewBuilder
     private var usageStrip: some View {
-        if (fieldVisible("tokens") && (task.totalTokens != nil || task.estimatedCostUsdMicros != nil))
+        if (fieldVisible("tokens") && task.totalTokens != nil)
+            || (fieldVisible("cost") && task.estimatedCostUsdMicros != nil)
             || (fieldVisible("context") && task.contextUsageFraction != nil) {
             HStack(spacing: 6) {
                 if fieldVisible("tokens"), let total = task.totalTokens {
@@ -283,7 +284,7 @@ private struct TaskRow: View {
                 if fieldVisible("context"), let fraction = task.contextUsageFraction {
                     usageChip("上下文 \(Int((fraction * 100).rounded()))%", tone: fraction >= 0.7 ? .amber : .blue)
                 }
-                if fieldVisible("tokens"), task.estimatedCostUsdMicros != nil {
+                if fieldVisible("cost"), task.estimatedCostUsdMicros != nil {
                     usageChip("估算 API 价格 \(estimatedCostText)", tone: .blue)
                 }
                 Spacer(minLength: 0)
@@ -367,7 +368,6 @@ private struct TaskRow: View {
         if fieldVisible("tokens") {
             items.append(("会话累计 Token", tokenText, tokenIsHigh))
             items.append(("本轮 Token", lastTurnTokenText, false))
-            items.append(("估算 API 价格", estimatedCostText, false))
             if task.inputTokens != nil || task.outputTokens != nil {
                 items.append((
                     "输入 / 输出",
@@ -386,6 +386,7 @@ private struct TaskRow: View {
                 items.append(("推理 Token", ZhFormat.tokenCount(reasoning), false))
             }
         }
+        if fieldVisible("cost") { items.append(("估算 API 价格", estimatedCostText, false)) }
         if fieldVisible("tool") { items.append(("当前工具", task.session.currentTool ?? "—", false)) }
         if fieldVisible("permissionMode") { items.append(("权限模式", task.session.permissionMode ?? "—", false)) }
         if fieldVisible("subagents") { items.append(("运行中的子 Agent", "\(task.session.activeSubagents ?? 0)", false)) }

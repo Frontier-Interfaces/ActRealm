@@ -92,7 +92,8 @@ let settingsState = {
   codexEnhancedActivity: true,
   retentionDays: 90,
   displayProfile: "detailed",
-  taskCardFields: ["project", "task", "model", "activity", "plan", "tokens", "context", "tool", "subagents", "environment", "recovery", "control", "jump"],
+  displayFieldsVersion: 2,
+  taskCardFields: ["project", "task", "model", "activity", "plan", "tokens", "cost", "context", "tool", "subagents", "environment", "recovery", "control", "jump"],
 };
 let displayCatalog = [];
 let claudeBridge = { status: "not_installed" };
@@ -126,8 +127,8 @@ const SETUP_FOCUS_REFRESH_AFTER_MS = 5 * 1000;
 const USER_GUIDE_URL = "https://github.com/Frontier-Interfaces/ActRealm/blob/agent/v1-full/docs/USER_GUIDE_zh-CN.md";
 const DISPLAY_PRESETS = {
   concise: ["project", "task", "activity"],
-  detailed: ["project", "task", "model", "activity", "plan", "tokens", "context", "tool", "subagents", "environment", "recovery", "control", "jump"],
-  developer: ["project", "task", "model", "activity", "plan", "tokens", "context", "tool", "permissionMode", "subagents", "environment", "recovery", "control", "jump", "titleSource", "sessionId", "providerSessionId", "providerTurnId", "lastEventAt"],
+  detailed: ["project", "task", "model", "activity", "plan", "tokens", "cost", "context", "tool", "subagents", "environment", "recovery", "control", "jump"],
+  developer: ["project", "task", "model", "activity", "plan", "tokens", "cost", "context", "tool", "permissionMode", "subagents", "environment", "recovery", "control", "jump", "titleSource", "sessionId", "providerSessionId", "providerTurnId", "lastEventAt"],
 };
 
 function updateClock() {
@@ -581,6 +582,7 @@ function settingsFromForm() {
     codexEnhancedActivity: ui.codexEnhanced.checked,
     retentionDays: Number(ui.retentionDays.value),
     displayProfile: ui.displayProfile.value,
+    displayFieldsVersion: settingsState.displayFieldsVersion || 2,
     taskCardFields: [...ui.taskCardFields.querySelectorAll("input:checked")].map((input) => input.value),
   };
 }
@@ -1190,14 +1192,17 @@ function estimatedCostText(session) {
 }
 
 function appendUsageStrip(container, session) {
-  const total = session.tokenTotal == null ? undefined : compactCount(session.tokenTotal);
+  const total = cardFieldVisible("tokens") && session.tokenTotal != null
+    ? compactCount(session.tokenTotal)
+    : undefined;
   const context = contextUsage(session);
-  const cost = estimatedCostText(session);
-  if (total == null && context.percent == null && cost == null) return;
+  const contextPercent = cardFieldVisible("context") ? context.percent : undefined;
+  const cost = cardFieldVisible("cost") ? estimatedCostText(session) : undefined;
+  if (total == null && contextPercent == null && cost == null) return;
   const strip = element("div", "session-usage-strip");
   if (total != null) strip.append(element("span", "usage-chip", `累计 ${total} Token`));
-  if (context.percent != null) {
-    const chip = element("span", "usage-chip context", `上下文 ${context.percent}%`);
+  if (contextPercent != null) {
+    const chip = element("span", "usage-chip context", `上下文 ${contextPercent}%`);
     chip.title = contextUsageText(session);
     strip.append(chip);
   }
@@ -1262,7 +1267,7 @@ function openSessionDetail(session) {
       : `${compactCount(session.cacheReadTokens || 0)} / ${compactCount(session.cacheCreationTokens || 0)}`) : undefined,
     fields.has("tokens") ? detailPair("推理 Token", session.reasoningTokens == null ? undefined : compactCount(session.reasoningTokens)) : undefined,
     fields.has("tokens") ? detailPair("本轮 Token", session.lastTurnTokens == null ? undefined : compactCount(session.lastTurnTokens)) : undefined,
-    fields.has("tokens") ? detailPair("估算 API 价格", estimatedCostText(session)) : undefined,
+    fields.has("cost") ? detailPair("估算 API 价格", estimatedCostText(session)) : undefined,
     fields.has("tool") ? detailPair("当前工具", session.currentTool) : undefined,
     fields.has("permissionMode") ? detailPair("权限模式", session.permissionMode) : undefined,
     fields.has("subagents") ? detailPair("运行中的子 Agent", String(session.activeSubagents || 0)) : undefined,
