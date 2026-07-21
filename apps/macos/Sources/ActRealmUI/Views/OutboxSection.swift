@@ -1,4 +1,3 @@
-import AppKit
 import ActRealmKit
 import SwiftUI
 
@@ -19,7 +18,7 @@ struct OutboxSection: View {
                     .font(.system(size: 13, weight: .heavy))
                     .kerning(0.65)
                     .foregroundStyle(DT.textPrimary)
-                Text("需要你处理")
+                Text("需要处理")
                     .font(.system(size: 11))
                     .foregroundStyle(DT.textSecondary)
                 Spacer()
@@ -105,7 +104,7 @@ struct OutboxSection: View {
     }
 
     private var subtitle: String {
-        guard let wait = model.derived.longestWait else { return "没有需要你处理的事项" }
+        guard let wait = model.derived.longestWait else { return "暂无需要处理的事项" }
         return "最久等待 \(max(0, Int(wait / 60))) 分钟"
     }
 }
@@ -115,7 +114,6 @@ private struct OutboxPrimaryCard: View {
     @Environment(\.snapshotRendering) private var snapshotRendering
     let entry: OutboxEntry
     @State private var confirming = false
-    @State private var reply = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -167,6 +165,8 @@ private struct OutboxPrimaryCard: View {
             switch entry.kind {
             case .approval:
                 approvalBody
+            case .nativeApproval:
+                nativeApprovalBody
             case .question:
                 questionBody
             case .completion:
@@ -216,7 +216,12 @@ private struct OutboxPrimaryCard: View {
                 .foregroundStyle(DT.textSecondary)
                 .padding(.top, 9)
 
-            if confirming {
+            if entry.state != .open {
+                Text(entry.state == .committing ? "决定将在 3 秒撤回窗口后提交" : "决定已写给 Provider，等待后续事件确认")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(DT.amberText)
+                    .padding(.top, 12)
+            } else if confirming {
                 HStack(spacing: 8) {
                     Text("确认允许运行这条命令？")
                         .font(.system(size: 11, weight: .bold))
@@ -247,48 +252,56 @@ private struct OutboxPrimaryCard: View {
     }
 
     private var questionBody: some View {
-        VStack(spacing: 10) {
-            Text(entry.attention.detail ?? "Agent 正在等待你的回答。")
+        Group {
+            if let prompt = entry.attention.interaction,
+               entry.state == .open,
+               entry.attention.requestId != nil {
+                InteractiveQuestionView(entry: entry, prompt: prompt)
+            } else {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(entry.attention.detail ?? "Agent 正在等待回答。")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(DT.textSecondary)
+                        .lineSpacing(3)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 9)
+                        .background(DT.blueBg.opacity(0.7), in: RoundedRectangle(cornerRadius: 10))
+                        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(DT.blueBadgeStroke, lineWidth: 1))
+                    Text("当前没有可用的直接回复通道；ActRealm 不会把复制文字伪装成已回答。")
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(DT.textWeak)
+                    Button("返回 Agent 原窗口") {
+                        Task { await model.jump(to: entry) }
+                    }
+                    .buttonStyle(ActionButtonStyle(kind: .secondary, compact: true))
+                }
+                .padding(.top, 9)
+            }
+        }
+    }
+
+    private var nativeApprovalBody: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(entry.attention.detail ?? "此请求由 Provider 原界面拥有；ActRealm 只同步等待与解决状态。")
                 .font(.system(size: 11.5))
                 .foregroundStyle(DT.textSecondary)
                 .lineSpacing(3)
+                .padding(10)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 11)
-                .padding(.vertical, 9)
-                .background(DT.blueBg.opacity(0.7), in: RoundedRectangle(cornerRadius: 10))
-                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(DT.blueBadgeStroke, lineWidth: 1))
-
-            HStack(spacing: 7) {
-                if snapshotRendering {
-                    Text("输入回答，回车复制…")
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(DT.textFaint)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 7)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(DT.cardStrong, in: Capsule())
-                        .overlay(Capsule().strokeBorder(DT.neutralBadgeStroke, lineWidth: 1))
-                } else {
-                    TextField("输入回答，回车复制…", text: $reply)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 11.5))
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 7)
-                        .background(DT.cardStrong, in: Capsule())
-                        .overlay(Capsule().strokeBorder(DT.neutralBadgeStroke, lineWidth: 1))
-                        .onSubmit(copyReply)
-                }
-                Button("复制回答") { copyReply() }
-                    .buttonStyle(ActionButtonStyle(kind: .primary, compact: true))
-                    .disabled(reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .background(DT.amberBg.opacity(0.62), in: RoundedRectangle(cornerRadius: 10))
+                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(DT.amberStroke, lineWidth: 1))
+            Button("打开应用") {
+                Task { await model.jump(to: entry) }
             }
+            .buttonStyle(ActionButtonStyle(kind: .primary, compact: true))
         }
-        .padding(.top, 9)
+        .padding(.top, 10)
     }
 
     private var completionBody: some View {
         VStack(spacing: 12) {
-            Text(entry.attention.detail ?? "本轮修改已完成，等待你确认。")
+            Text(entry.attention.detail ?? "本轮修改已完成，等待确认。")
                 .font(.system(size: 11.5))
                 .foregroundStyle(DT.textSecondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -299,9 +312,8 @@ private struct OutboxPrimaryCard: View {
             HStack(spacing: 7) {
                 Button("确认完成") { model.acknowledge(entry) }
                     .buttonStyle(ActionButtonStyle(kind: .success))
-                Button("返回原窗口") {
-                    model.revealSession(for: entry)
-                    model.showToast("已定位对应任务")
+                Button("打开应用") {
+                    Task { await model.jump(to: entry) }
                 }
                 .buttonStyle(ActionButtonStyle(kind: .secondary))
             }
@@ -328,18 +340,6 @@ private struct OutboxPrimaryCard: View {
         .padding(.top, 9)
     }
 
-    private func copyReply() {
-        let answer = reply.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !answer.isEmpty else {
-            model.showToast("请输入回答内容")
-            return
-        }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(answer, forType: .string)
-        model.revealSession(for: entry)
-        model.showToast("回答已复制，请在原 Agent 窗口发送")
-    }
-
     private var waitText: String {
         "已等 \(ZhFormat.waitDuration(model.now.timeIntervalSince(entry.createdAt)))"
     }
@@ -361,7 +361,7 @@ private struct OutboxPrimaryCard: View {
 
     private var cardBackground: AnyShapeStyle {
         switch entry.kind {
-        case .approval:
+        case .approval, .nativeApproval:
             AnyShapeStyle(LinearGradient(
                 colors: [DT.amberBg.opacity(0.72), DT.cardStrong.opacity(0.76)],
                 startPoint: .top, endPoint: .bottom
@@ -386,7 +386,7 @@ private struct OutboxPrimaryCard: View {
 
     private var cardBorder: Color {
         switch entry.kind {
-        case .approval: DT.amberStroke
+        case .approval, .nativeApproval: DT.amberStroke
         case .question: DT.blueBadgeStroke
         case .completion: DT.greenStroke
         case .error: DT.redStroke
@@ -424,18 +424,26 @@ private struct QueueRow: View {
 }
 
 private struct OutboxEmpty: View {
+    @EnvironmentObject private var model: AppModel
+
     var body: some View {
         VStack(spacing: 10) {
-            Text("✓")
+            Text(model.setupInfo == nil ? "…" : "✓")
                 .font(.system(size: 22, weight: .semibold))
-                .foregroundStyle(DT.greenText)
+                .foregroundStyle(model.setupInfo == nil ? DT.textWeak : DT.greenText)
                 .frame(width: 52, height: 52)
-                .background(DT.greenBg, in: Circle())
-                .overlay(Circle().strokeBorder(DT.greenStroke, lineWidth: 1))
-            Text("全部处理完毕")
+                .background(model.setupInfo == nil ? DT.cardFaint : DT.greenBg, in: Circle())
+                .overlay(Circle().strokeBorder(model.setupInfo == nil ? DT.hairline : DT.greenStroke, lineWidth: 1))
+            Text(model.setupInfo == nil
+                ? "正在检测本机 Agent"
+                : model.isFirstRun ? "还没有需要处理的事项" : "全部处理完毕")
                 .font(.system(size: 13, weight: .bold))
                 .foregroundStyle(DT.textSecondary)
-            Text("新事件会先以 HUD 胶囊出现")
+            Text(model.setupInfo == nil
+                ? "接入状态确认前不会显示缓存或演示数据"
+                : model.isFirstRun
+                    ? "连接 Agent 后，审批、提问和完成确认会出现在这里"
+                    : "新事件会先以 HUD 胶囊出现")
                 .font(.system(size: 10.5))
                 .foregroundStyle(DT.textWeak)
         }
@@ -459,7 +467,7 @@ private struct UndoBar: View {
                 .font(.system(size: 10.5, weight: .bold))
                 .foregroundStyle(DT.textPrimary)
                 .lineLimit(1)
-            Text("· 决定已发送，等待确认")
+            Text(phaseText)
                 .font(.system(size: 10.5))
                 .foregroundStyle(DT.textSecondary)
                 .lineLimit(1)
@@ -481,6 +489,13 @@ private struct UndoBar: View {
     }
     private var fraction: Double { min(1, remaining / DerivedState.undoWindow) }
     private var secondsLabel: String { "\(Int(ceil(remaining)))s" }
+    private var phaseText: String {
+        switch pending.phase {
+        case .undoable: "· 尚未写给 Provider"
+        case .sent: "· 已写给 Provider，等待后续事件"
+        case .confirmed: "· Provider 后续事件已确认继续"
+        }
+    }
 }
 
 struct ActionButtonStyle: ButtonStyle {

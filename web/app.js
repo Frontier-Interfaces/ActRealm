@@ -92,7 +92,8 @@ let settingsState = {
   codexEnhancedActivity: true,
   retentionDays: 90,
   displayProfile: "detailed",
-  taskCardFields: ["project", "task", "model", "activity", "plan", "tokens", "context", "tool", "subagents", "environment", "recovery", "control", "jump"],
+  displayFieldsVersion: 2,
+  taskCardFields: ["project", "task", "model", "activity", "plan", "tokens", "cost", "context", "tool", "subagents", "environment", "recovery", "control", "jump"],
 };
 let displayCatalog = [];
 let claudeBridge = { status: "not_installed" };
@@ -125,9 +126,9 @@ const SNAPSHOT_FALLBACK_AFTER_MS = 15 * 1000;
 const SETUP_FOCUS_REFRESH_AFTER_MS = 5 * 1000;
 const USER_GUIDE_URL = "https://github.com/Frontier-Interfaces/ActRealm/blob/agent/v1-full/docs/USER_GUIDE_zh-CN.md";
 const DISPLAY_PRESETS = {
-  concise: ["task", "activity"],
-  detailed: ["project", "task", "model", "activity", "plan", "tokens", "context", "tool", "subagents", "environment", "recovery", "control", "jump"],
-  developer: ["project", "task", "model", "activity", "plan", "tokens", "context", "tool", "permissionMode", "subagents", "environment", "recovery", "control", "jump", "titleSource", "sessionId", "providerSessionId", "providerTurnId", "lastEventAt"],
+  concise: ["project", "task", "activity"],
+  detailed: ["project", "task", "model", "activity", "plan", "tokens", "cost", "context", "tool", "subagents", "environment", "recovery", "control", "jump"],
+  developer: ["project", "task", "model", "activity", "plan", "tokens", "cost", "context", "tool", "permissionMode", "subagents", "environment", "recovery", "control", "jump", "titleSource", "sessionId", "providerSessionId", "providerTurnId", "lastEventAt"],
 };
 
 function updateClock() {
@@ -173,7 +174,7 @@ function onboardingTaskEmpty() {
   icon.append(signal);
   root.append(icon);
   root.append(element("h3", "", "尚未连接任何 Agent"));
-  root.append(element("p", "", "连接 Claude 或 Codex 后，正在运行的任务与需要你处理的事会显示在这里。数据仅留在本机。"));
+  root.append(element("p", "", "连接 Claude 或 Codex 后，运行中的任务与待处理事项会显示在这里。数据仅留在本机。"));
   const actions = element("div", "onboarding-actions");
   const connect = element("button", "onboarding-primary", "＋ 连接 Agent");
   connect.type = "button";
@@ -260,7 +261,7 @@ function setupStatus(status) {
     connected: { label: "已接入", className: "ready", detail: "已收到安装后的真实 Agent 事件，实时活动可以正常显示。" },
     needs_reinstall: { label: "配置有变化", className: "error", detail: "发现不完整或被修改的 ActRealm 条目；不会自动覆盖。" },
     inline_conflict: { label: "配置冲突", className: "error", detail: "Codex 同时存在 inline Hook。请先保留一种同层配置形式。" },
-    error: { label: "配置无法解析", className: "error", detail: "为保护你的设置，ActRealm 已拒绝改写。请先恢复或修正配置。" },
+    error: { label: "配置无法解析", className: "error", detail: "为保护现有设置，ActRealm 已拒绝改写。请先恢复或修正配置。" },
   }[status] || { label: status, className: "muted", detail: "状态暂时无法识别。" };
 }
 
@@ -376,7 +377,7 @@ function renderSetup() {
 
     if (provider.provider === "codex" && provider.status === "needs_trust") {
       const trust = element("div", "setup-trust");
-      trust.append(element("strong", "", "Codex 信任必须由你在官方界面确认"));
+      trust.append(element("strong", "", "Codex 信任必须在官方界面确认"));
       const steps = element("ol", "trust-steps");
       const startStep = provider.cliInstalled
         ? "打开任意 Codex 终端会话"
@@ -548,7 +549,7 @@ function renderFieldSelector() {
     input.type = "checkbox";
     input.value = field.id;
     input.checked = selected.has(field.id);
-    input.disabled = field.level === "developer" && profile !== "developer";
+    input.disabled = profile !== "custom";
     label.append(input, element("span", "", field.label));
     ui.taskCardFields.append(label);
   }
@@ -581,6 +582,7 @@ function settingsFromForm() {
     codexEnhancedActivity: ui.codexEnhanced.checked,
     retentionDays: Number(ui.retentionDays.value),
     displayProfile: ui.displayProfile.value,
+    displayFieldsVersion: settingsState.displayFieldsVersion || 2,
     taskCardFields: [...ui.taskCardFields.querySelectorAll("input:checked")].map((input) => input.value),
   };
 }
@@ -750,11 +752,11 @@ function renderMetrics() {
 }
 
 function attentionTitle(item) {
-  if (item.kind === "approval") return `想运行 ${item.commandPreview || "一项工具操作"}，等你点头`;
-  if (item.kind === "native_approval") return item.title || `${providerName(item.provider)} 需要你在原界面批准`;
+  if (item.kind === "approval") return `请求运行 ${item.commandPreview || "一项工具操作"}，等待批准`;
+  if (item.kind === "native_approval") return item.title || `${providerName(item.provider)} 等待在原界面批准`;
   if (item.kind === "error") return item.title || "任务出错停下来了";
   if (item.kind === "completion") return item.title || "这一轮已经完成";
-  return item.title || "Agent 有一件事需要你处理";
+  return item.title || "Agent 有一项待处理事项";
 }
 
 function attentionContext(item) {
@@ -780,7 +782,7 @@ function attentionContext(item) {
     };
   }
   return {
-    kicker: item.kind === "completion" ? "任务已完成 · 不着急" : "需要你处理 · 任务已暂停",
+    kicker: item.kind === "completion" ? "任务已完成" : "需要处理 · 任务已暂停",
     state: stateLabel(item.state),
     notification: stateLabel(item.kind),
   };
@@ -953,7 +955,7 @@ function updateAttentionTimes() {
     const minutes = Math.max(0, Math.floor((Date.now() - oldest) / 60000));
     ui.attentionSummary.textContent = `最久等待 ${minutes} 分钟`;
   } else {
-    ui.attentionSummary.textContent = "没有需要你处理的事项";
+    ui.attentionSummary.textContent = "暂无需要处理的事项";
   }
   updateMarkedElapsed(ui.attentionList);
 }
@@ -1084,7 +1086,7 @@ function sessionStatus(session) {
     const suffix = waiting.length > 1 ? ` ×${waiting.length}` : "";
     if (first.kind === "native_approval") return { label: `原界面请求${suffix}`, className: "waiting" };
     if (first.kind === "approval") return { label: `面板可审批${suffix}`, className: "waiting" };
-    if (first.kind === "question") return { label: `等你回答${suffix}`, className: "waiting" };
+    if (first.kind === "question") return { label: `等待回答${suffix}`, className: "waiting" };
     if (first.kind === "completion") return { label: `待确认${suffix}`, className: "waiting" };
     return { label: `待处理${suffix}`, className: "waiting" };
   }
@@ -1190,19 +1192,22 @@ function estimatedCostText(session) {
 }
 
 function appendUsageStrip(container, session) {
-  const total = session.tokenTotal == null ? undefined : compactCount(session.tokenTotal);
+  const total = cardFieldVisible("tokens") && session.tokenTotal != null
+    ? compactCount(session.tokenTotal)
+    : undefined;
   const context = contextUsage(session);
-  const cost = estimatedCostText(session);
-  if (total == null && context.percent == null && cost == null) return;
+  const contextPercent = cardFieldVisible("context") ? context.percent : undefined;
+  const cost = cardFieldVisible("cost") ? estimatedCostText(session) : undefined;
+  if (total == null && contextPercent == null && cost == null) return;
   const strip = element("div", "session-usage-strip");
   if (total != null) strip.append(element("span", "usage-chip", `累计 ${total} Token`));
-  if (context.percent != null) {
-    const chip = element("span", "usage-chip context", `上下文 ${context.percent}%`);
+  if (contextPercent != null) {
+    const chip = element("span", "usage-chip context", `上下文 ${contextPercent}%`);
     chip.title = contextUsageText(session);
     strip.append(chip);
   }
   if (cost != null) {
-    const chip = element("span", "usage-chip cost", `估算 API 价 ${cost}`);
+    const chip = element("span", "usage-chip", `估算 API 价格 ${cost}`);
     chip.title = "按公开 API 单价或 Provider 官方会话费用估算；不是订阅账单";
     strip.append(chip);
   }
@@ -1262,7 +1267,7 @@ function openSessionDetail(session) {
       : `${compactCount(session.cacheReadTokens || 0)} / ${compactCount(session.cacheCreationTokens || 0)}`) : undefined,
     fields.has("tokens") ? detailPair("推理 Token", session.reasoningTokens == null ? undefined : compactCount(session.reasoningTokens)) : undefined,
     fields.has("tokens") ? detailPair("本轮 Token", session.lastTurnTokens == null ? undefined : compactCount(session.lastTurnTokens)) : undefined,
-    fields.has("tokens") ? detailPair("估算 API 价", estimatedCostText(session)) : undefined,
+    fields.has("cost") ? detailPair("估算 API 价格", estimatedCostText(session)) : undefined,
     fields.has("tool") ? detailPair("当前工具", session.currentTool) : undefined,
     fields.has("permissionMode") ? detailPair("权限模式", session.permissionMode) : undefined,
     fields.has("subagents") ? detailPair("运行中的子 Agent", String(session.activeSubagents || 0)) : undefined,
@@ -1311,10 +1316,10 @@ function activityDisplay(session) {
     const text = waiting.kind === "native_approval"
       ? `${providerName(waiting.provider)} 正在请求批准，请回原界面处理`
       : waiting.kind === "approval"
-        ? "等待你在 ActRealm 审批"
+        ? "等待在 ActRealm 审批"
         : waiting.kind === "question"
-          ? "等待你在 ActRealm 回答"
-          : "等待你处理";
+          ? "等待在 ActRealm 回答"
+          : "等待处理";
     return {
       className: "waiting",
       marker: "!",
@@ -1519,7 +1524,7 @@ function buildSessionRow(session) {
         ["计划", plan],
         ["会话累计 Token", session.tokenTotal == null ? "—" : compactCount(session.tokenTotal)],
         ["本轮 Token", session.lastTurnTokens == null ? "—" : compactCount(session.lastTurnTokens)],
-        ["估算 API 价", estimatedCostText(session) || "—"],
+        ["估算 API 价格", estimatedCostText(session) || "—"],
       ];
       for (const [label, value] of pairs) {
         const pair = element("div", "task-detail-pair");
@@ -1553,7 +1558,7 @@ function renderSessions() {
   const waitingCount = sessions.filter((session) => sessionStatus(session).className === "waiting").length;
   const runningCount = sessions.filter((session) => isSessionActive(session) && sessionStatus(session).className !== "waiting").length;
   const finishedCount = sessions.filter((session) => ["idle", "response_finished"].includes(session.execState)).length;
-  ui.sessionCount.textContent = `${sessions.length} 个任务 · ${waitingCount} 等你 · ${runningCount} 在跑 · ${finishedCount} 刚完成`;
+  ui.sessionCount.textContent = `${sessions.length} 个任务 · ${waitingCount} 等待 · ${runningCount} 运行中 · ${finishedCount} 已完成`;
   if (!sessions.length) {
     selectedSessionId = undefined;
     sessionActivityRefs.clear();
@@ -2183,6 +2188,8 @@ ui.displayProfile.addEventListener("change", () => {
   saveSettings();
 });
 ui.taskCardFields.addEventListener("change", () => {
+  settingsState.displayProfile = "custom";
+  ui.displayProfile.value = "custom";
   settingsState.taskCardFields = [...ui.taskCardFields.querySelectorAll("input:checked")].map((input) => input.value);
   saveSettings();
 });

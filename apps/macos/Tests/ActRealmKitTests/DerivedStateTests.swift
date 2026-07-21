@@ -75,13 +75,22 @@ private func makeSnapshot(
         #expect(derived.outbox.map(\.id) == ["live"])
     }
 
+    @Test func snoozedItemsStayOutOfOutboxUntilRuntimeReopensThem() {
+        let snapshot = makeSnapshot(attention: [
+            makeAttention(id: "later", kind: "completion", createdAt: 100, state: "snoozed")
+        ])
+        let derived = DerivedState.derive(from: snapshot)
+        #expect(derived.outbox.map(\.id) == ["later"])
+        #expect(derived.openOutbox.isEmpty)
+    }
+
     @Test func toolNameParsedFromRuntimeTitle() {
         let snapshot = makeSnapshot(attention: [
             makeAttention(id: "a", kind: "approval", createdAt: 1, title: "允许 Bash？")
         ])
         let entry = DerivedState.derive(from: snapshot).outbox[0]
         #expect(entry.toolName == "Bash")
-        #expect(entry.actionTitle == "Codex 想运行 Bash，等你批准")
+        #expect(entry.actionTitle == "Codex 请求运行 Bash，等待批准")
     }
 
     @Test func highAndUnknownRiskNeedVerification() {
@@ -90,34 +99,38 @@ private func makeSnapshot(
         #expect(!RiskLevel(record: "med").needsVerification)
         #expect(!RiskLevel(record: "low").needsVerification)
     }
+
+    @Test func providerNativeApprovalIsNotPresentedAsDirectlyAnswerable() {
+        let snapshot = makeSnapshot(attention: [
+            makeAttention(id: "native", kind: "native_approval", createdAt: 100)
+        ])
+        let entry = DerivedState.derive(from: snapshot).openOutbox[0]
+        #expect(entry.kind == .nativeApproval)
+        #expect(entry.actionTitle == "允许 Bash？")
+    }
 }
 
 @Suite struct QuotaSlotTests {
-    @Test func alwaysExactlyThreeFixedSlots() {
+    @Test func missingQuotaDoesNotInventFixedWindows() {
         let derived = DerivedState.derive(from: makeSnapshot())
-        #expect(derived.quotaSlots.map(\.slot) == [.claude5h, .claude7d, .codexWeek])
-        for slot in derived.quotaSlots {
-            guard case .unavailable = slot.availability else {
-                Issue.record("missing entries must be unavailable, not 0%")
-                return
-            }
-        }
+        #expect(derived.quotaSlots.isEmpty)
     }
 
     @Test func availableEntryMapsRemainingPct() {
         let snapshot = makeSnapshot(quota: [
             QuotaEntry(
                 provider: "claude", window: "5h", status: "available",
-                usedPct: 32, remainingPct: 68, resetsAt: 2_000_000, source: "statusline",
+                usedPct: 32, remainingPct: 68, resetsAt: 1_784_193_000, source: "statusline",
                 capturedAt: 1_000_000, reason: nil
             )
         ])
         let slot = DerivedState.derive(from: snapshot).quotaSlots[0]
-        guard case .available(let pct, _, _) = slot.availability else {
+        guard case .available(let pct, let resetsAt, _) = slot.availability else {
             Issue.record("expected available")
             return
         }
         #expect(pct == 68)
+        #expect(resetsAt?.timeIntervalSince1970 == 1_784_193_000)
         #expect(!slot.isTight)
     }
 
@@ -129,8 +142,29 @@ private func makeSnapshot(
                 capturedAt: nil, reason: nil
             )
         ])
-        let slot = DerivedState.derive(from: snapshot).quotaSlots[2]
+        let slot = DerivedState.derive(from: snapshot).quotaSlots[0]
         #expect(slot.isTight)
+    }
+
+    @Test func keepsEveryRuntimeWindowAndMetadataInServerOrder() {
+        let snapshot = makeSnapshot(quota: [
+            QuotaEntry(
+                provider: "codex", window: "primary", status: "available",
+                usedPct: 10, remainingPct: 90, resetsAt: nil, source: "oauth_usage",
+                windowMinutes: 300, limitId: "codex", limitName: "主窗口",
+                planType: "Plus", capturedAt: 1_000, reason: nil
+            ),
+            QuotaEntry(
+                provider: "codex", window: "fable", status: "available",
+                usedPct: 20, remainingPct: 80, resetsAt: nil, source: "oauth_usage",
+                windowMinutes: 1_440, limitId: "fable", limitName: "Fable",
+                planType: "Plus", capturedAt: 1_000, reason: nil
+            ),
+        ])
+        let slots = DerivedState.derive(from: snapshot).quotaSlots
+        #expect(slots.map(\.title) == ["主窗口", "Fable"])
+        #expect(slots.map(\.planType) == ["Plus", "Plus"])
+        #expect(slots.map(\.windowMinutes) == [300, 1_440])
     }
 }
 
@@ -185,6 +219,29 @@ private func makeSnapshot(
         #expect(task.status == .waiting)
         #expect(task.openOutboxCount == 1)
     }
+
+    @Test func completionWaitingForConfirmationMarksFinishedTaskWaiting() {
+        let task = LaneTask(
+            session: makeSession(id: "x", execState: "response_finished"),
+            openAttention: [makeAttention(id: "done", kind: "completion", createdAt: 5)]
+        )
+        #expect(task.status == .waiting)
+        #expect(task.primaryAttentionKind == .completion)
+    }
+
+    @Test func snoozedAttentionKeepsSessionVisibleWithoutBlockingIt() {
+        let snoozed = makeAttention(
+            id: "later", kind: "question", createdAt: 5, state: "snoozed", sessionId: "x"
+        )
+        let snapshot = makeSnapshot(
+            sessions: [makeSession(id: "x", execState: "idle")],
+            attention: [snoozed]
+        )
+        let task = DerivedState.derive(from: snapshot).agentTasks[0]
+        #expect(task.status == .idle)
+        #expect(task.openOutboxCount == 0)
+        #expect(task.hasVisibleAttention)
+    }
 }
 
 @Suite struct PendingDecisionTests {
@@ -206,7 +263,7 @@ private func makeSnapshot(
             return
         }
         #expect(abs(deadline.timeIntervalSince(ZhFormat.date(fromMillis: createdAt).addingTimeInterval(3))) < 0.001)
-        #expect(pending?.summary.hasPrefix("已允许") == true)
+        #expect(pending?.summary.hasPrefix("将允许") == true)
     }
 
     @Test func oldConfirmedCommandsProduceNothing() {

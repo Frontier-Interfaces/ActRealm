@@ -44,9 +44,9 @@
             <div>
               <div class="heading-line">
                 <p class="panel-kicker">OUTBOX</p>
-                <span>需要你处理</span>
+                <span>需要处理</span>
               </div>
-              <p class="panel-subtitle" id="attention-summary">没有需要你处理的事项</p>
+              <p class="panel-subtitle" id="attention-summary">暂无需要处理的事项</p>
             </div>
             <span class="count-badge" id="attention-count">0</span>
           </div>
@@ -156,30 +156,30 @@
         <div class="reminder-list">
           <article class="reminder-row" data-rule="approval">
             <span class="reminder-dot approval"><i></i></span>
-            <div><strong>等待批准</strong><p>Agent 想运行命令，等你批准</p></div>
+            <div><strong>等待批准</strong><p>Agent 请求运行命令，等待批准</p></div>
             <div class="segmented-options">
-              <button type="button" data-value="ignore">不提醒</button><button type="button" data-value="list">仅列表</button>
+              <button type="button" data-value="ignore">关闭</button><button type="button" data-value="list">仅列表</button>
             </div>
           </article>
           <article class="reminder-row" data-rule="question">
             <span class="reminder-dot question"><i></i></span>
-            <div><strong>Agent 提问</strong><p>Agent 有问题需要你回答</p></div>
+            <div><strong>Agent 提问</strong><p>Agent 发出需要回答的问题</p></div>
             <div class="segmented-options">
-              <button type="button" data-value="ignore">不提醒</button><button type="button" data-value="list">仅列表</button>
+              <button type="button" data-value="ignore">关闭</button><button type="button" data-value="list">仅列表</button>
             </div>
           </article>
           <article class="reminder-row" data-rule="error">
             <span class="reminder-dot error"><i></i></span>
             <div><strong>出错 / 卡住</strong><p>Agent 报错或长时间无进展</p></div>
             <div class="segmented-options">
-              <button type="button" data-value="ignore">不提醒</button><button type="button" data-value="list">仅列表</button>
+              <button type="button" data-value="ignore">关闭</button><button type="button" data-value="list">仅列表</button>
             </div>
           </article>
           <article class="reminder-row" data-rule="completion">
             <span class="reminder-dot completion"><i></i></span>
             <div><strong>任务完成</strong><p>本轮修改完成，等待确认</p></div>
             <div class="segmented-options">
-              <button type="button" data-value="ignore">不提醒</button><button type="button" data-value="list">仅列表</button>
+              <button type="button" data-value="ignore">关闭</button><button type="button" data-value="list">仅列表</button>
             </div>
           </article>
           <article class="reminder-row sound-row">
@@ -216,17 +216,17 @@
 
       <section class="settings-glass metrics-settings">
         <div class="settings-section-heading metrics-heading">
-          <div><h3>我的使用统计</h3><span>本机累计 · 不发送遥测</span></div>
+          <div><h3>使用统计</h3><span>本机累计 · 不发送遥测</span></div>
           <button id="export-metrics" type="button">导出统计</button>
         </div>
         <div class="metrics-summary" id="metrics-summary" aria-live="polite"></div>
       </section>
 
       <div class="legacy-only" aria-hidden="true">
-        <select id="notify-approval"><option value="list">仅列表</option><option value="ignore">不提醒</option></select>
-        <select id="notify-question"><option value="list">仅列表</option><option value="ignore">不提醒</option></select>
-        <select id="notify-error"><option value="list">仅列表</option><option value="ignore">不提醒</option></select>
-        <select id="notify-completion"><option value="list">仅列表</option><option value="ignore">不提醒</option></select>
+        <select id="notify-approval"><option value="list">仅列表</option><option value="ignore">关闭</option></select>
+        <select id="notify-question"><option value="list">仅列表</option><option value="ignore">关闭</option></select>
+        <select id="notify-error"><option value="list">仅列表</option><option value="ignore">关闭</option></select>
+        <select id="notify-completion"><option value="list">仅列表</option><option value="ignore">关闭</option></select>
         <input id="mute-claude" type="checkbox">
         <input id="mute-codex" type="checkbox">
         <input id="codex-enhanced" type="checkbox">
@@ -234,7 +234,7 @@
         <span id="claude-bridge-status"></span>
         <button id="claude-bridge-action" type="button">开启</button>
         <select id="retention-days"><option value="30">30</option><option value="90">90</option><option value="180">180</option><option value="0">0</option></select>
-        <select id="display-profile"><option value="concise">简洁</option><option value="detailed">详细</option><option value="developer">开发者</option></select>
+        <select id="display-profile"><option value="concise">简洁</option><option value="detailed">详细</option><option value="developer">开发者</option><option value="custom">自定义</option></select>
         <div id="task-card-fields"></div>
       </div>
     </section>

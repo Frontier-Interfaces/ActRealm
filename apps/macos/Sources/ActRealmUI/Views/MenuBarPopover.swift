@@ -24,7 +24,7 @@ public struct MenuBarPopoverView: View {
                 }
             } else {
                 sectionLabel("OUTBOX")
-                Text("现在没有需要你处理的任务")
+                Text("暂无需要处理的事项")
                     .font(DT.body(11))
                     .foregroundStyle(DT.textWeak)
                     .padding(.vertical, 8)
@@ -138,7 +138,7 @@ public struct MenuBarPopoverView: View {
         if lane.provider == .gemini { return "gemini · notify-only" }
         if let top = lane.tasks.first {
             switch top.status {
-            case .waiting: return "\(lane.provider.displayName) · 等待你处理"
+            case .waiting: return "\(lane.provider.displayName) · 等待处理"
             case .running: return "\(lane.provider.displayName) · \(top.activity ?? "在跑")"
             case .failed: return "\(lane.provider.displayName) · 运行失败"
             case .done: return "\(lane.provider.displayName) · 本轮已完成"
@@ -196,6 +196,7 @@ public struct MenuBarPopoverView: View {
 
 private struct CompactApprovalCard: View {
     @EnvironmentObject var model: AppModel
+    @Environment(\.openWindow) private var openWindow
     @State private var confirmingAllow = false
     let entry: OutboxEntry
 
@@ -251,6 +252,7 @@ private struct CompactApprovalCard: View {
     private var kindLabel: String {
         switch entry.kind {
         case .approval: "PermissionRequest"
+        case .nativeApproval: "原界面批准"
         case .question: "提问"
         case .error: "运行出错"
         case .completion: "完成确认"
@@ -283,7 +285,17 @@ private struct CompactApprovalCard: View {
                 .buttonStyle(PillButtonStyle(rank: .secondary, fontSize: 11.5, horizontalPadding: 14))
             Button("Allow") { model.approve(entry) }
                 .buttonStyle(PillButtonStyle(rank: .primary, fontSize: 11.5, horizontalPadding: 14))
-        case .question, .error:
+        case .nativeApproval:
+            Button("打开应用") { Task { await model.jump(to: entry) } }
+                .buttonStyle(PillButtonStyle(rank: .primary, fontSize: 11.5, horizontalPadding: 14))
+        case .question:
+            Button("在 ActRealm 回答") {
+                model.revealSession(for: entry)
+                openWindow(id: "main")
+                NSApplication.shared.activate(ignoringOtherApps: true)
+            }
+            .buttonStyle(PillButtonStyle(rank: .primary, fontSize: 11.5, horizontalPadding: 14))
+        case .error:
             Button("稍后提醒") { model.snooze(entry) }
                 .buttonStyle(PillButtonStyle(rank: .secondary, fontSize: 11.5, horizontalPadding: 14))
             Button("标记已处理") { model.acknowledge(entry) }

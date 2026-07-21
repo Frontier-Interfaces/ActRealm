@@ -5,6 +5,86 @@ import Foundation
 public enum DemoData {
     private static let anchor = Date()
 
+    public static let setup = SetupInfo(
+        schemaVersion: 1,
+        firstRun: false,
+        providers: [
+            SetupInfo.ProviderSetup(
+                provider: "claude",
+                status: "connected",
+                cliInstalled: true,
+                desktopInstalled: true,
+                desktopAppPath: "/Applications/Claude.app",
+                reviewCommand: nil,
+                intent: "installed",
+                configPath: "~/.claude/settings.json",
+                ownedHandlers: 4,
+                expectedHandlers: 4,
+                binaryHealth: "current",
+                trustStatus: nil,
+                featureStatus: nil,
+                inlineEvents: nil,
+                canRepair: false,
+                realEventVerified: true
+            ),
+            SetupInfo.ProviderSetup(
+                provider: "codex",
+                status: "needs_trust",
+                cliInstalled: true,
+                desktopInstalled: true,
+                desktopAppPath: "/Applications/Codex.app",
+                reviewCommand: "/Applications/Codex.app/Contents/Resources/codex",
+                intent: "installed",
+                configPath: "~/.codex/config.toml",
+                ownedHandlers: 5,
+                expectedHandlers: 5,
+                binaryHealth: "current",
+                trustStatus: "review_required",
+                featureStatus: "enabled",
+                inlineEvents: nil,
+                canRepair: false,
+                realEventVerified: false
+            ),
+        ],
+        safety: SetupInfo.Safety(
+            backsUpBeforeWrite: true,
+            codexTrustIsManual: true,
+            repairRespectsRemoval: true
+        )
+    )
+
+    public static let settings = SettingsResponse(
+        settings: .defaults,
+        displayCatalog: [
+            DisplayField(id: "project", label: "项目", level: "detailed"),
+            DisplayField(id: "task", label: "任务摘要", level: "concise"),
+            DisplayField(id: "model", label: "模型", level: "detailed"),
+            DisplayField(id: "activity", label: "实时状态", level: "concise"),
+            DisplayField(id: "plan", label: "计划进度", level: "detailed"),
+            DisplayField(id: "tokens", label: "Token", level: "detailed"),
+            DisplayField(id: "cost", label: "估算 API 价格", level: "detailed"),
+            DisplayField(id: "context", label: "上下文占用", level: "detailed"),
+            DisplayField(id: "tool", label: "当前工具", level: "detailed"),
+            DisplayField(id: "permissionMode", label: "权限模式", level: "detailed"),
+            DisplayField(id: "subagents", label: "运行中的子 Agent", level: "detailed"),
+            DisplayField(id: "environment", label: "运行环境", level: "detailed"),
+            DisplayField(id: "recovery", label: "恢复状态", level: "detailed"),
+            DisplayField(id: "control", label: "托管能力", level: "detailed"),
+            DisplayField(id: "jump", label: "打开应用", level: "detailed"),
+            DisplayField(id: "titleSource", label: "标题来源", level: "developer"),
+            DisplayField(id: "sessionId", label: "ActRealm Session ID", level: "developer"),
+            DisplayField(id: "providerSessionId", label: "Provider Session ID", level: "developer"),
+            DisplayField(id: "providerTurnId", label: "Provider Turn ID", level: "developer"),
+            DisplayField(id: "lastEventAt", label: "最后事件时间", level: "developer"),
+        ],
+        claudeQuotaBridge: ClaudeQuotaBridge(
+            status: "installed",
+            configPath: "~/.claude/settings.json",
+            helperPath: "~/.actrealm/bin/claude-statusline",
+            customConflict: false
+        )
+    )
+
     public static func derivedState(now: Date = Date()) -> DerivedState {
         DerivedState.derive(from: snapshot(now: now), now: now)
     }
@@ -13,17 +93,21 @@ public enum DemoData {
         func millis(_ date: Date) -> UInt64 {
             UInt64(max(0, date.timeIntervalSince1970 * 1000))
         }
+        func seconds(_ date: Date) -> UInt64 {
+            UInt64(max(0, date.timeIntervalSince1970))
+        }
         func ago(_ seconds: TimeInterval) -> UInt64 { millis(now.addingTimeInterval(-seconds)) }
 
         let approvalRequestId = UUID(uuidString: "0198C2F4-0000-7000-8000-000000000001")!
         let undoCommandId = UUID(uuidString: "0198C2F4-0000-7000-8000-000000000002")!
+        let questionRequestId = UUID(uuidString: "0198C2F4-0000-7000-8000-000000000003")!
 
         let sessions = [
             SessionRecord(
                 id: "codex-upgrade", provider: "codex", providerSessionId: "s1",
                 project: "actrealm", title: "升级依赖并修复构建脚本", model: "gpt-5-codex",
                 execState: "awaiting_approval", approvalOwner: "widget",
-                activity: "等待你批准（Bash）", activitySince: ago(362),
+                activity: "等待批准（Bash）", activitySince: ago(362),
                 planDone: nil, planTotal: nil,
                 inputTokens: 48_329, outputTokens: 1_317, totalTokens: 48_329,
                 contextWindowTokens: 258_400, usageCapturedAt: ago(25),
@@ -43,7 +127,7 @@ public enum DemoData {
                 id: "claude-notes", provider: "claude", providerSessionId: "s3",
                 project: "docs-site", title: "整理发布说明草稿", model: "claude-sonnet-4.5",
                 execState: "idle", approvalOwner: nil,
-                activity: "等待你回答", activitySince: ago(130),
+                activity: "等待回答", activitySince: ago(130),
                 planDone: nil, planTotal: nil,
                 inputTokens: 84_200, outputTokens: 1_640, totalTokens: 85_840,
                 contextWindowTokens: nil, usageCapturedAt: ago(130),
@@ -83,15 +167,40 @@ public enum DemoData {
             ),
             AttentionRecord(
                 id: "att-question", sessionId: "claude-notes", provider: "claude",
-                project: "docs-site", requestId: nil, kind: "question",
+                project: "docs-site", requestId: questionRequestId, kind: "question",
                 title: "Agent 有问题", detail: "发布说明需要包含迁移指引吗？",
                 state: "open", risk: "low", riskNotes: [], commandPreview: nil,
-                expiresAt: nil, createdAt: ago(130), resolution: nil
+                expiresAt: millis(now.addingTimeInterval(20 * 60)), createdAt: ago(130), resolution: nil,
+                interaction: InteractivePrompt(
+                    requestId: questionRequestId,
+                    kind: "claude_question",
+                    provider: "claude",
+                    title: "发布说明范围",
+                    message: "请选择这次发布说明需要覆盖的内容。",
+                    expiresAt: millis(now.addingTimeInterval(20 * 60)),
+                    supportsNative: true,
+                    questions: [
+                        InteractiveQuestion(
+                            id: "migration",
+                            label: "迁移指引",
+                            prompt: "是否在主文中加入升级步骤？",
+                            inputType: "choice",
+                            multiSelect: false,
+                            isSecret: false,
+                            required: true,
+                            allowsOther: true,
+                            options: [
+                                InteractiveOption(label: "加入完整步骤", description: "适合有破坏性变更的发布"),
+                                InteractiveOption(label: "只链接详细指南", description: "保持发布说明简洁"),
+                            ]
+                        ),
+                    ]
+                )
             ),
             AttentionRecord(
                 id: "att-done", sessionId: "claude-landing", provider: "claude",
                 project: "example-app", requestId: nil, kind: "completion",
-                title: "任务已完成，等你确认", detail: nil,
+                title: "任务已完成，等待确认", detail: nil,
                 state: "open", risk: "low", riskNotes: [], commandPreview: nil,
                 expiresAt: nil, createdAt: ago(20), resolution: nil
             ),
@@ -142,19 +251,19 @@ public enum DemoData {
             QuotaEntry(
                 provider: "claude", window: "5h", status: "available",
                 usedPct: 32, remainingPct: 68,
-                resetsAt: millis(nextClock(hour: 14, minute: 30)),
+                resetsAt: seconds(nextClock(hour: 14, minute: 30)),
                 source: "statusline", capturedAt: ago(180), reason: nil
             ),
             QuotaEntry(
                 provider: "claude", window: "7d", status: "available",
                 usedPct: 59, remainingPct: 41,
-                resetsAt: millis(nextWeekday(6, hour: 9, minute: 0)),
+                resetsAt: seconds(nextWeekday(6, hour: 9, minute: 0)),
                 source: "statusline", capturedAt: ago(180), reason: nil
             ),
             QuotaEntry(
                 provider: "codex", window: "week", status: "available",
                 usedPct: 83, remainingPct: 17,
-                resetsAt: millis(nextWeekday(2, hour: 0, minute: 0)),
+                resetsAt: seconds(nextWeekday(2, hour: 0, minute: 0)),
                 source: "rollout_experimental", capturedAt: ago(300), reason: nil
             ),
         ]

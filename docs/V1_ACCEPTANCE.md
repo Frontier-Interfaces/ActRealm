@@ -391,6 +391,38 @@ without making the final v1 release complete.
 - [x] The verified merge commit is created locally.
 - [ ] Push is separately performed by the user.
 
+### Post-M14 - macOS/Web feature parity
+
+- [x] The macOS client decodes the current Runtime session, interaction,
+      capability, setup, settings, and dynamic quota fields instead of relying
+      on the older reduced native model.
+- [x] The native header and first-run empty states open one Claude/Codex Agent
+      setup center backed only by authenticated `/api/v1/setup` operations.
+- [x] Native OUTBOX separates request-keyed approval from Provider-native
+      observation and renders the real Claude/Codex interactive-question
+      schemas with memory-only secret drafts.
+- [x] Native task cards expose the Web safe-field catalog, activity/turn
+      timing, usage/context/cost, recovery/control/jump state, and managed
+      Codex Connector action.
+- [x] Native quota renders the Runtime's arbitrary windows and metadata; it no
+      longer invents fixed three-window placeholders when no quota exists.
+- [x] Native settings use the shared settings, Claude quota bridge, export,
+      metrics, clear-data, and controlled Runtime-restart contracts.
+- [x] Web task visibility/clear, reminder-ignore, sound, retention, and
+      Provider-mute semantics are represented in native state and focused
+      tests.
+- [x] macOS-only foreground scheduling remains separate and does not mutate or
+      infer Runtime approval/Provider capability state.
+- [x] The isolated ActRealmKit suite passes 39 tests, including current JSON
+      contract decoding and derived-state parity cases.
+- [ ] The repository macOS script completes a full SwiftUI build and test run.
+      The managed run first hits SwiftPM `sandbox_apply`; bypassing that local
+      sandbox exposes a pinned-SDK/compiler mismatch, and selecting the
+      matching SDK then exposes the missing `SwiftUIMacros` plugin.
+- [ ] The native UI is visually accepted and exercised against real Claude and
+      Codex setup, question, quota, jump, and Connector states.
+- [ ] Commit and push are separately authorized by the user.
+
 ## Publishing rule
 
 Each milestone is implemented test-first. A test-candidate branch push requires

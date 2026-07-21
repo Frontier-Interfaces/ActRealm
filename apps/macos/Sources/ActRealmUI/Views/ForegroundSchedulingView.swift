@@ -7,8 +7,6 @@ import SwiftUI
 public struct ForegroundSchedulingView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.snapshotRendering) private var snapshotRendering
-    @State private var showsMouseExplanation = false
-
     private let onBack: () -> Void
 
     public init(onBack: @escaping () -> Void) {
@@ -93,18 +91,44 @@ public struct ForegroundSchedulingView: View {
             Spacer(minLength: 16)
 
             HStack(spacing: 7) {
-                StatusDot(color: DT.greenDot, size: 7, glow: true)
-                Text("当前：运行正常")
+                StatusDot(color: pageStatusColor, size: 7, glow: pageStatusGlow)
+                Text(pageStatusText)
                     .font(.system(size: 11, weight: .bold))
             }
-            .foregroundStyle(DT.greenText)
+            .foregroundStyle(pageStatusForeground)
             .padding(.horizontal, 13)
             .padding(.vertical, 6)
-            .background(DT.greenBg, in: Capsule())
-            .overlay(Capsule().strokeBorder(DT.greenStroke, lineWidth: 1))
+            .background(pageStatusBackground, in: Capsule())
+            .overlay(Capsule().strokeBorder(pageStatusStroke, lineWidth: 1))
             .padding(.top, 5)
         }
         .padding(2)
+    }
+
+    private var pageStatusText: String {
+        if !settings.isEnabled { return "当前：调度已关闭" }
+        if settings.workspaceApps.isEmpty { return "当前：待绑定桌面" }
+        return "当前：运行正常"
+    }
+
+    private var pageStatusColor: Color {
+        settings.isEnabled && !settings.workspaceApps.isEmpty ? DT.greenDot : DT.amberDot
+    }
+
+    private var pageStatusGlow: Bool {
+        settings.isEnabled && !settings.workspaceApps.isEmpty
+    }
+
+    private var pageStatusForeground: Color {
+        settings.isEnabled && !settings.workspaceApps.isEmpty ? DT.greenText : DT.amberText
+    }
+
+    private var pageStatusBackground: Color {
+        settings.isEnabled && !settings.workspaceApps.isEmpty ? DT.greenBg : DT.amberBg
+    }
+
+    private var pageStatusStroke: Color {
+        settings.isEnabled && !settings.workspaceApps.isEmpty ? DT.greenStroke : DT.amberStroke
     }
 
     private var masterSwitches: some View {
@@ -112,7 +136,7 @@ public struct ForegroundSchedulingView: View {
             VStack(spacing: 0) {
                 SchedulingToggleRow(
                     title: "启用台前调度",
-                    detail: "关闭后不自动切换窗口，新任务只进入待处理列表，由你自己切换（会比较乱）",
+                    detail: "关闭后不自动切换窗口，新任务只进入待处理列表。",
                     isOn: binding(\.isEnabled)
                 )
 
@@ -141,42 +165,61 @@ public struct ForegroundSchedulingView: View {
                     Text("调度工作桌面")
                         .font(.system(size: 13, weight: .heavy))
                         .foregroundStyle(DT.textPrimary)
-                    Text("台前调度绑定在这个虚拟桌面上运行")
+                    Text("绑定放置协作应用的虚拟桌面")
                         .font(DT.body(11))
                         .foregroundStyle(DT.textWeak)
                     Spacer()
-                    WorkspaceReadinessPill(status: workspace)
+                    if settings.workspaceApps.isEmpty {
+                        Text("尚未绑定")
+                            .font(.system(size: 10.5, weight: .bold))
+                            .foregroundStyle(DT.amberText)
+                    } else {
+                        WorkspaceReadinessPill(status: workspace)
+                    }
                 }
 
-                HStack(spacing: 10) {
-                    WorkspaceMetric(title: "当前桌面") {
-                        HStack(spacing: 7) {
-                            StatusDot(color: DT.logoTint, size: 9, glow: true)
-                            Text("工作桌面 2")
+                if settings.workspaceApps.isEmpty {
+                    HStack(alignment: .center, spacing: 16) {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("先选择协作桌面")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundStyle(DT.textPrimary)
+                            Text("选择窗口会跟随虚拟桌面显示。切换到放置 Claude、Codex、Chrome 等应用的桌面后，绑定当前桌面即可。")
+                                .font(DT.body(11))
+                                .foregroundStyle(DT.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
+                        Spacer()
+                        Button("选择协作桌面…") {
+                            model.beginForegroundWorkspaceSelection()
+                        }
+                        .buttonStyle(.borderedProminent)
                     }
-                    WorkspaceMetric(title: "ActRealm 工作区") {
-                        WorkspaceAvailabilityValue(
-                            available: workspace.isActRealmWorkspaceReady,
-                            readyText: "已就位",
-                            unavailableText: "未就位"
-                        )
-                    }
-                    WorkspaceMetric(title: "目标 Agent") {
-                        WorkspaceAvailabilityValue(
-                            available: workspace.isAgentAvailable,
-                            readyText: "可在此打开",
-                            unavailableText: "当前未运行"
-                        )
-                    }
-                    WorkspaceMetric(title: "鼠标位置") {
-                        HStack(spacing: 7) {
-                            StatusDot(
-                                color: workspace.isSchedulingWorkspaceActive ? DT.greenDot : DT.amberDot,
-                                size: 9
+                } else {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 8) {
+                            ForEach(settings.workspaceApps) { application in
+                                Text(application.name)
+                                    .font(.system(size: 10.5, weight: .semibold))
+                                    .foregroundStyle(DT.textSecondary)
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 4)
+                                    .background(DT.neutralBadgeBg, in: Capsule())
+                            }
+                            Spacer()
+                        }
+
+                        HStack {
+                            Label(
+                                workspace.isSchedulingWorkspaceActive ? "当前位于协作桌面" : "当前位于其他桌面",
+                                systemImage: workspace.isSchedulingWorkspaceActive ? "checkmark.circle.fill" : "circle.dashed"
                             )
-                            Text(workspace.isSchedulingWorkspaceActive ? "调度工作桌面" : "其他工作桌面")
-                                .foregroundStyle(workspace.isSchedulingWorkspaceActive ? DT.greenText : DT.amberText)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(workspace.isSchedulingWorkspaceActive ? DT.greenText : DT.textWeak)
+                            Spacer()
+                            Button("测试调度") { model.testForegroundScheduling() }
+                            Button("重新选择…") { model.beginForegroundWorkspaceSelection() }
+                            Button("清除绑定", role: .destructive) { model.clearForegroundWorkspaceBinding() }
                         }
                     }
                 }
@@ -190,7 +233,7 @@ public struct ForegroundSchedulingView: View {
         SchedulingPageCard {
             VStack(alignment: .leading, spacing: 15) {
                 HStack(alignment: .firstTextBaseline, spacing: 9) {
-                    Text("当任务需要你时")
+                    Text("当任务需要处理时")
                         .font(.system(size: 14, weight: .heavy))
                         .foregroundStyle(DT.textPrimary)
                     Text("三种到达策略互斥，选一个")
@@ -203,7 +246,7 @@ public struct ForegroundSchedulingView: View {
                         strategy: .immediate,
                         selected: settings.strategy == .immediate,
                         title: "立即打开 Agent",
-                        detail: "任务需要你时，直接在调度工作桌面打开对应 Agent。",
+                        detail: "任务需要处理时，直接在协作桌面打开对应 Agent。",
                         steps: [
                             FlowToken("任务到达", tone: .neutral),
                             FlowToken("Agent 前台", tone: .blue),
@@ -298,10 +341,10 @@ public struct ForegroundSchedulingView: View {
                     SettingsInsetRow {
                         HStack(spacing: 14) {
                             VStack(alignment: .leading, spacing: 3) {
-                                Text("等待用户进入当前工作桌面")
+                                Text("等待协作桌面出现")
                                     .font(.system(size: 12.5, weight: .bold))
                                     .foregroundStyle(DT.textPrimary)
-                                Text("超时仍未进入调度桌面，则恢复 ActRealm 工作区")
+                                Text("超时仍未检测到已绑定应用，则恢复 ActRealm 工作区")
                                     .font(DT.body(10.5))
                                     .foregroundStyle(DT.textWeak)
                             }
@@ -317,25 +360,6 @@ public struct ForegroundSchedulingView: View {
                     .opacity(settings.returnsToActRealmWorkspace ? 1 : 0.4)
                     .allowsHitTesting(settings.returnsToActRealmWorkspace)
 
-                    Button {
-                        withAnimation(.easeOut(duration: 0.24)) {
-                            showsMouseExplanation.toggle()
-                        }
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: showsMouseExplanation ? "chevron.down" : "chevron.right")
-                                .font(.system(size: 9, weight: .bold))
-                            Text("鼠标如何判断是否接收？（点开看示意图）")
-                                .font(.system(size: 11.5, weight: .bold))
-                        }
-                        .foregroundStyle(DT.blueText)
-                    }
-                    .buttonStyle(.plain)
-
-                    if showsMouseExplanation {
-                        MouseAcceptanceExplanation(waitSeconds: settings.acceptanceSeconds)
-                            .transition(.move(edge: .top).combined(with: .opacity))
-                    }
                 }
                 .opacity(available ? 1 : 0.5)
                 .allowsHitTesting(available)
@@ -1005,7 +1029,7 @@ private struct RulePreviewContent: View {
         guard settings.isEnabled else {
             return [
                 .init("新任务", tone: .neutral),
-                .init("进入待处理列表", tone: .blue, branch: "你自己切换窗口处理", branchTone: .neutral),
+                .init("进入待处理列表", tone: .blue, branch: "手动切换窗口处理", branchTone: .neutral),
             ]
         }
         switch settings.strategy {
@@ -1036,14 +1060,14 @@ private struct RulePreviewContent: View {
             return [
                 .init("新任务", tone: .neutral),
                 .init("进入待处理列表", tone: .blue),
-                .init("你手动打开", tone: .green, branch: "手动打开，无需接收倒计时", branchTone: .neutral),
+                .init("手动打开", tone: .green, branch: "手动打开，无需接收倒计时", branchTone: .neutral),
             ]
         }
     }
 
     private var summary: String {
         guard settings.isEnabled else {
-            return "台前调度已关闭：新任务只进入待处理列表，由你手动切换窗口（可能比较乱）"
+            return "台前调度已关闭：新任务只进入待处理列表，需手动切换窗口"
         }
         switch settings.strategy {
         case .immediate:
@@ -1057,7 +1081,7 @@ private struct RulePreviewContent: View {
                 : ""
             return "先在 ActRealm 工作区提醒 \(settings.reminderSeconds) 秒，未处理再自动打开 Agent\(ending)"
         case .actRealmWorkspace:
-            return "任务只进入待处理列表，不自动切换窗口，由你手动打开"
+            return "任务只进入待处理列表，不自动切换窗口，需手动打开"
         }
     }
 }

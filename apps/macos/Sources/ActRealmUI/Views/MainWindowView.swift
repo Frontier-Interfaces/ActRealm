@@ -1,33 +1,34 @@
+import AppKit
 import ActRealmKit
 import SwiftUI
 
 public enum MainWindowPage: Sendable, Hashable {
     case actRealmWorkspace
+    case agentSetup
     case foregroundScheduling
 }
 
 /// Native SwiftUI reproduction of `ActRealm Interactive Demo.dc.html`.
-/// The hidden native title bar keeps real macOS traffic-light controls while
-/// this view supplies the interaction model's floating glass header.
+/// The native title bar is transparent: macOS keeps ownership of the window
+/// controls while the app header shares the same uninterrupted background.
 public struct MainWindowView: View {
     public init(initialPage: MainWindowPage = .actRealmWorkspace) {
         _page = State(initialValue: initialPage)
     }
 
     @EnvironmentObject private var model: AppModel
-    @State private var showingRuntimeMonitor = false
+    @Environment(\.openWindow) private var openWindow
     @State private var page: MainWindowPage
 
     public var body: some View {
         VStack(spacing: 0) {
-            WindowHeader(
+            IntegratedWindowHeader(
                 page: page,
+                openWorkspace: { switchPage(to: .actRealmWorkspace) },
+                openSetup: { switchPage(to: .agentSetup) },
                 openScheduling: { switchPage(to: .foregroundScheduling) },
-                openRuntime: { showingRuntimeMonitor = true }
+                openSettings: { openWindow(id: "settings") }
             )
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.horizontal, 16)
-                .padding(.top, 16)
 
             Group {
                 if page == .actRealmWorkspace {
@@ -38,9 +39,11 @@ public struct MainWindowView: View {
                         HStack(spacing: gap) {
                             OutboxSection()
                                 .frame(width: available * 0.30)
-                            AgentTasksSection()
+                            AgentTasksSection(
+                                onOpenSetup: { switchPage(to: .agentSetup) }
+                            )
                                 .frame(width: available * 0.48)
-                            QuotaSection { showingRuntimeMonitor = true }
+                            QuotaSection()
                                 .frame(width: available * 0.22)
                         }
                     }
@@ -48,6 +51,11 @@ public struct MainWindowView: View {
                     .padding(.top, 14)
                     .padding(.bottom, 14)
                     .transition(.opacity.combined(with: .scale(scale: 0.99)))
+                } else if page == .agentSetup {
+                    AgentSetupView {
+                        switchPage(to: .actRealmWorkspace)
+                    }
+                    .transition(.opacity.combined(with: .move(edge: .trailing)))
                 } else {
                     ForegroundSchedulingView {
                         switchPage(to: .actRealmWorkspace)
@@ -65,9 +73,7 @@ public struct MainWindowView: View {
             maxHeight: .infinity
         )
         .modifier(WindowGlassBackground())
-        .sheet(isPresented: $showingRuntimeMonitor) {
-            RuntimeMonitorView().environmentObject(model)
-        }
+        .ignoresSafeArea(.container, edges: .top)
         .overlay(alignment: .bottom) {
             if let toast = model.toastMessage {
                 StatusToast(text: toast)
@@ -76,12 +82,21 @@ public struct MainWindowView: View {
                     .allowsHitTesting(false)
             }
         }
+        .overlay(alignment: .bottomTrailing) {
+            RuntimeLiveStatus()
+                .padding(.trailing, 18)
+                .padding(.bottom, 10)
+        }
         .animation(.easeOut(duration: 0.22), value: model.toastMessage)
         .animation(.easeOut(duration: 0.25), value: page)
         .onChange(of: model.foregroundDispatch?.phase) { _, phase in
             if phase == .returnedToActRealmWorkspace {
                 switchPage(to: .actRealmWorkspace)
             }
+        }
+        .onChange(of: model.notificationPulse) { _, _ in
+            guard model.uiSettings.soundEnabled else { return }
+            NSSound.beep()
         }
     }
 
@@ -91,38 +106,186 @@ public struct MainWindowView: View {
     }
 }
 
-private struct WindowHeader: View {
+private struct IntegratedWindowHeader: View {
     @EnvironmentObject private var model: AppModel
     let page: MainWindowPage
+    let openWorkspace: () -> Void
+    let openSetup: () -> Void
     let openScheduling: () -> Void
-    let openRuntime: () -> Void
+    let openSettings: () -> Void
 
     var body: some View {
         HStack(spacing: 10) {
+            WindowBrand()
+            if shouldShowAgentSetupNotice {
+                AgentConnectionButton(action: openSetup)
+            }
+            Spacer(minLength: 20)
+
+            if page != .actRealmWorkspace {
+                Button(action: openWorkspace) {
+                    Label("工作区", systemImage: "square.grid.3x3")
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundStyle(DT.textSecondary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(DT.cardMedium, in: Capsule())
+                        .overlay(Capsule().strokeBorder(DT.neutralBadgeStroke, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .help("返回 ActRealm 工作区")
+            }
+
+            SchedulingNavigationButton(
+                selected: page == .foregroundScheduling,
+                action: openScheduling
+            )
+
+            Button(action: openSettings) {
+                Label("设置", systemImage: "gearshape")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(DT.textSecondary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(DT.cardMedium, in: Capsule())
+                    .overlay(Capsule().strokeBorder(DT.neutralBadgeStroke, lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+            .focusable(false)
+            .help("打开 ActRealm 设置")
+
+            if !model.bridgeStatus.isListening {
+                Button(action: openSettings) {
+                    Label(runtimeIssueLabel, systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundStyle(DT.redText)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(DT.redBg, in: Capsule())
+                        .overlay(Capsule().strokeBorder(DT.redStroke, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .help("打开设置检查本机服务")
+            }
+        }
+        .padding(.leading, 82)
+        .padding(.trailing, 16)
+        .frame(height: 34)
+        .contentShape(Rectangle())
+    }
+
+    private var shouldShowAgentSetupNotice: Bool {
+        model.setupInfo == nil || model.isFirstRun || model.pendingAgentSetupCount > 0
+    }
+
+    private var runtimeIssueLabel: String {
+        switch model.bridgeStatus {
+        case .starting: "服务启动中"
+        case .absent: "服务未连接"
+        case .listening: ""
+        }
+    }
+}
+
+private struct RuntimeLiveStatus: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        HStack(spacing: 7) {
+            StatusDot(color: color, size: 6, glow: model.bridgeStatus.isListening)
+            Text(status)
+                .font(.system(size: 9.5, weight: .semibold))
+            Text("·")
+                .foregroundStyle(DT.textFaint)
+            Text("同步 \(model.lastSyncAt.map(ZhFormat.syncClock) ?? "—")")
+                .font(.system(size: 9.5))
+        }
+        .foregroundStyle(DT.textWeak)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(DT.cardMedium, in: Capsule())
+        .overlay(Capsule().strokeBorder(DT.neutralBadgeStroke, lineWidth: 1))
+        .allowsHitTesting(false)
+    }
+
+    private var status: String {
+        switch model.bridgeStatus {
+        case .listening: "Runtime 在线"
+        case .starting: "Runtime 启动中"
+        case .absent: "Runtime 未连接"
+        }
+    }
+
+    private var color: Color {
+        switch model.bridgeStatus {
+        case .listening: DT.greenDot
+        case .starting: DT.amberDot
+        case .absent: DT.redText
+        }
+    }
+}
+
+private struct WindowBrand: View {
+    var body: some View {
+        HStack(spacing: 7) {
             LogoMark(barWidth: 3, heights: [6, 11, 8])
                 .frame(width: 14, height: 12, alignment: .bottom)
             Text("ActRealm")
                 .font(.system(size: 14, weight: .bold))
                 .foregroundStyle(DT.textStrong)
-            Spacer(minLength: 20)
-            SchedulingNavigationButton(
-                selected: page == .foregroundScheduling,
-                action: openScheduling
-            )
-            BridgeChip(action: openRuntime)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
-        .frame(height: 42)
-        .liquidGlassSurface(
-            tint: DT.cardSoft.opacity(0.2),
-            radius: 16,
-            interactive: false,
-            stroke: DT.hairline,
-            shadow: DT.cardShadow.opacity(0.65),
-            shadowRadius: 15,
-            shadowY: 6
-        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("ActRealm")
+    }
+}
+
+private struct AgentConnectionButton: View {
+    @EnvironmentObject private var model: AppModel
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                StatusDot(color: color, size: 6, glow: model.connectedAgentCount > 0)
+                Text(label)
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(textColor)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(background, in: Capsule())
+            .overlay(Capsule().strokeBorder(stroke, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .help("打开 Agent 接入中心")
+    }
+
+    private var label: String {
+        guard model.setupInfo != nil else { return "正在检测 Agent" }
+        if model.isFirstRun { return "未连接 Agent" }
+        if model.pendingAgentSetupCount > 0 {
+            return model.connectedAgentCount > 0
+                ? "\(model.connectedAgentCount) 个已接入 · \(model.pendingAgentSetupCount) 待处理"
+                : "\(model.pendingAgentSetupCount) 项接入待处理"
+        }
+        return "管理 Agent"
+    }
+
+    private var color: Color {
+        model.pendingAgentSetupCount > 0 || model.isFirstRun ? DT.amberDot
+            : model.connectedAgentCount > 0 ? DT.greenDot : DT.textFaint
+    }
+    private var textColor: Color {
+        model.pendingAgentSetupCount > 0 || model.isFirstRun ? DT.amberText
+            : model.connectedAgentCount > 0 ? DT.greenText : DT.textWeak
+    }
+    private var background: Color {
+        model.pendingAgentSetupCount > 0 || model.isFirstRun ? DT.amberBg
+            : model.connectedAgentCount > 0 ? DT.greenBg : DT.cardFaint
+    }
+    private var stroke: Color {
+        model.pendingAgentSetupCount > 0 || model.isFirstRun ? DT.amberStroke
+            : model.connectedAgentCount > 0 ? DT.greenStroke : DT.hairline
     }
 }
 
@@ -152,69 +315,6 @@ private struct SchedulingNavigationButton: View {
         .buttonStyle(.plain)
         .focusable(false)
         .help(selected ? "当前正在查看台前调度" : "打开台前调度")
-    }
-}
-
-private struct BridgeChip: View {
-    @EnvironmentObject private var model: AppModel
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 6) {
-                StatusDot(color: dotColor, size: 6)
-                Text(label)
-                    .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundStyle(textColor)
-            }
-            .padding(.horizontal, 11)
-            .padding(.vertical, 4)
-            .background(tint, in: Capsule())
-            .overlay(Capsule().strokeBorder(stroke, lineWidth: 1))
-        }
-        .buttonStyle(.plain)
-        .focusable(false)
-        .help("打开 Runtime 监控、诊断与重启")
-    }
-
-    private var label: String {
-        switch model.bridgeStatus {
-        case .listening: "bridge.sock"
-        case .starting: "启动中…"
-        case .absent: "Runtime 未连接"
-        }
-    }
-
-    private var dotColor: Color {
-        switch model.bridgeStatus {
-        case .listening: DT.greenDot
-        case .starting: DT.amberDot
-        case .absent: DT.redText
-        }
-    }
-
-    private var textColor: Color {
-        switch model.bridgeStatus {
-        case .listening: DT.greenText
-        case .starting: DT.amberText
-        case .absent: DT.redText
-        }
-    }
-
-    private var tint: Color {
-        switch model.bridgeStatus {
-        case .listening: DT.greenBg
-        case .starting: DT.amberBg
-        case .absent: DT.redBg
-        }
-    }
-
-    private var stroke: Color {
-        switch model.bridgeStatus {
-        case .listening: DT.greenStroke
-        case .starting: DT.amberStroke
-        case .absent: DT.redStroke
-        }
     }
 }
 

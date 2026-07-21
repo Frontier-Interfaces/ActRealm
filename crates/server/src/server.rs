@@ -52,6 +52,7 @@ const TASK_CARD_DISPLAY_FIELDS: &[&str] = &[
     "activity",
     "plan",
     "tokens",
+    "cost",
     "context",
     "tool",
     "permissionMode",
@@ -1387,6 +1388,7 @@ struct UiSettings {
     retention_days: u32,
     display_profile: String,
     task_card_fields: Vec<String>,
+    display_fields_version: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1429,6 +1431,7 @@ impl Default for UiSettings {
                 "activity".to_owned(),
                 "plan".to_owned(),
                 "tokens".to_owned(),
+                "cost".to_owned(),
                 "context".to_owned(),
                 "tool".to_owned(),
                 "subagents".to_owned(),
@@ -1437,6 +1440,7 @@ impl Default for UiSettings {
                 "control".to_owned(),
                 "jump".to_owned(),
             ],
+            display_fields_version: 2,
         }
     }
 }
@@ -1458,9 +1462,9 @@ impl UiSettings {
         }
         if !matches!(
             self.display_profile.as_str(),
-            "concise" | "detailed" | "developer"
+            "concise" | "detailed" | "developer" | "custom"
         ) {
-            return Err("displayProfile must be concise, detailed, or developer");
+            return Err("displayProfile must be concise, detailed, developer, or custom");
         }
         if self.task_card_fields.len() > TASK_CARD_DISPLAY_FIELDS.len() {
             return Err("taskCardFields contains too many fields");
@@ -1572,10 +1576,38 @@ async fn update_settings(
 
 fn load_ui_settings(state: &AppState) -> Result<UiSettings, StoreError> {
     match state.store.read_setting(SETTINGS_KEY)? {
-        Some(value) => serde_json::from_str::<UiSettings>(&value)
-            .map_err(|error| StoreError::Storage(format!("settings JSON is invalid: {error}"))),
+        Some(value) => decode_ui_settings(&value),
         None => Ok(UiSettings::default()),
     }
+}
+
+fn decode_ui_settings(encoded: &str) -> Result<UiSettings, StoreError> {
+    let raw = serde_json::from_str::<Value>(encoded)
+        .map_err(|error| StoreError::Storage(format!("settings JSON is invalid: {error}")))?;
+    let is_legacy_display_fields = raw.get("displayFieldsVersion").is_none();
+    let mut settings = serde_json::from_value::<UiSettings>(raw)
+        .map_err(|error| StoreError::Storage(format!("settings JSON is invalid: {error}")))?;
+
+    if is_legacy_display_fields {
+        if let Some(token_index) = settings
+            .task_card_fields
+            .iter()
+            .position(|field| field == "tokens")
+        {
+            if !settings
+                .task_card_fields
+                .iter()
+                .any(|field| field == "cost")
+            {
+                settings
+                    .task_card_fields
+                    .insert(token_index.saturating_add(1), "cost".to_owned());
+            }
+        }
+        settings.display_fields_version = 2;
+    }
+
+    Ok(settings)
 }
 
 fn settings_value(state: &AppState) -> Result<Value, String> {
@@ -1587,20 +1619,21 @@ fn settings_value(state: &AppState) -> Result<Value, String> {
     Ok(json!({
         "settings": settings,
         "displayCatalog": [
-            { "id": "project", "label": "项目名", "level": "detailed" },
-            { "id": "task", "label": "任务内容", "level": "concise" },
+            { "id": "project", "label": "项目", "level": "detailed" },
+            { "id": "task", "label": "任务摘要", "level": "concise" },
             { "id": "model", "label": "模型", "level": "detailed" },
-            { "id": "activity", "label": "实时状态与本轮时间", "level": "concise" },
+            { "id": "activity", "label": "实时状态", "level": "concise" },
             { "id": "plan", "label": "计划进度", "level": "detailed" },
-            { "id": "tokens", "label": "会话 Token 与估算价格", "level": "detailed" },
+            { "id": "tokens", "label": "Token", "level": "detailed" },
+            { "id": "cost", "label": "估算 API 价格", "level": "detailed" },
             { "id": "context", "label": "上下文占用", "level": "detailed" },
             { "id": "tool", "label": "当前工具", "level": "detailed" },
             { "id": "permissionMode", "label": "权限模式", "level": "detailed" },
             { "id": "subagents", "label": "运行中的子 Agent", "level": "detailed" },
             { "id": "environment", "label": "运行环境", "level": "detailed" },
             { "id": "recovery", "label": "恢复状态", "level": "detailed" },
-            { "id": "control", "label": "控制能力", "level": "detailed" },
-            { "id": "jump", "label": "跳转能力", "level": "detailed" },
+            { "id": "control", "label": "托管能力", "level": "detailed" },
+            { "id": "jump", "label": "打开应用", "level": "detailed" },
             { "id": "titleSource", "label": "标题来源", "level": "developer" },
             { "id": "sessionId", "label": "ActRealm Session ID", "level": "developer" },
             { "id": "providerSessionId", "label": "Provider Session ID", "level": "developer" },
@@ -3369,7 +3402,7 @@ mod tests {
             assert_eq!(metrics_export["scope"], "metrics_only");
             assert!(metrics_export.get("tables").is_none());
         });
-        assert!(INDEX_HTML.contains("我的使用统计"));
+        assert!(INDEX_HTML.contains("使用统计"));
         assert!(INDEX_HTML.contains("导出统计"));
         assert!(APP_JS.contains("widgetApprovals"));
         assert!(APP_JS.contains("banner_shown"));
@@ -3427,6 +3460,40 @@ mod tests {
         assert_eq!(legacy.display_profile, "detailed");
         assert!(legacy.task_card_fields.contains(&"activity".to_owned()));
         legacy.validate().unwrap();
+
+        let migrated =
+            decode_ui_settings(r#"{"displayProfile":"custom","taskCardFields":["tokens"]}"#)
+                .unwrap();
+        assert_eq!(
+            migrated.task_card_fields,
+            vec!["tokens".to_owned(), "cost".to_owned()]
+        );
+        assert_eq!(migrated.display_fields_version, 2);
+
+        let independent = decode_ui_settings(
+            r#"{"displayProfile":"custom","displayFieldsVersion":2,"taskCardFields":["tokens"]}"#,
+        )
+        .unwrap();
+        assert_eq!(independent.task_card_fields, vec!["tokens".to_owned()]);
+
+        let custom = UiSettings {
+            display_profile: "custom".to_owned(),
+            task_card_fields: vec!["project".to_owned(), "activity".to_owned()],
+            ..UiSettings::default()
+        };
+        custom.validate().unwrap();
+
+        for independent_usage_field in ["tokens", "cost"] {
+            let custom = UiSettings {
+                display_profile: "custom".to_owned(),
+                task_card_fields: vec![independent_usage_field.to_owned()],
+                ..UiSettings::default()
+            };
+            custom.validate().unwrap();
+        }
+        assert!(UiSettings::default()
+            .task_card_fields
+            .contains(&"cost".to_owned()));
 
         for unsafe_field in ["raw", "payload", "fullCommand", "transcript"] {
             let unsafe_settings = UiSettings {

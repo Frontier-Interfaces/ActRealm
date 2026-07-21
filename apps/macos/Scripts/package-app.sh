@@ -55,10 +55,13 @@ fi
 echo "==> Assembling $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$APP/Contents/Resources"
+mkdir -p "$APP/Contents/Resources/ProviderIcons"
 
 cp "$SWIFT_BIN" "$APP/Contents/MacOS/ActRealm"
 cp "$RUST_REPO/target/release/actrealm" "$APP/Contents/Helpers/actrealm"
 cp "$INFO_PLIST" "$APP/Contents/Info.plist"
+cp "$REPO_ROOT/web/assets/claude.png" "$APP/Contents/Resources/ProviderIcons/claude.png"
+cp "$REPO_ROOT/web/assets/codex.png" "$APP/Contents/Resources/ProviderIcons/codex.png"
 plutil -lint "$APP/Contents/Info.plist"
 
 echo "==> Codesigning (ad-hoc)"
