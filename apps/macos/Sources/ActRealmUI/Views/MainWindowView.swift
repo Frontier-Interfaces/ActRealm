@@ -68,7 +68,9 @@ public struct MainWindowView: View {
             minWidth: 1120,
             idealWidth: 1440,
             maxWidth: .infinity,
-            minHeight: 650,
+            // Fits a 600-point-tall display after macOS reserves space for
+            // the menu bar, while each lane keeps its own scrolling content.
+            minHeight: 500,
             idealHeight: 820,
             maxHeight: .infinity
         )
