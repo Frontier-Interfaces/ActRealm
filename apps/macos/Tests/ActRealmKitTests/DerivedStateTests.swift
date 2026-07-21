@@ -174,6 +174,16 @@ private func makeSnapshot(
         #expect(Set(derived.lanes.map(\.provider)) == Set([.claude, .codex]))
     }
 
+    @Test func futureProviderGetsItsOwnLaneWithoutNativeClientChanges() {
+        let snapshot = makeSnapshot(sessions: [
+            makeSession(id: "cursor-1", provider: "cursor-agent", execState: "thinking")
+        ])
+        let derived = DerivedState.derive(from: snapshot)
+        let provider = ProviderKind(record: "cursor-agent")
+        #expect(provider == .custom("cursor-agent"))
+        #expect(derived.lanes.first(where: { $0.provider == provider })?.tasks.count == 1)
+    }
+
     @Test func newestTaskIsAlwaysLeftmostInsideLane() {
         let snapshot = makeSnapshot(
             sessions: [
@@ -262,6 +272,7 @@ private func makeSnapshot(
             Issue.record("expected undoable phase")
             return
         }
+        #expect(pending?.attentionID == "att")
         #expect(abs(deadline.timeIntervalSince(ZhFormat.date(fromMillis: createdAt).addingTimeInterval(3))) < 0.001)
         #expect(pending?.summary.hasPrefix("将允许") == true)
     }

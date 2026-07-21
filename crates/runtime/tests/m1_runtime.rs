@@ -117,7 +117,7 @@ fn existing_v1_database_adds_task_titles_without_losing_sessions() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        9
+        10
     );
     let usage_columns = connection
         .prepare("PRAGMA table_info(session_usage)")
@@ -651,7 +651,15 @@ fn versioned_fixtures_replay_idempotently_into_wal() {
     let snapshot = store.snapshot().unwrap();
     assert_eq!(snapshot.event_count, envelopes.len() as u64);
     assert_eq!(snapshot.sessions.len(), 2);
-    assert_eq!(snapshot.attention.len(), 2);
+    assert_eq!(snapshot.attention.len(), 4);
+    assert_eq!(
+        snapshot
+            .attention
+            .iter()
+            .filter(|item| item.kind == "completion" && item.state == "open")
+            .count(),
+        2
+    );
     assert!(snapshot
         .sessions
         .iter()
@@ -1975,6 +1983,109 @@ fn a_new_prompt_closes_attention_left_open_by_the_previous_turn() {
     );
     assert_eq!(snapshot.sessions[0].exec_state, "thinking");
     assert_eq!(snapshot.sessions[0].approval_owner, None);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn successful_turn_without_write_tools_still_creates_completion_attention() {
+    let root = temp_root("read-only-completion");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(request_at(
+            Provider::Codex,
+            "UserPromptSubmit",
+            "read-only-session",
+            Some("turn-1"),
+            None,
+            70_000,
+        ))
+        .unwrap();
+    store
+        .ingest(request_at(
+            Provider::Codex,
+            "Stop",
+            "read-only-session",
+            Some("turn-1"),
+            None,
+            70_001,
+        ))
+        .unwrap();
+
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.sessions[0].exec_state, "response_finished");
+    let completion = snapshot
+        .attention
+        .iter()
+        .find(|item| item.kind == "completion")
+        .unwrap();
+    assert_eq!(completion.state, "open");
+    assert_eq!(completion.title, "任务已完成，等你确认");
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn codex_plan_updates_persist_real_steps_and_progress() {
+    let root = temp_root("codex-plan");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(BridgeRequest::from_provider_event_at(
+            Provider::Codex,
+            "PlanUpdated",
+            "plan-session",
+            Some("turn-plan"),
+            json!({
+                "plan": [
+                    {"step":"读取现有实现", "status":"completed"},
+                    {"step":"修复通知语义", "status":"inProgress"},
+                    {"step":"运行门禁", "status":"pending"}
+                ],
+                "explanation":"以 Provider 官方事件为事实来源"
+            }),
+            71_000,
+        ))
+        .unwrap();
+
+    let snapshot = store.snapshot().unwrap();
+    let session = &snapshot.sessions[0];
+    assert_eq!((session.plan_done, session.plan_total), (Some(1), Some(3)));
+    assert_eq!(session.plan_steps.len(), 3);
+    assert_eq!(session.plan_steps[1].text, "修复通知语义");
+    assert_eq!(session.plan_steps[1].status, "in_progress");
+    assert_eq!(
+        session.plan_steps[0].detail.as_deref(),
+        Some("以 Provider 官方事件为事实来源")
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn codex_provider_owned_permission_never_opens_a_user_approval_item() {
+    let root = temp_root("provider-owned-pretool");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"PreToolUse",
+                "session_id":"auto-review-session",
+                "turn_id":"turn-1",
+                "tool_name":"request_permissions",
+                "_approvals_reviewer":"auto_review"
+            }),
+            72_000,
+        ))
+        .unwrap();
+
+    let snapshot = store.snapshot().unwrap();
+    assert!(snapshot.attention.is_empty());
+    assert_eq!(snapshot.sessions[0].exec_state, "thinking");
+    assert_eq!(
+        snapshot.sessions[0].approval_owner.as_deref(),
+        Some("provider")
+    );
     drop(store);
     fs::remove_dir_all(root).unwrap();
 }

@@ -52,6 +52,12 @@ pub struct CodexThread {
     pub status: String,
     pub active_flags: Vec<String>,
     pub updated_at: Option<u64>,
+    #[serde(default)]
+    pub approval_policy: Option<String>,
+    #[serde(default)]
+    pub approvals_reviewer: Option<String>,
+    #[serde(default)]
+    pub sandbox_mode: Option<String>,
 }
 
 pub struct ConnectorChannels {
@@ -201,8 +207,12 @@ impl CodexConnector {
             json!({"threadId": thread_id, "excludeTurns": true}),
             RPC_TIMEOUT,
         )?;
-        parse_thread(result.get("thread").unwrap_or(&Value::Null))
-            .ok_or_else(|| ConnectorError::Protocol("thread/resume omitted thread".to_owned()))
+        let mut thread = parse_thread(result.get("thread").unwrap_or(&Value::Null))
+            .ok_or_else(|| ConnectorError::Protocol("thread/resume omitted thread".to_owned()))?;
+        thread.approval_policy = protocol_variant(result.get("approvalPolicy"));
+        thread.approvals_reviewer = protocol_variant(result.get("approvalsReviewer"));
+        thread.sandbox_mode = protocol_variant(result.get("sandbox"));
+        Ok(thread)
     }
 
     pub fn call(
@@ -367,7 +377,18 @@ pub fn parse_thread(value: &Value) -> Option<CodexThread> {
             })
             .unwrap_or_default(),
         updated_at: value.get("updatedAt").and_then(Value::as_u64),
+        approval_policy: protocol_variant(value.get("approvalPolicy")),
+        approvals_reviewer: protocol_variant(value.get("approvalsReviewer")),
+        sandbox_mode: protocol_variant(value.get("sandbox")),
     })
+}
+
+fn protocol_variant(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    value
+        .as_str()
+        .or_else(|| value.get("type").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(all(test, unix))]

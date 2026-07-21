@@ -12,7 +12,7 @@ Source branch: local working tree based on `agent/v1-full`
 
 The Web control surface had accumulated Runtime-backed capabilities that the
 native macOS client did not expose. The native client now consumes those same
-authenticated localhost contracts and keeps only foreground scheduling as an
+authenticated localhost contracts and keeps only Agent Focus as an
 additional macOS-specific capability.
 
 The Rust Runtime remains the sole owner of setup/configuration writes, SQLite,

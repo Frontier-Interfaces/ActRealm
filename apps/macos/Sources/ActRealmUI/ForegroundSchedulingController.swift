@@ -17,9 +17,102 @@ public struct WorkspaceDisplayOption: Identifiable, Equatable, Sendable {
     public var label: String { isPrimary ? "\(name)（主显示器）" : name }
 }
 
-/// Executes the AppKit half of 台前调度: foregrounding a matching Agent app,
-/// observing active Space changes, and returning the ActRealm Workspace window after an
-/// unaccepted dispatch. ActRealmKit remains responsible for policy/timers.
+protocol StageManagerControlling {
+    func isEnabled() -> Bool?
+    @discardableResult func setEnabled(_ enabled: Bool) -> Bool
+}
+
+struct SystemStageManagerController: StageManagerControlling {
+    typealias CommandResult = (status: Int32, output: String)
+    typealias CommandRunner = (_ executable: String, _ arguments: [String]) -> CommandResult
+
+    private let commandRunner: CommandRunner
+
+    init(commandRunner: @escaping CommandRunner = Self.run) {
+        self.commandRunner = commandRunner
+    }
+
+    func isEnabled() -> Bool? {
+        let result = commandRunner("/usr/bin/defaults", [
+            "read", "com.apple.WindowManager", "GloballyEnabled",
+        ])
+        guard result.status == 0 else { return nil }
+        switch result.output.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "1", "true", "yes": return true
+        case "0", "false", "no": return false
+        default: return nil
+        }
+    }
+
+    @discardableResult
+    func setEnabled(_ enabled: Bool) -> Bool {
+        let write = commandRunner("/usr/bin/defaults", [
+            "write", "com.apple.WindowManager", "GloballyEnabled", "-bool",
+            enabled ? "true" : "false",
+        ])
+        guard write.status == 0 else { return false }
+        // WindowManager observes this preference on supported macOS versions.
+        // Do not terminate or relaunch it: that causes a visible desktop flash
+        // and can disturb the user's current windows and Spaces.
+        return isEnabled() == enabled
+    }
+
+    private static func run(_ executable: String, _ arguments: [String]) -> CommandResult {
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardOutput = pipe
+        process.standardError = pipe
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return (-1, "")
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+    }
+}
+
+enum StageManagerRestoreTrigger: Equatable {
+    case acceptance
+    case actRealmReturn
+    case focusDisabled
+}
+
+struct StageManagerLease: Equatable {
+    private(set) var didEnableStageManager = false
+    private(set) var restoreTiming: StageManagerRestoreTiming = .onReturnToActRealm
+
+    mutating func begin(
+        allowed: Bool,
+        restoreTiming: StageManagerRestoreTiming,
+        originalState: Bool?,
+        enableSucceeded: Bool
+    ) {
+        guard !didEnableStageManager, allowed, originalState == false, enableSucceeded else { return }
+        didEnableStageManager = true
+        self.restoreTiming = restoreTiming
+    }
+
+    func shouldRestore(for trigger: StageManagerRestoreTrigger) -> Bool {
+        guard didEnableStageManager else { return false }
+        switch restoreTiming {
+        case .afterAcceptance: return trigger == .acceptance || trigger == .focusDisabled
+        case .onReturnToActRealm: return trigger == .actRealmReturn || trigger == .focusDisabled
+        case .keepEnabled: return false
+        }
+    }
+
+    mutating func finishRestore(succeeded: Bool) {
+        if succeeded { didEnableStageManager = false }
+    }
+}
+
+/// Executes the AppKit half of Agent Focus: foregrounding a matching Agent,
+/// observing the bound workspace and pointer, and restoring any Stage Manager
+/// state that this focus session changed. ActRealmKit owns policy and timers.
 @MainActor
 public final class ForegroundSchedulingController: ObservableObject {
     @Published private(set) var visibleWorkspaceApps: [ForegroundWorkspaceApp] = []
@@ -32,9 +125,18 @@ public final class ForegroundSchedulingController: ObservableObject {
     private var lastHandledID: String?
     private var workspaceSelectionPanel: NSPanel?
     private var selectionRefreshTask: Task<Void, Never>?
+    private var dispatchObservationTask: Task<Void, Never>?
+    private var openingTask: Task<Void, Never>?
+    private let stageManagerController: any StageManagerControlling
+    private var stageManagerLease = StageManagerLease()
 
-    public init(model: AppModel) {
+    public convenience init(model: AppModel) {
+        self.init(model: model, stageManagerController: SystemStageManagerController())
+    }
+
+    init(model: AppModel, stageManagerController: any StageManagerControlling) {
         self.model = model
+        self.stageManagerController = stageManagerController
 
         model.$foregroundDispatch
             .receive(on: RunLoop.main)
@@ -54,10 +156,22 @@ public final class ForegroundSchedulingController: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
                 self?.refreshWorkspaceStatus()
-                self?.acceptIfSchedulingWorkspaceIsActive()
+                self?.acceptIfPointerEnteredBoundWorkspace()
                 if self?.model.isSelectingForegroundWorkspace == true {
                     self?.refreshVisibleWorkspaceApps()
                 }
+            }
+            .store(in: &cancellables)
+
+        NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didActivateApplicationNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] notification in
+                guard let self,
+                      let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
+                        as? NSRunningApplication,
+                      application.bundleIdentifier == Bundle.main.bundleIdentifier
+                else { return }
+                self.restoreStageManagerIfNeeded(for: .actRealmReturn)
             }
             .store(in: &cancellables)
 
@@ -85,45 +199,80 @@ public final class ForegroundSchedulingController: ObservableObject {
 
     deinit {
         selectionRefreshTask?.cancel()
+        dispatchObservationTask?.cancel()
+        openingTask?.cancel()
     }
 
     private func handle(_ dispatch: ForegroundDispatchState?) {
         guard let dispatch else {
+            dispatchObservationTask?.cancel()
+            openingTask?.cancel()
+            if !model.foregroundScheduling.isEnabled {
+                restoreStageManagerIfNeeded(for: .focusDisabled)
+            }
+            if stageManagerLease.restoreTiming == .keepEnabled {
+                stageManagerLease.finishRestore(succeeded: true)
+            }
             lastHandledID = nil
             lastHandledPhase = nil
             return
         }
         guard dispatch.id != lastHandledID || dispatch.phase != lastHandledPhase else { return }
+        if dispatch.id != lastHandledID {
+            startDispatchObservation()
+        }
         lastHandledID = dispatch.id
         lastHandledPhase = dispatch.phase
+
+        refreshWorkspaceStatus()
+        if acceptsCurrentFocus(dispatch) { return }
 
         switch dispatch.phase {
         case .reminding:
             break
         case .opening:
-            activateAgent(for: dispatch.provider)
+            beginOpening(dispatch)
         case .awaitingWorkspace:
-            // App activation and Mission Control notifications settle on the
-            // following run-loop turn. If the Agent was already beside Act
-            // Room, this immediately satisfies the documented receive rule.
             Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .milliseconds(180))
                 self?.refreshWorkspaceStatus()
-                self?.acceptIfSchedulingWorkspaceIsActive()
+                self?.acceptIfPointerEnteredBoundWorkspace()
             }
         case .returnedToActRealmWorkspace:
             activateActRealmWorkspace()
+            restoreStageManagerIfNeeded(for: .actRealmReturn)
         }
     }
 
-    private func activateAgent(for provider: ProviderKind?) {
+    private func beginOpening(_ dispatch: ForegroundDispatchState) {
+        prepareStageManagerIfNeeded()
+        openingTask?.cancel()
+        openingTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let openedSpecificTask = await self.model.focusSpecificTask(attentionID: dispatch.id)
+            guard !Task.isCancelled,
+                  self.model.foregroundDispatch?.id == dispatch.id,
+                  self.model.foregroundDispatch?.phase == .opening
+            else { return }
+            let activatedAgent = self.activateAgent(for: dispatch.provider, reportFailure: false)
+            if !openedSpecificTask && !activatedAgent {
+                self.model.failForegroundTargetActivation()
+            }
+        }
+    }
+
+    @discardableResult
+    private func activateAgent(for provider: ProviderKind?, reportFailure: Bool = true) -> Bool {
         guard let target = agentTarget(for: provider) else {
-            model.showToast("未找到对应 Agent 窗口；任务仍保留在 ActRealm 工作区")
+            if reportFailure {
+                model.showToast("未找到对应 Agent 窗口；事件仍保留在 ActRealm")
+            }
             refreshWorkspaceStatus()
-            return
+            return false
         }
         _ = target.activate(options: [])
         refreshWorkspaceStatus()
+        return true
     }
 
     private func agentTarget(for provider: ProviderKind?) -> NSRunningApplication? {
@@ -133,6 +282,7 @@ public final class ForegroundSchedulingController: ObservableObject {
         case .codex: providerTokens = ["codex"]
         case .claude: providerTokens = ["claude"]
         case .gemini: providerTokens = ["gemini"]
+        case let .custom(value): providerTokens = [value]
         case nil: providerTokens = ["codex", "claude", "gemini", "cursor"]
         }
 
@@ -147,11 +297,27 @@ public final class ForegroundSchedulingController: ObservableObject {
         })
     }
 
-    private func acceptIfSchedulingWorkspaceIsActive() {
-        guard model.foregroundDispatch?.phase == .awaitingWorkspace,
-              isBoundWorkspaceActive
-        else { return }
-        model.acceptForegroundWorkspace()
+    private func acceptsCurrentFocus(_ dispatch: ForegroundDispatchState) -> Bool {
+        guard model.foregroundWorkspaceStatus.isPointerInsideSchedulingWorkspace else {
+            return false
+        }
+        switch dispatch.phase {
+        case .reminding, .opening:
+            restoreStageManagerIfNeeded(for: .acceptance)
+            model.acceptForegroundInPlace()
+            return true
+        case .awaitingWorkspace:
+            restoreStageManagerIfNeeded(for: .acceptance)
+            model.acceptForegroundWorkspace()
+            return true
+        case .returnedToActRealmWorkspace:
+            return false
+        }
+    }
+
+    private func acceptIfPointerEnteredBoundWorkspace() {
+        guard let dispatch = model.foregroundDispatch else { return }
+        _ = acceptsCurrentFocus(dispatch)
     }
 
     private func activateActRealmWorkspace() {
@@ -165,21 +331,88 @@ public final class ForegroundSchedulingController: ObservableObject {
 
     private func refreshWorkspaceStatus() {
         let window = actRealmWorkspaceWindow
+        let provider = model.foregroundDispatch?.provider
+        let workspaceActive = isBoundWorkspaceActive(for: provider)
         model.updateForegroundWorkspaceStatus(ForegroundWorkspaceStatus(
             isActRealmWorkspaceReady: window != nil,
-            isAgentAvailable: agentTarget(for: model.foregroundDispatch?.provider) != nil,
-            isSchedulingWorkspaceActive: isBoundWorkspaceActive
+            isAgentAvailable: agentTarget(for: provider) != nil,
+            isSchedulingWorkspaceActive: workspaceActive,
+            isPointerInsideSchedulingWorkspace: workspaceActive && isPointerInsideBoundDisplay
         ))
     }
 
-    private var isBoundWorkspaceActive: Bool {
-        let bound = Set(model.foregroundScheduling.workspaceApps.map(\.bundleIdentifier))
+    private func isBoundWorkspaceActive(for provider: ProviderKind?) -> Bool {
+        let bound = Set(model.foregroundScheduling.workspaceApps.filter {
+            workspaceApplication($0, matches: provider)
+        }.map(\.bundleIdentifier))
         guard !bound.isEmpty else { return false }
         let visible = Set(visibleApplications(
             on: resolvedBoundDisplayID
         ).map(\.bundleIdentifier))
-        let requiredMatches = max(1, Int(ceil(Double(bound.count) * 0.5)))
-        return bound.intersection(visible).count >= requiredMatches
+        return !bound.isDisjoint(with: visible)
+    }
+
+    private var isPointerInsideBoundDisplay: Bool {
+        guard let displayID = resolvedBoundDisplayID,
+              let screen = screen(with: displayID)
+        else { return false }
+        return screen.frame.contains(NSEvent.mouseLocation)
+    }
+
+    private func workspaceApplication(
+        _ application: ForegroundWorkspaceApp,
+        matches provider: ProviderKind?
+    ) -> Bool {
+        guard let provider else { return true }
+        let identity = "\(application.bundleIdentifier) \(application.name)".lowercased()
+        let providerTokens: [String]
+        switch provider {
+        case .codex: providerTokens = ["codex", "chatgpt"]
+        case .claude: providerTokens = ["claude"]
+        case .gemini: providerTokens = ["gemini"]
+        case let .custom(value): providerTokens = [value.lowercased()]
+        }
+        return providerTokens.contains(where: identity.contains)
+            || ["terminal", "iterm", "warp", "wezterm", "alacritty"].contains(
+                where: identity.contains
+            )
+    }
+
+    private func startDispatchObservation() {
+        dispatchObservationTask?.cancel()
+        dispatchObservationTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled, self?.model.foregroundDispatch != nil {
+                self?.refreshWorkspaceStatus()
+                self?.acceptIfPointerEnteredBoundWorkspace()
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+        }
+    }
+
+    private func prepareStageManagerIfNeeded() {
+        guard !stageManagerLease.didEnableStageManager,
+              model.foregroundScheduling.allowsStageManager
+        else { return }
+        let originalState = stageManagerController.isEnabled()
+        let enabled = originalState == false && stageManagerController.setEnabled(true)
+        stageManagerLease.begin(
+            allowed: true,
+            restoreTiming: model.foregroundScheduling.stageManagerRestoreTiming,
+            originalState: originalState,
+            enableSucceeded: enabled
+        )
+        if originalState == nil || (originalState == false && !enabled) {
+            model.showToast("无法更改 macOS 台前调度；仍继续聚焦 Agent")
+        }
+    }
+
+    private func restoreStageManagerIfNeeded(for trigger: StageManagerRestoreTrigger) {
+        guard stageManagerLease.shouldRestore(for: trigger) else { return }
+        let restored = stageManagerController.setEnabled(false)
+        stageManagerLease.finishRestore(succeeded: restored)
+        if !restored {
+            model.showToast("无法恢复台前调度进入前状态，请在控制中心检查")
+        }
     }
 
     private func presentWorkspaceSelection() {
@@ -211,7 +444,7 @@ public final class ForegroundSchedulingController: ObservableObject {
             backing: .buffered,
             defer: true
         )
-        panel.title = "选择协作桌面"
+        panel.title = "选择 Agent 绑定工作区"
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.hidesOnDeactivate = false
@@ -375,9 +608,9 @@ private struct WorkspaceSelectionPanelView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 5) {
-                Text("选择协作桌面")
+                Text("选择 Agent 绑定工作区")
                     .font(.title2.weight(.bold))
-                Text("切换到放置 Claude、Codex、浏览器等协作应用的虚拟桌面，再绑定当前桌面。")
+                Text("切换到放置 Claude、Codex 或终端的工作区，再绑定当前显示器上的窗口。")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -396,7 +629,7 @@ private struct WorkspaceSelectionPanelView: View {
                 .pickerStyle(.menu)
             }
 
-            GroupBox("所选显示器当前桌面的应用") {
+            GroupBox("所选显示器当前工作区的应用") {
                 if controller.visibleWorkspaceApps.isEmpty {
                     Text("未检测到可绑定的应用窗口")
                         .foregroundStyle(.secondary)
@@ -417,7 +650,7 @@ private struct WorkspaceSelectionPanelView: View {
                 }
             }
 
-            Text("可选择内建或外接显示器。切换该显示器的虚拟桌面后，点击“重新检测”再绑定。")
+            Text("智能聚焦只会处理已绑定的 Agent；鼠标进入该工作区即视为已接收。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 

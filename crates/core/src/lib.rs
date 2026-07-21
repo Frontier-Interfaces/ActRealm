@@ -82,8 +82,12 @@ pub enum EventKind {
     SubagentStopped,
     TaskCreated,
     TaskCompleted,
+    PlanUpdated,
+    AutoReviewStarted,
+    AutoReviewCompleted,
     Compacting,
     Stopped,
+    Interrupted,
     Failed,
     Unknown,
 }
@@ -202,12 +206,15 @@ impl SessionProjection {
             }
             EventKind::Compacting => self.exec_state = ExecState::Compacting,
             EventKind::Stopped => self.exec_state = ExecState::ResponseFinished,
-            EventKind::Failed => self.exec_state = ExecState::Failed,
+            EventKind::Interrupted | EventKind::Failed => self.exec_state = ExecState::Failed,
             EventKind::Notification
             | EventKind::SubagentStarted
             | EventKind::SubagentStopped
             | EventKind::TaskCreated
             | EventKind::TaskCompleted
+            | EventKind::PlanUpdated
+            | EventKind::AutoReviewStarted
+            | EventKind::AutoReviewCompleted
             | EventKind::Unknown => {}
         }
         self.last_event_at = occurred_at;
@@ -391,8 +398,11 @@ impl BridgeRequest {
 
     pub fn from_hook_at(provider: Provider, raw: Value, received_at: u64) -> Self {
         let event_name = raw.get("hook_event_name").and_then(Value::as_str);
+        let codex_permission_lifecycle = event_name == Some("PermissionRequest")
+            || (event_name == Some("PreToolUse")
+                && raw.get("tool_name").and_then(Value::as_str) == Some("request_permissions"));
         let provider_handles_approval = provider == Provider::Codex
-            && event_name == Some("PermissionRequest")
+            && codex_permission_lifecycle
             && codex_provider_handles_approval(&raw);
         let blocking_kind = match (provider, event_name, provider_handles_approval) {
             (Provider::Codex, Some("PermissionRequest"), true) => None,
@@ -431,6 +441,34 @@ impl BridgeRequest {
             term: terminal_context(),
             raw,
         }
+    }
+
+    /// Builds a provider-authored lifecycle event that arrived over a
+    /// versioned connector rather than a shell Hook. The normalized payload
+    /// intentionally uses the same validated ingestion path as Hook events.
+    pub fn from_provider_event_at(
+        provider: Provider,
+        event_name: &str,
+        provider_session_id: &str,
+        provider_turn_id: Option<&str>,
+        raw: Value,
+        received_at: u64,
+    ) -> Self {
+        let mut object = raw.as_object().cloned().unwrap_or_default();
+        object.insert(
+            "hook_event_name".to_owned(),
+            Value::String(event_name.to_owned()),
+        );
+        object.insert(
+            "session_id".to_owned(),
+            Value::String(provider_session_id.to_owned()),
+        );
+        if let Some(turn_id) = provider_turn_id.filter(|value| !value.is_empty()) {
+            object.insert("turn_id".to_owned(), Value::String(turn_id.to_owned()));
+        }
+        let mut request = Self::from_hook_at(provider, Value::Object(object), received_at);
+        request.term = None;
+        request
     }
 
     pub fn doctor_probe_at(received_at: u64) -> Self {
@@ -624,7 +662,14 @@ pub fn codex_provider_handles_approval(raw: &Value) -> bool {
 
     matches!(
         raw.get("permission_mode").and_then(Value::as_str),
-        Some("dontAsk" | "bypassPermissions")
+        Some(
+            "dontAsk"
+                | "bypassPermissions"
+                | "never"
+                | "fullAccess"
+                | "full_access"
+                | "danger-full-access"
+        )
     )
 }
 
@@ -811,6 +856,17 @@ mod tests {
                 "hook_event_name":"PermissionRequest",
                 "session_id":"never-ask",
                 "permission_mode":"dontAsk"
+            }),
+            serde_json::json!({
+                "hook_event_name":"PermissionRequest",
+                "session_id":"full-access",
+                "permission_mode":"danger-full-access"
+            }),
+            serde_json::json!({
+                "hook_event_name":"PreToolUse",
+                "session_id":"auto-review-pretool",
+                "tool_name":"request_permissions",
+                "approvalsReviewer":"auto_review"
             }),
         ] {
             let request = BridgeRequest::from_hook_at(Provider::Codex, raw, 1_000);

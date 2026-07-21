@@ -184,6 +184,9 @@ Task { @MainActor in
         )
     }
 
+    model.bindForegroundWorkspace(apps: [
+        ForegroundWorkspaceApp(bundleIdentifier: "com.openai.codex", name: "Codex")
+    ])
     model.previewForegroundScheduling()
     render(
         Backdrop(dark: false) {

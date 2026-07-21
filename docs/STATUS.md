@@ -78,6 +78,14 @@ provide the detailed requirements and evidence.
   compilation and visual acceptance remain open because the installed Command
   Line Tools do not include `SwiftUIMacros`; see the
   [verification record](POST_M14_MACOS_WEB_PARITY.md).
+- **Post-M14 Provider lifecycle projection candidate:** successful Provider
+  turn completion is no longer restricted to write tools; managed Codex plan,
+  auto-review, interruption, and collab/sub-Agent events now enter the same
+  Runtime projection used by Claude Hooks. The native task detail shows real
+  plan steps and active sub-Agent records, and future adapter names receive a
+  dynamic lane instead of being dropped. Full Rust, release, language, and
+  macOS gates pass; fresh real-Provider visual acceptance remains pending. See the
+  [verification record](POST_M14_PROVIDER_LIFECYCLE_PROJECTION.md).
 - **Latest synchronized-tree gates:** 177 Rust tests passed, with three
   explicitly manual/resource tests ignored in the ordinary workspace run;
   zero-warning Clippy, format, JavaScript syntax, release build, language
@@ -120,6 +128,7 @@ provide the detailed requirements and evidence.
 | Post-M14 | First-run workspace and Agent setup center | Visual acceptance passed; real-Provider install/function gates pending | [verification](POST_M14_FIRST_RUN_ONBOARDING.md) |
 | Post-M14 | Codex internal-session filtering | Synchronized Rust/resource gates pass; latest installation and macOS Swift rerun pending | [verification](POST_M14_CODEX_INTERNAL_SESSION_FILTERING.md) |
 | Post-M14 | macOS/Web feature parity | Native source and focused Kit tests complete; full SwiftUI build and visual/real-Provider acceptance pending | [verification](POST_M14_MACOS_WEB_PARITY.md) |
+| Post-M14 | Provider lifecycle projection | Full automated/release/macOS gates pass; real Claude/Codex visual acceptance pending | [verification](POST_M14_PROVIDER_LIFECYCLE_PROJECTION.md) |
 
 M5 is a release-qualification track, not the chronological end of feature
 development. Later functional milestones may be implemented while M5's

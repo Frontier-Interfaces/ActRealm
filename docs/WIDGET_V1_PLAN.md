@@ -204,10 +204,10 @@ PermissionRequest 的额外铁律：
 | `PostToolUseFailure` | 记 error 计数（不单独成卡，v1 仅在 StopFailure 成卡） | 否 |
 | `PermissionRequest` | **批准卡**。最长挂起 24 小时；支持 allow/deny/pass-through | **是** |
 | `Notification` | 更新活动文案（不做关键词解析——CodePulse 教训 #6） | 否 |
-| `Stop` | 轮结束 → completion 卡（若该轮有文件改动）或回 idle | 否 |
+| `Stop` | 轮结束 → completion 卡；与是否写文件、批准模式无关；仍有明确后台任务时暂不结束 | 否 |
 | `StopFailure` | error 卡 | 否 |
 | `SubagentStart/Stop` | 活动态"派了 N 个子 Agent" | 否 |
-| `TaskCreated/TaskCompleted` | 计划进度 n/m（Agent 任务模块进度条唯一合法来源） | 否 |
+| `TaskCreated/TaskCompleted` | Claude 结构化任务步骤与进度 n/m | 否 |
 | `PreCompact` | 活动态"压缩记忆" | 否 |
 
 字段必须按事件解析，**不得假设全事件通用**。公共候选字段包括 `session_id, prompt_id, cwd, hook_event_name, transcript_path, permission_mode`；事件特有字段包括 `tool_name, tool_input, tool_use_id, prompt, last_assistant_message, error` 等。Claude `PermissionRequest` 没有 `tool_use_id`，批准关联一律使用 ActRealm 自己生成的 `requestId`。`transcript_path` 一律不读取。
@@ -410,7 +410,7 @@ PreCompact → compacting（短暂态，下一事件覆盖）
 | Claude AskUserQuestion / Elicitation | question | requestId | 官方 reply channel；secret 只在 DOM/请求/内存/一次回复中 |
 | Managed Codex requestUserInput | question | server request id | 只有显式 attach 且 capability 成功时可回答 |
 | StopFailure | error | session+turn+error | detail=error 首行（脱敏） |
-| Stop 且本轮有 PostToolUse(写类工具) | completion | session+turn+completion | "干完了，等你确认" |
+| Provider 明确完成本轮（Hook `Stop` / managed Codex `turn/completed`） | completion | session+turn+completion | "干完了，等你确认"；不依赖写工具或批准模式 |
 | Notification(claude, 显式 question 类型字段) | question_notice | session+notification_id | **仅当 payload 有结构化类型字段**；不做文案关键词猜测；无 reply channel 时只跳转 |
 
 批准生命周期：
@@ -593,7 +593,9 @@ Command 提交语义：
 
 ### 12.3 进度条（严格条件展示）
 
-唯一合法数据源：Claude 的 TaskCreated/TaskCompleted → `plan_done/plan_total`，显示 `第 n/m 步` + 真实百分比。**没有该数据一律不显示进度条**（禁止时间估算假进度——诚实原则）。
+唯一合法数据源是 Provider 的结构化计划事件：Claude 的
+`TaskCreated/TaskCompleted`，以及显式 managed Codex app-server 的
+`turn/plan/updated`。两者都写入步骤文本、状态与 `plan_done/plan_total`；没有结构化事件时显示“未提供计划事件”，绝不根据时间或普通文本伪造进度。
 
 ### 12.4 渲染工程要求
 
@@ -617,8 +619,7 @@ decision_sent / snoozed 事项的会话都必须保留。
 
 ### 13.1 展示
 
-- 固定三行且顺序不漂移：`Claude · 5 小时`、`Claude · 7 天`、
-  `Codex · 本周`；每行包含百分比进度条（≥50% 绿 / 20–50% 橙 /
+- 渲染 Runtime 返回的全部有效额度窗口，不把 Codex 硬编码为“本周”，也不限制 Claude 只能有两档；每行包含 Provider/window 名称与百分比进度条（≥50% 绿 / 20–50% 橙 /
   <20% 红）+ `周几 HH:MM 重置`；
 - **数据不可用是一等状态**：显示灰条 + "暂无数据（<原因：未安装桥 / 文件不存在 / 解析失败>）"，附"如何开启"入口——绝不显示旧数据冒充实时（快照超过 30 分钟标注"N 分钟前"）；
 - 常规轮询仍为 5 分钟，但 Claude cache 从不存在变为存在或文件修改时间变化时

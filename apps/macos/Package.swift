@@ -28,7 +28,7 @@ let package = Package(
         ),
         .testTarget(
             name: "ActRealmKitTests",
-            dependencies: ["ActRealmKit"],
+            dependencies: ["ActRealmKit", "ActRealmUI"],
             // CommandLineTools ships Swift Testing outside SwiftPM's default
             // macro search path. Full Xcode ignores these compatible paths.
             swiftSettings: [

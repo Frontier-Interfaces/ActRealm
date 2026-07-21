@@ -16,7 +16,7 @@ struct ActRealmApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("", id: "main") {
+        Window("", id: "main") {
             MainWindowView()
                 .environmentObject(model)
                 .task {
@@ -42,6 +42,12 @@ struct ActRealmApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {}
             SettingsWindowCommands()
+            CommandGroup(replacing: .appTermination) {
+                Button("退出 ActRealm") {
+                    NSApplication.shared.terminate(nil)
+                }
+                .keyboardShortcut("q", modifiers: .command)
+            }
         }
 
         MenuBarExtra {

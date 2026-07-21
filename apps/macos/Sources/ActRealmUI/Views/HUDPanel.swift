@@ -3,13 +3,129 @@ import Combine
 import ActRealmKit
 import SwiftUI
 
-/// Floating, non-activating approval capsule shown whenever something waits
+enum HUDPanelLayout {
+    static let topSpacing: CGFloat = 8
+
+    static func origin(
+        screenFrame: NSRect,
+        visibleFrame: NSRect,
+        safeAreaInsets: NSEdgeInsets,
+        panelSize: NSSize
+    ) -> NSPoint {
+        let safeMinX = max(screenFrame.minX + safeAreaInsets.left, visibleFrame.minX)
+        let safeMaxX = min(screenFrame.maxX - safeAreaInsets.right, visibleFrame.maxX)
+        let centeredX = screenFrame.midX - panelSize.width / 2
+        let availableWidth = safeMaxX - safeMinX
+        let originX: CGFloat
+        if availableWidth >= panelSize.width {
+            originX = min(max(centeredX, safeMinX), safeMaxX - panelSize.width)
+        } else {
+            originX = centeredX
+        }
+
+        // `safeAreaInsets.top` excludes a MacBook camera housing/notch. The
+        // visible frame also excludes an exposed menu bar, so using the lower
+        // of the two top edges keeps the capsule clear of both.
+        let safeTop = min(
+            visibleFrame.maxY,
+            screenFrame.maxY - safeAreaInsets.top
+        )
+        let minimumY = screenFrame.minY + safeAreaInsets.bottom
+        let originY = max(minimumY, safeTop - panelSize.height - topSpacing)
+        return NSPoint(x: originX, y: originY)
+    }
+}
+
+struct HUDDisplayOption: Identifiable, Equatable {
+    let id: UInt32
+    let name: String
+    let isMain: Bool
+}
+
+enum HUDDisplayCatalog {
+    static var options: [HUDDisplayOption] {
+        let mainID = CGMainDisplayID()
+        return NSScreen.screens.compactMap { screen in
+            guard let id = displayID(for: screen) else { return nil }
+            return HUDDisplayOption(id: id, name: screen.localizedName, isMain: id == mainID)
+        }
+        .sorted { left, right in
+            if left.isMain != right.isMain { return left.isMain }
+            return left.name.localizedStandardCompare(right.name) == .orderedAscending
+        }
+    }
+
+    static var mainScreen: NSScreen? {
+        screen(with: CGMainDisplayID()) ?? NSScreen.main ?? NSScreen.screens.first
+    }
+
+    static func displayID(for screen: NSScreen) -> UInt32? {
+        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?
+            .uint32Value
+    }
+
+    static func screen(with id: UInt32) -> NSScreen? {
+        NSScreen.screens.first { displayID(for: $0) == id }
+    }
+}
+
+enum HUDDisplaySelection {
+    static func resolve(
+        mode: HUDDisplayMode,
+        selectedID: UInt32?,
+        selectedName: String?,
+        mainID: UInt32?,
+        actRealmWindowID: UInt32?,
+        available: [HUDDisplayOption]
+    ) -> UInt32? {
+        switch mode {
+        case .systemMain:
+            return mainID ?? available.first?.id
+        case .selectedDisplay:
+            if let selectedID, available.contains(where: { $0.id == selectedID }) {
+                return selectedID
+            }
+            if let selectedName,
+               let reconnected = available.first(where: { $0.name == selectedName }) {
+                return reconnected.id
+            }
+            return mainID ?? available.first?.id
+        case .followActRealmWindow:
+            if let actRealmWindowID,
+               available.contains(where: { $0.id == actRealmWindowID }) {
+                return actRealmWindowID
+            }
+            return mainID ?? available.first?.id
+        }
+    }
+}
+
+final class HUDInteractiveHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
+}
+
+struct HUDDecisionSubmission: Equatable {
+    let attentionID: String
+    let action: AttentionAction
+}
+
+enum HUDDecisionInteraction {
+    static func showsDecisionButtons(
+        entryID: String,
+        state: OutboxItemState,
+        submission: HUDDecisionSubmission?
+    ) -> Bool {
+        state == .open && submission?.attentionID != entryID
+    }
+}
+
+/// Top-level, non-activating approval capsule shown whenever something waits
 /// on the user, including while the main window is in front.
 @MainActor
 public final class HUDPanelController {
     private let model: AppModel
     private var panel: NSPanel?
-    private var dragStartOrigin: NSPoint?
     private var cancellables: Set<AnyCancellable> = []
 
     public init(model: AppModel) {
@@ -38,27 +154,49 @@ public final class HUDPanelController {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.updateVisibility() }
             .store(in: &cancellables)
-        for name in [NSApplication.didBecomeActiveNotification, NSApplication.didResignActiveNotification] {
+        for name in [
+            NSApplication.didBecomeActiveNotification,
+            NSApplication.didResignActiveNotification,
+            NSApplication.didChangeScreenParametersNotification,
+        ] {
             NotificationCenter.default.publisher(for: name)
                 .receive(on: RunLoop.main)
                 .sink { [weak self] _ in self?.updateVisibility() }
                 .store(in: &cancellables)
         }
+        NotificationCenter.default.publisher(for: NSWindow.didChangeScreenNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] notification in
+                guard let self,
+                      let window = notification.object as? NSWindow,
+                      self.isActRealmMainWindow(window)
+                else { return }
+                self.updateVisibility()
+            }
+            .store(in: &cancellables)
     }
 
     private var shouldShow: Bool {
         model.isHUDPreviewActive
             || model.foregroundDispatch != nil
+            || (panel?.isVisible == true && undoablePendingDecision != nil)
             || (model.hudSettings.isEnabled
                 && model.hudArrivalID != nil
                 && (model.hudArrivalDeadline ?? .distantPast) > model.now)
+    }
+
+    private var undoablePendingDecision: PendingDecision? {
+        guard let pending = model.derived.pendingDecision,
+              pending.attentionID == model.hudArrivalID,
+              case .undoable = pending.phase
+        else { return nil }
+        return pending
     }
 
     private func updateVisibility() {
         if shouldShow {
             presentPanel()
         } else {
-            dragStartOrigin = nil
             panel?.orderOut(nil)
         }
     }
@@ -66,9 +204,9 @@ public final class HUDPanelController {
     private func presentPanel() {
         let panel = ensurePanel()
         let wasVisible = panel.isVisible
-        fitPanel(panel, preservingCenter: wasVisible)
+        fitPanel(panel)
+        positionAtTopCenter(panel)
         if !wasVisible {
-            positionAtScreenCenter(panel)
             panel.orderFrontRegardless()
         }
     }
@@ -81,89 +219,107 @@ public final class HUDPanelController {
             backing: .buffered,
             defer: true
         )
-        panel.level = .floating
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.level = .statusBar
+        panel.collectionBehavior = [
+            .canJoinAllSpaces,
+            .fullScreenAuxiliary,
+            .stationary,
+            .ignoresCycle,
+        ]
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = false
-        panel.isMovable = true
+        panel.isMovable = false
         panel.isMovableByWindowBackground = false
         panel.hidesOnDeactivate = false
         panel.becomesKeyOnlyIfNeeded = true
+        panel.ignoresMouseEvents = false
+        panel.isReleasedWhenClosed = false
 
-        let host = NSHostingView(
-            rootView: HUDCapsuleView(
-                onDragChanged: { [weak self] translation in
-                    self?.movePanel(by: translation)
-                },
-                onDragEnded: { [weak self] in
-                    self?.dragStartOrigin = nil
-                }
-            )
+        let host = HUDInteractiveHostingView(
+            rootView: HUDCapsuleView()
             .environmentObject(model)
         )
-        host.sizingOptions = [.preferredContentSize]
+        host.sizingOptions = [.intrinsicContentSize]
         panel.contentView = host
         self.panel = panel
         return panel
     }
 
-    private func fitPanel(_ panel: NSPanel, preservingCenter: Bool) {
-        let center = NSPoint(x: panel.frame.midX, y: panel.frame.midY)
-        panel.setContentSize(panel.contentView?.fittingSize ?? NSSize(width: 560, height: 76))
-        guard preservingCenter else { return }
-        panel.setFrameOrigin(NSPoint(
-            x: center.x - panel.frame.width / 2,
-            y: center.y - panel.frame.height / 2
-        ))
-    }
-
-    private func positionAtScreenCenter(_ panel: NSPanel) {
-        let pointer = NSEvent.mouseLocation
-        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(pointer) })
-            ?? NSScreen.main
-        else { return }
-        let frame = screen.visibleFrame
-        let size = panel.frame.size
-        let origin = NSPoint(
-            x: frame.midX - size.width / 2,
-            y: frame.midY - size.height / 2
-        )
-        panel.setFrameOrigin(origin)
-    }
-
-    private func movePanel(by translation: CGSize) {
-        guard let panel else { return }
-        if dragStartOrigin == nil {
-            dragStartOrigin = panel.frame.origin
+    private func fitPanel(_ panel: NSPanel) {
+        guard let contentView = panel.contentView else {
+            panel.setContentSize(NSSize(width: 560, height: 76))
+            return
         }
-        guard let dragStartOrigin else { return }
-        panel.setFrameOrigin(NSPoint(
-            x: dragStartOrigin.x + translation.width,
-            y: dragStartOrigin.y - translation.height
+        contentView.layoutSubtreeIfNeeded()
+        let measuredSize = contentView.fittingSize
+        let currentSize = panel.contentLayoutRect.size
+        let resolvedSize = NSSize(
+            width: measuredSize.width.isFinite && measuredSize.width > 1
+                ? measuredSize.width
+                : max(currentSize.width, 560),
+            height: measuredSize.height.isFinite && measuredSize.height > 1
+                ? measuredSize.height
+                : max(currentSize.height, 76)
+        )
+        panel.setContentSize(resolvedSize)
+        contentView.frame = NSRect(origin: .zero, size: resolvedSize)
+        contentView.layoutSubtreeIfNeeded()
+    }
+
+    private func positionAtTopCenter(_ panel: NSPanel) {
+        guard let screen = targetScreen else { return }
+        panel.setFrameOrigin(HUDPanelLayout.origin(
+            screenFrame: screen.frame,
+            visibleFrame: screen.visibleFrame,
+            safeAreaInsets: screen.safeAreaInsets,
+            panelSize: panel.frame.size
         ))
+    }
+
+    private var targetScreen: NSScreen? {
+        let options = HUDDisplayCatalog.options
+        let mainID = HUDDisplayCatalog.mainScreen.flatMap(HUDDisplayCatalog.displayID(for:))
+        let windowID = actRealmMainWindow?.screen.flatMap(HUDDisplayCatalog.displayID(for:))
+        let resolvedID = HUDDisplaySelection.resolve(
+            mode: model.hudSettings.displayMode,
+            selectedID: model.hudSettings.selectedDisplayID,
+            selectedName: model.hudSettings.selectedDisplayName,
+            mainID: mainID,
+            actRealmWindowID: windowID,
+            available: options
+        )
+        return resolvedID.flatMap(HUDDisplayCatalog.screen(with:))
+            ?? HUDDisplayCatalog.mainScreen
+    }
+
+    private var actRealmMainWindow: NSWindow? {
+        let candidates = NSApplication.shared.windows.filter(isActRealmMainWindow)
+        return candidates.first {
+            $0.identifier?.rawValue.hasPrefix("main-") == true
+        } ?? candidates.first { $0.title.isEmpty }
+    }
+
+    private func isActRealmMainWindow(_ window: NSWindow) -> Bool {
+        guard !(window is NSPanel), window.canBecomeMain else { return false }
+        return window.identifier?.rawValue.hasPrefix("main-") == true
+            || window.title.isEmpty
     }
 }
 
 // MARK: - Capsule content
 
 public struct HUDCapsuleView: View {
-    private let onDragChanged: ((CGSize) -> Void)?
-    private let onDragEnded: (() -> Void)?
-
-    public init(
-        onDragChanged: ((CGSize) -> Void)? = nil,
-        onDragEnded: (() -> Void)? = nil
-    ) {
-        self.onDragChanged = onDragChanged
-        self.onDragEnded = onDragEnded
-    }
+    public init() {}
 
     @EnvironmentObject var model: AppModel
     @Environment(\.snapshotRendering) private var snapshotRendering
+    @State private var decisionSubmission: HUDDecisionSubmission? = nil
+    @State private var isHovering = false
 
     private var notification: OutboxEntry? {
         if let id = model.hudArrivalID,
+           !model.isForegroundHUDSuppressed(for: id),
            let live = model.derived.openOutbox.first(where: { $0.id == id }) {
             return live
         }
@@ -175,7 +331,19 @@ public struct HUDCapsuleView: View {
 
     public var body: some View {
         VStack(spacing: 7) {
-            if let dispatch = model.foregroundDispatch {
+            if let pending = undoablePendingDecision {
+                let content = undoContent(pending)
+                    .padding(.horizontal, 15)
+                    .padding(.vertical, 11)
+
+                HUDCapsuleSurface(snapshotRendering: snapshotRendering) {
+                    content
+                }
+
+                Text("3 秒内可以撤回 · 尚未写给 Provider")
+                    .font(.system(size: 10))
+                    .foregroundStyle(DT.textFaint)
+            } else if let dispatch = model.foregroundDispatch {
                 let content = dispatchContent(dispatch)
                     .padding(.horizontal, 15)
                     .padding(.vertical, 11)
@@ -203,12 +371,47 @@ public struct HUDCapsuleView: View {
         }
         .padding(14)
         .fixedSize()
-        .contentShape(Rectangle())
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 3)
-                .onChanged { onDragChanged?($0.translation) }
-                .onEnded { _ in onDragEnded?() }
-        )
+        .overlay(alignment: .topLeading) {
+            if isHovering && !snapshotRendering {
+                Button {
+                    isHovering = false
+                    model.dismissHUD()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(DT.textSecondary)
+                        .frame(width: 24, height: 24)
+                        .background(DT.cardStrong.opacity(0.96), in: Circle())
+                        .overlay(
+                            Circle()
+                                .strokeBorder(Color.white.opacity(0.36), lineWidth: 0.8)
+                                .allowsHitTesting(false)
+                        )
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .contentShape(Circle())
+                .shadow(color: Color.black.opacity(0.28), radius: 6, y: 2)
+                .padding(.leading, 3)
+                .padding(.top, 3)
+                .help("关闭通知")
+                .accessibilityLabel("关闭通知")
+                .transition(.opacity.combined(with: .scale(scale: 0.84)))
+            }
+        }
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.14)) {
+                isHovering = hovering
+            }
+        }
+    }
+
+    private var undoablePendingDecision: PendingDecision? {
+        guard let pending = model.derived.pendingDecision,
+              pending.attentionID == (decisionSubmission?.attentionID ?? notification?.id),
+              case .undoable = pending.phase
+        else { return nil }
+        return pending
     }
 
     // MARK: Approval
@@ -230,16 +433,16 @@ public struct HUDCapsuleView: View {
                         .lineLimit(1)
                 }
                 .frame(maxWidth: 300, alignment: .leading)
-                Button("立即打开") { model.openForegroundAgentNow() }
+                Button("立即查看") { model.openForegroundAgentNow() }
                     .buttonStyle(PillButtonStyle(rank: .primary, fontSize: 11, horizontalPadding: 14))
-                Button("留在 ActRealm 工作区") { model.keepForegroundTaskInActRealmWorkspace() }
+                Button("稍后处理") { model.keepForegroundTaskInActRealmWorkspace() }
                     .buttonStyle(PillButtonStyle(rank: .secondary, fontSize: 11, horizontalPadding: 14))
             }
         case .opening:
             HStack(spacing: 12) {
                 ProviderAvatar(kind: dispatch.provider ?? .codex, size: 34)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("正在打开 \(providerName(dispatch.provider))")
+                    Text("正在聚焦 \(providerName(dispatch.provider))")
                         .font(.system(size: 12.5, weight: .bold))
                         .foregroundStyle(DT.textStrong)
                     Text(dispatch.title)
@@ -253,10 +456,10 @@ public struct HUDCapsuleView: View {
             HStack(spacing: 12) {
                 dispatchRing(dispatch, color: DT.greenDot)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("等待进入协作桌面 · \(remainingSeconds(dispatch)) 秒")
+                    Text("等待鼠标进入绑定工作区 · \(remainingSeconds(dispatch)) 秒")
                         .font(.system(size: 12.5, weight: .bold))
                         .foregroundStyle(DT.textStrong)
-                    Text("协作应用出现在当前桌面后，自动返回倒计时会停止")
+                    Text("进入即视为已接收；事件仍等待批准、回答或确认")
                         .font(DT.body(10.5))
                         .foregroundStyle(DT.textWeak)
                 }
@@ -269,7 +472,7 @@ public struct HUDCapsuleView: View {
                     .foregroundStyle(DT.amberText)
                     .frame(width: 32, height: 32)
                     .background(DT.amberBg, in: Circle())
-                Text("未检测到进入调度工作桌面，已返回 ActRealm 工作区")
+                Text("未检测到接收，已返回 ActRealm")
                     .font(.system(size: 12.5, weight: .bold))
                     .foregroundStyle(DT.textStrong)
             }
@@ -302,20 +505,15 @@ public struct HUDCapsuleView: View {
 
     private func dispatchHint(_ dispatch: ForegroundDispatchState) -> String {
         switch dispatch.phase {
-        case .reminding: "倒计时结束后自动打开 · 也可以留在 ActRealm 工作区"
-        case .opening: "正在把对应 Agent 带到前台"
-        case .awaitingWorkspace: "进入调度工作桌面即视为已接收"
+        case .reminding: "倒计时结束后自动聚焦 · 也可以稍后处理"
+        case .opening: "优先打开具体任务；失败时打开 Agent 页面"
+        case .awaitingWorkspace: "鼠标进入绑定工作区即视为已接收"
         case .returnedToActRealmWorkspace: "任务仍保留在待处理列表"
         }
     }
 
     private func providerName(_ provider: ProviderKind?) -> String {
-        switch provider {
-        case .codex: "Codex"
-        case .claude: "Claude"
-        case .gemini: "Gemini"
-        case nil: "Agent"
-        }
+        provider?.displayName ?? "Agent"
     }
 
     @ViewBuilder
@@ -341,34 +539,103 @@ public struct HUDCapsuleView: View {
             .frame(maxWidth: 520, alignment: .leading)
 
             if entry.kind == .approval {
-                Button {
-                    model.deny(entry)
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 13, weight: .bold))
-                        .foregroundStyle(DT.redText)
-                        .frame(width: 36, height: 36)
-                        .background(Circle().fill(DT.redBg))
-                        .overlay(Circle().strokeBorder(DT.redStroke, lineWidth: 1))
-                        .contentShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .help("拒绝")
+                if HUDDecisionInteraction.showsDecisionButtons(
+                    entryID: entry.id,
+                    state: entry.state,
+                    submission: decisionSubmission
+                ) {
+                    Button {
+                        submit(.deny, entry: entry)
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(DT.redText)
+                            .frame(width: 40, height: 40)
+                            .background(Circle().fill(DT.redBg))
+                            .overlay(Circle().strokeBorder(DT.redStroke, lineWidth: 1))
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .contentShape(Circle())
+                    .help("拒绝")
 
-                Button {
-                    model.approve(entry)
-                } label: {
-                    Image(systemName: "checkmark")
-                        .font(.system(size: 13, weight: .bold))
-                        .foregroundStyle(.white)
-                        .frame(width: 36, height: 36)
-                        .background(Circle().fill(DT.primaryGradient))
-                        .contentShape(Circle())
+                    Button {
+                        submit(.approve, entry: entry)
+                    } label: {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 40, height: 40)
+                            .background(Circle().fill(DT.primaryGradient))
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .contentShape(Circle())
+                    .shadow(color: DT.blue.opacity(0.4), radius: 8, y: 4)
+                    .help("允许（3 秒内可撤回）")
+                } else {
+                    decisionSubmissionStatus(entry)
                 }
-                .buttonStyle(.plain)
-                .shadow(color: DT.blue.opacity(0.4), radius: 8, y: 4)
-                .help("允许（3 秒内可撤回）")
             }
+        }
+    }
+
+    private func submit(_ action: AttentionAction, entry: OutboxEntry) {
+        guard HUDDecisionInteraction.showsDecisionButtons(
+            entryID: entry.id,
+            state: entry.state,
+            submission: decisionSubmission
+        ) else { return }
+
+        decisionSubmission = HUDDecisionSubmission(attentionID: entry.id, action: action)
+        switch action {
+        case .approve: model.approve(entry)
+        case .deny: model.deny(entry)
+        default: return
+        }
+
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            guard decisionSubmission?.attentionID == entry.id,
+                  model.derived.pendingDecision == nil,
+                  model.derived.openOutbox.first(where: { $0.id == entry.id })?.state == .open
+            else { return }
+            decisionSubmission = nil
+        }
+    }
+
+    @ViewBuilder
+    private func decisionSubmissionStatus(_ entry: OutboxEntry) -> some View {
+        HStack(spacing: 8) {
+            if entry.state == .open {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Image(systemName: entry.state == .decisionSent ? "paperplane.fill" : "clock.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(DT.greenText)
+            }
+            Text(decisionStatusText(entry))
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(DT.textWeak)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 40)
+        .background(DT.greenBg.opacity(0.75), in: Capsule())
+        .overlay(Capsule().strokeBorder(DT.greenStroke, lineWidth: 1))
+    }
+
+    private func decisionStatusText(_ entry: OutboxEntry) -> String {
+        switch entry.state {
+        case .open:
+            return decisionSubmission?.action == .deny ? "正在提交拒绝…" : "正在提交允许…"
+        case .committing:
+            return "正在建立撤回窗口…"
+        case .decisionSent:
+            return "已写给 Provider，等待确认"
+        case .snoozed, .resolved:
+            return "请求状态已更新"
         }
     }
 
@@ -400,12 +667,7 @@ public struct HUDCapsuleView: View {
     }
 
     private func providerName(_ entry: OutboxEntry) -> String {
-        switch entry.provider {
-        case .codex: "Codex"
-        case .claude: "Claude"
-        case .gemini: "Gemini"
-        case nil: "Agent"
-        }
+        entry.provider?.displayName ?? "Agent"
     }
 
     @ViewBuilder
@@ -460,7 +722,7 @@ public struct HUDCapsuleView: View {
                     .font(.system(size: 12.5, weight: .bold))
                     .foregroundStyle(DT.textStrong)
                     .lineLimit(1)
-                Text("决定已发送，等待确认")
+                Text("倒计时结束后才会写给 Provider")
                     .font(DT.body(10.5))
                     .foregroundStyle(DT.textWeak)
             }
@@ -485,6 +747,7 @@ private struct HUDCapsuleSurface<Content: View>: View {
                     radius: 24,
                     y: 10
                 )
+                .allowsHitTesting(false)
 
             if snapshotRendering {
                 content.background(DT.cardStrong.opacity(0.62), in: Capsule())
@@ -492,6 +755,10 @@ private struct HUDCapsuleSurface<Content: View>: View {
                 content.glassEffect(.regular, in: .capsule)
             }
         }
-        .overlay(Capsule().strokeBorder(Color.white.opacity(0.8), lineWidth: 1))
+        .overlay(
+            Capsule()
+                .strokeBorder(Color.white.opacity(0.8), lineWidth: 1)
+                .allowsHitTesting(false)
+        )
     }
 }

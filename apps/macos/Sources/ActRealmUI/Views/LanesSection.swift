@@ -237,6 +237,14 @@ private struct TaskRow: View {
             }
             .font(.system(size: 11))
 
+            if fieldVisible("plan"), !task.session.planSteps.isEmpty {
+                planDetails
+            }
+
+            if fieldVisible("subagents"), !task.session.subagents.isEmpty {
+                subagentDetails
+            }
+
             HStack(spacing: 10) {
                 if task.openOutboxCount > 0 {
                     Button("查看待处理事项") {
@@ -269,6 +277,101 @@ private struct TaskRow: View {
             Rectangle().fill(DT.separator).frame(height: 1)
         }
         .padding(.top, 10)
+    }
+
+    private var planDetails: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("执行计划")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(DT.textWeak)
+            ForEach(task.session.planSteps.prefix(12)) { step in
+                HStack(alignment: .top, spacing: 7) {
+                    Image(systemName: planIcon(for: step.status))
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(planColor(for: step.status))
+                        .frame(width: 12, height: 15)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(step.text)
+                            .font(.system(size: 10.5, weight: step.status == "in_progress" ? .semibold : .regular))
+                            .foregroundStyle(DT.textSecondary)
+                            .lineLimit(2)
+                        if let detail = step.detail, !detail.isEmpty {
+                            Text(detail)
+                                .font(.system(size: 9.5))
+                                .foregroundStyle(DT.textFaint)
+                                .lineLimit(2)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(9)
+        .background(DT.neutralChipBg, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(DT.neutralChipStroke, lineWidth: 1)
+        )
+    }
+
+    private var subagentDetails: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 6) {
+                Text("运行中的子 Agent")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(DT.textWeak)
+                ForEach(task.session.subagents.prefix(8)) { agent in
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(DT.blueText)
+                        .frame(width: 18, height: 18)
+                        .background(DT.blueBg, in: Circle())
+                        .help(agent.agentType ?? "子 Agent")
+                }
+            }
+            ForEach(task.session.subagents.prefix(6)) { agent in
+                HStack(spacing: 6) {
+                    Circle().fill(DT.greenDot).frame(width: 5, height: 5)
+                    Text(agent.agentType ?? "子 Agent")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(DT.textSecondary)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text(subagentStatus(agent.status))
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(DT.textFaint)
+                }
+            }
+        }
+        .padding(9)
+        .background(DT.neutralChipBg, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(DT.neutralChipStroke, lineWidth: 1)
+        )
+    }
+
+    private func subagentStatus(_ status: String) -> String {
+        switch status {
+        case "pendingInit": "准备中"
+        case "running", "started", "interacted": "运行中"
+        default: status
+        }
+    }
+
+    private func planIcon(for status: String) -> String {
+        switch status {
+        case "completed": "checkmark.circle.fill"
+        case "in_progress": "circle.dotted"
+        default: "circle"
+        }
+    }
+
+    private func planColor(for status: String) -> Color {
+        switch status {
+        case "completed": DT.greenText
+        case "in_progress": DT.blue
+        default: DT.textFaint
+        }
     }
 
     @ViewBuilder
@@ -310,6 +413,7 @@ private struct TaskRow: View {
         case .claude: return "Claude Code CLI"
         case .codex: return "Codex CLI"
         case .gemini: return "Gemini CLI"
+        case .custom: return "Provider 连接器"
         }
     }
     private var contextText: String {
@@ -323,7 +427,7 @@ private struct TaskRow: View {
     private var contextIsTight: Bool { (task.contextUsageFraction ?? 0) >= 0.7 }
     private var planText: String {
         if let plan = task.planProgress { return "\(plan.done)/\(plan.total)（进行中）" }
-        return provider == .codex ? "未提供计划事件" : "未提供"
+        return "未提供计划事件"
     }
     private var tokenText: String { task.totalTokens.map(ZhFormat.tokenCount) ?? "暂无数据" }
     private var tokenIsHigh: Bool { (task.totalTokens ?? 0) >= 140_000 }
@@ -409,7 +513,7 @@ private struct TaskRow: View {
         }
     }
     private var providerName: String {
-        switch provider { case .claude: "Claude"; case .codex: "Codex"; case .gemini: "Gemini" }
+        provider.displayName
     }
     private var badge: String {
         switch task.status {

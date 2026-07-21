@@ -85,8 +85,12 @@ fn normalize_event(provider: Provider, event_name: &str, raw: &Value) -> EventKi
         "SubagentStop" => EventKind::SubagentStopped,
         "TaskCreated" => EventKind::TaskCreated,
         "TaskCompleted" => EventKind::TaskCompleted,
+        "PlanUpdated" => EventKind::PlanUpdated,
+        "AutoApprovalReviewStarted" => EventKind::AutoReviewStarted,
+        "AutoApprovalReviewCompleted" => EventKind::AutoReviewCompleted,
         "PreCompact" => EventKind::Compacting,
         "Stop" => EventKind::Stopped,
+        "TurnInterrupted" => EventKind::Interrupted,
         "StopFailure" => EventKind::Failed,
         _ => EventKind::Unknown,
     }

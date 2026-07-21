@@ -350,12 +350,7 @@ private struct OutboxPrimaryCard: View {
     }
 
     private var providerName: String {
-        switch entry.provider {
-        case .claude: "Claude"
-        case .codex: "Codex"
-        case .gemini: "Gemini"
-        case nil: entry.attention.provider
-        }
+        entry.provider?.displayName ?? entry.attention.provider
     }
 
     private var cardBackground: AnyShapeStyle {

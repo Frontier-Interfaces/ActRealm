@@ -10,6 +10,8 @@
     <string>com.frontierinterfaces.actrealm</string>
     <key>CFBundleExecutable</key>
     <string>ActRealm</string>
+    <key>CFBundleIconFile</key>
+    <string>ActRealm.icns</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

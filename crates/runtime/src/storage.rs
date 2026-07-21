@@ -20,8 +20,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const MAX_TASK_TITLE_CHARS: usize = 64;
+const MAX_PLAN_STEPS: usize = 64;
+const MAX_PLAN_STEP_CHARS: usize = 500;
+const MAX_PLAN_DETAIL_CHARS: usize = 1_500;
 const PROVIDER_TITLE_REFRESH_INTERVAL_MS: u64 = 2_000;
 const PROVIDER_TITLE_ACTIVE_WINDOW_MS: u64 = 30 * 60 * 1_000;
 const CODEX_INTERNAL_PROMPT_PREFIXES: [&str; 2] = [
@@ -181,6 +184,8 @@ pub struct SessionRecord {
     pub activity_since: Option<u64>,
     pub plan_done: Option<u32>,
     pub plan_total: Option<u32>,
+    #[serde(default)]
+    pub plan_steps: Vec<PlanStepRecord>,
     pub turn_started_at: Option<u64>,
     pub turn_ended_at: Option<u64>,
     pub token_total: Option<u64>,
@@ -202,6 +207,8 @@ pub struct SessionRecord {
     pub permission_mode: Option<String>,
     pub current_tool: Option<String>,
     pub active_subagents: u32,
+    #[serde(default)]
+    pub subagents: Vec<SubagentRecord>,
     pub provider_turn_id: Option<String>,
     pub environment: Option<String>,
     pub jump_capability: String,
@@ -219,6 +226,25 @@ pub struct SessionRecord {
     #[serde(skip)]
     pub provider_pid: Option<u32>,
     pub last_event_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanStepRecord {
+    pub id: String,
+    pub text: String,
+    pub detail: Option<String>,
+    pub status: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentRecord {
+    pub id: String,
+    pub agent_type: Option<String>,
+    pub status: String,
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1343,15 +1369,32 @@ fn initialize(connection: &mut Connection) -> Result<(), StoreError> {
             CREATE TABLE IF NOT EXISTS session_tasks (
               session_id TEXT NOT NULL,
               task_id TEXT NOT NULL,
+              subject TEXT,
+              description TEXT,
               completed INTEGER NOT NULL DEFAULT 0,
               created_at INTEGER NOT NULL,
               completed_at INTEGER,
               PRIMARY KEY(session_id, task_id),
               FOREIGN KEY(session_id) REFERENCES sessions(id)
             );
+            CREATE TABLE IF NOT EXISTS session_plan_steps (
+              session_id TEXT NOT NULL,
+              provider_turn_id TEXT NOT NULL,
+              step_index INTEGER NOT NULL,
+              step TEXT NOT NULL,
+              detail TEXT,
+              status TEXT NOT NULL,
+              source TEXT NOT NULL,
+              updated_at INTEGER NOT NULL,
+              PRIMARY KEY(session_id, provider_turn_id, step_index),
+              FOREIGN KEY(session_id) REFERENCES sessions(id)
+            );
             CREATE TABLE IF NOT EXISTS session_subagents (
               session_id TEXT NOT NULL,
               agent_id TEXT NOT NULL,
+              agent_type TEXT,
+              status TEXT NOT NULL DEFAULT 'running',
+              source TEXT,
               active INTEGER NOT NULL DEFAULT 1,
               started_at INTEGER NOT NULL,
               stopped_at INTEGER,
@@ -1436,6 +1479,8 @@ fn initialize(connection: &mut Connection) -> Result<(), StoreError> {
     ensure_session_usage_columns(connection)?;
     ensure_session_usage_model_column(connection)?;
     ensure_session_locator_columns(connection)?;
+    ensure_session_task_content_columns(connection)?;
+    ensure_session_subagent_columns(connection)?;
     suppress_existing_codex_internal_sessions(connection)?;
     connection
         .pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -1542,6 +1587,54 @@ fn ensure_session_locator_columns(connection: &Connection) -> Result<(), StoreEr
                             "TEXT"
                         }
                     ),
+                    [],
+                )
+                .map_err(storage_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_session_task_content_columns(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(session_tasks)")
+        .map_err(storage_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    for column in ["subject", "description"] {
+        if !columns.iter().any(|existing| existing == column) {
+            connection
+                .execute(
+                    &format!("ALTER TABLE session_tasks ADD COLUMN {column} TEXT"),
+                    [],
+                )
+                .map_err(storage_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_session_subagent_columns(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(session_subagents)")
+        .map_err(storage_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    for (column, definition) in [
+        ("agent_type", "TEXT"),
+        ("status", "TEXT NOT NULL DEFAULT 'running'"),
+        ("source", "TEXT"),
+    ] {
+        if !columns.iter().any(|existing| existing == column) {
+            connection
+                .execute(
+                    &format!("ALTER TABLE session_subagents ADD COLUMN {column} {definition}"),
                     [],
                 )
                 .map_err(storage_error)?;
@@ -1730,19 +1823,12 @@ fn ingest_transaction(
         )
         .map_err(storage_error)?;
 
-    let stopped_after_write =
-        if parsed.kind == EventKind::Stopped && !has_background_work(&request.raw) {
-            turn_id
-                .as_deref()
-                .map(|turn| turn_has_write_tool(&transaction, turn))
-                .transpose()?
-                .unwrap_or(false)
-        } else {
-            false
-        };
-    let plan_progress = update_task_progress(
+    let completed_without_background =
+        parsed.kind == EventKind::Stopped && !has_background_work(&request.raw);
+    let plan_progress = update_plan_progress(
         &transaction,
         &session_id,
+        parsed.provider_turn_id.as_deref(),
         parsed.kind,
         &request.raw,
         occurred_at,
@@ -1819,6 +1905,26 @@ fn ingest_transaction(
                 ),
             },
         )?),
+        EventKind::Interrupted => Some(insert_nonapproval_attention(
+            &transaction,
+            &session_id,
+            turn_id.as_deref(),
+            &request,
+            NonApprovalSpec {
+                kind: "error",
+                title: "Agent 本轮已中断",
+                detail: request
+                    .raw
+                    .get("error")
+                    .or_else(|| request.raw.get("reason"))
+                    .and_then(Value::as_str),
+                dedupe_key: format!(
+                    "{}:{}:interrupted",
+                    session_id,
+                    turn_id.as_deref().unwrap_or("none")
+                ),
+            },
+        )?),
         EventKind::Notification if is_structured_question(&request.raw) => {
             Some(insert_nonapproval_attention(
                 &transaction,
@@ -1846,7 +1952,7 @@ fn ingest_transaction(
                 },
             )?)
         }
-        EventKind::Stopped if stopped_after_write => Some(insert_nonapproval_attention(
+        EventKind::Stopped if completed_without_background => Some(insert_nonapproval_attention(
             &transaction,
             &session_id,
             turn_id.as_deref(),
@@ -1864,6 +1970,14 @@ fn ingest_transaction(
         )?),
         _ => None,
     };
+
+    reconcile_auto_review_attention(
+        &transaction,
+        &session_id,
+        parsed.kind,
+        &request.raw,
+        occurred_at,
+    )?;
 
     let native_permission_resolved = reconcile_observed_native_permission(
         &transaction,
@@ -1897,6 +2011,7 @@ fn ingest_transaction(
                 parsed.kind,
                 EventKind::PromptSubmitted
                     | EventKind::Stopped
+                    | EventKind::Interrupted
                     | EventKind::Failed
                     | EventKind::SessionEnded
             );
@@ -2012,7 +2127,7 @@ fn ingest_transaction(
 
     if matches!(
         parsed.kind,
-        EventKind::Stopped | EventKind::Failed | EventKind::SessionEnded
+        EventKind::Stopped | EventKind::Interrupted | EventKind::Failed | EventKind::SessionEnded
     ) {
         if let Some(turn_id) = turn_id.as_deref() {
             transaction
@@ -2021,7 +2136,7 @@ fn ingest_transaction(
                     params![
                         turn_id,
                         match parsed.kind {
-                            EventKind::Failed => "failed",
+                            EventKind::Interrupted | EventKind::Failed => "failed",
                             EventKind::SessionEnded => "idle",
                             _ => "response_finished",
                         },
@@ -3041,7 +3156,7 @@ fn should_refresh_provider_title(
 }
 
 fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
-    let sessions = {
+    let mut sessions = {
         let mut statement = connection
             .prepare(
                 "SELECT sessions.id, sessions.provider, sessions.provider_session_id,
@@ -3132,6 +3247,7 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
                     plan_total: row
                         .get::<_, Option<i64>>(13)?
                         .and_then(|value| u32::try_from(value).ok()),
+                    plan_steps: Vec::new(),
                     turn_started_at: row.get::<_, Option<i64>>(14)?.map(from_i64),
                     turn_ended_at: row.get::<_, Option<i64>>(15)?.map(from_i64),
                     token_total: row.get::<_, Option<i64>>(16)?.map(from_i64),
@@ -3159,6 +3275,7 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
                         .ok()
                         .and_then(|value| u32::try_from(value).ok())
                         .unwrap_or_default(),
+                    subagents: Vec::new(),
                     provider_turn_id: row.get(28)?,
                     environment,
                     jump_capability,
@@ -3177,6 +3294,10 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
             .map_err(storage_error)?;
         rows
     };
+    for session in &mut sessions {
+        session.plan_steps = read_plan_steps(connection, &session.id)?;
+        session.subagents = read_active_subagents(connection, &session.id)?;
+    }
     let attention = {
         let mut statement = connection
             .prepare(
@@ -3252,6 +3373,102 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
         event_count,
         metrics,
     })
+}
+
+fn read_plan_steps(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<PlanStepRecord>, StoreError> {
+    let connector_steps = {
+        let mut statement = connection
+            .prepare(
+                "SELECT provider_turn_id || ':' || step_index, step, detail, status, source
+                 FROM session_plan_steps
+                 WHERE session_id = ?1
+                 ORDER BY step_index ASC LIMIT ?2",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(
+                params![
+                    session_id,
+                    i64::try_from(MAX_PLAN_STEPS).unwrap_or(i64::MAX)
+                ],
+                |row| {
+                    Ok(PlanStepRecord {
+                        id: row.get(0)?,
+                        text: row.get(1)?,
+                        detail: row.get(2)?,
+                        status: row.get(3)?,
+                        source: row.get(4)?,
+                    })
+                },
+            )
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+        rows
+    };
+    if !connector_steps.is_empty() {
+        return Ok(connector_steps);
+    }
+
+    let mut statement = connection
+        .prepare(
+            "SELECT task_id, COALESCE(subject, '未命名任务'), description,
+                    CASE completed WHEN 1 THEN 'completed' ELSE 'pending' END
+             FROM session_tasks
+             WHERE session_id = ?1
+             ORDER BY created_at ASC LIMIT ?2",
+        )
+        .map_err(storage_error)?;
+    let rows = statement
+        .query_map(
+            params![
+                session_id,
+                i64::try_from(MAX_PLAN_STEPS).unwrap_or(i64::MAX)
+            ],
+            |row| {
+                Ok(PlanStepRecord {
+                    id: row.get(0)?,
+                    text: row.get(1)?,
+                    detail: row.get(2)?,
+                    status: row.get(3)?,
+                    source: "claude_task".to_owned(),
+                })
+            },
+        )
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    Ok(rows)
+}
+
+fn read_active_subagents(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<SubagentRecord>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT agent_id, agent_type, status, source
+             FROM session_subagents
+             WHERE session_id = ?1 AND active = 1
+             ORDER BY started_at ASC LIMIT 64",
+        )
+        .map_err(storage_error)?;
+    let rows = statement
+        .query_map([session_id], |row| {
+            Ok(SubagentRecord {
+                id: row.get(0)?,
+                agent_type: row.get(1)?,
+                status: row.get(2)?,
+                source: row.get(3)?,
+            })
+        })
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    Ok(rows)
 }
 
 fn environment_label(surface: Option<&str>, app: Option<&str>) -> Option<String> {
@@ -3576,20 +3793,6 @@ fn is_structured_question(raw: &Value) -> bool {
         .any(|value| value.eq_ignore_ascii_case("question"))
 }
 
-fn turn_has_write_tool(transaction: &Transaction<'_>, turn_id: &str) -> Result<bool, StoreError> {
-    transaction
-        .query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM events WHERE turn_id = ?1
-               AND type IN ('tool.started', 'tool.finished')
-               AND tool_name IN ('Edit', 'Write', 'apply_patch', 'MultiEdit')
-             )",
-            [turn_id],
-            |row| row.get::<_, bool>(0),
-        )
-        .map_err(storage_error)
-}
-
 fn attention_id_for_request(
     transaction: &Transaction<'_>,
     request_id: Uuid,
@@ -3648,6 +3851,7 @@ fn is_observed_codex_permission_start(request: &BridgeRequest) -> bool {
         && request.event_name() == Some("PreToolUse")
         && request.raw.get("tool_name").and_then(Value::as_str) == Some("request_permissions")
         && !request.needs_reply
+        && !request.provider_handles_approval
 }
 
 fn reconcile_superseded_nonblocking_attention(
@@ -3677,6 +3881,40 @@ fn reconcile_superseded_nonblocking_attention(
              WHERE session_id = ?1 AND kind IN ('completion', 'error')
                AND state IN ('open', 'snoozed') AND created_at < ?2",
             params![session_id, occurred_at],
+        )
+        .map_err(storage_error)?;
+    Ok(())
+}
+
+fn reconcile_auto_review_attention(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    kind: EventKind,
+    raw: &Value,
+    occurred_at: i64,
+) -> Result<(), StoreError> {
+    if !matches!(
+        kind,
+        EventKind::AutoReviewStarted | EventKind::AutoReviewCompleted
+    ) {
+        return Ok(());
+    }
+    let status = raw
+        .pointer("/review/status")
+        .or_else(|| raw.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or(if kind == EventKind::AutoReviewStarted {
+            "inProgress"
+        } else {
+            "completed"
+        });
+    transaction
+        .execute(
+            "UPDATE attention_items SET state = 'resolved', resolved_at = ?2,
+               resolution = ?3, expires_at = NULL
+             WHERE session_id = ?1 AND kind = 'native_approval'
+               AND state IN ('open', 'snoozed')",
+            params![session_id, occurred_at, format!("auto_review:{status}")],
         )
         .map_err(storage_error)?;
     Ok(())
@@ -3913,13 +4151,23 @@ fn sanitized_attention_text(value: &str) -> Option<String> {
     Some(bounded)
 }
 
-fn update_task_progress(
+fn update_plan_progress(
     transaction: &Transaction<'_>,
     session_id: &str,
+    provider_turn_id: Option<&str>,
     kind: EventKind,
     raw: &Value,
     occurred_at: i64,
 ) -> Result<Option<(u32, u32)>, StoreError> {
+    if kind == EventKind::PlanUpdated {
+        return update_codex_plan_progress(
+            transaction,
+            session_id,
+            provider_turn_id,
+            raw,
+            occurred_at,
+        );
+    }
     if !matches!(kind, EventKind::TaskCreated | EventKind::TaskCompleted) {
         return Ok(None);
     }
@@ -3933,22 +4181,39 @@ fn update_task_progress(
     if kind == EventKind::TaskCreated {
         transaction
             .execute(
-                "INSERT OR IGNORE INTO session_tasks (
-                   session_id, task_id, completed, created_at
-                 ) VALUES (?1, ?2, 0, ?3)",
-                params![session_id, task_id, occurred_at],
+                "INSERT INTO session_tasks (
+                   session_id, task_id, subject, description, completed, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, 0, ?5)
+                 ON CONFLICT(session_id, task_id) DO UPDATE SET
+                   subject = COALESCE(excluded.subject, session_tasks.subject),
+                   description = COALESCE(excluded.description, session_tasks.description)",
+                params![
+                    session_id,
+                    task_id,
+                    bounded_plan_text(raw.get("task_subject").and_then(Value::as_str)),
+                    bounded_plan_detail(raw.get("task_description").and_then(Value::as_str)),
+                    occurred_at
+                ],
             )
             .map_err(storage_error)?;
     } else {
         transaction
             .execute(
                 "INSERT INTO session_tasks (
-                   session_id, task_id, completed, created_at, completed_at
-                 ) VALUES (?1, ?2, 1, ?3, ?3)
+                   session_id, task_id, subject, description, completed, created_at, completed_at
+                 ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5)
                  ON CONFLICT(session_id, task_id) DO UPDATE SET
+                   subject = COALESCE(excluded.subject, session_tasks.subject),
+                   description = COALESCE(excluded.description, session_tasks.description),
                    completed = 1,
                    completed_at = COALESCE(session_tasks.completed_at, excluded.completed_at)",
-                params![session_id, task_id, occurred_at],
+                params![
+                    session_id,
+                    task_id,
+                    bounded_plan_text(raw.get("task_subject").and_then(Value::as_str)),
+                    bounded_plan_detail(raw.get("task_description").and_then(Value::as_str)),
+                    occurred_at
+                ],
             )
             .map_err(storage_error)?;
     }
@@ -3966,6 +4231,98 @@ fn update_task_progress(
     )))
 }
 
+fn update_codex_plan_progress(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    provider_turn_id: Option<&str>,
+    raw: &Value,
+    occurred_at: i64,
+) -> Result<Option<(u32, u32)>, StoreError> {
+    let Some(provider_turn_id) = provider_turn_id.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(plan) = raw.get("plan").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    let steps = plan
+        .iter()
+        .take(MAX_PLAN_STEPS)
+        .filter_map(|entry| {
+            let text = bounded_plan_text(entry.get("step").and_then(Value::as_str))?;
+            let status = normalize_plan_status(entry.get("status").and_then(Value::as_str));
+            Some((text, status))
+        })
+        .collect::<Vec<_>>();
+    transaction
+        .execute(
+            "DELETE FROM session_plan_steps WHERE session_id = ?1",
+            [session_id],
+        )
+        .map_err(storage_error)?;
+    let detail = bounded_plan_detail(raw.get("explanation").and_then(Value::as_str));
+    for (index, (step, status)) in steps.iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO session_plan_steps (
+                   session_id, provider_turn_id, step_index, step, detail,
+                   status, source, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'codex_turn_plan', ?7)",
+                params![
+                    session_id,
+                    provider_turn_id,
+                    i64::try_from(index).unwrap_or(i64::MAX),
+                    step,
+                    (index == 0).then_some(detail.as_deref()).flatten(),
+                    status,
+                    occurred_at
+                ],
+            )
+            .map_err(storage_error)?;
+    }
+    let total = u32::try_from(steps.len()).unwrap_or(u32::MAX);
+    let done = u32::try_from(
+        steps
+            .iter()
+            .filter(|(_, status)| *status == "completed")
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    Ok((total > 0).then_some((done, total)))
+}
+
+fn bounded_plan_text(value: Option<&str>) -> Option<String> {
+    bounded_clean_text(value, MAX_PLAN_STEP_CHARS)
+}
+
+fn bounded_plan_detail(value: Option<&str>) -> Option<String> {
+    bounded_clean_text(value, MAX_PLAN_DETAIL_CHARS)
+}
+
+fn bounded_clean_text(value: Option<&str>, max_chars: usize) -> Option<String> {
+    let normalized = value?
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_owned();
+    if normalized.is_empty() {
+        return None;
+    }
+    let mut bounded = normalized.chars().take(max_chars).collect::<String>();
+    if normalized.chars().count() > max_chars {
+        bounded.push('…');
+    }
+    Some(bounded)
+}
+
+fn normalize_plan_status(value: Option<&str>) -> &'static str {
+    match value {
+        Some("completed") => "completed",
+        Some("inProgress" | "in_progress") => "in_progress",
+        _ => "pending",
+    }
+}
+
 fn update_subagent_activity(
     transaction: &Transaction<'_>,
     session_id: &str,
@@ -3973,6 +4330,30 @@ fn update_subagent_activity(
     raw: &Value,
     occurred_at: i64,
 ) -> Result<Option<u32>, StoreError> {
+    if matches!(
+        kind,
+        EventKind::Stopped | EventKind::Interrupted | EventKind::Failed | EventKind::SessionEnded
+    ) && !has_background_work(raw)
+    {
+        transaction
+            .execute(
+                "UPDATE session_subagents SET active = 0,
+                   status = ?3,
+                   stopped_at = COALESCE(stopped_at, ?2)
+                 WHERE session_id = ?1 AND active = 1",
+                params![
+                    session_id,
+                    occurred_at,
+                    if matches!(kind, EventKind::Interrupted | EventKind::Failed) {
+                        "interrupted"
+                    } else {
+                        "completed"
+                    }
+                ],
+            )
+            .map_err(storage_error)?;
+        return Ok(Some(0));
+    }
     if !matches!(
         kind,
         EventKind::SubagentStarted | EventKind::SubagentStopped
@@ -3986,26 +4367,58 @@ fn update_subagent_activity(
     else {
         return Ok(None);
     };
+    let agent_type = bounded_clean_text(raw.get("agent_type").and_then(Value::as_str), 128);
+    let agent_status = bounded_clean_text(raw.get("agent_status").and_then(Value::as_str), 64)
+        .unwrap_or_else(|| {
+            if kind == EventKind::SubagentStarted {
+                "running".to_owned()
+            } else {
+                "completed".to_owned()
+            }
+        });
+    let source = bounded_clean_text(raw.get("source").and_then(Value::as_str), 64);
     if kind == EventKind::SubagentStarted {
         transaction
             .execute(
                 "INSERT INTO session_subagents (
-                   session_id, agent_id, active, started_at
-                 ) VALUES (?1, ?2, 1, ?3)
-                 ON CONFLICT(session_id, agent_id) DO UPDATE SET active = 1",
-                params![session_id, agent_id, occurred_at],
+                   session_id, agent_id, agent_type, status, source, active, started_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)
+                 ON CONFLICT(session_id, agent_id) DO UPDATE SET
+                   agent_type = COALESCE(excluded.agent_type, session_subagents.agent_type),
+                   status = excluded.status,
+                   source = COALESCE(excluded.source, session_subagents.source),
+                   active = 1",
+                params![
+                    session_id,
+                    agent_id,
+                    agent_type,
+                    agent_status,
+                    source,
+                    occurred_at
+                ],
             )
             .map_err(storage_error)?;
     } else {
         transaction
             .execute(
                 "INSERT INTO session_subagents (
-                   session_id, agent_id, active, started_at, stopped_at
-                 ) VALUES (?1, ?2, 0, ?3, ?3)
+                   session_id, agent_id, agent_type, status, source,
+                   active, started_at, stopped_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?6)
                  ON CONFLICT(session_id, agent_id) DO UPDATE SET
+                   agent_type = COALESCE(excluded.agent_type, session_subagents.agent_type),
+                   status = excluded.status,
+                   source = COALESCE(excluded.source, session_subagents.source),
                    active = 0,
                    stopped_at = COALESCE(session_subagents.stopped_at, excluded.stopped_at)",
-                params![session_id, agent_id, occurred_at],
+                params![
+                    session_id,
+                    agent_id,
+                    agent_type,
+                    agent_status,
+                    source,
+                    occurred_at
+                ],
             )
             .map_err(storage_error)?;
     }
@@ -4140,6 +4553,26 @@ fn project_event<'a>(
             ("awaiting_approval", Some("widget"), "等待你回答".to_owned())
         }
         EventKind::PermissionDenied => ("thinking", None, "操作已在 Agent 中拒绝".to_owned()),
+        EventKind::AutoReviewStarted => (
+            "thinking",
+            Some("provider"),
+            "Codex 正在自动审查权限".to_owned(),
+        ),
+        EventKind::AutoReviewCompleted => {
+            let status = raw
+                .pointer("/review/status")
+                .or_else(|| raw.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or("completed");
+            let label = match status {
+                "approved" => "Codex 自动审查已批准",
+                "denied" => "Codex 自动审查已拒绝",
+                "timedOut" => "Codex 自动审查超时，等待后续状态",
+                "aborted" => "Codex 自动审查已取消，等待后续状态",
+                _ => "Codex 自动审查已结束",
+            };
+            ("thinking", None, label.to_owned())
+        }
         EventKind::Compacting => ("compacting", None, "正在压缩记忆".to_owned()),
         EventKind::Stopped if has_background_work(raw) => {
             let count = ["background_tasks", "session_crons"]
@@ -4150,13 +4583,15 @@ fn project_event<'a>(
             ("tool_running", None, format!("后台任务仍在运行 · {count}"))
         }
         EventKind::Stopped => ("response_finished", None, "本轮已完成".to_owned()),
+        EventKind::Interrupted => ("failed", None, "本轮已中断".to_owned()),
         EventKind::Failed => ("failed", None, "运行失败".to_owned()),
         EventKind::Unknown => (current, None, "⚠ 事件不识别（可能版本不兼容）".to_owned()),
         EventKind::Notification
         | EventKind::SubagentStarted
         | EventKind::SubagentStopped
         | EventKind::TaskCreated
-        | EventKind::TaskCompleted => (current, None, "活动已更新".to_owned()),
+        | EventKind::TaskCompleted
+        | EventKind::PlanUpdated => (current, None, "活动已更新".to_owned()),
     }
 }
 
@@ -4316,6 +4751,10 @@ fn event_summary(raw: &Value, kind: EventKind) -> Option<String> {
         }
         EventKind::QuestionRequested => Some("Claude AskUserQuestion".to_owned()),
         EventKind::ElicitationRequested => Some("Claude Elicitation".to_owned()),
+        EventKind::PlanUpdated => Some("Provider plan updated".to_owned()),
+        EventKind::AutoReviewStarted => Some("Codex auto approval review started".to_owned()),
+        EventKind::AutoReviewCompleted => Some("Codex auto approval review completed".to_owned()),
+        EventKind::Interrupted => Some("Provider turn interrupted".to_owned()),
         EventKind::Unknown => Some("未知 Provider 事件".to_owned()),
         _ => None,
     }
@@ -4338,8 +4777,12 @@ fn event_type(kind: EventKind) -> &'static str {
         EventKind::SubagentStopped => "subagent.stopped",
         EventKind::TaskCreated => "task.created",
         EventKind::TaskCompleted => "task.completed",
+        EventKind::PlanUpdated => "plan.updated",
+        EventKind::AutoReviewStarted => "approval.auto_review.started",
+        EventKind::AutoReviewCompleted => "approval.auto_review.completed",
         EventKind::Compacting => "session.compacting",
         EventKind::Stopped => "turn.stopped",
+        EventKind::Interrupted => "turn.interrupted",
         EventKind::Failed => "turn.failed",
         EventKind::Unknown => "unknown",
     }
