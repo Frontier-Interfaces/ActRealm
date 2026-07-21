@@ -460,6 +460,7 @@ public struct PendingDecision: Identifiable, Equatable, Sendable {
     }
 
     public let commandId: UUID
+    public let attentionID: String
     public let action: AttentionAction
     public let phase: Phase
     public let summary: String
@@ -665,6 +666,7 @@ public struct DerivedState: Equatable, Sendable {
                 }
                 return PendingDecision(
                     commandId: command.id,
+                    attentionID: command.attentionId,
                     action: action,
                     phase: phase,
                     summary: "\(verb) \(subject)",

@@ -65,7 +65,7 @@ ActRealm 用四条原则组织这个闭环：
   WebSocket 更新、诊断和本地导出；
 - **稳定实时刷新与受控恢复**：提供心跳、失活连接回退、原位时间更新、本机健康
   监控和保持端口不变的一键 Runtime 重启；
-- **原生 macOS 客户端代码**：包含菜单栏、HUD、Runtime 监管和实验性的台前调度。
+- **原生 macOS 客户端代码**：包含菜单栏、HUD、Runtime 监管和智能聚焦（Agent Focus）。
 
 产品、Runtime 可执行文件和 CLI 全部使用 **ActRealm** 这一名称；命令行形式为
 `actrealm`。
@@ -156,7 +156,7 @@ open apps/macos/dist/ActRealm.app
 | --- | --- | --- |
 | 本地 Runtime 与 Web 控制界面 | 当前测试候选版 | 功能实现到 M14 并包含实时状态/恢复优化；M13 真实 Provider 验收和 48 小时稳定性门禁仍待完成 |
 | Claude Code 与 Codex | 当前构建 | 只覆盖本机会话；直接操作取决于事件是否带有真实回复通道 |
-| 原生 macOS 客户端 | 可测试源码 | 已能在本地打包；台前调度与窗口激活仍需更广泛的人工验收 |
+| 原生 macOS 客户端 | 可测试源码 | 已能在本地打包；智能聚焦、台前调度状态恢复与窗口激活仍需更广泛的人工验收 |
 | ActRealm 工作区自动排布 | 实验性能力 | 需要 macOS 辅助功能权限，失败时不得修改 Runtime 任务状态 |
 | ActRealm Review | 开发中 | 规划包含测试、diff、证据与检查点审阅；不属于当前构建 |
 | Gemini CLI 适配器 | 开发中 | 尚未作为当前正式支持的 Provider 交付 |

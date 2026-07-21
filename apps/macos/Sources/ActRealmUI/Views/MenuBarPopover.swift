@@ -8,7 +8,6 @@ public struct MenuBarPopoverView: View {
 
     @EnvironmentObject var model: AppModel
     @Environment(\.openWindow) private var openWindow
-    @Environment(\.openSettings) private var openSettings
 
     private var entries: [OutboxEntry] { model.derived.openOutbox }
 
@@ -46,7 +45,7 @@ public struct MenuBarPopoverView: View {
     private var header: some View {
         HStack(spacing: 8) {
             LogoMark()
-            Text("actrealm")
+            Text("ActRealm")
                 .font(.system(size: 13, weight: .bold))
                 .foregroundStyle(DT.textStrong)
             Spacer()
@@ -55,27 +54,35 @@ public struct MenuBarPopoverView: View {
     }
 
     private var listeningPill: some View {
-        HStack(spacing: 6) {
+        let tone = runtimeTone
+        return HStack(spacing: 6) {
             StatusDot(
-                color: model.bridgeStatus.isListening ? DT.greenDot : Color(lightWhite: 0.3, darkWhite: 0.4),
+                color: tone.dotColor,
                 size: 6
             )
             Text(pillText)
                 .font(.system(size: 10.5, weight: .semibold))
-                .foregroundStyle(model.bridgeStatus.isListening ? DT.greenText : DT.textWeak)
+                .foregroundStyle(tone.textColor)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 3)
-        .background(Capsule().fill(model.bridgeStatus.isListening ? DT.greenBg : DT.neutralBadgeBg))
-        .overlay(Capsule().strokeBorder(
-            model.bridgeStatus.isListening ? DT.greenStroke : DT.neutralBadgeStroke, lineWidth: 1))
+        .background(Capsule().fill(tone.backgroundColor))
+        .overlay(Capsule().strokeBorder(tone.strokeColor, lineWidth: 1))
     }
 
     private var pillText: String {
         switch model.bridgeStatus {
-        case .listening: "Listening"
+        case .listening: "本机在线"
         case .starting: "启动中…"
-        case .absent: "Runtime absent · fail-open"
+        case .absent: "Runtime 未连接"
+        }
+    }
+
+    private var runtimeTone: MenuBarStatusTone {
+        switch model.bridgeStatus {
+        case .listening: .green
+        case .starting: .blue
+        case .absent: .red
         }
     }
 
@@ -108,20 +115,23 @@ public struct MenuBarPopoverView: View {
     }
 
     private func laneRow(_ lane: Lane) -> some View {
-        HStack(spacing: 9) {
+        let presentation = MenuBarLanePresentation(lane: lane, now: model.now)
+        return HStack(spacing: 9) {
             ProviderAvatar(kind: lane.provider, size: 22)
             VStack(alignment: .leading, spacing: 0) {
-                Text(laneTitle(lane))
+                Text(presentation.title)
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(Color(lightWhite: 0.85, darkWhite: 0.88))
                     .lineLimit(1)
-                Text(laneSubtitle(lane))
+                Text(presentation.subtitle)
                     .font(DT.body(10.5))
                     .foregroundStyle(DT.textWeak)
                     .lineLimit(1)
             }
             Spacer()
-            trailing(lane)
+            Text(presentation.trailing)
+                .font(.system(size: 10.5, weight: presentation.tone == .neutral ? .regular : .semibold))
+                .foregroundStyle(presentation.tone.textColor)
         }
         .padding(.horizontal, 6)
         .padding(.vertical, 7)
@@ -130,51 +140,13 @@ public struct MenuBarPopoverView: View {
         .onTapGesture { openMainWindow() }
     }
 
-    private func laneTitle(_ lane: Lane) -> String {
-        lane.tasks.first?.projectName ?? lane.tasks.first?.title ?? lane.provider.displayName
-    }
-
-    private func laneSubtitle(_ lane: Lane) -> String {
-        if lane.provider == .gemini { return "gemini · notify-only" }
-        if let top = lane.tasks.first {
-            switch top.status {
-            case .waiting: return "\(lane.provider.displayName) · 等待处理"
-            case .running: return "\(lane.provider.displayName) · \(top.activity ?? "在跑")"
-            case .failed: return "\(lane.provider.displayName) · 运行失败"
-            case .done: return "\(lane.provider.displayName) · 本轮已完成"
-            case .idle: return "\(lane.provider.displayName) · 空闲"
-            }
-        }
-        return "\(lane.provider.displayName) · 无活动任务"
-    }
-
-    @ViewBuilder
-    private func trailing(_ lane: Lane) -> some View {
-        if lane.waitingCount > 0 {
-            Text("\(lane.waitingCount) waiting")
-                .font(.system(size: 10.5, weight: .semibold))
-                .foregroundStyle(DT.amberText)
-        } else if let top = lane.tasks.first {
-            Text(ZhFormat.shortAge(model.now.timeIntervalSince(top.lastEventAt)))
-                .font(DT.micro(10.5))
-                .foregroundStyle(DT.textFaint)
-        } else {
-            Text("idle")
-                .font(DT.micro(10.5))
-                .foregroundStyle(DT.textFaint)
-        }
-    }
-
     // MARK: Footer
 
     private var footer: some View {
         HStack {
-            Button("Open actrealm…") { openMainWindow() }
+            Button("打开 ActRealm") { openMainWindow() }
             Spacer()
-            Button("Settings…") {
-                NSApp.activate(ignoringOtherApps: true)
-                openSettings()
-            }
+            Button("设置…") { openSettingsWindow() }
         }
         .buttonStyle(.plain)
         .font(.system(size: 11.5, weight: .semibold))
@@ -187,8 +159,127 @@ public struct MenuBarPopoverView: View {
     }
 
     private func openMainWindow() {
-        openWindow(id: "main")
         NSApp.activate(ignoringOtherApps: true)
+        if let window = NSApp.windows.first(where: {
+            guard let id = $0.identifier?.rawValue else { return false }
+            return id == "main" || id.hasPrefix("main-AppWindow-")
+        }) {
+            window.deminiaturize(nil)
+            window.makeKeyAndOrderFront(nil)
+        } else {
+            openWindow(id: "main")
+        }
+    }
+
+    private func openSettingsWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        openWindow(id: "settings")
+    }
+}
+
+// MARK: - Menu bar presentation
+
+enum MenuBarStatusTone: Equatable {
+    case amber
+    case red
+    case blue
+    case green
+    case neutral
+
+    init(kind: OutboxKind) {
+        switch kind {
+        case .approval, .nativeApproval: self = .amber
+        case .question: self = .blue
+        case .error: self = .red
+        case .completion: self = .green
+        }
+    }
+
+    var textColor: Color {
+        switch self {
+        case .amber: DT.amberText
+        case .red: DT.redText
+        case .blue: DT.blueText
+        case .green: DT.greenText
+        case .neutral: DT.textFaint
+        }
+    }
+
+    var dotColor: Color {
+        switch self {
+        case .amber: DT.amberDot
+        case .red: DT.redRing
+        case .blue: DT.blue
+        case .green: DT.greenDot
+        case .neutral: DT.textFaint
+        }
+    }
+
+    var backgroundColor: Color {
+        switch self {
+        case .amber: DT.amberBg
+        case .red: DT.redBg
+        case .blue: DT.blueBg
+        case .green: DT.greenBg
+        case .neutral: DT.cardSoft
+        }
+    }
+
+    var strokeColor: Color {
+        switch self {
+        case .amber: DT.amberStroke
+        case .red: DT.redStroke
+        case .blue: DT.blueBadgeStroke
+        case .green: DT.greenStroke
+        case .neutral: DT.hairlineSoft
+        }
+    }
+}
+
+struct MenuBarLanePresentation: Equatable {
+    let title: String
+    let subtitle: String
+    let trailing: String
+    let tone: MenuBarStatusTone
+
+    init(lane: Lane, now: Date) {
+        let waiting = lane.tasks.filter { $0.status == .waiting }
+        let failed = lane.tasks.filter { $0.status == .failed }
+        let running = lane.tasks.filter { $0.status == .running }
+        let featured = waiting.first ?? failed.first ?? running.first ?? lane.tasks.first
+
+        title = featured?.projectName ?? featured?.title ?? lane.provider.displayName
+
+        if lane.provider == .gemini {
+            subtitle = "\(lane.provider.displayName) · 仅通知"
+        } else if let featured {
+            switch featured.status {
+            case .waiting: subtitle = "\(lane.provider.displayName) · 等待处理"
+            case .running: subtitle = "\(lane.provider.displayName) · \(featured.activity ?? "正在运行")"
+            case .failed: subtitle = "\(lane.provider.displayName) · 运行失败"
+            case .done: subtitle = "\(lane.provider.displayName) · 本轮已完成"
+            case .idle: subtitle = "\(lane.provider.displayName) · 空闲"
+            }
+        } else {
+            subtitle = "\(lane.provider.displayName) · 无活动任务"
+        }
+
+        if !waiting.isEmpty {
+            trailing = "\(waiting.count) 项待处理"
+            tone = .amber
+        } else if !failed.isEmpty {
+            trailing = "\(failed.count) 项出错"
+            tone = .red
+        } else if !running.isEmpty {
+            trailing = "\(running.count) 项运行中"
+            tone = .blue
+        } else if let featured {
+            trailing = ZhFormat.shortAge(now.timeIntervalSince(featured.lastEventAt))
+            tone = .neutral
+        } else {
+            trailing = "无活动"
+            tone = .neutral
+        }
     }
 }
 
@@ -200,13 +291,15 @@ private struct CompactApprovalCard: View {
     @State private var confirmingAllow = false
     let entry: OutboxEntry
 
+    private var tone: MenuBarStatusTone { MenuBarStatusTone(kind: entry.kind) }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 7) {
-                StatusDot(color: entry.provider.map { DT.providerText($0).opacity(0.85) } ?? DT.amberDot, size: 7)
-                Text("\(entry.provider?.displayName ?? entry.attention.provider) · \(kindLabel)")
+                StatusDot(color: tone.dotColor, size: 7)
+                Text("\(entry.provider?.displayName ?? entry.attention.provider) · \(entry.kind.badgeText)")
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(DT.amberText)
+                    .foregroundStyle(tone.textColor)
                 Spacer()
                 Text("已等 \(ZhFormat.waitDuration(model.now.timeIntervalSince(entry.createdAt)))")
                     .font(DT.micro(9.5))
@@ -246,17 +339,7 @@ private struct CompactApprovalCard: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 11)
-        .sheetCard(fill: DT.amberBg, stroke: DT.amberStroke, radius: DT.radiusCard)
-    }
-
-    private var kindLabel: String {
-        switch entry.kind {
-        case .approval: "PermissionRequest"
-        case .nativeApproval: "原界面批准"
-        case .question: "提问"
-        case .error: "运行出错"
-        case .completion: "完成确认"
-        }
+        .sheetCard(fill: tone.backgroundColor, stroke: tone.strokeColor, radius: DT.radiusCard)
     }
 
     private var contextLine: String {
@@ -264,10 +347,10 @@ private struct CompactApprovalCard: View {
         if let project = entry.attention.project { parts.append(project) }
         if let provider = entry.provider {
             switch provider {
-            case .claude: parts.append("no reply in 24h → fails open")
-            case .codex: parts.append("no reply in 1h → fails open")
-            case .gemini: parts.append("notify-only")
-            case .custom: parts.append("connector-defined")
+            case .claude: parts.append("24 小时未回复将交回 Provider")
+            case .codex: parts.append("1 小时未回复将交回 Provider")
+            case .gemini: parts.append("仅通知")
+            case .custom: parts.append("由连接器定义")
             }
         }
         return parts.joined(separator: " · ")
@@ -277,14 +360,14 @@ private struct CompactApprovalCard: View {
     private var buttons: some View {
         switch entry.kind {
         case .approval where entry.risk.needsVerification:
-            Button("Deny") { model.deny(entry) }
+            Button("拒绝") { model.deny(entry) }
                 .buttonStyle(PillButtonStyle(rank: .secondary, fontSize: 11.5, horizontalPadding: 14))
             Button("去核对") { model.passThrough(entry) }
                 .buttonStyle(PillButtonStyle(rank: .primary, fontSize: 11.5, horizontalPadding: 14))
         case .approval:
-            Button("Deny") { model.deny(entry) }
+            Button("拒绝") { model.deny(entry) }
                 .buttonStyle(PillButtonStyle(rank: .secondary, fontSize: 11.5, horizontalPadding: 14))
-            Button("Allow") { model.approve(entry) }
+            Button("允许") { model.approve(entry) }
                 .buttonStyle(PillButtonStyle(rank: .primary, fontSize: 11.5, horizontalPadding: 14))
         case .nativeApproval:
             Button("打开应用") { Task { await model.jump(to: entry) } }
@@ -305,7 +388,7 @@ private struct CompactApprovalCard: View {
             Button("稍后提醒") { model.snooze(entry) }
                 .buttonStyle(PillButtonStyle(rank: .secondary, fontSize: 11.5, horizontalPadding: 14))
             Button("确认完成") { model.acknowledge(entry) }
-                .buttonStyle(PillButtonStyle(rank: .primary, fontSize: 11.5, horizontalPadding: 14))
+                .buttonStyle(ActionButtonStyle(kind: .success, compact: true))
         }
     }
 }
@@ -318,16 +401,16 @@ public struct MenuBarLabel: View {
     @EnvironmentObject var model: AppModel
 
     public var body: some View {
-        let waiting = !model.derived.openOutbox.isEmpty
         let absent = !model.bridgeStatus.isListening
         HStack(spacing: 3) {
             Image(nsImage: Self.barsImage)
                 .opacity(absent ? 0.28 : 1)
-            if waiting && !absent {
+            if let entry = model.derived.openOutbox.first, !absent {
+                let tone = MenuBarStatusTone(kind: entry.kind)
                 Circle()
-                    .fill(Color(nsColor: .rgba(255, 159, 10, 1)))
+                    .fill(tone.dotColor)
                     .frame(width: 6, height: 6)
-                    .shadow(color: Color(nsColor: .rgba(255, 159, 10, 0.8)), radius: 2)
+                    .shadow(color: tone.dotColor.opacity(0.8), radius: 2)
             }
         }
     }

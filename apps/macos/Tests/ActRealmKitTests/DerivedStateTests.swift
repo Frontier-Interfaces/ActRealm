@@ -272,6 +272,7 @@ private func makeSnapshot(
             Issue.record("expected undoable phase")
             return
         }
+        #expect(pending?.attentionID == "att")
         #expect(abs(deadline.timeIntervalSince(ZhFormat.date(fromMillis: createdAt).addingTimeInterval(3))) < 0.001)
         #expect(pending?.summary.hasPrefix("将允许") == true)
     }

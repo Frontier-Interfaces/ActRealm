@@ -7,7 +7,8 @@ Native SwiftUI/AppKit client for the local `actrealm` Runtime.
 - render Attention, tasks, quota, settings, menu-bar, and HUD surfaces;
 - supervise the bundled Runtime helper and connect through its authenticated
   loopback API and WebSocket;
-- execute macOS-only foreground scheduling through `NSWorkspace` and AppKit;
+- execute macOS-only Agent Focus through `NSWorkspace` and AppKit, including
+  pointer acceptance and bounded Stage Manager state restoration;
 - package one tested `actrealm` binary inside `ActRealm.app`.
 
 The client does not read SQLite or Provider configuration directly. Hooks,
@@ -44,8 +45,8 @@ user state, snapshots, and packaged apps are ignored by Git.
 ## Source layout
 
 - `Sources/ActRealmKit/`: models, derived state, Runtime client/supervisor, and
-  platform-neutral foreground scheduling policy;
-- `Sources/ActRealmUI/`: SwiftUI views and the AppKit scheduling executor;
+  platform-neutral Agent Focus policy;
+- `Sources/ActRealmUI/`: SwiftUI views and the AppKit Agent Focus executor;
 - `Sources/ActRealmApp/`: app, window, menu-bar, and lifecycle entry point;
 - `Sources/SnapshotTool/`: deterministic UI snapshot utility;
 - `Tests/ActRealmKitTests/`: model, decoding, scheduling, and bootstrap tests.

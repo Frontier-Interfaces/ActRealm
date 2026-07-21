@@ -411,7 +411,7 @@ without making the final v1 release complete.
 - [x] Web task visibility/clear, reminder-ignore, sound, retention, and
       Provider-mute semantics are represented in native state and focused
       tests.
-- [x] macOS-only foreground scheduling remains separate and does not mutate or
+- [x] macOS-only Agent Focus remains separate and does not mutate or
       infer Runtime approval/Provider capability state.
 - [x] The isolated ActRealmKit suite passes 39 tests, including current JSON
       contract decoding and derived-state parity cases.

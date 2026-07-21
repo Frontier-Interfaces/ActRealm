@@ -1,8 +1,7 @@
 import ActRealmKit
 import SwiftUI
 
-/// Native SwiftUI reproduction of the reference HTML's 台前调度 management
-/// screen. Every edit is written through AppModel so the selected policy is
+/// Native management screen for 智能聚焦（Agent Focus）. Every edit is
 /// durable and immediately reflected by the rule preview.
 public struct ForegroundSchedulingView: View {
     @EnvironmentObject private var model: AppModel
@@ -32,18 +31,16 @@ public struct ForegroundSchedulingView: View {
             masterSwitches
 
             Group {
+                eventTriggers
                 workspaceStatus
                 arrivalStrategies
+                stageManagerBehavior
                 afterOpening
             }
             .opacity(settings.isEnabled ? 1 : 0.45)
             .allowsHitTesting(settings.isEnabled)
 
             rulePreview
-
-            providerRules
-                .opacity(settings.isEnabled ? 1 : 0.45)
-                .allowsHitTesting(settings.isEnabled)
         }
         .frame(maxWidth: 1060)
         .padding(.horizontal, 20)
@@ -80,10 +77,10 @@ public struct ForegroundSchedulingView: View {
             .help("返回 ActRealm 工作区")
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("台前调度")
+                Text("智能聚焦")
                     .font(.system(size: 23, weight: .heavy))
                     .foregroundStyle(DT.textStrong)
-                Text("决定 Agent 什么时候进入前台，以及何时把控制权还给 ActRealm 工作区")
+                Text("Agent Focus · 在需要你判断时提醒并带回对应 Agent")
                     .font(DT.body(12.5))
                     .foregroundStyle(DT.textSecondary)
             }
@@ -106,8 +103,9 @@ public struct ForegroundSchedulingView: View {
     }
 
     private var pageStatusText: String {
-        if !settings.isEnabled { return "当前：调度已关闭" }
+        if !settings.isEnabled { return "当前：智能聚焦已关闭" }
         if settings.workspaceApps.isEmpty { return "当前：待绑定桌面" }
+        if model.foregroundQueuedCount > 0 { return "当前：队列中 (model.foregroundQueuedCount) 项" }
         return "当前：运行正常"
     }
 
@@ -135,22 +133,48 @@ public struct ForegroundSchedulingView: View {
         SchedulingPageCard(padding: 0) {
             VStack(spacing: 0) {
                 SchedulingToggleRow(
-                    title: "启用台前调度",
-                    detail: "关闭后不自动切换窗口，新任务只进入待处理列表。",
+                    title: "启用智能聚焦",
+                    detail: "关闭后事件仍进入 ActRealm，但不显示聚焦倒计时，也不自动切换 Agent。",
                     isOn: binding(\.isEnabled)
                 )
+            }
+        }
+    }
 
-                Divider()
-                    .overlay(DT.separator)
-                    .padding(.horizontal, 18)
+    private var eventTriggers: some View {
+        SchedulingPageCard {
+            VStack(alignment: .leading, spacing: 13) {
+                HStack(alignment: .firstTextBaseline, spacing: 9) {
+                    Text("触发智能聚焦的事件")
+                        .font(.system(size: 14, weight: .heavy))
+                        .foregroundStyle(DT.textPrimary)
+                    Text("关闭只影响聚焦，事件仍正常进入 ActRealm")
+                        .font(DT.body(11.5))
+                        .foregroundStyle(DT.textSecondary)
+                }
 
-                SchedulingToggleRow(
-                    title: "切换完成后自动关闭调度",
-                    detail: "页面成功切换（已接收）后自动关闭台前调度，避免反复切换窗口",
-                    isOn: binding(\.closesAfterAcceptance)
-                )
-                .opacity(settings.isEnabled ? 1 : 0.45)
-                .allowsHitTesting(settings.isEnabled)
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 9) {
+                    AgentFocusEventToggle(
+                        title: "等待批准",
+                        detail: "请求运行命令或执行操作",
+                        isOn: eventRuleBinding(\.approval)
+                    )
+                    AgentFocusEventToggle(
+                        title: "Agent 提问",
+                        detail: "需要用户回答的问题",
+                        isOn: eventRuleBinding(\.question)
+                    )
+                    AgentFocusEventToggle(
+                        title: "出错或卡住",
+                        detail: "任务失败或需要检查",
+                        isOn: eventRuleBinding(\.error)
+                    )
+                    AgentFocusEventToggle(
+                        title: "任务完成",
+                        detail: "本轮完成、等待确认",
+                        isOn: eventRuleBinding(\.completion)
+                    )
+                }
             }
         }
     }
@@ -162,7 +186,7 @@ public struct ForegroundSchedulingView: View {
         return SchedulingPageCard {
             VStack(alignment: .leading, spacing: 14) {
                 HStack(spacing: 10) {
-                    Text("调度工作桌面")
+                    Text("Agent 绑定工作区")
                         .font(.system(size: 13, weight: .heavy))
                         .foregroundStyle(DT.textPrimary)
                     Text("绑定放置协作应用的虚拟桌面")
@@ -181,16 +205,16 @@ public struct ForegroundSchedulingView: View {
                 if settings.workspaceApps.isEmpty {
                     HStack(alignment: .center, spacing: 16) {
                         VStack(alignment: .leading, spacing: 5) {
-                            Text("先选择协作桌面")
+                            Text("先选择 Agent 绑定工作区")
                                 .font(.system(size: 13, weight: .bold))
                                 .foregroundStyle(DT.textPrimary)
-                            Text("选择窗口会跟随虚拟桌面显示。切换到放置 Claude、Codex、Chrome 等应用的桌面后，绑定当前桌面即可。")
+                            Text("切换到放置 Claude、Codex 或终端的工作区后，绑定当前显示器；只有已绑定 Agent 才会触发聚焦。")
                                 .font(DT.body(11))
                                 .foregroundStyle(DT.textSecondary)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                         Spacer()
-                        Button("选择协作桌面…") {
+                        Button("选择绑定工作区…") {
                             model.beginForegroundWorkspaceSelection()
                         }
                         .buttonStyle(.borderedProminent)
@@ -220,13 +244,19 @@ public struct ForegroundSchedulingView: View {
 
                         HStack {
                             Label(
-                                workspace.isSchedulingWorkspaceActive ? "当前位于协作桌面" : "当前位于其他桌面",
-                                systemImage: workspace.isSchedulingWorkspaceActive ? "checkmark.circle.fill" : "circle.dashed"
+                                workspace.isPointerInsideSchedulingWorkspace
+                                    ? "鼠标已进入绑定工作区"
+                                    : workspace.isSchedulingWorkspaceActive
+                                        ? "绑定工作区可见，等待鼠标进入"
+                                        : "当前位于其他工作区",
+                                systemImage: workspace.isPointerInsideSchedulingWorkspace
+                                    ? "cursorarrow.motionlines.click"
+                                    : "circle.dashed"
                             )
                             .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(workspace.isSchedulingWorkspaceActive ? DT.greenText : DT.textWeak)
+                            .foregroundStyle(workspace.isPointerInsideSchedulingWorkspace ? DT.greenText : DT.textWeak)
                             Spacer()
-                            Button("测试调度") { model.testForegroundScheduling() }
+                            Button("测试智能聚焦") { model.testForegroundScheduling() }
                             Button("重新选择…") { model.beginForegroundWorkspaceSelection() }
                             Button("清除绑定", role: .destructive) { model.clearForegroundWorkspaceBinding() }
                         }
@@ -242,7 +272,7 @@ public struct ForegroundSchedulingView: View {
         SchedulingPageCard {
             VStack(alignment: .leading, spacing: 15) {
                 HStack(alignment: .firstTextBaseline, spacing: 9) {
-                    Text("当任务需要处理时")
+                    Text("聚焦方式")
                         .font(.system(size: 14, weight: .heavy))
                         .foregroundStyle(DT.textPrimary)
                     Text("三种到达策略互斥，选一个")
@@ -254,11 +284,11 @@ public struct ForegroundSchedulingView: View {
                     StrategyCard(
                         strategy: .immediate,
                         selected: settings.strategy == .immediate,
-                        title: "立即打开 Agent",
-                        detail: "任务需要处理时，直接在协作桌面打开对应 Agent。",
+                        title: "立即聚焦",
+                        detail: "收到允许触发的事件后，直接打开对应 Agent 的具体任务。",
                         steps: [
-                            FlowToken("任务到达", tone: .neutral),
-                            FlowToken("Agent 前台", tone: .blue),
+                            FlowToken("事件到达", tone: .neutral),
+                            FlowToken("具体任务", tone: .blue),
                             FlowToken("等待接收", tone: .green),
                         ],
                         recommended: false,
@@ -270,12 +300,12 @@ public struct ForegroundSchedulingView: View {
                     StrategyCard(
                         strategy: .remind,
                         selected: settings.strategy == .remind,
-                        title: "先提醒，再打开",
-                        detail: "ActRealm 工作区先提醒；没有处理时，再自动打开 Agent。",
+                        title: "提醒后聚焦",
+                        detail: "先显示 HUD；可立即查看、稍后处理，或在倒计时后自动打开。",
                         steps: [
-                            FlowToken("任务到达", tone: .neutral),
-                            FlowToken("提醒倒计时", tone: .amber),
-                            FlowToken("Agent 前台", tone: .blue),
+                            FlowToken("事件到达", tone: .neutral),
+                            FlowToken("HUD 倒计时", tone: .amber),
+                            FlowToken("具体任务", tone: .blue),
                             FlowToken("等待接收", tone: .green),
                         ],
                         recommended: true,
@@ -289,12 +319,12 @@ public struct ForegroundSchedulingView: View {
                     StrategyCard(
                         strategy: .actRealmWorkspace,
                         selected: settings.strategy == .actRealmWorkspace,
-                        title: "只留在 ActRealm 工作区",
-                        detail: "任务只进入待处理列表，不自动切换窗口。",
+                        title: "仅进入 ActRealm",
+                        detail: "只保存事件，不显示聚焦倒计时，也不自动切换页面。",
                         steps: [
-                            FlowToken("任务到达", tone: .neutral),
-                            FlowToken("待处理列表", tone: .blue),
-                            FlowToken("手动打开", tone: .green),
+                            FlowToken("事件到达", tone: .neutral),
+                            FlowToken("ActRealm", tone: .blue),
+                            FlowToken("手动查看", tone: .green),
                         ],
                         recommended: false,
                         reminderSeconds: nil,
@@ -306,6 +336,76 @@ public struct ForegroundSchedulingView: View {
         }
     }
 
+    // MARK: - macOS Stage Manager
+
+    private var stageManagerBehavior: some View {
+        let available = settings.strategy != .actRealmWorkspace
+        return SchedulingPageCard {
+            VStack(alignment: .leading, spacing: 13) {
+                HStack(alignment: .firstTextBaseline, spacing: 9) {
+                    Text("聚焦时使用 macOS 台前调度")
+                        .font(.system(size: 14, weight: .heavy))
+                        .foregroundStyle(DT.textPrimary)
+                    Text("只恢复本次智能聚焦主动改变的状态")
+                        .font(DT.body(11.5))
+                        .foregroundStyle(DT.textSecondary)
+                }
+
+                SettingsInsetRow {
+                    HStack(spacing: 14) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("允许智能聚焦启用台前调度")
+                                .font(.system(size: 12.5, weight: .bold))
+                                .foregroundStyle(DT.textPrimary)
+                            Text("先记录进入前状态；原本开启时保持开启，原本关闭时才临时开启。")
+                                .font(DT.body(10.5))
+                                .foregroundStyle(DT.textWeak)
+                        }
+                        Spacer()
+                        SchedulingSwitch(isOn: binding(\.allowsStageManager))
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("恢复进入前状态的时机")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(DT.textSecondary)
+                    HStack(spacing: 8) {
+                        RestoreTimingButton(
+                            title: "用户接收后恢复",
+                            selected: settings.stageManagerRestoreTiming == .afterAcceptance
+                        ) {
+                            model.updateForegroundScheduling {
+                                $0.stageManagerRestoreTiming = .afterAcceptance
+                            }
+                        }
+                        RestoreTimingButton(
+                            title: "返回 ActRealm 时恢复",
+                            selected: settings.stageManagerRestoreTiming == .onReturnToActRealm,
+                            recommended: true
+                        ) {
+                            model.updateForegroundScheduling {
+                                $0.stageManagerRestoreTiming = .onReturnToActRealm
+                            }
+                        }
+                        RestoreTimingButton(
+                            title: "保持开启",
+                            selected: settings.stageManagerRestoreTiming == .keepEnabled
+                        ) {
+                            model.updateForegroundScheduling {
+                                $0.stageManagerRestoreTiming = .keepEnabled
+                            }
+                        }
+                    }
+                }
+                .opacity(settings.allowsStageManager ? 1 : 0.4)
+                .allowsHitTesting(settings.allowsStageManager)
+            }
+            .opacity(available ? 1 : 0.5)
+            .allowsHitTesting(available)
+        }
+    }
+
     // MARK: - After opening
 
     private var afterOpening: some View {
@@ -313,15 +413,15 @@ public struct ForegroundSchedulingView: View {
         return SchedulingPageCard {
             VStack(alignment: .leading, spacing: 14) {
                 HStack(alignment: .firstTextBaseline, spacing: 9) {
-                    Text("Agent 打开之后")
+                    Text("未接收时自动返回")
                         .font(.system(size: 14, weight: .heavy))
                         .foregroundStyle(DT.textPrimary)
-                    Text("「立即打开」「先提醒」两种模式共用的打开后行为")
+                    Text("鼠标进入绑定工作区即视为已接收，不要求点击或键盘输入")
                         .font(DT.body(11.5))
                         .foregroundStyle(DT.textSecondary)
                     Spacer()
                     if !available {
-                        Text("「只留在 ActRealm 工作区」无需此行为")
+                        Text("「仅进入 ActRealm」无需此行为")
                             .font(.system(size: 10, weight: .bold))
                             .foregroundStyle(DT.textWeak)
                             .padding(.horizontal, 11)
@@ -335,10 +435,10 @@ public struct ForegroundSchedulingView: View {
                     SettingsInsetRow {
                         HStack(spacing: 14) {
                             VStack(alignment: .leading, spacing: 3) {
-                                Text("自动返回 ActRealm 工作区")
+                                Text("开启自动返回")
                                     .font(.system(size: 12.5, weight: .bold))
                                     .foregroundStyle(DT.textPrimary)
-                                Text("Agent 打开后若未被接收，自动把控制权交还 ActRealm 工作区")
+                                Text("超时未检测到鼠标进入绑定工作区时，返回 ActRealm；事件仍保留。")
                                     .font(DT.body(10.5))
                                     .foregroundStyle(DT.textWeak)
                             }
@@ -350,10 +450,10 @@ public struct ForegroundSchedulingView: View {
                     SettingsInsetRow {
                         HStack(spacing: 14) {
                             VStack(alignment: .leading, spacing: 3) {
-                                Text("等待协作桌面出现")
+                                Text("接收等待时间")
                                     .font(.system(size: 12.5, weight: .bold))
                                     .foregroundStyle(DT.textPrimary)
-                                Text("超时仍未检测到已绑定应用，则恢复 ActRealm 工作区")
+                                Text("从 Agent 打开后开始计算，可选 5 / 10 / 30 秒。")
                                     .font(DT.body(10.5))
                                     .foregroundStyle(DT.textWeak)
                             }
@@ -396,53 +496,15 @@ public struct ForegroundSchedulingView: View {
         }
     }
 
-    // MARK: - Provider overrides
-
-    private var providerRules: some View {
-        SchedulingPageCard {
-            VStack(alignment: .leading, spacing: 13) {
-                HStack(alignment: .firstTextBaseline, spacing: 9) {
-                    Text("Agent 单独规则")
-                        .font(.system(size: 14, weight: .heavy))
-                        .foregroundStyle(DT.textPrimary)
-                    Text("覆盖全局策略，仅对该 Agent 生效")
-                        .font(DT.body(11.5))
-                        .foregroundStyle(DT.textSecondary)
-                }
-
-                VStack(spacing: 9) {
-                    ProviderRuleRow(
-                        provider: .codex,
-                        name: "Codex CLI",
-                        globalStrategy: settings.strategy,
-                        selected: settings.codexRule,
-                        onSelect: { rule in
-                            model.updateForegroundScheduling { $0.codexRule = rule }
-                        }
-                    )
-                    ProviderRuleRow(
-                        provider: .claude,
-                        name: "Claude Code",
-                        globalStrategy: settings.strategy,
-                        selected: settings.claudeRule,
-                        onSelect: { rule in
-                            model.updateForegroundScheduling { $0.claudeRule = rule }
-                        }
-                    )
-                }
-            }
-        }
-    }
-
     private func chooseStrategy(_ strategy: ForegroundArrivalStrategy) {
         model.updateForegroundScheduling { $0.strategy = strategy }
         let label: String
         switch strategy {
-        case .immediate: label = "立即打开 Agent"
-        case .remind: label = "先提醒，再打开"
-        case .actRealmWorkspace: label = "只留在 ActRealm 工作区"
+        case .immediate: label = "立即聚焦"
+        case .remind: label = "提醒后聚焦"
+        case .actRealmWorkspace: label = "仅进入 ActRealm"
         }
-        model.showToast("到达策略：\(label)")
+        model.showToast("聚焦方式：\(label)")
     }
 
     private func binding<Value>(
@@ -452,6 +514,19 @@ public struct ForegroundSchedulingView: View {
             get: { model.foregroundScheduling[keyPath: keyPath] },
             set: { value in
                 model.updateForegroundScheduling { $0[keyPath: keyPath] = value }
+            }
+        )
+    }
+
+    private func eventRuleBinding(
+        _ keyPath: WritableKeyPath<AgentFocusEventRules, Bool>
+    ) -> Binding<Bool> {
+        Binding(
+            get: { model.foregroundScheduling.eventRules[keyPath: keyPath] },
+            set: { value in
+                model.updateForegroundScheduling {
+                    $0.eventRules[keyPath: keyPath] = value
+                }
             }
         )
     }
@@ -528,6 +603,74 @@ private struct SchedulingSwitch: View {
     }
 }
 
+private struct AgentFocusEventToggle: View {
+    let title: String
+    let detail: String
+    @Binding var isOn: Bool
+
+    var body: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.system(size: 12.5, weight: .bold))
+                    .foregroundStyle(DT.textPrimary)
+                Text(detail)
+                    .font(DT.body(10.5))
+                    .foregroundStyle(DT.textWeak)
+            }
+            Spacer()
+            SchedulingSwitch(isOn: $isOn)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .sheetCard(
+            fill: DT.cardMedium,
+            stroke: DT.hairline,
+            radius: 15,
+            shadow: DT.softShadow,
+            shadowRadius: 3,
+            shadowY: 1
+        )
+    }
+}
+
+private struct RestoreTimingButton: View {
+    let title: String
+    let selected: Bool
+    var recommended = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 7) {
+                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                Text(title)
+                if recommended {
+                    Text("推荐")
+                        .font(.system(size: 8.5, weight: .heavy))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(selected ? Color.white.opacity(0.16) : DT.blueBg, in: Capsule())
+                }
+            }
+            .font(.system(size: 10.5, weight: .bold))
+            .foregroundStyle(selected ? Color.white : DT.textSecondary)
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(
+                selected ? AnyShapeStyle(DT.primaryGradient) : AnyShapeStyle(DT.cardMedium),
+                in: RoundedRectangle(cornerRadius: 11, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .strokeBorder(selected ? DT.blueBadgeStroke : DT.neutralBadgeStroke, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 private struct WorkspaceMetric<Content: View>: View {
     let title: String
     @ViewBuilder let value: Content
@@ -597,7 +740,7 @@ private struct WorkspaceReadinessPill: View {
     private var label: String {
         if !status.isActRealmWorkspaceReady { return "ActRealm 工作区尚未就位" }
         if !status.isAgentAvailable { return "目标 Agent 当前未运行" }
-        return "台前调度已就绪"
+        return "智能聚焦已就绪"
     }
 
     private var dotColor: Color {
@@ -892,19 +1035,19 @@ private struct MouseAcceptanceExplanation: View {
         VStack(alignment: .leading, spacing: 9) {
             AcceptanceRule(
                 icon: "checkmark",
-                text: "鼠标进入调度工作桌面 → 视为已接收，停止倒计时",
+                text: "鼠标进入 Agent 绑定工作区 → 视为已接收，停止自动返回",
                 tone: .green
             )
             AcceptanceRule(
                 icon: "arrow.uturn.backward",
-                text: "鼠标仍在其他工作桌面 → 倒计时结束后恢复 ActRealm 工作区",
+                text: "鼠标仍在其他工作区 → 倒计时结束后按设置返回 ActRealm",
                 tone: .amber
             )
 
             VStack(spacing: 12) {
                 HStack(spacing: 12) {
                     DesktopDiagram(
-                        title: "调度工作桌面",
+                        title: "Agent 绑定工作区",
                         labels: ["ActRealm 工作区", "Agent"],
                         selected: true,
                         showsMouse: false
@@ -913,7 +1056,7 @@ private struct MouseAcceptanceExplanation: View {
                         .font(.system(size: 15, weight: .bold))
                         .foregroundStyle(DT.logoTint)
                     DesktopDiagram(
-                        title: "其他工作桌面",
+                        title: "其他工作区",
                         labels: ["Browser", "Mail"],
                         selected: false,
                         showsMouse: true
@@ -933,7 +1076,7 @@ private struct MouseAcceptanceExplanation: View {
                             .font(.system(size: 8, weight: .heavy))
                             .foregroundStyle(DT.amberText)
                     }
-                    Text("当前未接收：鼠标仍在其他工作桌面 · 倒计时结束后返回 ActRealm 工作区")
+                    Text("当前未接收：鼠标仍在其他工作区 · 倒计时结束后返回 ActRealm")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(DT.amberText)
                     Spacer()
@@ -1062,60 +1205,61 @@ private struct RulePreviewContent: View {
     private var steps: [PreviewStepModel] {
         guard settings.isEnabled else {
             return [
-                .init("新任务", tone: .neutral),
-                .init("进入待处理列表", tone: .blue, branch: "手动切换窗口处理", branchTone: .neutral),
+                .init("Agent 事件", tone: .neutral),
+                .init("进入 ActRealm", tone: .blue, branch: "不显示聚焦 HUD · 不切换", branchTone: .neutral),
             ]
         }
         switch settings.strategy {
         case .immediate:
             return [
-                .init("新任务", tone: .neutral),
-                .init("打开 Agent", tone: .blue),
+                .init("允许触发的事件", tone: .neutral),
+                .init(settings.allowsStageManager ? "记录系统状态" : "保持系统状态", tone: .amber),
+                .init("聚焦具体任务", tone: .blue),
                 .init(
-                    "等待桌面接收 \(settings.acceptanceSeconds) 秒",
+                    "等待鼠标进入 \(settings.acceptanceSeconds) 秒",
                     tone: .green,
-                    branch: settings.returnsToActRealmWorkspace ? "未进入桌面 → 返回 ActRealm 工作区" : "保持前台继续等待",
+                    branch: settings.returnsToActRealmWorkspace ? "未接收 → 返回 ActRealm" : "未接收 → 保持 Agent 页面",
                     branchTone: settings.returnsToActRealmWorkspace ? .amber : .green
                 ),
             ]
         case .remind:
             return [
-                .init("新任务", tone: .neutral),
-                .init("提醒 \(settings.reminderSeconds) 秒", tone: .amber, branch: "期间已处理 → 不再打开", branchTone: .amber),
-                .init("打开 Agent", tone: .blue),
+                .init("允许触发的事件", tone: .neutral),
+                .init("HUD \(settings.reminderSeconds) 秒", tone: .amber, branch: "已解决或稍后处理 → 取消", branchTone: .amber),
+                .init("聚焦具体任务", tone: .blue),
                 .init(
-                    "等待桌面接收 \(settings.acceptanceSeconds) 秒",
+                    "等待鼠标进入 \(settings.acceptanceSeconds) 秒",
                     tone: .green,
-                    branch: settings.returnsToActRealmWorkspace ? "未进入桌面 → 返回 ActRealm 工作区" : "保持前台继续等待",
+                    branch: settings.returnsToActRealmWorkspace ? "未接收 → 返回 ActRealm" : "未接收 → 保持 Agent 页面",
                     branchTone: settings.returnsToActRealmWorkspace ? .amber : .green
                 ),
             ]
         case .actRealmWorkspace:
             return [
-                .init("新任务", tone: .neutral),
-                .init("进入待处理列表", tone: .blue),
-                .init("手动打开", tone: .green, branch: "手动打开，无需接收倒计时", branchTone: .neutral),
+                .init("允许触发的事件", tone: .neutral),
+                .init("进入 ActRealm", tone: .blue),
+                .init("等待手动查看", tone: .green, branch: "不自动切换页面", branchTone: .neutral),
             ]
         }
     }
 
     private var summary: String {
         guard settings.isEnabled else {
-            return "台前调度已关闭：新任务只进入待处理列表，需手动切换窗口"
+            return "智能聚焦已关闭：事件照常进入 ActRealm，不显示聚焦倒计时，也不切换页面"
         }
         switch settings.strategy {
         case .immediate:
             let ending = settings.returnsToActRealmWorkspace
-                ? "，\(settings.acceptanceSeconds) 秒内未进入桌面则返回 ActRealm 工作区"
+                ? "，\(settings.acceptanceSeconds) 秒内鼠标未进入绑定工作区则返回 ActRealm"
                 : "，不自动返回"
-            return "新任务直接在调度桌面打开对应 Agent\(ending)"
+            return "允许触发的事件会立即聚焦对应 Agent 的具体任务\(ending)"
         case .remind:
             let ending = settings.returnsToActRealmWorkspace
-                ? "；\(settings.acceptanceSeconds) 秒未进入桌面则返回"
+                ? "；\(settings.acceptanceSeconds) 秒未接收则返回 ActRealm"
                 : ""
-            return "先在 ActRealm 工作区提醒 \(settings.reminderSeconds) 秒，未处理再自动打开 Agent\(ending)"
+            return "先显示 \(settings.reminderSeconds) 秒 HUD，可立即查看或稍后处理；倒计时后聚焦 Agent\(ending)"
         case .actRealmWorkspace:
-            return "任务只进入待处理列表，不自动切换窗口，需手动打开"
+            return "事件只进入 ActRealm，不显示聚焦倒计时，也不自动切换页面"
         }
     }
 }
@@ -1160,101 +1304,6 @@ private struct PreviewStep: View {
                     .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(step.branchTone.stroke, lineWidth: 1))
                     .fixedSize()
             }
-        }
-    }
-}
-
-// MARK: - Provider override rows
-
-private struct ProviderRuleRow: View {
-    let provider: ProviderKind
-    let name: String
-    let globalStrategy: ForegroundArrivalStrategy
-    let selected: ForegroundAgentRule
-    let onSelect: (ForegroundAgentRule) -> Void
-
-    var body: some View {
-        HStack(spacing: 12) {
-            ProviderAvatar(kind: provider, size: 26)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(name)
-                    .font(.system(size: 12.5, weight: .bold))
-                    .foregroundStyle(DT.textPrimary)
-                Text(subtitle)
-                    .font(DT.body(10.5))
-                    .foregroundStyle(DT.textWeak)
-            }
-            Spacer()
-            HStack(spacing: 6) {
-                ForEach(ForegroundAgentRule.allCases, id: \.self) { rule in
-                    Button(rule.shortTitle) {
-                        onSelect(rule)
-                    }
-                    .buttonStyle(RuleButtonStyle(selected: selected == rule))
-                }
-            }
-        }
-        .padding(.horizontal, 15)
-        .padding(.vertical, 13)
-        .sheetCard(
-            fill: DT.cardMedium,
-            stroke: DT.hairline,
-            radius: 15,
-            shadow: DT.softShadow,
-            shadowRadius: 3,
-            shadowY: 1
-        )
-    }
-
-    private var subtitle: String {
-        if selected == .defaultRule {
-            return "默认跟随全局 · \(globalStrategy.shortTitle)"
-        }
-        return selected.fullTitle
-    }
-}
-
-private struct RuleButtonStyle: ButtonStyle {
-    let selected: Bool
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.system(size: 10.5, weight: .bold))
-            .foregroundStyle(selected ? Color.white : DT.textSecondary)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 5)
-            .background(selected ? AnyShapeStyle(DT.primaryGradient) : AnyShapeStyle(DT.cardMedium), in: Capsule())
-            .overlay(Capsule().strokeBorder(selected ? DT.blueBadgeStroke : DT.neutralBadgeStroke, lineWidth: 1))
-            .brightness(configuration.isPressed ? -0.06 : 0)
-    }
-}
-
-private extension ForegroundArrivalStrategy {
-    var shortTitle: String {
-        switch self {
-        case .immediate: "立即打开"
-        case .remind: "先提醒，再打开"
-        case .actRealmWorkspace: "只留在 ActRealm 工作区"
-        }
-    }
-}
-
-private extension ForegroundAgentRule {
-    var shortTitle: String {
-        switch self {
-        case .defaultRule: "使用默认"
-        case .immediate: "立即打开"
-        case .remind: "先提醒"
-        case .actRealmWorkspace: "只进待处理"
-        }
-    }
-
-    var fullTitle: String {
-        switch self {
-        case .defaultRule: "跟随全局策略"
-        case .immediate: "立即打开 Agent"
-        case .remind: "先提醒，再打开"
-        case .actRealmWorkspace: "只进入待处理列表"
         }
     }
 }

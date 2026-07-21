@@ -9,21 +9,61 @@ public enum BridgeStatus: Equatable, Sendable {
     public var isListening: Bool { self == .listening }
 }
 
-/// Mutually-exclusive policy used when a task reaches the front-of-house
-/// attention queue.
+/// Mutually-exclusive policy used when an eligible event enters Agent Focus.
 public enum ForegroundArrivalStrategy: String, CaseIterable, Codable, Sendable, Hashable {
     case immediate
     case remind
     case actRealmWorkspace
 }
 
-/// Optional per-provider override. `defaultRule` follows the global arrival
-/// strategy while the remaining cases pin that provider to a concrete policy.
-public enum ForegroundAgentRule: String, CaseIterable, Codable, Sendable, Hashable {
-    case defaultRule
-    case immediate
-    case remind
-    case actRealmWorkspace
+public enum AgentFocusEventKind: String, CaseIterable, Codable, Sendable, Hashable {
+    case approval
+    case question
+    case error
+    case completion
+
+    public init(outboxKind: OutboxKind) {
+        switch outboxKind {
+        case .approval, .nativeApproval: self = .approval
+        case .question: self = .question
+        case .error: self = .error
+        case .completion: self = .completion
+        }
+    }
+}
+
+public struct AgentFocusEventRules: Codable, Equatable, Sendable {
+    public var approval: Bool
+    public var question: Bool
+    public var error: Bool
+    public var completion: Bool
+
+    public init(
+        approval: Bool = true,
+        question: Bool = true,
+        error: Bool = true,
+        completion: Bool = false
+    ) {
+        self.approval = approval
+        self.question = question
+        self.error = error
+        self.completion = completion
+    }
+
+    public func allows(_ kind: AgentFocusEventKind) -> Bool {
+        switch kind {
+        case .approval: approval
+        case .question: question
+        case .error: error
+        case .completion: completion
+        }
+    }
+}
+
+public enum StageManagerRestoreTiming: String, CaseIterable, Codable, Sendable, Hashable {
+    case afterAcceptance
+    case onReturnToActRealm
+    case keepEnabled
 }
 
 public struct ForegroundWorkspaceApp: Codable, Equatable, Sendable, Identifiable {
@@ -38,18 +78,18 @@ public struct ForegroundWorkspaceApp: Codable, Equatable, Sendable, Identifiable
     }
 }
 
-/// Durable settings edited by the 台前调度 management page. Keeping the
-/// policy in ActRealmKit gives the Runtime integration one authoritative
-/// value instead of leaving behavior hidden inside view-local state.
+/// Durable settings edited by the Agent Focus management page. Keeping the
+/// policy in ActRealmKit gives the macOS client one authoritative value while
+/// the Rust Runtime remains the owner of event and reply-channel truth.
 public struct ForegroundSchedulingSettings: Codable, Equatable, Sendable {
     public var isEnabled: Bool
-    public var closesAfterAcceptance: Bool
+    public var eventRules: AgentFocusEventRules
     public var strategy: ForegroundArrivalStrategy
     public var reminderSeconds: Int
+    public var allowsStageManager: Bool
+    public var stageManagerRestoreTiming: StageManagerRestoreTiming
     public var returnsToActRealmWorkspace: Bool
     public var acceptanceSeconds: Int
-    public var codexRule: ForegroundAgentRule
-    public var claudeRule: ForegroundAgentRule
     public var workspaceApps: [ForegroundWorkspaceApp]
     public var workspaceBoundAt: Date?
     public var workspaceDisplayID: UInt32?
@@ -57,26 +97,26 @@ public struct ForegroundSchedulingSettings: Codable, Equatable, Sendable {
 
     public init(
         isEnabled: Bool = true,
-        closesAfterAcceptance: Bool = true,
+        eventRules: AgentFocusEventRules = AgentFocusEventRules(),
         strategy: ForegroundArrivalStrategy = .remind,
         reminderSeconds: Int = 10,
+        allowsStageManager: Bool = true,
+        stageManagerRestoreTiming: StageManagerRestoreTiming = .onReturnToActRealm,
         returnsToActRealmWorkspace: Bool = true,
         acceptanceSeconds: Int = 10,
-        codexRule: ForegroundAgentRule = .defaultRule,
-        claudeRule: ForegroundAgentRule = .immediate,
         workspaceApps: [ForegroundWorkspaceApp] = [],
         workspaceBoundAt: Date? = nil,
         workspaceDisplayID: UInt32? = nil,
         workspaceDisplayName: String? = nil
     ) {
         self.isEnabled = isEnabled
-        self.closesAfterAcceptance = closesAfterAcceptance
+        self.eventRules = eventRules
         self.strategy = strategy
         self.reminderSeconds = reminderSeconds
+        self.allowsStageManager = allowsStageManager
+        self.stageManagerRestoreTiming = stageManagerRestoreTiming
         self.returnsToActRealmWorkspace = returnsToActRealmWorkspace
         self.acceptanceSeconds = acceptanceSeconds
-        self.codexRule = codexRule
-        self.claudeRule = claudeRule
         self.workspaceApps = workspaceApps
         self.workspaceBoundAt = workspaceBoundAt
         self.workspaceDisplayID = workspaceDisplayID
@@ -86,21 +126,26 @@ public struct ForegroundSchedulingSettings: Codable, Equatable, Sendable {
     public static let defaults = ForegroundSchedulingSettings()
 
     private enum CodingKeys: String, CodingKey {
-        case isEnabled, closesAfterAcceptance, strategy, reminderSeconds
-        case returnsToActRealmWorkspace, acceptanceSeconds, codexRule, claudeRule
+        case isEnabled, eventRules, strategy, reminderSeconds
+        case allowsStageManager, stageManagerRestoreTiming
+        case returnsToActRealmWorkspace, acceptanceSeconds
         case workspaceApps, workspaceBoundAt, workspaceDisplayID, workspaceDisplayName
     }
 
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         isEnabled = try values.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
-        closesAfterAcceptance = try values.decodeIfPresent(Bool.self, forKey: .closesAfterAcceptance) ?? true
+        eventRules = try values.decodeIfPresent(AgentFocusEventRules.self, forKey: .eventRules)
+            ?? AgentFocusEventRules()
         strategy = try values.decodeIfPresent(ForegroundArrivalStrategy.self, forKey: .strategy) ?? .remind
         reminderSeconds = try values.decodeIfPresent(Int.self, forKey: .reminderSeconds) ?? 10
+        allowsStageManager = try values.decodeIfPresent(Bool.self, forKey: .allowsStageManager) ?? true
+        stageManagerRestoreTiming = try values.decodeIfPresent(
+            StageManagerRestoreTiming.self,
+            forKey: .stageManagerRestoreTiming
+        ) ?? .onReturnToActRealm
         returnsToActRealmWorkspace = try values.decodeIfPresent(Bool.self, forKey: .returnsToActRealmWorkspace) ?? true
         acceptanceSeconds = try values.decodeIfPresent(Int.self, forKey: .acceptanceSeconds) ?? 10
-        codexRule = try values.decodeIfPresent(ForegroundAgentRule.self, forKey: .codexRule) ?? .defaultRule
-        claudeRule = try values.decodeIfPresent(ForegroundAgentRule.self, forKey: .claudeRule) ?? .immediate
         workspaceApps = try values.decodeIfPresent([ForegroundWorkspaceApp].self, forKey: .workspaceApps) ?? []
         workspaceBoundAt = try values.decodeIfPresent(Date.self, forKey: .workspaceBoundAt)
         workspaceDisplayID = try values.decodeIfPresent(UInt32.self, forKey: .workspaceDisplayID)
@@ -118,22 +163,54 @@ public enum HUDDisplayField: String, CaseIterable, Codable, Sendable, Hashable, 
     public var id: Self { self }
 }
 
+public enum HUDDisplayMode: String, CaseIterable, Codable, Sendable, Hashable {
+    case systemMain
+    case selectedDisplay
+    case followActRealmWindow
+}
+
 public struct HUDSettings: Codable, Equatable, Sendable {
     public var isEnabled: Bool
     public var displaySeconds: Int
     public var fields: [HUDDisplayField]
+    public var displayMode: HUDDisplayMode
+    public var selectedDisplayID: UInt32?
+    public var selectedDisplayName: String?
 
     public init(
         isEnabled: Bool = true,
         displaySeconds: Int = 8,
-        fields: [HUDDisplayField] = [.provider, .event, .task, .elapsed]
+        fields: [HUDDisplayField] = [.provider, .event, .task, .elapsed],
+        displayMode: HUDDisplayMode = .systemMain,
+        selectedDisplayID: UInt32? = nil,
+        selectedDisplayName: String? = nil
     ) {
         self.isEnabled = isEnabled
         self.displaySeconds = displaySeconds
         self.fields = fields
+        self.displayMode = displayMode
+        self.selectedDisplayID = selectedDisplayID
+        self.selectedDisplayName = selectedDisplayName
     }
 
     public static let defaults = HUDSettings()
+
+    private enum CodingKeys: String, CodingKey {
+        case isEnabled, displaySeconds, fields
+        case displayMode, selectedDisplayID, selectedDisplayName
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        isEnabled = try values.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
+        displaySeconds = try values.decodeIfPresent(Int.self, forKey: .displaySeconds) ?? 8
+        fields = try values.decodeIfPresent([HUDDisplayField].self, forKey: .fields)
+            ?? [.provider, .event, .task, .elapsed]
+        displayMode = (try? values.decode(HUDDisplayMode.self, forKey: .displayMode))
+            ?? .systemMain
+        selectedDisplayID = try values.decodeIfPresent(UInt32.self, forKey: .selectedDisplayID)
+        selectedDisplayName = try values.decodeIfPresent(String.self, forKey: .selectedDisplayName)
+    }
 }
 
 /// macOS-only visual preference. Selected media is copied into ActRealm's
@@ -204,12 +281,13 @@ public enum ForegroundDispatchPhase: Equatable, Sendable {
     case returnedToActRealmWorkspace
 }
 
-/// One live arrival moving through the policy selected on the 台前调度 page.
-/// The UI renders this as the reminder/opening/acceptance HUD while AppKit owns
-/// the actual foreground application and Space observations.
+/// One live arrival moving through Agent Focus. The UI renders this as the
+/// reminder/opening/acceptance HUD while AppKit owns application activation,
+/// pointer/workspace observation, and macOS Stage Manager restoration.
 public struct ForegroundDispatchState: Identifiable, Equatable, Sendable {
     public let id: String
     public let provider: ProviderKind?
+    public let eventKind: AgentFocusEventKind
     public let title: String
     public let taskTitle: String?
     public let phase: ForegroundDispatchPhase
@@ -219,6 +297,7 @@ public struct ForegroundDispatchState: Identifiable, Equatable, Sendable {
     public init(
         id: String,
         provider: ProviderKind?,
+        eventKind: AgentFocusEventKind = .approval,
         title: String,
         taskTitle: String?,
         phase: ForegroundDispatchPhase,
@@ -227,6 +306,7 @@ public struct ForegroundDispatchState: Identifiable, Equatable, Sendable {
     ) {
         self.id = id
         self.provider = provider
+        self.eventKind = eventKind
         self.title = title
         self.taskTitle = taskTitle
         self.phase = phase
@@ -239,16 +319,28 @@ public struct ForegroundWorkspaceStatus: Equatable, Sendable {
     public var isActRealmWorkspaceReady: Bool
     public var isAgentAvailable: Bool
     public var isSchedulingWorkspaceActive: Bool
+    public var isPointerInsideSchedulingWorkspace: Bool
 
     public init(
         isActRealmWorkspaceReady: Bool = true,
         isAgentAvailable: Bool = true,
-        isSchedulingWorkspaceActive: Bool = false
+        isSchedulingWorkspaceActive: Bool = false,
+        isPointerInsideSchedulingWorkspace: Bool = false
     ) {
         self.isActRealmWorkspaceReady = isActRealmWorkspaceReady
         self.isAgentAvailable = isAgentAvailable
         self.isSchedulingWorkspaceActive = isSchedulingWorkspaceActive
+        self.isPointerInsideSchedulingWorkspace = isPointerInsideSchedulingWorkspace
     }
+}
+
+private struct ForegroundQueuedArrival: Equatable, Sendable {
+    let id: String
+    let provider: ProviderKind?
+    let eventKind: AgentFocusEventKind
+    let title: String
+    let taskTitle: String?
+    let receivedAt: Date
 }
 
 /// Top-level observable state for every scene (main window, HUD, menu bar,
@@ -295,6 +387,7 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var outboxHighlighted = false
     @Published public private(set) var foregroundScheduling: ForegroundSchedulingSettings
     @Published public private(set) var foregroundDispatch: ForegroundDispatchState?
+    @Published public private(set) var foregroundQueuedCount = 0
     @Published public private(set) var foregroundReturnNotes: [String: String] = [:]
     @Published public private(set) var foregroundSuppressedAttentionIDs: Set<String> = []
     @Published public private(set) var foregroundWorkspaceStatus = ForegroundWorkspaceStatus()
@@ -332,6 +425,7 @@ public final class AppModel: ObservableObject {
     private var setupRefreshTask: Task<Void, Never>?
     private var seededForegroundArrivals = false
     private var seededNotifications = false
+    private var foregroundQueue: [ForegroundQueuedArrival] = []
     private var lastSetupRefreshEventCount: UInt64 = 0
     private var latestSnapshot: Snapshot = .empty
     private var persistedUISettings: UISettings = .defaults
@@ -732,11 +826,15 @@ public final class AppModel: ObservableObject {
         let nextOpenIDs = Set(next.openOutbox.map(\.id))
         foregroundReturnNotes = foregroundReturnNotes.filter { nextOpenIDs.contains($0.key) }
         foregroundSuppressedAttentionIDs.formIntersection(nextOpenIDs)
+        foregroundQueue.removeAll { !nextOpenIDs.contains($0.id) }
+        foregroundQueuedCount = foregroundQueue.count
+        var shouldStartNextFocus = false
         if let dispatch = foregroundDispatch,
            dispatch.id != Self.foregroundTestDispatchID,
            !nextOpenIDs.contains(dispatch.id)
         {
-            foregroundDispatch = nil
+            resolveForegroundArrival(id: dispatch.id, at: Date(), startNext: false)
+            shouldStartNextFocus = true
         }
 
         if emitArrivals, seededForegroundArrivals {
@@ -748,11 +846,16 @@ public final class AppModel: ObservableObject {
                 receiveForegroundArrival(
                     id: arrival.id,
                     provider: arrival.provider,
+                    eventKind: AgentFocusEventKind(outboxKind: arrival.kind),
                     title: arrival.actionTitle,
                     taskTitle: arrival.taskTitle
                 )
             }
-            if hudSettings.isEnabled, let arrival = arrivals.last {
+            if hudSettings.isEnabled,
+               let arrival = arrivals.last(where: {
+                   !foregroundSuppressedAttentionIDs.contains($0.id)
+               })
+            {
                 hudArrivalID = arrival.id
                 hudArrivalDeadline = Date().addingTimeInterval(TimeInterval(hudSettings.displaySeconds))
             }
@@ -765,6 +868,9 @@ public final class AppModel: ObservableObject {
         if emitArrivals { seededNotifications = true }
 
         derived = next
+        if shouldStartNextFocus {
+            startNextForegroundArrivalIfNeeded(at: Date())
+        }
         if emitArrivals { lastSyncAt = Date() }
         if emitArrivals, snapshot.stats.eventCount > renderedEventCount {
             let latestEventAt = snapshot.sessions.map(\.lastEventAt).max() ?? 0
@@ -828,10 +934,12 @@ public final class AppModel: ObservableObject {
     // MARK: - User actions
 
     public func approve(_ entry: OutboxEntry) {
+        guard entry.state == .open else { return }
         send(.approve, entry: entry)
     }
 
     public func deny(_ entry: OutboxEntry) {
+        guard entry.state == .open else { return }
         send(.deny, entry: entry)
     }
 
@@ -937,6 +1045,23 @@ public final class AppModel: ObservableObject {
         settings.acceptanceSeconds = Self.supportedSeconds(settings.acceptanceSeconds)
         guard settings != foregroundScheduling else { return }
         foregroundScheduling = settings
+        foregroundQueue.removeAll { !settings.eventRules.allows($0.eventKind) }
+        foregroundQueuedCount = foregroundQueue.count
+        if !settings.isEnabled {
+            if let dispatch = foregroundDispatch {
+                foregroundSuppressedAttentionIDs.remove(dispatch.id)
+            }
+            foregroundSuppressedAttentionIDs.subtract(foregroundQueue.map(\.id))
+            foregroundQueue.removeAll()
+            foregroundQueuedCount = 0
+            foregroundDispatch = nil
+        } else if let dispatch = foregroundDispatch,
+                  !settings.eventRules.allows(dispatch.eventKind)
+        {
+            foregroundSuppressedAttentionIDs.remove(dispatch.id)
+            foregroundDispatch = nil
+            startNextForegroundArrivalIfNeeded(at: Date())
+        }
         guard !isDemo, let data = try? JSONEncoder().encode(settings) else { return }
         defaults.set(data, forKey: Self.foregroundSchedulingKey)
     }
@@ -959,7 +1084,7 @@ public final class AppModel: ObservableObject {
         displayName: String?
     ) {
         guard !apps.isEmpty else {
-            showToast("当前桌面没有可绑定的协作应用")
+            showToast("当前工作区没有可绑定的 Agent 应用")
             return
         }
         updateForegroundScheduling {
@@ -969,7 +1094,7 @@ public final class AppModel: ObservableObject {
             $0.workspaceDisplayName = displayName
         }
         isSelectingForegroundWorkspace = false
-        showToast("协作桌面已绑定")
+        showToast("Agent 的绑定工作区已保存")
     }
 
     public func clearForegroundWorkspaceBinding() {
@@ -979,7 +1104,7 @@ public final class AppModel: ObservableObject {
             $0.workspaceDisplayID = nil
             $0.workspaceDisplayName = nil
         }
-        showToast("协作桌面绑定已清除")
+        showToast("Agent 的绑定工作区已清除")
     }
 
     public var themeBackgroundURL: URL? {
@@ -1083,19 +1208,7 @@ public final class AppModel: ObservableObject {
     }
 
     public func effectiveForegroundStrategy(for provider: ProviderKind?) -> ForegroundArrivalStrategy {
-        guard foregroundScheduling.isEnabled else { return .actRealmWorkspace }
-        let rule: ForegroundAgentRule
-        switch provider {
-        case .codex: rule = foregroundScheduling.codexRule
-        case .claude: rule = foregroundScheduling.claudeRule
-        case .gemini, .custom, nil: rule = .defaultRule
-        }
-        switch rule {
-        case .defaultRule: return foregroundScheduling.strategy
-        case .immediate: return .immediate
-        case .remind: return .remind
-        case .actRealmWorkspace: return .actRealmWorkspace
-        }
+        foregroundScheduling.isEnabled ? foregroundScheduling.strategy : .actRealmWorkspace
     }
 
     public func openForegroundAgentNow() {
@@ -1105,8 +1218,8 @@ public final class AppModel: ObservableObject {
 
     public func keepForegroundTaskInActRealmWorkspace() {
         guard foregroundDispatch != nil else { return }
-        foregroundDispatch = nil
-        showToast("任务已留在 ActRealm 工作区的待处理列表")
+        completeForegroundDispatch(startNext: true, at: Date())
+        showToast("已稍后处理；事件仍保留在 ActRealm")
     }
 
     /// Deterministic visual preview used by SnapshotTool. It never creates a
@@ -1122,9 +1235,10 @@ public final class AppModel: ObservableObject {
         foregroundDispatch = nil
         receiveForegroundArrival(
             id: Self.foregroundTestDispatchID,
-            provider: .claude,
-            title: "台前调度测试",
-            taskTitle: "验证协作桌面切换与接收",
+            provider: nil,
+            eventKind: .approval,
+            title: "智能聚焦测试",
+            taskTitle: "验证 Agent Focus 切换与接收",
             at: Date()
         )
     }
@@ -1133,13 +1247,36 @@ public final class AppModel: ObservableObject {
         guard let dispatch = foregroundDispatch,
               dispatch.phase == .awaitingWorkspace
         else { return }
-        foregroundDispatch = nil
-        if foregroundScheduling.closesAfterAcceptance {
-            updateForegroundScheduling { $0.isEnabled = false }
-            showToast("已接收 · 台前调度已自动关闭")
-        } else {
-            showToast("已接收 · 返回倒计时已停止")
+        completeForegroundDispatch(startNext: true, at: Date())
+        showToast("已接收 · 事件仍等待实际处理")
+    }
+
+    public func acceptForegroundInPlace() {
+        guard let dispatch = foregroundDispatch else { return }
+        if hudSettings.isEnabled {
+            hudArrivalID = dispatch.id
+            hudArrivalDeadline = Date().addingTimeInterval(TimeInterval(hudSettings.displaySeconds))
         }
+        completeForegroundDispatch(startNext: true, at: Date())
+        showToast("已在对应 Agent 的绑定工作区 · 不重复切换")
+    }
+
+    public func failForegroundTargetActivation() {
+        guard let dispatch = foregroundDispatch else { return }
+        let now = Date()
+        let note = "未找到具体任务或 Agent 页面，已返回 ActRealm"
+        foregroundReturnNotes[dispatch.id] = note
+        foregroundDispatch = ForegroundDispatchState(
+            id: dispatch.id,
+            provider: dispatch.provider,
+            eventKind: dispatch.eventKind,
+            title: dispatch.title,
+            taskTitle: dispatch.taskTitle,
+            phase: .returnedToActRealmWorkspace,
+            startedAt: now,
+            deadline: now.addingTimeInterval(1.4)
+        )
+        showToast(note)
     }
 
     public func isForegroundHUDSuppressed(for attentionID: String) -> Bool {
@@ -1155,41 +1292,65 @@ public final class AppModel: ObservableObject {
     func receiveForegroundArrival(
         id: String,
         provider: ProviderKind?,
+        eventKind: AgentFocusEventKind = .approval,
         title: String,
         taskTitle: String?,
         at date: Date = Date()
     ) {
-        guard foregroundDispatch == nil else { return }
-
-        switch effectiveForegroundStrategy(for: provider) {
-        case .actRealmWorkspace:
-            showToast("新任务已进入 ActRealm 工作区的待处理列表")
-        case .immediate:
-            guard !foregroundScheduling.workspaceApps.isEmpty else {
-                showToast("新任务已进入待处理列表；绑定协作桌面后可自动打开")
-                return
-            }
+        let arrival = ForegroundQueuedArrival(
+            id: id,
+            provider: provider,
+            eventKind: eventKind,
+            title: title,
+            taskTitle: taskTitle,
+            receivedAt: date
+        )
+        guard foregroundScheduling.isEnabled else { return }
+        guard foregroundScheduling.eventRules.allows(eventKind) else { return }
+        guard workspaceSupportsForegroundFocus(for: provider) else {
+            showToast("事件已进入 ActRealm；对应 Agent 尚未绑定到工作区")
+            return
+        }
+        guard effectiveForegroundStrategy(for: provider) != .actRealmWorkspace else {
+            showToast("事件已进入 ActRealm，不自动切换页面")
+            return
+        }
+        guard foregroundDispatch?.id != id,
+              !foregroundQueue.contains(where: { $0.id == id })
+        else { return }
+        if foregroundDispatch != nil {
+            foregroundQueue.append(arrival)
+            foregroundQueuedCount = foregroundQueue.count
             foregroundSuppressedAttentionIDs.insert(id)
+            return
+        }
+        startForegroundArrival(arrival, at: date)
+    }
+
+    private func startForegroundArrival(_ arrival: ForegroundQueuedArrival, at date: Date) {
+        switch effectiveForegroundStrategy(for: arrival.provider) {
+        case .actRealmWorkspace:
+            foregroundSuppressedAttentionIDs.remove(arrival.id)
+        case .immediate:
+            foregroundSuppressedAttentionIDs.insert(arrival.id)
             foregroundDispatch = ForegroundDispatchState(
-                id: id,
-                provider: provider,
-                title: title,
-                taskTitle: taskTitle,
+                id: arrival.id,
+                provider: arrival.provider,
+                eventKind: arrival.eventKind,
+                title: arrival.title,
+                taskTitle: arrival.taskTitle,
                 phase: .opening,
                 startedAt: date,
                 deadline: date.addingTimeInterval(1.2)
             )
         case .remind:
-            guard !foregroundScheduling.workspaceApps.isEmpty else {
-                showToast("新任务已进入待处理列表；绑定协作桌面后可自动打开")
-                return
-            }
-            foregroundSuppressedAttentionIDs.insert(id)
+            foregroundSuppressedAttentionIDs.insert(arrival.id)
             foregroundDispatch = ForegroundDispatchState(
-                id: id,
-                provider: provider,
-                title: title,
-                taskTitle: taskTitle,
+                id: arrival.id,
+                provider: arrival.provider,
+                eventKind: arrival.eventKind,
+                title: arrival.title,
+                taskTitle: arrival.taskTitle,
                 phase: .reminding,
                 startedAt: date,
                 deadline: date.addingTimeInterval(TimeInterval(foregroundScheduling.reminderSeconds))
@@ -1203,13 +1364,10 @@ public final class AppModel: ObservableObject {
         case .reminding:
             beginOpening(dispatch, at: date)
         case .opening:
-            guard foregroundScheduling.returnsToActRealmWorkspace else {
-                foregroundDispatch = nil
-                return
-            }
             foregroundDispatch = ForegroundDispatchState(
                 id: dispatch.id,
                 provider: dispatch.provider,
+                eventKind: dispatch.eventKind,
                 title: dispatch.title,
                 taskTitle: dispatch.taskTitle,
                 phase: .awaitingWorkspace,
@@ -1217,20 +1375,26 @@ public final class AppModel: ObservableObject {
                 deadline: date.addingTimeInterval(TimeInterval(foregroundScheduling.acceptanceSeconds))
             )
         case .awaitingWorkspace:
-            let note = "未检测到进入调度工作桌面，已返回"
-            foregroundReturnNotes[dispatch.id] = note
-            foregroundDispatch = ForegroundDispatchState(
-                id: dispatch.id,
-                provider: dispatch.provider,
-                title: dispatch.title,
-                taskTitle: dispatch.taskTitle,
-                phase: .returnedToActRealmWorkspace,
-                startedAt: date,
-                deadline: date.addingTimeInterval(1.4)
-            )
-            showToast(note)
+            if foregroundScheduling.returnsToActRealmWorkspace {
+                let note = "未检测到鼠标进入对应 Agent 的绑定工作区，已返回 ActRealm"
+                foregroundReturnNotes[dispatch.id] = note
+                foregroundDispatch = ForegroundDispatchState(
+                    id: dispatch.id,
+                    provider: dispatch.provider,
+                    eventKind: dispatch.eventKind,
+                    title: dispatch.title,
+                    taskTitle: dispatch.taskTitle,
+                    phase: .returnedToActRealmWorkspace,
+                    startedAt: date,
+                    deadline: date.addingTimeInterval(1.4)
+                )
+                showToast(note)
+            } else {
+                completeForegroundDispatch(startNext: true, at: date)
+                showToast("未检测到接收；保持当前 Agent 页面")
+            }
         case .returnedToActRealmWorkspace:
-            foregroundDispatch = nil
+            completeForegroundDispatch(startNext: true, at: date)
         }
     }
 
@@ -1238,12 +1402,88 @@ public final class AppModel: ObservableObject {
         foregroundDispatch = ForegroundDispatchState(
             id: dispatch.id,
             provider: dispatch.provider,
+            eventKind: dispatch.eventKind,
             title: dispatch.title,
             taskTitle: dispatch.taskTitle,
             phase: .opening,
             startedAt: date,
             deadline: date.addingTimeInterval(1.2)
         )
+    }
+
+    public func workspaceSupportsForegroundFocus(for provider: ProviderKind?) -> Bool {
+        guard !foregroundScheduling.workspaceApps.isEmpty else { return false }
+        guard let provider else { return true }
+        let providerTokens: [String]
+        switch provider {
+        case .codex: providerTokens = ["codex", "chatgpt"]
+        case .claude: providerTokens = ["claude"]
+        case .gemini: providerTokens = ["gemini"]
+        case let .custom(value): providerTokens = [value.lowercased()]
+        }
+        let terminalTokens = ["terminal", "iterm", "warp", "wezterm", "alacritty"]
+        return foregroundScheduling.workspaceApps.contains { application in
+            let identity = "\(application.bundleIdentifier) \(application.name)".lowercased()
+            return providerTokens.contains(where: identity.contains)
+                || terminalTokens.contains(where: identity.contains)
+        }
+    }
+
+    public func focusSpecificTask(attentionID: String) async -> Bool {
+        guard attentionID != Self.foregroundTestDispatchID,
+              let entry = derived.openOutbox.first(where: { $0.id == attentionID }),
+              let task = derived.agentTasks.first(where: {
+                  $0.id == entry.attention.sessionId
+              }),
+              task.session.jumpCapability != "unsupported"
+        else { return false }
+        let (response, _) = await client.jumpSession(task.id)
+        return response?.success == true
+    }
+
+    private func completeForegroundDispatch(startNext: Bool, at date: Date) {
+        if let dispatch = foregroundDispatch {
+            foregroundSuppressedAttentionIDs.remove(dispatch.id)
+        }
+        foregroundDispatch = nil
+        if startNext {
+            startNextForegroundArrivalIfNeeded(at: date)
+        }
+    }
+
+    func resolveForegroundArrival(
+        id: String,
+        at date: Date = Date(),
+        startNext: Bool = true
+    ) {
+        foregroundQueue.removeAll { $0.id == id }
+        foregroundQueuedCount = foregroundQueue.count
+        foregroundSuppressedAttentionIDs.remove(id)
+        if foregroundDispatch?.id == id {
+            foregroundDispatch = nil
+            if startNext {
+                startNextForegroundArrivalIfNeeded(at: date)
+            }
+        }
+    }
+
+    private func startNextForegroundArrivalIfNeeded(at date: Date) {
+        guard foregroundDispatch == nil else { return }
+        while !foregroundQueue.isEmpty {
+            let next = foregroundQueue.removeFirst()
+            foregroundQueuedCount = foregroundQueue.count
+            guard foregroundScheduling.isEnabled,
+                  foregroundScheduling.eventRules.allows(next.eventKind),
+                  workspaceSupportsForegroundFocus(for: next.provider),
+                  effectiveForegroundStrategy(for: next.provider) != .actRealmWorkspace
+            else {
+                foregroundSuppressedAttentionIDs.remove(next.id)
+                continue
+            }
+            startForegroundArrival(next, at: max(date, next.receivedAt))
+            return
+        }
+        foregroundQueuedCount = 0
     }
 
     /// Visual-only HUD preview used by Runtime Monitor. It never creates an
@@ -1257,6 +1497,20 @@ public final class AppModel: ObservableObject {
             guard !Task.isCancelled else { return }
             self?.isHUDPreviewActive = false
         }
+    }
+
+    /// Closes only the current HUD presentation. The underlying attention
+    /// remains in OUTBOX; closing an Agent Focus reminder also cancels that
+    /// focus attempt so a hidden countdown can never switch workspaces later.
+    public func dismissHUD() {
+        hudPreviewTask?.cancel()
+        isHUDPreviewActive = false
+        if foregroundDispatch != nil {
+            keepForegroundTaskInActRealmWorkspace()
+            return
+        }
+        hudArrivalID = nil
+        hudArrivalDeadline = nil
     }
 
     private func send(_ action: AttentionAction, entry: OutboxEntry) {

@@ -376,6 +376,7 @@ private struct AgentSettingsPage: View {
 
 private struct NotificationSettingsPage: View {
     @EnvironmentObject private var model: AppModel
+    @State private var displayCatalogRevision = 0
 
     var body: some View {
         VStack(spacing: 0) {
@@ -429,7 +430,34 @@ private struct NotificationSettingsPage: View {
                         get: { model.hudSettings.isEnabled },
                         set: { enabled in model.updateHUDSettings { $0.isEnabled = enabled } }
                     )) {
-                        SettingsLabel("显示 HUD 胶囊", detail: "新事件到达时在当前屏幕中央显示，可自由拖动")
+                        SettingsLabel("显示 HUD 胶囊", detail: "新事件到达时在目标显示器的安全区域顶部居中")
+                    }
+
+                    Picker(selection: hudDisplayModeBinding) {
+                        Text("系统主显示器").tag(HUDDisplayMode.systemMain)
+                        Text("指定显示器").tag(HUDDisplayMode.selectedDisplay)
+                        Text("跟随 ActRealm 窗口").tag(HUDDisplayMode.followActRealmWindow)
+                    } label: {
+                        SettingsLabel("显示位置", detail: hudDisplayModeDetail)
+                    }
+                    .disabled(!model.hudSettings.isEnabled)
+
+                    if model.hudSettings.displayMode == .selectedDisplay {
+                        Picker(selection: selectedDisplayBinding) {
+                            ForEach(displayOptions) { display in
+                                Text(display.isMain ? "\(display.name)（主显示器）" : display.name)
+                                    .tag(display.id)
+                            }
+                            if let selectedID = model.hudSettings.selectedDisplayID,
+                               resolvedSelectedDisplay == nil
+                            {
+                                Text("\(model.hudSettings.selectedDisplayName ?? "显示器")（未连接）")
+                                    .tag(selectedID)
+                            }
+                        } label: {
+                            SettingsLabel("目标显示器", detail: selectedDisplayDetail)
+                        }
+                        .disabled(!model.hudSettings.isEnabled || displayOptions.isEmpty)
                     }
 
                     Picker(selection: Binding(
@@ -441,7 +469,7 @@ private struct NotificationSettingsPage: View {
                         Text("12 秒").tag(12)
                         Text("20 秒").tag(20)
                     } label: {
-                        SettingsLabel("显示时间", detail: "台前调度倒计时不受此设置影响")
+                        SettingsLabel("显示时间", detail: "智能聚焦 HUD 的等待时间由 Agent Focus 单独设置")
                     }
                     .disabled(!model.hudSettings.isEnabled)
 
@@ -469,12 +497,89 @@ private struct NotificationSettingsPage: View {
                 } header: {
                     Text("HUD 胶囊")
                 } footer: {
-                    Text("审批按钮始终保留；字段设置只控制事件信息。")
+                    Text("指定显示器断开时会暂时回退到系统主显示器；审批按钮始终保留。")
                 }
             }
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)
         }
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didChangeScreenParametersNotification
+        )) { _ in
+            displayCatalogRevision &+= 1
+        }
+    }
+
+    private var displayOptions: [HUDDisplayOption] {
+        _ = displayCatalogRevision
+        return HUDDisplayCatalog.options
+    }
+
+    private var hudDisplayModeBinding: Binding<HUDDisplayMode> {
+        Binding(
+            get: { model.hudSettings.displayMode },
+            set: { mode in
+                let displays = displayOptions
+                model.updateHUDSettings { settings in
+                    settings.displayMode = mode
+                    if mode == .selectedDisplay,
+                       settings.selectedDisplayID == nil,
+                       settings.selectedDisplayName == nil,
+                       let display = displays.first
+                    {
+                        settings.selectedDisplayID = display.id
+                        settings.selectedDisplayName = display.name
+                    }
+                }
+            }
+        )
+    }
+
+    private var selectedDisplayBinding: Binding<UInt32> {
+        let displays = displayOptions
+        let fallbackID = displays.first?.id ?? CGMainDisplayID()
+        return Binding(
+            get: {
+                resolvedSelectedDisplay?.id
+                    ?? model.hudSettings.selectedDisplayID
+                    ?? fallbackID
+            },
+            set: { displayID in
+                guard let display = displays.first(where: { $0.id == displayID }) else { return }
+                model.updateHUDSettings { settings in
+                    settings.selectedDisplayID = display.id
+                    settings.selectedDisplayName = display.name
+                }
+            }
+        )
+    }
+
+    private var hudDisplayModeDetail: String {
+        switch model.hudSettings.displayMode {
+        case .systemMain:
+            "始终显示在 macOS 当前的主显示器"
+        case .selectedDisplay:
+            "固定显示在下方选择的显示器"
+        case .followActRealmWindow:
+            "ActRealm 主窗口跨屏移动后，HUD 会同步跟随"
+        }
+    }
+
+    private var selectedDisplayDetail: String {
+        guard resolvedSelectedDisplay != nil else {
+            return "所选显示器未连接时暂用系统主显示器"
+        }
+        return "当前已连接"
+    }
+
+    private var resolvedSelectedDisplay: HUDDisplayOption? {
+        if let selectedID = model.hudSettings.selectedDisplayID,
+           let display = displayOptions.first(where: { $0.id == selectedID })
+        {
+            return display
+        }
+        guard let selectedName = model.hudSettings.selectedDisplayName else { return nil }
+        return displayOptions.first { $0.name == selectedName }
     }
 
     private func notificationRow(

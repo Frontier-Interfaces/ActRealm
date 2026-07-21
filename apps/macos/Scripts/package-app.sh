@@ -22,6 +22,7 @@ fi
 OUT_DIR="${1:-$PACKAGE_DIR/dist}"
 APP="$OUT_DIR/ActRealm.app"
 INFO_PLIST="$PACKAGE_DIR/Resources/Info.plist"
+APP_ICON="$PACKAGE_DIR/Resources/ActRealm.icns"
 if [[ -z "${SDKROOT:-}" ]]; then
   export SDKROOT="$("$SCRIPT_DIR/resolve-sdk.sh")"
 fi
@@ -32,6 +33,7 @@ if [[ ! -f "$RUST_REPO/Cargo.toml" ]]; then
   exit 1
 fi
 [[ -f "$INFO_PLIST" ]] || { echo "error: missing $INFO_PLIST" >&2; exit 1; }
+[[ -f "$APP_ICON" ]] || { echo "error: missing $APP_ICON" >&2; exit 1; }
 if [[ "${ACTREALM_SKIP_RUST_BUILD:-0}" == "1" ]]; then
   echo "==> Reusing existing Rust backend (release)"
   [[ -x "$RUST_REPO/target/release/actrealm" ]] || {
@@ -60,6 +62,7 @@ mkdir -p "$APP/Contents/Resources/ProviderIcons"
 cp "$SWIFT_BIN" "$APP/Contents/MacOS/ActRealm"
 cp "$RUST_REPO/target/release/actrealm" "$APP/Contents/Helpers/actrealm"
 cp "$INFO_PLIST" "$APP/Contents/Info.plist"
+cp "$APP_ICON" "$APP/Contents/Resources/ActRealm.icns"
 cp "$REPO_ROOT/web/assets/claude.png" "$APP/Contents/Resources/ProviderIcons/claude.png"
 cp "$REPO_ROOT/web/assets/codex.png" "$APP/Contents/Resources/ProviderIcons/codex.png"
 plutil -lint "$APP/Contents/Info.plist"

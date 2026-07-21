@@ -265,7 +265,7 @@ private struct SchedulingNavigationButton: View {
 
     var body: some View {
         Button(action: action) {
-            Label("台前调度", systemImage: "rectangle.3.group")
+            Label("智能聚焦", systemImage: "scope")
                 .font(.system(size: 10.5, weight: .bold))
                 .foregroundStyle(selected ? Color.white : DT.textSecondary)
                 .padding(.horizontal, 11)
@@ -284,7 +284,7 @@ private struct SchedulingNavigationButton: View {
         }
         .buttonStyle(.plain)
         .focusable(false)
-        .help(selected ? "当前正在查看台前调度" : "打开台前调度")
+        .help(selected ? "当前正在查看智能聚焦（Agent Focus）" : "打开智能聚焦（Agent Focus）")
     }
 }
 
