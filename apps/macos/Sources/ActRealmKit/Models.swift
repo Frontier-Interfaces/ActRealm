@@ -627,6 +627,26 @@ public struct ProviderMuted: Codable, Equatable, Sendable {
     }
 }
 
+public enum TaskCardDisplayPresets {
+    public static let concise = [
+        "project", "task", "model", "activity", "plan", "sessionTokens", "context",
+    ]
+    public static let detailed = [
+        "project", "task", "model", "activity", "plan", "sessionTokens", "turnTokens",
+        "inputOutputTokens", "cacheTokens", "reasoningTokens", "cost", "context", "tool",
+        "subagents", "environment", "recovery", "control", "jump",
+    ]
+    public static let developer = detailed + [
+        "permissionMode", "titleSource", "sessionId", "providerSessionId", "providerTurnId",
+        "lastEventAt",
+    ]
+    public static let all = [
+        "concise": concise,
+        "detailed": detailed,
+        "developer": developer,
+    ]
+}
+
 public struct UISettings: Codable, Equatable, Sendable {
     public var notificationRules: NotificationRules
     public var soundEnabled: Bool
@@ -644,11 +664,8 @@ public struct UISettings: Codable, Equatable, Sendable {
         codexEnhancedActivity: Bool = true,
         retentionDays: UInt32 = 90,
         displayProfile: String = "detailed",
-        taskCardFields: [String] = [
-            "project", "task", "model", "activity", "plan", "tokens", "cost", "context",
-            "tool", "subagents", "environment", "recovery", "control", "jump",
-        ],
-        displayFieldsVersion: UInt32? = 2
+        taskCardFields: [String] = TaskCardDisplayPresets.detailed,
+        displayFieldsVersion: UInt32? = 3
     ) {
         self.notificationRules = notificationRules
         self.soundEnabled = soundEnabled
@@ -667,6 +684,22 @@ public struct DisplayField: Codable, Equatable, Sendable, Identifiable {
     public let id: String
     public let label: String
     public let level: String
+    public let placement: String?
+    public let description: String?
+
+    public init(
+        id: String,
+        label: String,
+        level: String,
+        placement: String? = nil,
+        description: String? = nil
+    ) {
+        self.id = id
+        self.label = label
+        self.level = level
+        self.placement = placement
+        self.description = description
+    }
 }
 
 public struct ClaudeQuotaBridge: Codable, Equatable, Sendable {

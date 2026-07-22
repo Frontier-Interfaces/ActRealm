@@ -51,7 +51,11 @@ const TASK_CARD_DISPLAY_FIELDS: &[&str] = &[
     "model",
     "activity",
     "plan",
-    "tokens",
+    "sessionTokens",
+    "turnTokens",
+    "inputOutputTokens",
+    "cacheTokens",
+    "reasoningTokens",
     "cost",
     "context",
     "tool",
@@ -1666,7 +1670,11 @@ impl Default for UiSettings {
                 "model".to_owned(),
                 "activity".to_owned(),
                 "plan".to_owned(),
-                "tokens".to_owned(),
+                "sessionTokens".to_owned(),
+                "turnTokens".to_owned(),
+                "inputOutputTokens".to_owned(),
+                "cacheTokens".to_owned(),
+                "reasoningTokens".to_owned(),
                 "cost".to_owned(),
                 "context".to_owned(),
                 "tool".to_owned(),
@@ -1676,7 +1684,7 @@ impl Default for UiSettings {
                 "control".to_owned(),
                 "jump".to_owned(),
             ],
-            display_fields_version: 2,
+            display_fields_version: 3,
         }
     }
 }
@@ -1737,11 +1745,13 @@ async fn settings(State(state): State<AppState>, headers: HeaderMap) -> Response
 async fn update_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(next): Json<UiSettings>,
+    Json(mut next): Json<UiSettings>,
 ) -> Response {
     if !authorized_mutation(&state, &headers) {
         return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_MUTATION");
     }
+    let source_display_fields_version = next.display_fields_version;
+    migrate_display_fields(&mut next, Some(source_display_fields_version));
     if let Err(reason) = next.validate() {
         return api_error_detail(StatusCode::BAD_REQUEST, "INVALID_SETTINGS", reason);
     }
@@ -1820,11 +1830,17 @@ fn load_ui_settings(state: &AppState) -> Result<UiSettings, StoreError> {
 fn decode_ui_settings(encoded: &str) -> Result<UiSettings, StoreError> {
     let raw = serde_json::from_str::<Value>(encoded)
         .map_err(|error| StoreError::Storage(format!("settings JSON is invalid: {error}")))?;
-    let is_legacy_display_fields = raw.get("displayFieldsVersion").is_none();
+    let source_version = raw.get("displayFieldsVersion").and_then(Value::as_u64);
     let mut settings = serde_json::from_value::<UiSettings>(raw)
         .map_err(|error| StoreError::Storage(format!("settings JSON is invalid: {error}")))?;
 
-    if is_legacy_display_fields {
+    migrate_display_fields(&mut settings, source_version.map(|version| version as u32));
+
+    Ok(settings)
+}
+
+fn migrate_display_fields(settings: &mut UiSettings, source_version: Option<u32>) {
+    if source_version.unwrap_or(1) < 2 {
         if let Some(token_index) = settings
             .task_card_fields
             .iter()
@@ -1840,10 +1856,33 @@ fn decode_ui_settings(encoded: &str) -> Result<UiSettings, StoreError> {
                     .insert(token_index.saturating_add(1), "cost".to_owned());
             }
         }
-        settings.display_fields_version = 2;
     }
 
-    Ok(settings)
+    if let Some(token_index) = settings
+        .task_card_fields
+        .iter()
+        .position(|field| field == "tokens")
+    {
+        settings.task_card_fields.remove(token_index);
+        let replacement_fields = [
+            "sessionTokens",
+            "turnTokens",
+            "inputOutputTokens",
+            "cacheTokens",
+            "reasoningTokens",
+        ]
+        .into_iter()
+        .filter(|field| !settings.task_card_fields.iter().any(|item| item == field))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        for (offset, field) in replacement_fields.into_iter().enumerate() {
+            settings
+                .task_card_fields
+                .insert(token_index.saturating_add(offset), field);
+        }
+    }
+
+    settings.display_fields_version = 3;
 }
 
 fn settings_value(state: &AppState) -> Result<Value, String> {
@@ -1855,26 +1894,30 @@ fn settings_value(state: &AppState) -> Result<Value, String> {
     Ok(json!({
         "settings": settings,
         "displayCatalog": [
-            { "id": "project", "label": "项目", "level": "detailed" },
-            { "id": "task", "label": "任务摘要", "level": "concise" },
-            { "id": "model", "label": "模型", "level": "detailed" },
-            { "id": "activity", "label": "实时状态", "level": "concise" },
-            { "id": "plan", "label": "计划进度", "level": "detailed" },
-            { "id": "tokens", "label": "Token", "level": "detailed" },
-            { "id": "cost", "label": "估算 API 价格", "level": "detailed" },
-            { "id": "context", "label": "上下文占用", "level": "detailed" },
-            { "id": "tool", "label": "当前工具", "level": "detailed" },
-            { "id": "permissionMode", "label": "权限模式", "level": "detailed" },
-            { "id": "subagents", "label": "运行中的子 Agent", "level": "detailed" },
-            { "id": "environment", "label": "运行环境", "level": "detailed" },
-            { "id": "recovery", "label": "恢复状态", "level": "detailed" },
-            { "id": "control", "label": "托管能力", "level": "detailed" },
-            { "id": "jump", "label": "打开应用", "level": "detailed" },
-            { "id": "titleSource", "label": "标题来源", "level": "developer" },
-            { "id": "sessionId", "label": "ActRealm Session ID", "level": "developer" },
-            { "id": "providerSessionId", "label": "Provider Session ID", "level": "developer" },
-            { "id": "providerTurnId", "label": "Provider Turn ID", "level": "developer" },
-            { "id": "lastEventAt", "label": "最后事件时间", "level": "developer" }
+            { "id": "task", "label": "任务标题与摘要", "level": "concise", "placement": "headline", "description": "主标题；若 Provider 标题与任务摘要不同，摘要显示在下一行" },
+            { "id": "activity", "label": "实时状态", "level": "concise", "placement": "headline", "description": "标题栏右侧的运行阶段、等待状态与耗时" },
+            { "id": "project", "label": "项目", "level": "concise", "placement": "subtitle", "description": "副标题中的项目名称" },
+            { "id": "model", "label": "模型", "level": "concise", "placement": "subtitle", "description": "副标题中的模型名称" },
+            { "id": "plan", "label": "计划进度", "level": "concise", "placement": "subtitle", "description": "折叠卡中的完成步数与进度条" },
+            { "id": "sessionTokens", "label": "会话累计 Token", "level": "concise", "placement": "overview", "description": "折叠卡用量胶囊；展开后显示累计值" },
+            { "id": "context", "label": "上下文占用", "level": "concise", "placement": "overview", "description": "折叠卡用量胶囊；展示当前上下文百分比" },
+            { "id": "cost", "label": "估算 API 价格", "level": "detailed", "placement": "overview", "description": "折叠卡用量胶囊；不是订阅账单" },
+            { "id": "turnTokens", "label": "本轮 Token", "level": "detailed", "placement": "details", "description": "展开详情中的最近一轮 Token" },
+            { "id": "inputOutputTokens", "label": "输入 / 输出 Token", "level": "detailed", "placement": "details", "description": "展开详情中的输入与输出拆分" },
+            { "id": "cacheTokens", "label": "缓存读取 / 写入 Token", "level": "detailed", "placement": "details", "description": "展开详情中的缓存读取与创建拆分" },
+            { "id": "reasoningTokens", "label": "推理 Token", "level": "detailed", "placement": "details", "description": "展开详情中的 Provider 推理用量" },
+            { "id": "tool", "label": "当前工具", "level": "detailed", "placement": "details", "description": "展开详情中的当前工具类别" },
+            { "id": "permissionMode", "label": "权限模式", "level": "detailed", "placement": "details", "description": "展开详情中的 Provider 权限策略" },
+            { "id": "subagents", "label": "运行中的子 Agent", "level": "detailed", "placement": "details", "description": "展开详情中的子 Agent 数量与列表" },
+            { "id": "environment", "label": "运行环境", "level": "detailed", "placement": "details", "description": "展开详情中的工作区或客户端环境" },
+            { "id": "recovery", "label": "恢复状态", "level": "detailed", "placement": "details", "description": "展开详情中的重连与控制恢复状态" },
+            { "id": "control", "label": "托管能力", "level": "detailed", "placement": "details", "description": "展开详情中的 Hook 或 Connector 能力" },
+            { "id": "jump", "label": "打开应用", "level": "detailed", "placement": "details", "description": "展开详情中的原应用跳转入口" },
+            { "id": "titleSource", "label": "标题来源", "level": "developer", "placement": "developer", "description": "展开详情中的标题解析来源" },
+            { "id": "sessionId", "label": "ActRealm Session ID", "level": "developer", "placement": "developer", "description": "ActRealm 内部会话标识" },
+            { "id": "providerSessionId", "label": "Provider Session ID", "level": "developer", "placement": "developer", "description": "Provider 原始会话标识" },
+            { "id": "providerTurnId", "label": "Provider Turn ID", "level": "developer", "placement": "developer", "description": "Provider 当前轮次标识" },
+            { "id": "lastEventAt", "label": "最后事件时间", "level": "developer", "placement": "developer", "description": "Runtime 最近接收事件的本地时间" }
         ],
         "claudeQuotaBridge": {
             "status": bridge.status,
@@ -3702,15 +3745,55 @@ mod tests {
                 .unwrap();
         assert_eq!(
             migrated.task_card_fields,
-            vec!["tokens".to_owned(), "cost".to_owned()]
+            vec![
+                "sessionTokens".to_owned(),
+                "turnTokens".to_owned(),
+                "inputOutputTokens".to_owned(),
+                "cacheTokens".to_owned(),
+                "reasoningTokens".to_owned(),
+                "cost".to_owned(),
+            ]
         );
-        assert_eq!(migrated.display_fields_version, 2);
+        assert_eq!(migrated.display_fields_version, 3);
 
-        let independent = decode_ui_settings(
+        let version_two = decode_ui_settings(
             r#"{"displayProfile":"custom","displayFieldsVersion":2,"taskCardFields":["tokens"]}"#,
         )
         .unwrap();
-        assert_eq!(independent.task_card_fields, vec!["tokens".to_owned()]);
+        assert_eq!(
+            version_two.task_card_fields,
+            vec![
+                "sessionTokens".to_owned(),
+                "turnTokens".to_owned(),
+                "inputOutputTokens".to_owned(),
+                "cacheTokens".to_owned(),
+                "reasoningTokens".to_owned(),
+            ]
+        );
+
+        let independent = decode_ui_settings(
+            r#"{"displayProfile":"custom","displayFieldsVersion":3,"taskCardFields":["turnTokens"]}"#,
+        )
+        .unwrap();
+        assert_eq!(independent.task_card_fields, vec!["turnTokens".to_owned()]);
+
+        let mut stale_client = UiSettings {
+            display_profile: "custom".to_owned(),
+            task_card_fields: vec!["tokens".to_owned()],
+            display_fields_version: 3,
+            ..UiSettings::default()
+        };
+        migrate_display_fields(&mut stale_client, Some(3));
+        assert_eq!(
+            stale_client.task_card_fields,
+            vec![
+                "sessionTokens".to_owned(),
+                "turnTokens".to_owned(),
+                "inputOutputTokens".to_owned(),
+                "cacheTokens".to_owned(),
+                "reasoningTokens".to_owned(),
+            ]
+        );
 
         let custom = UiSettings {
             display_profile: "custom".to_owned(),
@@ -3719,7 +3802,14 @@ mod tests {
         };
         custom.validate().unwrap();
 
-        for independent_usage_field in ["tokens", "cost"] {
+        for independent_usage_field in [
+            "sessionTokens",
+            "turnTokens",
+            "inputOutputTokens",
+            "cacheTokens",
+            "reasoningTokens",
+            "cost",
+        ] {
             let custom = UiSettings {
                 display_profile: "custom".to_owned(),
                 task_card_fields: vec![independent_usage_field.to_owned()],
@@ -3730,6 +3820,10 @@ mod tests {
         assert!(UiSettings::default()
             .task_card_fields
             .contains(&"cost".to_owned()));
+        assert_eq!(UiSettings::default().display_fields_version, 3);
+        assert!(!UiSettings::default()
+            .task_card_fields
+            .contains(&"tokens".to_owned()));
 
         for unsafe_field in ["raw", "payload", "fullCommand", "transcript"] {
             let unsafe_settings = UiSettings {
