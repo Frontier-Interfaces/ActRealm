@@ -342,7 +342,10 @@ import Testing
             demo: false
         )
         try first.importThemeBackground(from: source, kind: .animatedImage)
-        first.updateThemeSettings { $0.laneOpacity = 0.68 }
+        first.updateThemeSettings {
+            $0.laneOpacity = 0.68
+            $0.maintainsTransparencyWhenInactive = false
+        }
         let copiedURL = try #require(first.themeBackgroundURL)
         #expect(copiedURL != source)
         #expect(FileManager.default.fileExists(atPath: copiedURL.path))
@@ -356,10 +359,12 @@ import Testing
         #expect(restored.themeBackgroundURL == copiedURL)
         #expect(restored.themeSettings.backgroundKind == .animatedImage)
         #expect(restored.themeSettings.laneOpacity == 0.68)
+        #expect(!restored.themeSettings.maintainsTransparencyWhenInactive)
         restored.resetThemeBackground()
         #expect(restored.themeBackgroundURL == nil)
         #expect(restored.themeSettings.backgroundKind == .image)
         #expect(restored.themeSettings.laneOpacity == 0.68)
+        #expect(!restored.themeSettings.maintainsTransparencyWhenInactive)
         #expect(!FileManager.default.fileExists(atPath: copiedURL.path))
     }
 
@@ -369,10 +374,21 @@ import Testing
         let decoded = try JSONDecoder().decode(AppThemeSettings.self, from: legacy)
         #expect(decoded.backgroundKind == .image)
         #expect(decoded.laneOpacity == 0.55)
+        #expect(decoded.maintainsTransparencyWhenInactive)
 
         let oldTransparency = Data(#"{"laneTransparency":0.68}"#.utf8)
         let migrated = try JSONDecoder().decode(AppThemeSettings.self, from: oldTransparency)
         #expect(abs(migrated.laneOpacity - 0.32) < 0.0001)
+        #expect(migrated.maintainsTransparencyWhenInactive)
+
+        let nativeInactiveAppearance = Data(
+            #"{"maintainsTransparencyWhenInactive":false}"#.utf8
+        )
+        let explicit = try JSONDecoder().decode(
+            AppThemeSettings.self,
+            from: nativeInactiveAppearance
+        )
+        #expect(!explicit.maintainsTransparencyWhenInactive)
 
         let model = AppModel(defaults: isolatedDefaults(), demo: false)
         model.updateThemeSettings { $0.laneOpacity = 2 }

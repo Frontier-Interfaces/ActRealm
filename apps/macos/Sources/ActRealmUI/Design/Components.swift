@@ -282,6 +282,7 @@ struct PillButtonStyle: ButtonStyle {
 // MARK: - Native Liquid Glass surface
 
 struct LiquidGlassSurface: ViewModifier {
+    @EnvironmentObject private var model: AppModel
     @Environment(\.snapshotRendering) private var snapshotRendering
     var tint: Color?
     var radius: CGFloat
@@ -296,8 +297,21 @@ struct LiquidGlassSurface: ViewModifier {
         Group {
             if snapshotRendering {
                 content.background(.ultraThinMaterial, in: shape)
-            } else {
+            } else if interactive || !model.themeSettings.maintainsTransparencyWhenInactive {
                 content.glassEffect(.regular.tint(tint).interactive(interactive), in: shape)
+            } else {
+                content.background {
+                    ZStack {
+                        AlwaysActiveVisualEffectView(
+                            material: .underWindowBackground,
+                            blendingMode: .withinWindow
+                        )
+                        if let tint {
+                            tint
+                        }
+                    }
+                    .clipShape(shape)
+                }
             }
         }
             .overlay(shape.strokeBorder(stroke, lineWidth: 1))
@@ -319,6 +333,8 @@ struct MainLaneSurface: ViewModifier {
     func body(content: Content) -> some View {
         content.modifier(ThemedLaneSurface(
             opacity: model.themeSettings.laneOpacity,
+            maintainsTransparencyWhenInactive:
+                model.themeSettings.maintainsTransparencyWhenInactive,
             radius: radius,
             stroke: stroke,
             shadow: shadow,
@@ -335,6 +351,7 @@ struct ThemedLaneSurface: ViewModifier {
     @Environment(\.snapshotRendering) private var snapshotRendering
 
     var opacity: Double
+    var maintainsTransparencyWhenInactive: Bool = true
     var radius: CGFloat
     var stroke: Color
     var shadow: Color
@@ -348,10 +365,22 @@ struct ThemedLaneSurface: ViewModifier {
         Group {
             if snapshotRendering || clampedOpacity == 0 {
                 content.background(shape.fill(DT.mainLaneFill(opacity: clampedOpacity)))
-            } else {
+            } else if !maintainsTransparencyWhenInactive {
                 content
                     .background(shape.fill(DT.mainLaneFill(opacity: clampedOpacity)))
                     .glassEffect(.clear, in: shape)
+            } else {
+                content.background {
+                    ZStack {
+                        AlwaysActiveVisualEffectView(
+                            material: .underWindowBackground,
+                            blendingMode: .withinWindow
+                        )
+                            .opacity(0.20)
+                        shape.fill(DT.mainLaneFill(opacity: clampedOpacity))
+                    }
+                    .clipShape(shape)
+                }
             }
         }
         .overlay(shape.strokeBorder(stroke, lineWidth: 1))
@@ -482,7 +511,46 @@ public extension EnvironmentValues {
 
 // MARK: - Window background
 
-/// Behind-window blur so the whole window reads as one glass sheet.
+/// AppKit's Liquid Glass view has no public way to opt out of the inactive
+/// rendering it applies when a window loses focus. NSVisualEffectView does:
+/// `.active` keeps the material stable without changing the real key window.
+struct AlwaysActiveVisualEffectView: NSViewRepresentable {
+    var material: NSVisualEffectView.Material
+    var blendingMode: NSVisualEffectView.BlendingMode
+
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        Self.makeView(material: material, blendingMode: blendingMode)
+    }
+
+    func updateNSView(_ view: NSVisualEffectView, context: Context) {
+        Self.configure(view, material: material, blendingMode: blendingMode)
+    }
+
+    @MainActor
+    static func makeView(
+        material: NSVisualEffectView.Material,
+        blendingMode: NSVisualEffectView.BlendingMode
+    ) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        configure(view, material: material, blendingMode: blendingMode)
+        return view
+    }
+
+    @MainActor
+    static func configure(
+        _ view: NSVisualEffectView,
+        material: NSVisualEffectView.Material,
+        blendingMode: NSVisualEffectView.BlendingMode
+    ) {
+        view.material = material
+        view.blendingMode = blendingMode
+        view.state = .active
+        view.isEmphasized = false
+    }
+}
+
+/// Native Liquid Glass behavior used when the user allows materials to follow
+/// the active state of the containing window.
 struct WindowGlass: NSViewRepresentable {
     func makeNSView(context: Context) -> NSGlassEffectView {
         let view = NSGlassEffectView()
@@ -531,10 +599,19 @@ struct WindowGlassBackground: ViewModifier {
                     if let url = model.themeBackgroundURL {
                         AppThemeBackdrop(
                             url: url,
-                            kind: model.themeSettings.backgroundKind
+                            kind: model.themeSettings.backgroundKind,
+                            maintainsTransparencyWhenInactive:
+                                model.themeSettings.maintainsTransparencyWhenInactive
                         )
                     } else if !snapshotRendering {
-                        WindowGlass()
+                        if model.themeSettings.maintainsTransparencyWhenInactive {
+                            AlwaysActiveVisualEffectView(
+                                material: .underWindowBackground,
+                                blendingMode: .behindWindow
+                            )
+                        } else {
+                            WindowGlass()
+                        }
                         AppThemeTint()
                     } else {
                         Rectangle().fill(.ultraThinMaterial)
@@ -551,13 +628,27 @@ struct WindowGlassBackground: ViewModifier {
 struct AppThemeBackdrop: View {
     let url: URL
     let kind: ThemeBackgroundKind
+    var maintainsTransparencyWhenInactive: Bool = true
+    @Environment(\.snapshotRendering) private var snapshotRendering
 
     var body: some View {
         ZStack {
             AppThemeMediaView(url: url, kind: kind)
-            Rectangle()
-                .fill(.ultraThinMaterial)
-                .opacity(0.58)
+            if snapshotRendering {
+                Rectangle()
+                    .fill(.ultraThinMaterial)
+                    .opacity(0.58)
+            } else if maintainsTransparencyWhenInactive {
+                AlwaysActiveVisualEffectView(
+                    material: .underWindowBackground,
+                    blendingMode: .withinWindow
+                )
+                    .opacity(0.58)
+            } else {
+                Rectangle()
+                    .fill(.ultraThinMaterial)
+                    .opacity(0.58)
+            }
             AppThemeTint()
         }
     }

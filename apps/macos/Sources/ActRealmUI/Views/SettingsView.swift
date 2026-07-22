@@ -648,14 +648,16 @@ private struct ThemeSettingsPage: View {
         VStack(spacing: 0) {
             SettingsPageHeader(
                 title: "主题",
-                subtitle: "用自己的图片更换 ActRealm 工作区背景。"
+                subtitle: "调整工作区背景、三栏透明度与窗口失焦外观。"
             )
             Form {
                 Section {
                     ThemeLanePreview(
                         backgroundURL: model.themeBackgroundURL,
                         backgroundKind: model.themeSettings.backgroundKind,
-                        laneOpacity: model.themeSettings.laneOpacity
+                        laneOpacity: model.themeSettings.laneOpacity,
+                        maintainsTransparencyWhenInactive:
+                            model.themeSettings.maintainsTransparencyWhenInactive
                     )
                     .frame(maxWidth: .infinity)
                     .aspectRatio(model.mainWindowAspectRatio, contentMode: .fit)
@@ -721,6 +723,26 @@ private struct ThemeSettingsPage: View {
                     Text("三栏外观")
                 } footer: {
                     Text("0% 为完全透明，100% 为完全不透明。上方预览会按主窗口当前比例实时显示最终叠加效果。")
+                }
+
+                Section {
+                    Toggle(isOn: Binding(
+                        get: { model.themeSettings.maintainsTransparencyWhenInactive },
+                        set: { enabled in
+                            model.updateThemeSettings {
+                                $0.maintainsTransparencyWhenInactive = enabled
+                            }
+                        }
+                    )) {
+                        SettingsLabel(
+                            "失焦时保持透明度",
+                            detail: "ActRealm 不在前台时，背景与三栏仍保持当前透明度"
+                        )
+                    }
+                } header: {
+                    Text("窗口失焦")
+                } footer: {
+                    Text("默认开启。关闭后恢复 macOS 原生玻璃行为，窗口失焦时材质会自动变厚。")
                 }
             }
             .formStyle(.grouped)
@@ -805,6 +827,7 @@ private struct ThemeLanePreview: View {
     let backgroundURL: URL?
     let backgroundKind: ThemeBackgroundKind
     let laneOpacity: Double
+    let maintainsTransparencyWhenInactive: Bool
 
     var body: some View {
         GeometryReader { proxy in
@@ -837,7 +860,11 @@ private struct ThemeLanePreview: View {
     @ViewBuilder
     private var background: some View {
         if let backgroundURL {
-            AppThemeBackdrop(url: backgroundURL, kind: backgroundKind)
+            AppThemeBackdrop(
+                url: backgroundURL,
+                kind: backgroundKind,
+                maintainsTransparencyWhenInactive: maintainsTransparencyWhenInactive
+            )
         } else {
             LinearGradient(
                 colors: [
@@ -873,6 +900,7 @@ private struct ThemeLanePreview: View {
         .frame(maxHeight: .infinity, alignment: .topLeading)
         .modifier(ThemedLaneSurface(
             opacity: laneOpacity,
+            maintainsTransparencyWhenInactive: maintainsTransparencyWhenInactive,
             radius: 13,
             stroke: Color.white.opacity(0.55),
             shadow: .clear,

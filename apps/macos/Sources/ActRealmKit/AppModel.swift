@@ -227,21 +227,26 @@ public struct AppThemeSettings: Codable, Equatable, Sendable {
     public var backgroundKind: ThemeBackgroundKind
     /// 0 is completely transparent; 1 is completely opaque.
     public var laneOpacity: Double
+    /// Keep background materials from becoming denser when the window is inactive.
+    public var maintainsTransparencyWhenInactive: Bool
 
     public init(
         customBackgroundPath: String? = nil,
         backgroundKind: ThemeBackgroundKind = .image,
-        laneOpacity: Double = 0.55
+        laneOpacity: Double = 0.55,
+        maintainsTransparencyWhenInactive: Bool = true
     ) {
         self.customBackgroundPath = customBackgroundPath
         self.backgroundKind = backgroundKind
         self.laneOpacity = laneOpacity
+        self.maintainsTransparencyWhenInactive = maintainsTransparencyWhenInactive
     }
 
     public static let defaults = AppThemeSettings()
 
     private enum CodingKeys: String, CodingKey {
         case customBackgroundPath, backgroundKind, laneOpacity, laneTransparency
+        case maintainsTransparencyWhenInactive
     }
 
     public init(from decoder: Decoder) throws {
@@ -264,6 +269,10 @@ public struct AppThemeSettings: Codable, Equatable, Sendable {
         } else {
             laneOpacity = 0.55
         }
+        maintainsTransparencyWhenInactive = try values.decodeIfPresent(
+            Bool.self,
+            forKey: .maintainsTransparencyWhenInactive
+        ) ?? true
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -271,6 +280,10 @@ public struct AppThemeSettings: Codable, Equatable, Sendable {
         try values.encodeIfPresent(customBackgroundPath, forKey: .customBackgroundPath)
         try values.encode(backgroundKind, forKey: .backgroundKind)
         try values.encode(laneOpacity, forKey: .laneOpacity)
+        try values.encode(
+            maintainsTransparencyWhenInactive,
+            forKey: .maintainsTransparencyWhenInactive
+        )
     }
 }
 
