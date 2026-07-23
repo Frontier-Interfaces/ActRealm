@@ -171,9 +171,12 @@ apps/macos/Scripts/package-app.sh
 open apps/macos/dist/ActRealm.app
 ```
 
-The current native UI uses Swift tools 6.2 and macOS 26 APIs. The generated app
-is ad-hoc signed for local development; a notarized public installer is not yet
-available.
+The current native UI uses Swift tools 6.2 and macOS 26 APIs and currently
+targets Apple Silicon. Local packages remain ad-hoc signed QA artifacts. The
+repository now contains a Developer ID signing, notarization, stapling, DMG,
+checksum, and GitHub release workflow, but a public installer is not considered
+available until that workflow runs with release credentials and the resulting
+DMG passes a clean-Mac install gate.
 
 ## Current boundaries and roadmap
 
@@ -181,12 +184,12 @@ available.
 | --- | --- | --- |
 | Local Runtime and web control surface | Current test candidate | Functional through M14 plus live-state/recovery refinements; M13 real-Provider acceptance and the 48-hour soak remain open |
 | Claude Code and Codex | Current build | Local sessions only; direct actions depend on the actual reply channel |
-| Native macOS client | Testable source | Packaging works locally; foreground/window activation still needs broader manual acceptance |
+| Native macOS client | Testable source | macOS 26+ on Apple Silicon; local packaging works, while clean-Mac release acceptance remains open |
 | Automatic ActRealm Workspace arrangement | Experimental | Requires macOS Accessibility permission and must fail without changing Runtime state |
 | ActRealm Review | In development | Planned test, diff, evidence, and checkpoint review; not part of the current build |
 | Gemini CLI adapter | In development | Not shipped as a current supported Provider |
 | Windows client | Roadmap | Runtime platform abstractions must land before the WinUI shell |
-| Public signed installer | Roadmap | No packaged M1 download is promised yet |
+| Public signed installer | Release-gated | Pipeline exists; Developer ID/notarization credentials and clean-Mac acceptance are still required |
 
 Roadmap-tagged capabilities on the website are target experiences, not evidence
 of shipped behavior. The detailed implementation and release truth lives in

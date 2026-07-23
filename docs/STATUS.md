@@ -1,6 +1,6 @@
 # ActRealm current status
 
-Last reviewed: 2026-07-20
+Last reviewed: 2026-07-22
 
 Source branch: `agent/v1-full`
 
@@ -21,6 +21,17 @@ provide the detailed requirements and evidence.
 
 - **Committed functional implementation:** delivered through M14 plus the
   ActRealm design alignment on `agent/v1-full`.
+- **P0 release-remediation candidate (uncommitted):** the 2026-07-22 global
+  release audit is being addressed on frozen baseline `50b891a`. The candidate
+  binds OUTBOX selection to stable Attention IDs, renders Claude questions and
+  Elicitation in the native primary card, disables stale controls while the
+  Runtime is offline, adds supervised Runtime restart and safe abandoned-child
+  takeover, releases sessions atomically when their reply channel ends, moves
+  the Codex app-server Connector to directly owned stdio transport, and pauses
+  background native projection/animation work while the workspace is hidden.
+  Local automated and targeted resource gates are recorded in the P0
+  remediation report; remote GitHub CI, Developer ID notarization, clean-Mac
+  install, and the continuous 48-hour soak remain external release gates.
 - **M14 acceptance:** automated/local gates passed; the exact release was
   installed with a matching SHA-256, live session/OAuth records were verified,
   and the user accepted the candidate and authorized the local commit on
@@ -169,8 +180,12 @@ Thread and must be separately planned, implemented, tested, and approved.
 
 1. Complete M13 manual reproduction against the real Provider surfaces and
    record the user's result.
-2. Run and retain the continuous 48-hour Runtime RSS soak on the exact frozen
+2. Run the new required GitHub core-gate workflow and protect the release
+   branch after the P0 remediation candidate is reviewed and pushed.
+3. Run Developer ID signing/notarization and clean-macOS-26 installation for
+   the exact release artifact; the current support target is Apple Silicon.
+4. Run and retain the continuous 48-hour Runtime RSS soak on the exact frozen
    release candidate.
-3. Re-run the full release gate after any resulting change.
-4. Obtain separate approval before bumping the version, tagging, publishing a
+5. Re-run the full release gate after any resulting change.
+6. Obtain separate approval before bumping the version, tagging, publishing a
    release, or changing the default branch again.

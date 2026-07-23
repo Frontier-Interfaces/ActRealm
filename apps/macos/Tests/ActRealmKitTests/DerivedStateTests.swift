@@ -46,6 +46,30 @@ private func makeSnapshot(
 }
 
 @Suite struct OutboxOrderingTests {
+    @Test func stableSelectionSurvivesPriorityReordering() {
+        let first = DerivedState.derive(from: makeSnapshot(attention: [
+            makeAttention(id: "approval", kind: "approval", createdAt: 100),
+            makeAttention(id: "question", kind: "question", createdAt: 200),
+        ])).openOutbox
+        #expect(OutboxSelection.resolvedID(currentID: "question", entries: first) == "question")
+
+        let reordered = DerivedState.derive(from: makeSnapshot(attention: [
+            makeAttention(id: "error", kind: "error", createdAt: 300),
+            makeAttention(id: "question", kind: "question", createdAt: 200),
+            makeAttention(id: "approval", kind: "approval", createdAt: 100),
+        ])).openOutbox
+        #expect(OutboxSelection.resolvedID(currentID: "question", entries: reordered) == "question")
+    }
+
+    @Test func resolvedSelectionFallsBackToHighestPriorityOpenItem() {
+        let entries = DerivedState.derive(from: makeSnapshot(attention: [
+            makeAttention(id: "approval", kind: "approval", createdAt: 100),
+            makeAttention(id: "question", kind: "question", createdAt: 200),
+        ])).openOutbox
+        #expect(OutboxSelection.resolvedID(currentID: "gone", entries: entries) == "approval")
+        #expect(OutboxSelection.resolvedID(currentID: "gone", entries: []) == nil)
+    }
+
     @Test func errorsBeatApprovalsBeatQuestionsBeatCompletions() {
         let snapshot = makeSnapshot(attention: [
             makeAttention(id: "done", kind: "completion", createdAt: 100),
@@ -107,6 +131,62 @@ private func makeSnapshot(
         let entry = DerivedState.derive(from: snapshot).openOutbox[0]
         #expect(entry.kind == .nativeApproval)
         #expect(entry.actionTitle == "允许 Bash？")
+    }
+}
+
+@Suite struct RuntimeControlAvailabilityTests {
+    @MainActor
+    @Test func disconnectedRuntimeCannotMutateAttention() {
+        let suite = "RuntimeControlAvailabilityTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let model = AppModel(defaults: defaults, demo: false)
+        #expect(!model.canControlRuntime)
+    }
+}
+
+@Suite struct BackgroundSnapshotProjectionTests {
+    @Test func sessionOnlyUpdatesWaitUntilTheWorkspaceIsVisible() {
+        let next = makeSnapshot(sessions: [makeSession(
+            id: "live",
+            provider: "codex",
+            execState: "thinking",
+            lastEventAt: 2
+        )])
+
+        #expect(!SnapshotProjectionPolicy.shouldApply(
+            previous: .empty,
+            next: next,
+            workspaceActive: false
+        ))
+        #expect(SnapshotProjectionPolicy.shouldApply(
+            previous: .empty,
+            next: next,
+            workspaceActive: true
+        ))
+    }
+
+    @Test func attentionAndCommandsStillProjectInTheBackground() {
+        let nextAttention = makeSnapshot(attention: [
+            makeAttention(id: "approval", kind: "approval", createdAt: 2)
+        ])
+        #expect(SnapshotProjectionPolicy.shouldApply(
+            previous: .empty,
+            next: nextAttention,
+            workspaceActive: false
+        ))
+
+        let nextCommand = makeSnapshot(commands: [
+            CommandRecord(
+                id: UUID(), attentionId: "approval", requestId: nil,
+                action: "approve", state: "committing", createdAt: 2
+            )
+        ])
+        #expect(SnapshotProjectionPolicy.shouldApply(
+            previous: .empty,
+            next: nextCommand,
+            workspaceActive: false
+        ))
     }
 }
 

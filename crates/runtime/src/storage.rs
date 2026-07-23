@@ -2484,7 +2484,8 @@ fn commit_transaction(
     let command = transaction
         .query_row(
             "SELECT commands.attention_id, commands.request_id, commands.action,
-                    commands.state, commands.created_at, attention_items.created_at
+                    commands.state, commands.created_at, attention_items.created_at,
+                    attention_items.session_id
              FROM commands JOIN attention_items
                ON attention_items.id = commands.attention_id
              WHERE commands.id = ?1",
@@ -2497,6 +2498,7 @@ fn commit_transaction(
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             },
         )
@@ -2535,6 +2537,12 @@ fn commit_transaction(
                 params![command.0, to_i64(now)],
             )
             .map_err(storage_error)?;
+        release_session_if_unblocked(
+            &transaction,
+            &command.6,
+            "回复通道已失效，等待 Agent 新事件",
+            now,
+        )?;
         transaction.commit().map_err(storage_error)?;
         return Err(StoreError::StaleApproval);
     }
@@ -2585,11 +2593,17 @@ fn act_attention_transaction(
     {
         return CommandState::parse(&state);
     }
-    let (kind, state) = transaction
+    let (kind, state, session_id) = transaction
         .query_row(
-            "SELECT kind, state FROM attention_items WHERE id = ?1",
+            "SELECT kind, state, session_id FROM attention_items WHERE id = ?1",
             [attention_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .optional()
         .map_err(storage_error)?
@@ -2639,6 +2653,14 @@ fn act_attention_transaction(
             ],
         )
         .map_err(storage_error)?;
+    if matches!(action, AttentionAction::Ack | AttentionAction::Dismiss) {
+        release_session_if_unblocked(
+            &transaction,
+            &session_id,
+            "待处理事项已结束，等待 Agent 后续事件",
+            now,
+        )?;
+    }
     transaction.commit().map_err(storage_error)?;
     Ok(CommandState::Confirmed)
 }
@@ -2669,14 +2691,18 @@ fn reconcile_transaction(
     let candidates = {
         let mut statement = transaction
             .prepare(
-                "SELECT id, request_id FROM attention_items
+                "SELECT id, request_id, session_id FROM attention_items
                  WHERE kind IN ('approval', 'question') AND request_id IS NOT NULL
                  AND state IN ('open', 'committing', 'decision_sent')",
             )
             .map_err(storage_error)?;
         let rows = statement
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })
             .map_err(storage_error)?
             .collect::<Result<Vec<_>, _>>()
@@ -2684,7 +2710,8 @@ fn reconcile_transaction(
         rows
     };
     let mut expired = 0;
-    for (attention_id, request_id) in candidates {
+    let mut affected_sessions = HashSet::new();
+    for (attention_id, request_id, session_id) in candidates {
         if active.contains(&request_id) {
             continue;
         }
@@ -2702,7 +2729,16 @@ fn reconcile_transaction(
                 [attention_id],
             )
             .map_err(storage_error)?;
+        affected_sessions.insert(session_id);
         expired += 1;
+    }
+    for session_id in affected_sessions {
+        release_session_if_unblocked(
+            &transaction,
+            &session_id,
+            "Runtime 已重启，旧回复通道失效；等待 Agent 新事件",
+            now,
+        )?;
     }
     transaction.commit().map_err(storage_error)?;
     Ok(expired)
@@ -2717,7 +2753,7 @@ fn expire_approval_transaction(
     let transaction = connection.transaction().map_err(storage_error)?;
     let attention_id = transaction
         .query_row(
-            "SELECT id, created_at, kind FROM attention_items WHERE request_id = ?1
+            "SELECT id, created_at, kind, session_id FROM attention_items WHERE request_id = ?1
              AND state IN ('open', 'committing', 'decision_sent')",
             [request_id.to_string()],
             |row| {
@@ -2725,12 +2761,13 @@ fn expire_approval_transaction(
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )
         .optional()
         .map_err(storage_error)?;
-    let Some((attention_id, _created_at, kind)) = attention_id else {
+    let Some((attention_id, _created_at, kind, session_id)) = attention_id else {
         return Ok(false);
     };
     transaction
@@ -2758,8 +2795,45 @@ fn expire_approval_transaction(
             )
             .map_err(storage_error)?;
     }
+    release_session_if_unblocked(
+        &transaction,
+        &session_id,
+        "回复通道已失效，等待 Agent 新事件",
+        now,
+    )?;
     transaction.commit().map_err(storage_error)?;
     Ok(true)
+}
+
+fn release_session_if_unblocked(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    activity: &str,
+    now: u64,
+) -> Result<(), StoreError> {
+    let blockers: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM attention_items
+             WHERE session_id = ?1
+               AND kind IN ('approval', 'native_approval', 'question')
+               AND state IN ('open', 'committing', 'decision_sent', 'snoozed')",
+            [session_id],
+            |row| row.get(0),
+        )
+        .map_err(storage_error)?;
+    if blockers != 0 {
+        return Ok(());
+    }
+    transaction
+        .execute(
+            "UPDATE sessions SET exec_state = 'waiting_for_event',
+               approval_owner = NULL, activity = ?2, activity_since = ?3
+             WHERE id = ?1
+               AND (exec_state = 'awaiting_approval' OR approval_owner = 'widget')",
+            params![session_id, activity, to_i64(now)],
+        )
+        .map_err(storage_error)?;
+    Ok(())
 }
 
 fn reconcile_sessions_transaction(

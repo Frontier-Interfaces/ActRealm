@@ -128,7 +128,9 @@ Task { @MainActor in
         to: "\(outDir)/main-expanded-light.png"
     )
 
-    model.outboxPageIndex = 1
+    if let question = model.derived.openOutbox.first(where: { $0.kind == .question }) {
+        model.selectOutbox(id: question.id)
+    }
     render(
         Backdrop(dark: false) {
             MainWindowView()
@@ -140,7 +142,9 @@ Task { @MainActor in
         size: CGSize(width: 1616, height: 1060),
         to: "\(outDir)/interactive-question-light.png"
     )
-    model.outboxPageIndex = 0
+    if let first = model.derived.openOutbox.first {
+        model.selectOutbox(id: first.id)
+    }
 
     render(
         Backdrop(dark: false) {

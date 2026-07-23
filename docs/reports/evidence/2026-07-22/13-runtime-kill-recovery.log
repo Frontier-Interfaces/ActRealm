@@ -1,0 +1,51 @@
+^Dbefore_app_pid=3097
+before_runtime_pid=3134
+socket_before mode=srw------- inode=4126281
+sessions_before|49
+open_before|1
+ok
+second=1 runtime=none
+second=2 runtime=none
+second=3 runtime=none
+second=4 runtime=none
+second=5 runtime=none
+second=6 runtime=none
+second=7 runtime=none
+second=8 runtime=none
+second=9 runtime=none
+second=10 runtime=none
+second=11 runtime=none
+second=12 runtime=none
+socket_after mode=srw------- inode=4126281
+ActRealm doctor: Fail
+[✓] socket.path — Unix socket path fits the operating-system limit
+    /Users/apple/.actrealm/run/bridge.sock
+[✓] claude.cli — claude CLI is available
+    /Users/apple/.local/bin/claude · 2.1.215 (Claude Code)
+[✓] codex.cli — codex CLI is available
+    /opt/homebrew/bin/codex · codex-cli 0.144.6
+[✓] claude.config — claude ActRealm hooks match the installation manifest
+    17 managed handlers in /Users/apple/.claude/settings.json
+[✓] claude.binary — Stable hook binary is executable
+    /Users/apple/.actrealm/bin/actrealm
+[✓] codex.config — codex ActRealm hooks match the installation manifest
+    6 managed handlers in /Users/apple/.codex/hooks.json
+[✓] codex.binary — Stable hook binary is executable
+    /Users/apple/.actrealm/bin/actrealm
+[✓] codex.feature — Codex Hooks are enabled
+    EnabledCanonical
+[✓] codex.trust — Codex trust state covers every ActRealm hook
+    Exact hook locations are enabled with trusted hashes newer than the installed definition
+[✓] runtime.socket_permissions — Runtime socket is private to the current user
+    /Users/apple/.actrealm/run/bridge.sock
+[×] runtime.control_loop — Runtime control round trip is unavailable
+    bridge I/O failed: Connection refused (os error 61)
+    next: Start or restart actrealm serve --approval widget
+[!] claude.real_event — claude installation is not yet verified by a real event
+    A diagnostic bridge probe is not counted as provider evidence
+    next: Start a new claude session, then run actrealm doctor again
+[!] codex.real_event — codex installation is not yet verified by a real event
+    A diagnostic bridge probe is not counted as provider evidence
+    next: Start a new codex session, then run actrealm doctor again
+[✓] hook.pass_through — Runtime-offline pass-through is silent and successful
+    No approval directive was written to stdout

@@ -9,6 +9,22 @@ public enum BridgeStatus: Equatable, Sendable {
     public var isListening: Bool { self == .listening }
 }
 
+/// Keeps OUTBOX selection attached to a stable Runtime identity instead of a
+/// transient array position. Runtime snapshots may reorder attention items as
+/// priorities or timestamps change, so an index can silently select the wrong
+/// request after any insert or resolution.
+public enum OutboxSelection {
+    public static func resolvedID(
+        currentID: String?,
+        entries: [OutboxEntry]
+    ) -> String? {
+        if let currentID, entries.contains(where: { $0.id == currentID }) {
+            return currentID
+        }
+        return entries.first?.id
+    }
+}
+
 /// Mutually-exclusive policy used when an eligible event enters Agent Focus.
 public enum ForegroundArrivalStrategy: String, CaseIterable, Codable, Sendable, Hashable {
     case immediate
@@ -343,6 +359,19 @@ private struct ForegroundQueuedArrival: Equatable, Sendable {
     let receivedAt: Date
 }
 
+enum SnapshotProjectionPolicy {
+    /// Background Agent work may change token counters every second. Those
+    /// snapshots remain cached, but they must not invalidate the whole
+    /// SwiftUI tree while the window is inactive. Attention/command changes
+    /// still project immediately so sounds, OUTBOX state, and focus policy do
+    /// not miss a request that genuinely needs the user.
+    static func shouldApply(previous: Snapshot, next: Snapshot, workspaceActive: Bool) -> Bool {
+        workspaceActive
+            || previous.attention != next.attention
+            || previous.commands != next.commands
+    }
+}
+
 /// Top-level observable state for every scene (main window, HUD, menu bar,
 /// settings). Owns the runtime supervisor + client and projects snapshots
 /// into `DerivedState`.
@@ -375,9 +404,12 @@ public final class AppModel: ObservableObject {
     /// Live main-window aspect ratio used by Settings to preview the same
     /// scaled-to-fill crop the user will see in the workspace.
     @Published public private(set) var mainWindowAspectRatio = 1440.0 / 820.0
+    /// AppKit-projected window visibility. Continuous visual effects must
+    /// pause while the workspace is minimized, occluded, or inactive.
+    @Published public private(set) var isWorkspaceAnimationActive = true
 
-    /// Index of the approval card currently shown in the OUTBOX stack.
-    @Published public var outboxPageIndex: Int = 0
+    /// Stable Runtime attention identity currently shown in the OUTBOX stack.
+    @Published public private(set) var selectedOutboxID: String?
     /// Session pinned by tapping an OUTBOX card (spec §3.7 cross-column link).
     @Published public var pinnedSessionId: String?
     /// Expanded row in the interaction model's AGENT TASKS column.
@@ -428,6 +460,7 @@ public final class AppModel: ObservableObject {
     private var foregroundQueue: [ForegroundQueuedArrival] = []
     private var lastSetupRefreshEventCount: UInt64 = 0
     private var latestSnapshot: Snapshot = .empty
+    private var hasDeferredSnapshotProjection = false
     private var persistedUISettings: UISettings = .defaults
     private var renderedEventCount: UInt64 = 0
     private var eventUILatenciesMs: [UInt64] = []
@@ -495,7 +528,7 @@ public final class AppModel: ObservableObject {
         client.$snapshot
             .receive(on: RunLoop.main)
             .sink { [weak self] snapshot in
-                self?.apply(snapshot: snapshot)
+                self?.receive(snapshot: snapshot)
             }
             .store(in: &cancellables)
         client.$connectionState
@@ -728,6 +761,10 @@ public final class AppModel: ObservableObject {
         action: String,
         answers: [String: JSONValue]? = nil
     ) async -> Bool {
+        guard canControlRuntime else {
+            showToast("Runtime 控制通道已断开；请恢复连接后再回答")
+            return false
+        }
         guard let requestId = entry.attention.requestId else {
             showToast("这个问题没有可用的回复通道")
             return false
@@ -789,20 +826,38 @@ public final class AppModel: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 guard let self else { return }
-                self.now = Date()
-                self.advanceForegroundDispatch(at: self.now)
-                if let deadline = self.hudArrivalDeadline, self.now >= deadline {
+                let tick = Date()
+                if self.isWorkspaceAnimationActive {
+                    self.now = tick
+                }
+                self.advanceForegroundDispatch(at: tick)
+                if let deadline = self.hudArrivalDeadline, tick >= deadline {
                     self.hudArrivalID = nil
                     self.hudArrivalDeadline = nil
                 }
-                if self.isDemo {
-                    self.derived = DemoData.derivedState(now: self.now)
+                if self.isDemo, self.isWorkspaceAnimationActive {
+                    self.derived = DemoData.derivedState(now: tick)
                 }
             }
         }
     }
 
     // MARK: - Snapshot handling
+
+    func receive(snapshot: Snapshot) {
+        let previous = latestSnapshot
+        latestSnapshot = snapshot
+        guard SnapshotProjectionPolicy.shouldApply(
+            previous: previous,
+            next: snapshot,
+            workspaceActive: isWorkspaceAnimationActive
+        ) else {
+            hasDeferredSnapshotProjection = true
+            return
+        }
+        hasDeferredSnapshotProjection = false
+        apply(snapshot: snapshot)
+    }
 
     private func apply(snapshot: Snapshot, emitArrivals: Bool = true) {
         latestSnapshot = snapshot
@@ -868,6 +923,10 @@ public final class AppModel: ObservableObject {
         if emitArrivals { seededNotifications = true }
 
         derived = next
+        selectedOutboxID = OutboxSelection.resolvedID(
+            currentID: selectedOutboxID,
+            entries: next.openOutbox
+        )
         if shouldStartNextFocus {
             startNextForegroundArrivalIfNeeded(at: Date())
         }
@@ -889,7 +948,6 @@ public final class AppModel: ObservableObject {
             }
             renderedEventCount = snapshot.stats.eventCount
         }
-        clampOutboxPage()
         if snapshot.stats.eventCount != lastSetupRefreshEventCount {
             lastSetupRefreshEventCount = snapshot.stats.eventCount
             scheduleSetupRefresh()
@@ -924,41 +982,47 @@ public final class AppModel: ObservableObject {
         }
     }
 
-    private func clampOutboxPage() {
-        let count = derived.openOutbox.count
-        if outboxPageIndex >= count {
-            outboxPageIndex = max(0, count - 1)
-        }
-    }
-
     // MARK: - User actions
 
+    public var canControlRuntime: Bool { isDemo || bridgeStatus.isListening }
+
+    public func selectOutbox(id: String) {
+        guard derived.openOutbox.contains(where: { $0.id == id }) else { return }
+        selectedOutboxID = id
+    }
+
     public func approve(_ entry: OutboxEntry) {
-        guard entry.state == .open else { return }
+        guard canControlRuntime, entry.state == .open else { return }
         send(.approve, entry: entry)
     }
 
     public func deny(_ entry: OutboxEntry) {
-        guard entry.state == .open else { return }
+        guard canControlRuntime, entry.state == .open else { return }
         send(.deny, entry: entry)
     }
 
     /// "去原窗口核对 / 处理" — hands the decision back to the CLI window.
     public func passThrough(_ entry: OutboxEntry) {
+        guard canControlRuntime else { return }
         send(.passThrough, entry: entry)
     }
 
     /// "标记已处理 / 确认完成" for question, error, completion items.
     public func acknowledge(_ entry: OutboxEntry) {
+        guard canControlRuntime else { return }
         send(.ack, entry: entry)
     }
 
     public func snooze(_ entry: OutboxEntry) {
+        guard canControlRuntime else { return }
         send(.snooze, entry: entry)
     }
 
     public func undoPendingDecision() {
-        guard let pending = derived.pendingDecision, case .undoable = pending.phase else { return }
+        guard canControlRuntime,
+              let pending = derived.pendingDecision,
+              case .undoable = pending.phase
+        else { return }
         guard !isDemo else { return }
         Task { await client.undo(commandId: pending.commandId) }
     }
@@ -972,9 +1036,9 @@ public final class AppModel: ObservableObject {
     /// Cross-column link: jump the OUTBOX pager to a task's first open item.
     public func revealOutbox(for task: LaneTask) {
         guard let target = task.firstOpenOutboxId,
-              let index = derived.openOutbox.firstIndex(where: { $0.id == target })
+              derived.openOutbox.contains(where: { $0.id == target })
         else { return }
-        outboxPageIndex = index
+        selectedOutboxID = target
         outboxHighlighted = true
         showToast("已定位到 OUTBOX 待处理事项")
         outboxHighlightTask?.cancel()
@@ -1173,6 +1237,17 @@ public final class AppModel: ObservableObject {
         let ratio = Double(size.width / size.height)
         guard abs(ratio - mainWindowAspectRatio) > 0.001 else { return }
         mainWindowAspectRatio = ratio
+    }
+
+    public func updateWorkspaceAnimationActive(_ active: Bool) {
+        guard active != isWorkspaceAnimationActive else { return }
+        isWorkspaceAnimationActive = active
+        guard active else { return }
+        now = Date()
+        if hasDeferredSnapshotProjection {
+            hasDeferredSnapshotProjection = false
+            apply(snapshot: latestSnapshot)
+        }
     }
 
     private static func clampedLaneOpacity(_ value: Double) -> Double {
@@ -1514,7 +1589,7 @@ public final class AppModel: ObservableObject {
     }
 
     private func send(_ action: AttentionAction, entry: OutboxEntry) {
-        guard !isDemo else { return }
+        guard canControlRuntime, !isDemo else { return }
         let requestId = entry.attention.requestId
         Task { await client.send(action: action, attentionId: entry.id, requestId: requestId) }
     }

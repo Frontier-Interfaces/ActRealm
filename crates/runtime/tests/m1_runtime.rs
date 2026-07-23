@@ -1099,12 +1099,17 @@ fn restart_expires_every_approval_without_a_live_waiter() {
         reopened.reconcile_orphaned_approvals(Vec::new(), 20_000),
         Ok(2)
     );
-    assert!(reopened
-        .snapshot()
-        .unwrap()
+    let recovered = reopened.snapshot().unwrap();
+    assert!(recovered
         .attention
         .iter()
         .all(|item| item.state == "expired"));
+    assert!(recovered.sessions.iter().all(|session| {
+        session.exec_state == "waiting_for_event" && session.approval_owner.is_none()
+    }));
+    assert!(recovered.sessions.iter().all(|session| {
+        session.activity.as_deref() == Some("Runtime 已重启，旧回复通道失效；等待 Agent 新事件")
+    }));
     drop(reopened);
     fs::remove_dir_all(root).unwrap();
 }

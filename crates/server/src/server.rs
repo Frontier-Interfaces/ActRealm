@@ -655,14 +655,17 @@ fn spawn_codex_handlers(
     store: RuntimeStore,
     waiters: WaiterRegistry,
 ) {
-    let request_connector = connector.clone();
+    let request_connector = connector.downgrade();
     let request_state = Arc::clone(&state);
     let request_store = store.clone();
     let request_waiters = waiters.clone();
     thread::spawn(move || {
         for request in channels.requests {
+            let Some(connector) = request_connector.upgrade() else {
+                break;
+            };
             handle_codex_server_request(
-                request_connector.clone(),
+                connector,
                 Arc::clone(&request_state),
                 request_store.clone(),
                 request_waiters.clone(),
@@ -3815,6 +3818,13 @@ mod tests {
             .unwrap()
             .iter()
             .all(|item| item.get("interaction").is_none()));
+        let recovered = store.snapshot().unwrap();
+        assert_eq!(recovered.sessions[0].exec_state, "waiting_for_event");
+        assert_eq!(recovered.sessions[0].approval_owner, None);
+        assert_eq!(
+            recovered.sessions[0].activity.as_deref(),
+            Some("待处理事项已结束，等待 Agent 后续事件")
+        );
         let exported = serde_json::to_string(&store.export_json(now_millis()).unwrap()).unwrap();
         assert!(!exported.contains("secret-48291"));
         drop(state);

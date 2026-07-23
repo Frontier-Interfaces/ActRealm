@@ -59,6 +59,7 @@ public final class RuntimeClient: ObservableObject {
     }
 
     public func connect(baseURL: URL, token: String) async {
+        disconnect()
         self.baseURL = baseURL
         connectionState = .connecting
         do {

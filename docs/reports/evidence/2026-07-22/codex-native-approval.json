@@ -1,0 +1,13 @@
+{
+  "hook_event_name": "PreToolUse",
+  "session_id": "launch-audit-native-approval-20260722",
+  "turn_id": "turn-native",
+  "cwd": "/tmp/actrealm-launch-audit",
+  "tool_name": "request_permissions",
+  "tool_use_id": "native-request-1",
+  "tool_input": {
+    "reason": "需要访问测试目录"
+  },
+  "permission_mode": "default",
+  "model": "gpt-5.6-sol"
+}

@@ -6,9 +6,13 @@ struct OutboxSection: View {
     @Environment(\.snapshotRendering) private var snapshotRendering
 
     private var entries: [OutboxEntry] { model.derived.openOutbox }
-    private var selectedIndex: Int {
-        guard !entries.isEmpty else { return 0 }
-        return min(model.outboxPageIndex, entries.count - 1)
+    private var selectedEntry: OutboxEntry? {
+        if let selectedID = model.selectedOutboxID,
+           let entry = entries.first(where: { $0.id == selectedID })
+        {
+            return entry
+        }
+        return entries.first
     }
 
     var body: some View {
@@ -77,25 +81,27 @@ struct OutboxSection: View {
 
     private var outboxContent: some View {
         LazyVStack(alignment: .leading, spacing: 0) {
-            OutboxPrimaryCard(entry: entries[selectedIndex])
-                .id(entries[selectedIndex].id)
-                .padding(.top, 14)
+            if let selectedEntry {
+                OutboxPrimaryCard(entry: selectedEntry)
+                    .id(selectedEntry.id)
+                    .padding(.top, 14)
 
-            let rest = entries.enumerated().filter { $0.offset != selectedIndex }
-            if !rest.isEmpty {
-                Text("队列 · 还有 \(rest.count) 项")
-                    .font(.system(size: 11))
-                    .foregroundStyle(DT.textWeak)
-                    .padding(.top, 16)
-                    .padding(.bottom, 8)
-                ForEach(rest, id: \.element.id) { index, entry in
-                    QueueRow(entry: entry) {
-                        withAnimation(.easeOut(duration: 0.2)) {
-                            model.outboxPageIndex = index
-                            model.revealSession(for: entry)
+                let rest = entries.filter { $0.id != selectedEntry.id }
+                if !rest.isEmpty {
+                    Text("队列 · 还有 \(rest.count) 项")
+                        .font(.system(size: 11))
+                        .foregroundStyle(DT.textWeak)
+                        .padding(.top, 16)
+                        .padding(.bottom, 8)
+                    ForEach(rest) { entry in
+                        QueueRow(entry: entry) {
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                model.selectOutbox(id: entry.id)
+                                model.revealSession(for: entry)
+                            }
                         }
+                        .padding(.bottom, 7)
                     }
-                    .padding(.bottom, 7)
                 }
             }
         }
@@ -144,6 +150,21 @@ private struct OutboxPrimaryCard: View {
                     .lineLimit(1)
             }
             .padding(.top, 7)
+
+            if !model.canControlRuntime, entry.kind != .nativeApproval {
+                HStack(spacing: 7) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                    Text("Runtime 控制通道已断开；此事项仅供查看，恢复连接后才能操作。")
+                }
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(DT.redText)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(DT.redBg.opacity(0.7), in: RoundedRectangle(cornerRadius: 10))
+                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(DT.redStroke, lineWidth: 1))
+                .padding(.top, 9)
+            }
 
             if let returnNote = model.foregroundReturnNotes[entry.id] {
                 HStack(spacing: 7) {
@@ -228,6 +249,7 @@ private struct OutboxPrimaryCard: View {
                     Spacer(minLength: 2)
                     Button("确认允许") { model.approve(entry); confirming = false }
                         .buttonStyle(ActionButtonStyle(kind: .danger, compact: true))
+                        .disabled(!model.canControlRuntime)
                     Button("取消") { confirming = false }
                         .buttonStyle(ActionButtonStyle(kind: .secondary, compact: true))
                 }
@@ -240,10 +262,13 @@ private struct OutboxPrimaryCard: View {
                 HStack(spacing: 9) {
                     Button("允许") { model.approve(entry) }
                         .buttonStyle(ActionButtonStyle(kind: .primary))
+                        .disabled(!model.canControlRuntime)
                     Button("拒绝") { model.deny(entry) }
                         .buttonStyle(ActionButtonStyle(kind: .secondary))
+                        .disabled(!model.canControlRuntime)
                     Button("二次确认后允许") { confirming = true }
                         .buttonStyle(ActionButtonStyle(kind: .tertiary))
+                        .disabled(!model.canControlRuntime)
                 }
                 .padding(.top, 14)
             }
@@ -311,6 +336,7 @@ private struct OutboxPrimaryCard: View {
             HStack(spacing: 7) {
                 Button("确认完成") { model.acknowledge(entry) }
                     .buttonStyle(ActionButtonStyle(kind: .success))
+                    .disabled(!model.canControlRuntime)
                 Button("打开应用") {
                     Task { await model.jump(to: entry) }
                 }
@@ -332,8 +358,10 @@ private struct OutboxPrimaryCard: View {
             HStack(spacing: 7) {
                 Button("标记已解决") { model.acknowledge(entry) }
                     .buttonStyle(ActionButtonStyle(kind: .primary))
+                    .disabled(!model.canControlRuntime)
                 Button("稍后提醒") { model.snooze(entry) }
                     .buttonStyle(ActionButtonStyle(kind: .secondary))
+                    .disabled(!model.canControlRuntime)
             }
         }
         .padding(.top, 9)
@@ -469,6 +497,7 @@ private struct UndoBar: View {
             if case .undoable = pending.phase {
                 Button("撤回") { model.undoPendingDecision() }
                     .buttonStyle(ActionButtonStyle(kind: .secondary, compact: true))
+                    .disabled(!model.canControlRuntime)
             }
         }
         .padding(.horizontal, 10)

@@ -1,0 +1,76 @@
+^D==> Reusing existing Rust backend (release)
+==> Building SwiftUI app (release)
+Building for production...
+[0/6] Write sources
+[3/6] Write swift-version--58304C5D6DBC2206.txt
+[5/7] Compiling ActRealmKit AppModel.swift
+[6/8] Compiling ActRealmUI Components.swift
+[7/9] Compiling ActRealmApp ActRealmApp.swift
+[7/9] Write Objects.LinkFileList
+[8/9] Linking ActRealmApp
+Build of product 'ActRealmApp' complete! (21.30s)
+==> Assembling /private/tmp/actrealm-global-audit-50b891a/apps/macos/dist/ActRealm.app
+/private/tmp/actrealm-global-audit-50b891a/apps/macos/dist/ActRealm.app/Contents/Info.plist: OK
+==> Codesigning (ad-hoc)
+/private/tmp/actrealm-global-audit-50b891a/apps/macos/dist/ActRealm.app/Contents/Helpers/actrealm: replacing existing signature
+/private/tmp/actrealm-global-audit-50b891a/apps/macos/dist/ActRealm.app/Contents/MacOS/ActRealm: replacing existing signature
+/private/tmp/actrealm-global-audit-50b891a/apps/macos/dist/ActRealm.app: replacing existing signature
+==> Done: /private/tmp/actrealm-global-audit-50b891a/apps/macos/dist/ActRealm.app
+    open "/private/tmp/actrealm-global-audit-50b891a/apps/macos/dist/ActRealm.app"
+--prepared:/private/tmp/actrealm-global-audit-50b891a/apps/macos/dist/ActRealm.app/Contents/Helpers/actrealm
+--validated:/private/tmp/actrealm-global-audit-50b891a/apps/macos/dist/ActRealm.app/Contents/Helpers/actrealm
+apps/macos/dist/ActRealm.app: valid on disk
+apps/macos/dist/ActRealm.app: satisfies its Designated Requirement
+apps/macos/dist/ActRealm.app: rejected
+{
+  "CFBundleDisplayName" => "ActRealm"
+  "CFBundleExecutable" => "ActRealm"
+  "CFBundleIconFile" => "ActRealm.icns"
+  "CFBundleIdentifier" => "com.frontierinterfaces.actrealm"
+  "CFBundleName" => "ActRealm"
+  "CFBundlePackageType" => "APPL"
+  "CFBundleShortVersionString" => "0.1.0"
+  "CFBundleVersion" => "1"
+  "LSMinimumSystemVersion" => "26.0"
+  "NSHighResolutionCapable" => true
+  "NSHumanReadableCopyright" => "Local-first — no telemetry, no cloud backend."
+  "NSSupportsAutomaticTermination" => false
+}
+apps/macos/dist/ActRealm.app/Contents/MacOS/ActRealm:   Mach-O 64-bit executable arm64
+apps/macos/dist/ActRealm.app/Contents/Helpers/actrealm: Mach-O 64-bit executable arm64
+      cmd LC_BUILD_VERSION
+  cmdsize 32
+ platform 1
+    minos 26.0
+      sdk 26.5
+      cmd LC_BUILD_VERSION
+  cmdsize 32
+ platform 1
+    minos 11.0
+      sdk 26.5
+720c6a758a783854f97b9f87c69a0bec33fe72d3d48ebc7c0b4a8e191a28b40d  apps/macos/dist/ActRealm.app/Contents/Helpers/actrealm
+720c6a758a783854f97b9f87c69a0bec33fe72d3d48ebc7c0b4a8e191a28b40d  /Applications/ActRealm.app/Contents/Helpers/actrealm
+720c6a758a783854f97b9f87c69a0bec33fe72d3d48ebc7c0b4a8e191a28b40d  /Users/apple/.actrealm/bin/actrealm
+Executable=/private/tmp/actrealm-global-audit-50b891a/apps/macos/dist/ActRealm.app/Contents/MacOS/ActRealm
+Identifier=com.frontierinterfaces.actrealm
+Format=app bundle with Mach-O thin (arm64)
+CodeDirectory v=20400 size=12632 flags=0x2(adhoc) hashes=388+3 location=embedded
+VersionPlatform=1
+VersionMin=1703936
+VersionSDK=1705216
+Hash type=sha256 size=32
+CandidateCDHash sha256=4935ced0872a73e21722deca9e12d344942d47f1
+CandidateCDHashFull sha256=4935ced0872a73e21722deca9e12d344942d47f1582ffd66fc0cf6137f4d81fb
+Hash choices=sha256
+CMSDigest=4935ced0872a73e21722deca9e12d344942d47f1582ffd66fc0cf6137f4d81fb
+CMSDigestType=2
+Executable Segment base=0
+Executable Segment limit=2129920
+Executable Segment flags=0x1
+Page size=16384
+CDHash=4935ced0872a73e21722deca9e12d344942d47f1
+Signature=adhoc
+Info.plist entries=12
+TeamIdentifier=not set
+Sealed Resources version=2 rules=13 files=4
+Internal requirements count=0 size=12

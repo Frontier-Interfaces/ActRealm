@@ -1,0 +1,42 @@
+stress_runtime_alive:
+no
+stress_socket_exists:
+yes
+final_integrity:
+ok
+main_doctor:
+ActRealm doctor: Pass
+[✓] socket.path — Unix socket path fits the operating-system limit
+    /Users/apple/.actrealm/run/bridge.sock
+[✓] claude.cli — claude CLI is available
+    /Users/apple/.local/bin/claude · 2.1.215 (Claude Code)
+[✓] codex.cli — codex CLI is available
+    /opt/homebrew/bin/codex · codex-cli 0.144.6
+[✓] claude.config — claude ActRealm hooks match the installation manifest
+    17 managed handlers in /Users/apple/.claude/settings.json
+[✓] claude.binary — Stable hook binary is executable
+    /Users/apple/.actrealm/bin/actrealm
+[✓] codex.config — codex ActRealm hooks match the installation manifest
+    6 managed handlers in /Users/apple/.codex/hooks.json
+[✓] codex.binary — Stable hook binary is executable
+    /Users/apple/.actrealm/bin/actrealm
+[✓] codex.feature — Codex Hooks are enabled
+    EnabledCanonical
+[✓] codex.trust — Codex trust state covers every ActRealm hook
+    Exact hook locations are enabled with trusted hashes newer than the installed definition
+[✓] runtime.socket_permissions — Runtime socket is private to the current user
+    /Users/apple/.actrealm/run/bridge.sock
+[✓] runtime.control_loop — Runtime control round trip succeeded
+    The diagnostic frame was acknowledged without creating an Agent session
+[✓] claude.real_event — claude emitted a real event after installation
+    latest event at 1784706814543
+[✓] codex.real_event — codex emitted a real event after installation
+    latest event at 1784710023208
+[✓] hook.pass_through — Runtime-offline pass-through is silent and successful
+    No approval directive was written to stdout
+candidate_worktree_removed=yes
+test_processes_remaining:
+main_runtime:
+20732 /Applications/ActRealm.app/Contents/Helpers/actrealm serve
+main_app:
+20447 /Applications/ActRealm.app/Contents/MacOS/ActRealm

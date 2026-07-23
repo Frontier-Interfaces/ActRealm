@@ -1,0 +1,6 @@
+Export all locally persisted, sanitized ActRealm data as JSON
+
+Usage: actrealm export
+
+Options:
+  -h, --help  Print help

@@ -1,0 +1,11 @@
+provider  provider_session_id                exec_state         approval_owner  activity         ended_at
+--------  ---------------------------------  -----------------  --------------  ---------------  --------
+codex     launch-audit-codex-20260722        response_finished                  子 Agent 已结束
+claude    launch-audit-elicitation-20260722  awaiting_approval  widget          等待你回答
+claude    launch-audit-question-20260722     awaiting_approval  widget          等待你回答
+kind        state     resolution  provider_session_id                exec_state         approval_owner  activity
+----------  --------  ----------  ---------------------------------  -----------------  --------------  ---------------
+approval    resolved  approve     launch-audit-codex-20260722        response_finished                  子 Agent 已结束
+completion  resolved  ack         launch-audit-codex-20260722        response_finished                  子 Agent 已结束
+question    resolved  ack         launch-audit-elicitation-20260722  awaiting_approval  widget          等待你回答
+question    resolved  ack         launch-audit-question-20260722     awaiting_approval  widget          等待你回答

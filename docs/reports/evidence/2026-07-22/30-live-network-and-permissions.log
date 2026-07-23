@@ -1,0 +1,53 @@
+=== runtime listeners ===
+COMMAND    PID  USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+actrealm 20732 apple    8u  IPv4 0xa62e791a0ae42434      0t0  TCP 127.0.0.1:51595 (LISTEN)
+actrealm 20732 apple   15u  IPv4 0x959b46e22329de51      0t0  TCP 127.0.0.1:51595->127.0.0.1:51597 (ESTABLISHED)
+COMMAND    PID  USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+actrealm 20732 apple    7u  unix 0x2ad1c8a52a44b97c      0t0      /Users/apple/.actrealm/run/bridge.sock
+=== all ActRealm listeners ===
+COMMAND     PID  USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+actrealm  20732 apple    8u  IPv4 0xa62e791a0ae42434      0t0  TCP 127.0.0.1:51595 (LISTEN)
+=== socket permissions ===
+-rw------- 501:20 /Users/apple/.actrealm/run/hooks-install.lock
+-rw------- 501:20 /Users/apple/.actrealm/run/runtime.lock
+srw------- 501:20 /Users/apple/.actrealm/run/bridge.sock
+srw------- 501:20 /Users/apple/.actrealm/run/codex-app-server.sock
+=== sensitive file permissions ===
+-rw------- 501:20 0 /Users/apple/.actrealm/run/hooks-install.lock
+-rw------- 501:20 10101 /Users/apple/.actrealm/backups/settings.json.1784546251641
+-rw------- 501:20 10101 /Users/apple/.actrealm/backups/settings.json.1784546704561
+-rw------- 501:20 10101 /Users/apple/.actrealm/backups/settings.json.1784618596105
+-rw------- 501:20 10101 /Users/apple/.actrealm/backups/settings.json.1784685813479
+-rw------- 501:20 10219 /Users/apple/.actrealm/backups/settings.json.1784685810491
+-rw------- 501:20 1036288 /Users/apple/.actrealm/data.sqlite
+-rw------- 501:20 3029 /Users/apple/.actrealm/backups/hooks.json.1784538071422
+-rw------- 501:20 3029 /Users/apple/.actrealm/backups/hooks.json.1784546285388
+-rw------- 501:20 3029 /Users/apple/.actrealm/backups/hooks.json.1784546740460
+-rw------- 501:20 32768 /Users/apple/.actrealm/data.sqlite-shm
+-rw------- 501:20 396 /Users/apple/.actrealm/cache/claude-session-usage/a9b4f44d-3b10-49a2-9df5-8bdfe410209f.json
+-rw------- 501:20 4148872 /Users/apple/.actrealm/data.sqlite-wal
+-rw------- 501:20 4180 /Users/apple/.actrealm/backups/hooks.json.1784628305023
+-rw------- 501:20 4748 /Users/apple/.actrealm/backups/hooks.json.1784546252572
+-rw------- 501:20 4748 /Users/apple/.actrealm/backups/hooks.json.1784546705360
+-rw------- 501:20 4748 /Users/apple/.actrealm/backups/hooks.json.1784628199891
+-rw------- 501:20 510 /Users/apple/.actrealm/install-state.json
+-rw------- 501:20 531 /Users/apple/.actrealm/cache/claude-rl.json
+-rw------- 501:20 6 /Users/apple/.actrealm/run/runtime.lock
+-rw------- 501:20 6502 /Users/apple/.actrealm/backups/settings.json.1784538071371
+-rw------- 501:20 6502 /Users/apple/.actrealm/backups/settings.json.1784546281437
+-rw------- 501:20 6502 /Users/apple/.actrealm/backups/settings.json.1784546720861
+-rwx------ 501:20 102 /Users/apple/.actrealm/bin/statusline-delegate
+-rwx------ 501:20 179 /Users/apple/.actrealm/bin/statusline
+-rwx------ 501:20 8584320 /Users/apple/.actrealm/bin/actrealm
+=== top-level directory permissions ===
+drwx------ 501:20 /Users/apple/.actrealm
+drwx------ 501:20 /Users/apple/.actrealm/backups
+drwx------ 501:20 /Users/apple/.actrealm/bin
+drwx------ 501:20 /Users/apple/.actrealm/cache
+drwx------ 501:20 /Users/apple/.actrealm/cache/claude-session-usage
+drwx------ 501:20 /Users/apple/.actrealm/run
+drwx------ 501:20 /Users/apple/.actrealm/spool
+=== running process ids ===
+20447 /Applications/ActRealm.app/Contents/MacOS/ActRealm
+20732 /Applications/ActRealm.app/Contents/Helpers/actrealm serve
+24190 /tmp/actrealm-global-audit-50b891a/target/release/actrealm serve --approval pass-through --socket /tmp/actrealm-stress-20260722-1617/bridge.sock

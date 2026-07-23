@@ -55,7 +55,10 @@ public final class RuntimeSupervisor: ObservableObject {
     private var stdoutTail = ""
     private var stderrTail = ""
     private var endpoint: URL?
-    private var onBootstrap: ((URL, String) -> Void)?
+    private var bootstrapHandler: ((URL, String) -> Void)?
+    private var desiredRunning = false
+    private var automaticRestartTask: Task<Void, Never>?
+    private var consecutiveFailures = 0
 
     /// - Parameter repoPath: dev checkout of the Rust workspace used as a
     ///   fallback when the app bundle does not contain a helper binary.
@@ -117,8 +120,20 @@ public final class RuntimeSupervisor: ObservableObject {
     /// `onBootstrap` exactly once with the base URL and one-time token
     /// parsed from its stdout.
     public func start(onBootstrap: @escaping (URL, String) -> Void) async {
-        self.onBootstrap = onBootstrap
+        desiredRunning = true
+        bootstrapHandler = onBootstrap
+        automaticRestartTask?.cancel()
+        automaticRestartTask = nil
         refreshDiagnostics()
+
+        guard await replaceAbandonedRuntimeIfNeeded() else { return }
+        await launchConfiguredRuntime()
+    }
+
+    private func launchConfiguredRuntime() async {
+        guard desiredRunning else { return }
+        if let process, process.isRunning { return }
+        endpoint = nil
 
         if let bundled = Self.bundledHelper() {
             state = .launching
@@ -135,7 +150,9 @@ public final class RuntimeSupervisor: ObservableObject {
             state = .buildingBackend
             let succeeded = await Self.buildRelease(repoPath: repoPath)
             guard succeeded else {
-                state = .failed("cargo build --release -p actrealm failed")
+                let message = "cargo build --release -p actrealm failed"
+                state = .failed(message)
+                scheduleAutomaticRestart(after: message)
                 return
             }
         }
@@ -144,10 +161,13 @@ public final class RuntimeSupervisor: ObservableObject {
     }
 
     public func stop() {
-        onBootstrap = nil
+        desiredRunning = false
+        bootstrapHandler = nil
+        automaticRestartTask?.cancel()
+        automaticRestartTask = nil
+        state = .stopped
         guard let process, process.isRunning else { return }
         process.terminate()
-        state = .stopped
         refreshDiagnostics()
     }
 
@@ -157,7 +177,11 @@ public final class RuntimeSupervisor: ObservableObject {
     @discardableResult
     public func restart(onBootstrap: @escaping (URL, String) -> Void) async -> String? {
         state = .restarting
-        self.onBootstrap = nil
+        desiredRunning = true
+        bootstrapHandler = onBootstrap
+        automaticRestartTask?.cancel()
+        automaticRestartTask = nil
+        consecutiveFailures = 0
         refreshDiagnostics()
 
         if await bootOutOutdatedLaunchAgent() {
@@ -191,7 +215,7 @@ public final class RuntimeSupervisor: ObservableObject {
         stdoutTail = ""
         stderrTail = ""
         endpoint = nil
-        await start(onBootstrap: onBootstrap)
+        await launchConfiguredRuntime()
         return nil
     }
 
@@ -228,10 +252,13 @@ public final class RuntimeSupervisor: ObservableObject {
             let status = finished.terminationStatus
             Task { @MainActor in
                 guard let self, self.process === proc else { return }
-                if status == 0 {
+                self.process = nil
+                if !self.desiredRunning {
                     self.state = .stopped
                 } else {
-                    self.state = .failed(Self.failureMessage(status: status, stderr: self.stderrTail))
+                    let message = Self.failureMessage(status: status, stderr: self.stderrTail)
+                    self.state = .failed(message)
+                    self.scheduleAutomaticRestart(after: message)
                 }
                 self.refreshDiagnostics()
             }
@@ -256,7 +283,10 @@ public final class RuntimeSupervisor: ObservableObject {
             process = proc
             refreshDiagnostics()
         } catch {
-            state = .failed("failed to launch actrealm: \(error.localizedDescription)")
+            process = nil
+            let message = "failed to launch actrealm: \(error.localizedDescription)"
+            state = .failed(message)
+            scheduleAutomaticRestart(after: message)
             refreshDiagnostics()
         }
     }
@@ -286,13 +316,62 @@ public final class RuntimeSupervisor: ObservableObject {
     }
 
     private func consume(line: String) {
-        guard onBootstrap != nil, let parsed = Self.parseBootstrapLine(line) else { return }
-        let callback = onBootstrap
-        onBootstrap = nil
+        guard desiredRunning, let parsed = Self.parseBootstrapLine(line) else { return }
+        consecutiveFailures = 0
+        automaticRestartTask?.cancel()
+        automaticRestartTask = nil
         state = .running
         endpoint = parsed.baseURL
         refreshDiagnostics()
-        callback?(parsed.baseURL, parsed.token)
+        bootstrapHandler?(parsed.baseURL, parsed.token)
+    }
+
+    private func replaceAbandonedRuntimeIfNeeded() async -> Bool {
+        guard process?.isRunning != true,
+              let owner = Self.lockOwnerPID(),
+              Self.isProcessAlive(owner)
+        else { return true }
+        let ownerPath = Self.processPath(owner)
+        guard isExpectedRuntimePath(ownerPath) else {
+            let path = ownerPath ?? "未知路径"
+            state = .failed("runtime.lock 由未识别进程 PID \(owner) 持有（\(path)），为避免误杀未自动接管")
+            refreshDiagnostics()
+            return false
+        }
+        state = .restarting
+        await terminate(processID: owner)
+        guard !Self.isProcessAlive(owner) else {
+            state = .failed("无法安全替换遗留 Runtime（PID \(owner)）")
+            refreshDiagnostics()
+            return false
+        }
+        return true
+    }
+
+    private func scheduleAutomaticRestart(after failure: String) {
+        guard desiredRunning, automaticRestartTask == nil else { return }
+        guard let delay = Self.automaticRestartDelay(attempt: consecutiveFailures) else {
+            state = .failed("\(failure)；自动恢复连续失败 5 次，已停止重试")
+            return
+        }
+        consecutiveFailures += 1
+        state = .failed("\(failure)；将在 \(Self.delayLabel(delay)) 后自动重启")
+        automaticRestartTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self, !Task.isCancelled, self.desiredRunning else { return }
+            self.automaticRestartTask = nil
+            await self.launchConfiguredRuntime()
+        }
+    }
+
+    public nonisolated static func automaticRestartDelay(attempt: Int) -> TimeInterval? {
+        let delays: [TimeInterval] = [0.5, 1, 2, 4, 8]
+        guard delays.indices.contains(attempt) else { return nil }
+        return delays[attempt]
+    }
+
+    private nonisolated static func delayLabel(_ delay: TimeInterval) -> String {
+        delay < 1 ? "0.5 秒" : "\(Int(delay)) 秒"
     }
 
     public func refreshDiagnostics() {
@@ -333,7 +412,85 @@ public final class RuntimeSupervisor: ObservableObject {
         if let process, process.executableURL?.path != nil {
             expected.append(process.executableURL!.path)
         }
-        return expected.contains(path)
+        if expected.contains(path) { return true }
+
+        // A previous ActRealm build may have been moved or replaced, so its
+        // helper path no longer equals the current bundle path. Production
+        // builds are accepted only when both app bundles share a non-empty
+        // Developer ID TeamIdentifier. Ad-hoc QA builds have no Team ID and
+        // are accepted only when the candidate app has the same bundle ID and
+        // its helper is owned by the current user.
+        let helperURL = URL(fileURLWithPath: path).standardizedFileURL
+        guard helperURL.lastPathComponent == "actrealm",
+              helperURL.deletingLastPathComponent().lastPathComponent == "Helpers"
+        else { return false }
+        let appURL = helperURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        guard appURL.pathExtension == "app" else { return false }
+        let candidateBundleID = Self.bundleIdentifier(at: appURL)
+        let currentBundleID = Bundle.main.bundleIdentifier
+        let candidateTeamID = Self.codeSigningTeamIdentifier(at: appURL)
+        let currentTeamID = Self.codeSigningTeamIdentifier(at: Bundle.main.bundleURL)
+        let candidateOwnerID = (try? FileManager.default.attributesOfItem(atPath: path)[.ownerAccountID])
+            .flatMap { ($0 as? NSNumber)?.uint32Value }
+        return Self.isCompatibleAppHelperIdentity(
+            currentBundleID: currentBundleID,
+            candidateBundleID: candidateBundleID,
+            currentTeamID: currentTeamID,
+            candidateTeamID: candidateTeamID,
+            candidateOwnerID: candidateOwnerID,
+            currentUserID: getuid()
+        )
+    }
+
+    nonisolated static func isCompatibleAppHelperIdentity(
+        currentBundleID: String?,
+        candidateBundleID: String?,
+        currentTeamID: String?,
+        candidateTeamID: String?,
+        candidateOwnerID: UInt32?,
+        currentUserID: UInt32
+    ) -> Bool {
+        guard let currentBundleID, candidateBundleID == currentBundleID else { return false }
+        if let currentTeamID, !currentTeamID.isEmpty {
+            return candidateTeamID == currentTeamID
+        }
+        return candidateTeamID == nil && candidateOwnerID == currentUserID
+    }
+
+    private nonisolated static func bundleIdentifier(at appURL: URL) -> String? {
+        let plistURL = appURL.appendingPathComponent("Contents/Info.plist")
+        guard let data = try? Data(contentsOf: plistURL),
+              let plist = try? PropertyListSerialization.propertyList(from: data, format: nil),
+              let dictionary = plist as? [String: Any]
+        else { return nil }
+        return dictionary["CFBundleIdentifier"] as? String
+    }
+
+    private nonisolated static func codeSigningTeamIdentifier(at appURL: URL) -> String? {
+        guard FileManager.default.fileExists(atPath: appURL.path) else { return nil }
+        let proc = Process()
+        let output = Pipe()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        proc.arguments = ["-dv", "--verbose=4", appURL.path]
+        proc.standardOutput = output
+        proc.standardError = output
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch {
+            return nil
+        }
+        guard let data = try? output.fileHandleForReading.readToEnd(),
+              let text = String(data: data, encoding: .utf8)
+        else { return nil }
+        for line in text.split(separator: "\n") where line.hasPrefix("TeamIdentifier=") {
+            let value = line.dropFirst("TeamIdentifier=".count)
+            return value == "not set" || value.isEmpty ? nil : String(value)
+        }
+        return nil
     }
 
     private func terminate(processID: Int32) async {

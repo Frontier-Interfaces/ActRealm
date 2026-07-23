@@ -1,0 +1,254 @@
+=== no sleep/wake observer in product sources ===
+none
+=== RuntimeClient websocket receive has no heartbeat deadline ===
+   326	    private func startStreaming() {
+   327	        streamTask?.cancel()
+   328	        streamTask = Task { [weak self] in
+   329	            await self?.streamLoop()
+   330	        }
+   331	    }
+   332
+   333	    private func streamLoop() async {
+   334	        var attempt = 0
+   335	        while !Task.isCancelled {
+   336	            guard let baseURL, let cookie = sessionCookie, let csrfToken else { return }
+   337	            guard var components = URLComponents(
+   338	                url: baseURL.appendingPathComponent("api/v1/ws"),
+   339	                resolvingAgainstBaseURL: false
+   340	            ) else { return }
+   341	            components.scheme = baseURL.scheme == "https" ? "wss" : "ws"
+   342	            components.queryItems = [URLQueryItem(name: "csrf", value: csrfToken)]
+   343	            guard let wsURL = components.url else { return }
+   344
+   345	            var request = URLRequest(url: wsURL)
+   346	            request.setValue("actrealm_session=\(cookie)", forHTTPHeaderField: "Cookie")
+   347	            request.setValue(originValue(for: baseURL), forHTTPHeaderField: "Origin")
+   348	            let task = session.webSocketTask(with: request)
+   349	            webSocketTask = task
+   350	            task.resume()
+   351	            connectionState = .live
+   352	            attempt = 0
+   353
+   354	            do {
+   355	                while !Task.isCancelled {
+   356	                    let message = try await task.receive()
+   357	                    switch message {
+   358	                    case .string(let text): handleSocketText(text)
+   359	                    case .data(let data):
+   360	                        if let text = String(data: data, encoding: .utf8) { handleSocketText(text) }
+   361	                    @unknown default: break
+   362	                    }
+   363	                }
+   364	            } catch {
+   365	                // Reconnect below. The last truthful snapshot stays visible.
+   366	            }
+   367	            if Task.isCancelled { return }
+   368
+   369	            connectionState = .connecting
+   370	            attempt += 1
+   371	            let delaySeconds = min(pow(2.0, Double(attempt)), 30)
+   372	            try? await Task.sleep(for: .seconds(delaySeconds))
+   373	        }
+   374	    }
+   375
+   376	    private func handleSocketText(_ text: String) {
+   377	        guard let data = text.data(using: .utf8),
+   378	              let envelope = try? JSONDecoder().decode(SnapshotEnvelope.self, from: data),
+   379	              envelope.type == "snapshot"
+   380	        else { return }
+   381	        snapshot = envelope.snapshot
+   382	    }
+=== quota refresh is driven by snapshot generation ===
+  2568	        self.0.fetch_sub(1, Ordering::AcqRel);
+  2569	    }
+  2570	}
+  2571
+  2572	async fn websocket_loop(mut socket: WebSocket, state: AppState) {
+  2573	    let _connection = WebSocketConnectionGuard::new(state.websocket_connections.clone());
+  2574	    let mut last_payload = String::new();
+  2575	    let mut last_heartbeat = Instant::now();
+  2576	    while !state.shutdown_flag.load(Ordering::Acquire) {
+  2577	        let Ok(snapshot) = snapshot_value(&state) else {
+  2578	            break;
+  2579	        };
+  2580	        let payload = json!({ "type": "snapshot", "snapshot": snapshot }).to_string();
+  2581	        if payload != last_payload {
+  2582	            if socket
+  2583	                .send(Message::Text(payload.clone().into()))
+  2584	                .await
+  2585	                .is_err()
+  2586	            {
+  2587	                break;
+  2588	            }
+  2589	            last_payload = payload;
+  2590	        }
+  2591	        if last_heartbeat.elapsed() >= state.heartbeat_interval {
+  2592	            let heartbeat = json!({
+  2593	                "type": "heartbeat",
+  2594	                "serverTime": now_millis(),
+  2595	            })
+  2596	            .to_string();
+  2597	            if socket.send(Message::Text(heartbeat.into())).await.is_err() {
+  2598	                break;
+  2599	            }
+  2600	            last_heartbeat = Instant::now();
+  2601	        }
+  2602	        match tokio::time::timeout(state.snapshot_interval, socket.recv()).await {
+  2603	            Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => break,
+  2604	            Ok(Some(Ok(_))) | Err(_) => {}
+  2605	        }
+  2606	    }
+  2607	}
+  2608
+  2609	fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
+  2610	    let now = now_millis();
+  2611	    state.codex.retry_unsynced_native_approvals();
+  2612	    refresh_session_usage(state, now)?;
+  2613	    let mut snapshot = state.store.snapshot()?;
+  2614	    let visible_attention_sessions = snapshot
+  2615	        .attention
+  2769	fn quota_entries(state: &AppState) -> Result<Vec<QuotaEntry>, StoreError> {
+  2770	    let mut quota = state
+  2771	        .quota
+  2772	        .lock()
+  2773	        .map_err(|_| StoreError::Storage("quota collector lock is poisoned".to_owned()))?;
+  2774	    let claude_cache_modified_at = fs::metadata(quota.collector.paths().claude_cache())
+  2775	        .and_then(|metadata| metadata.modified())
+  2776	        .ok();
+  2777	    let claude_cache_changed = claude_cache_modified_at != quota.claude_cache_modified_at;
+  2778	    let refresh = claude_cache_changed
+  2779	        || quota
+  2780	            .refreshed_at
+  2781	            .is_none_or(|instant| instant.elapsed() >= state.quota_poll_interval);
+  2782	    let start_oauth_refresh =
+  2783	        refresh && state.claude_oauth_quota && !quota.oauth_refresh_in_progress;
+  2784	    if start_oauth_refresh {
+  2785	        quota.oauth_refresh_in_progress = true;
+  2786	    }
+  2787	    if refresh {
+  2788	        let now = now_millis();
+  2789	        quota.entries = quota.collector.collect(now);
+  2790	        quota.refreshed_at = Some(Instant::now());
+  2791	        quota.claude_cache_modified_at = claude_cache_modified_at;
+  2792	        let persisted = quota.entries.iter().filter_map(quota_record).collect();
+  2793	        state.store.replace_quota_snapshots(persisted)?;
+  2794	    }
+  2795	    let entries = quota.entries.clone();
+  2796	    let paths = start_oauth_refresh.then(|| quota.collector.paths().clone());
+  2797	    drop(quota);
+  2798	    if let Some(paths) = paths {
+  2799	        spawn_oauth_quota_refresh(state.quota.clone(), state.store.clone(), paths);
+  2800	    }
+  2801	    Ok(entries)
+  2802	}
+  2803
+  2804	fn spawn_oauth_quota_refresh(
+  2805	    quota_state: Arc<Mutex<QuotaState>>,
+  2806	    store: RuntimeStore,
+  2807	    paths: QuotaPaths,
+  2808	) {
+  2809	    let state_on_failure = quota_state.clone();
+  2810	    let result = thread::Builder::new()
+  2811	        .name("actrealm-claude-quota".to_owned())
+  2812	        .spawn(move || {
+  2813	            let now = now_millis();
+  2814	            let mut collector = QuotaCollector::new(paths);
+  2815	            let result = collector.refresh_claude_oauth(now).map(|mut entries| {
+  2816	                entries.extend(collector.collect_codex(now));
+  2817	                entries
+  2818	            });
+  2819	            let Ok(mut quota) = quota_state.lock() else {
+  2820	                return;
+  2821	            };
+  2822	            quota.oauth_refresh_in_progress = false;
+  2823	            let Ok(entries) = result else { return };
+  2824	            quota.entries = entries.clone();
+  2825	            quota.refreshed_at = Some(Instant::now());
+  2826	            quota.claude_cache_modified_at = fs::metadata(quota.collector.paths().claude_cache())
+  2827	                .and_then(|metadata| metadata.modified())
+  2828	                .ok();
+  2829	            drop(quota);
+  2830	            let persisted = entries.iter().filter_map(quota_record).collect::<Vec<_>>();
+  2831	            let _ = store.replace_quota_snapshots(persisted);
+  2832	        });
+  2833	    if result.is_err() {
+  2834	        if let Ok(mut quota) = state_on_failure.lock() {
+  2835	            quota.oauth_refresh_in_progress = false;
+  2836	        }
+  2837	    }
+  2838	}
+=== recent session visibility rule ===
+    60	    "environment",
+    61	    "recovery",
+    62	    "control",
+    63	    "jump",
+    64	    "titleSource",
+    65	    "sessionId",
+    66	    "providerSessionId",
+    67	    "providerTurnId",
+    68	    "lastEventAt",
+    69	];
+    70	const SESSION_LIST_RETENTION_MS: u64 = 30 * 60 * 1_000;
+    71	const USAGE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+    72	const INDEX_HTML: &str = include_str!("../../../web/index.html");
+    73	const APP_CSS: &str = include_str!("../../../web/app.css");
+    74	const APP_JS: &str = include_str!("../../../web/app.js");
+    75	const CLAUDE_ICON: &[u8] = include_bytes!("../../../web/assets/claude.png");
+  2613	    let mut snapshot = state.store.snapshot()?;
+  2614	    let visible_attention_sessions = snapshot
+  2615	        .attention
+  2616	        .iter()
+  2617	        .filter(|item| {
+  2618	            matches!(
+  2619	                item.state.as_str(),
+  2620	                "open" | "committing" | "decision_sent" | "snoozed"
+  2621	            )
+  2622	        })
+  2623	        .map(|item| item.session_id.as_str())
+  2624	        .collect::<HashSet<_>>();
+  2625	    let cutoff = now.saturating_sub(SESSION_LIST_RETENTION_MS);
+  2626	    snapshot.sessions.retain(|session| {
+  2627	        let active = !matches!(
+  2628	            session.exec_state.as_str(),
+  2629	            "idle" | "response_finished" | "failed"
+  2630	        );
+  2631	        active
+  2632	            || session.last_event_at >= cutoff
+  2633	            || visible_attention_sessions.contains(session.id.as_str())
+  2634	    });
+  2635	    let mut sessions = serde_json::to_value(&snapshot.sessions)
+  2636	        .map_err(|error| StoreError::Storage(error.to_string()))?;
+  2637	    if let Some(items) = sessions.as_array_mut() {
+=== lifecycle-only events become recent sessions ===
+  4524	}
+  4525
+  4526	fn project_event<'a>(
+  4527	    kind: EventKind,
+  4528	    raw: &Value,
+  4529	    current: &'a str,
+  4530	) -> (&'a str, Option<&'static str>, String) {
+  4531	    match kind {
+  4532	        EventKind::SessionStarted | EventKind::SessionEnded => {
+  4533	            ("idle", None, "等待新任务".to_owned())
+  4534	        }
+  4535	        EventKind::PromptSubmitted => ("thinking", None, "正在思考".to_owned()),
+  4536	        EventKind::ToolStarted => (
+  4537	            "tool_running",
+  4538	            None,
+  4539	            format!(
+  4540	                "正在运行 {}",
+  4541	                raw.get("tool_name")
+  4542	                    .and_then(Value::as_str)
+  4760	    }
+  4761	}
+  4762
+  4763	fn event_type(kind: EventKind) -> &'static str {
+  4764	    match kind {
+  4765	        EventKind::SessionStarted => "session.started",
+  4766	        EventKind::SessionEnded => "session.ended",
+  4767	        EventKind::PromptSubmitted => "prompt.submitted",
+  4768	        EventKind::ToolStarted => "tool.started",
+  4769	        EventKind::ToolFinished => "tool.finished",
+  4770	        EventKind::ToolFailed => "tool.failed",
+  4771	        EventKind::PermissionRequested => "approval.requested",
+  4772	        EventKind::PermissionDenied => "approval.denied",

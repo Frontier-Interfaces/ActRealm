@@ -1,0 +1,111 @@
+name: Signed macOS release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Bundle version such as 1.0.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Require the supported macOS SDK
+        run: |
+          SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
+          test "${SDK_VERSION%%.*}" -ge 26 || { echo "macOS 26 SDK required, found $SDK_VERSION" >&2; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Require signing and notarization credentials
+        env:
+          CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          for value in CERTIFICATE CERTIFICATE_PASSWORD KEYCHAIN_PASSWORD SIGN_IDENTITY APPLE_ID APPLE_TEAM_ID APPLE_APP_PASSWORD; do
+            test -n "${!value}" || { echo "missing release secret: $value" >&2; exit 1; }
+          done
+
+      - name: Import Developer ID certificate
+        env:
+          CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/actrealm-signing.keychain-db"
+          echo "$CERTIFICATE" | base64 -D > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/certificate.p12" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security list-keychain -d user -s "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+      - name: Build signed app
+        env:
+          ACTREALM_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          ACTREALM_REQUIRE_RELEASE_SIGNING: "1"
+          ACTREALM_EXPECTED_ARCHS: arm64
+          ACTREALM_VERSION: ${{ inputs.version || github.ref_name }}
+        run: apps/macos/Scripts/package-app.sh apps/macos/release-dist
+
+      - name: Create DMG
+        run: |
+          codesign --verify --deep --strict --verbose=2 apps/macos/release-dist/ActRealm.app
+          mkdir -p apps/macos/dmg-root
+          cp -R apps/macos/release-dist/ActRealm.app apps/macos/dmg-root/
+          ln -s /Applications apps/macos/dmg-root/Applications
+          hdiutil create -volname ActRealm -srcfolder apps/macos/dmg-root -ov -format UDZO apps/macos/ActRealm.dmg
+
+      - name: Notarize, staple, and assess
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          xcrun notarytool submit apps/macos/ActRealm.dmg \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple apps/macos/ActRealm.dmg
+          xcrun stapler validate apps/macos/ActRealm.dmg
+          spctl --assess --type open --context context:primary-signature --verbose=4 apps/macos/ActRealm.dmg
+          shasum -a 256 apps/macos/ActRealm.dmg > apps/macos/ActRealm.dmg.sha256
+
+      - name: Upload signed release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ActRealm-signed-${{ github.sha }}
+          path: |
+            apps/macos/ActRealm.dmg
+            apps/macos/ActRealm.dmg.sha256
+          if-no-files-found: error
+
+      - name: Attach artifacts to GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" apps/macos/ActRealm.dmg apps/macos/ActRealm.dmg.sha256 --clobber
