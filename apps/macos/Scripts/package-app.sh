@@ -6,6 +6,9 @@
 #   ACTREALM_REPO   path to the Rust checkout (default: monorepo root)
 #   ACTREALM_SKIP_RUST_BUILD=1 reuses the existing release backend binary
 #   ACTREALM_SWIFT_CONFIGURATION=debug packages a debug Swift build
+#   ACTREALM_SIGN_IDENTITY Developer ID identity; defaults to ad-hoc for local QA
+#   ACTREALM_REQUIRE_RELEASE_SIGNING=1 rejects ad-hoc output
+#   ACTREALM_VERSION / ACTREALM_BUILD_NUMBER override bundle version metadata
 #   SDKROOT           macOS SDK (default: installed 26.0 SDK, then xcrun)
 set -euo pipefail
 
@@ -23,6 +26,24 @@ OUT_DIR="${1:-$PACKAGE_DIR/dist}"
 APP="$OUT_DIR/ActRealm.app"
 INFO_PLIST="$PACKAGE_DIR/Resources/Info.plist"
 APP_ICON="$PACKAGE_DIR/Resources/ActRealm.icns"
+SIGN_IDENTITY="${ACTREALM_SIGN_IDENTITY:--}"
+REQUIRE_RELEASE_SIGNING="${ACTREALM_REQUIRE_RELEASE_SIGNING:-0}"
+BUNDLE_VERSION="${ACTREALM_VERSION:-}"
+if [[ -n "$BUNDLE_VERSION" ]]; then
+  BUNDLE_VERSION="${BUNDLE_VERSION#v}"
+  if [[ ! "$BUNDLE_VERSION" =~ '^[0-9]+([.][0-9]+){0,2}$' ]]; then
+    echo "error: ACTREALM_VERSION must be a numeric bundle version (for example 1.2.3)" >&2
+    exit 1
+  fi
+fi
+if [[ "$REQUIRE_RELEASE_SIGNING" == "1" && "$SIGN_IDENTITY" == "-" ]]; then
+  echo "error: release packaging requires ACTREALM_SIGN_IDENTITY" >&2
+  exit 1
+fi
+if [[ "$REQUIRE_RELEASE_SIGNING" == "1" && -n "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=normal)" ]]; then
+  echo "error: release packaging requires a clean Git worktree so embedded commit metadata is exact" >&2
+  exit 1
+fi
 if [[ -z "${SDKROOT:-}" ]]; then
   export SDKROOT="$("$SCRIPT_DIR/resolve-sdk.sh")"
 fi
@@ -65,12 +86,40 @@ cp "$INFO_PLIST" "$APP/Contents/Info.plist"
 cp "$APP_ICON" "$APP/Contents/Resources/ActRealm.icns"
 cp "$REPO_ROOT/web/assets/claude.png" "$APP/Contents/Resources/ProviderIcons/claude.png"
 cp "$REPO_ROOT/web/assets/codex.png" "$APP/Contents/Resources/ProviderIcons/codex.png"
+GIT_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+BUILD_NUMBER="${ACTREALM_BUILD_NUMBER:-$(git -C "$REPO_ROOT" rev-list --count HEAD)}"
+BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+plutil -replace CFBundleVersion -string "$BUILD_NUMBER" "$APP/Contents/Info.plist"
+plutil -replace ActRealmGitCommit -string "$GIT_COMMIT" "$APP/Contents/Info.plist"
+plutil -replace ActRealmBuildDate -string "$BUILD_DATE" "$APP/Contents/Info.plist"
+if [[ -n "$BUNDLE_VERSION" ]]; then
+  plutil -replace CFBundleShortVersionString -string "$BUNDLE_VERSION" "$APP/Contents/Info.plist"
+fi
 plutil -lint "$APP/Contents/Info.plist"
 
-echo "==> Codesigning (ad-hoc)"
-codesign --force -s - "$APP/Contents/Helpers/actrealm"
-codesign --force -s - "$APP/Contents/MacOS/ActRealm"
-codesign --force -s - "$APP"
+SIGN_ARGS=(--force --sign "$SIGN_IDENTITY")
+if [[ "$SIGN_IDENTITY" != "-" ]]; then
+  SIGN_ARGS+=(--options runtime --timestamp)
+fi
+echo "==> Codesigning ($SIGN_IDENTITY)"
+codesign "${SIGN_ARGS[@]}" "$APP/Contents/Helpers/actrealm"
+codesign "${SIGN_ARGS[@]}" "$APP/Contents/MacOS/ActRealm"
+codesign "${SIGN_ARGS[@]}" "$APP"
+codesign --verify --deep --strict --verbose=2 "$APP"
+
+EXPECTED_ARCHS="${ACTREALM_EXPECTED_ARCHS:-arm64}"
+for binary in "$APP/Contents/MacOS/ActRealm" "$APP/Contents/Helpers/actrealm"; do
+  ARCHS="$(lipo -archs "$binary")"
+  for expected in ${(z)EXPECTED_ARCHS}; do
+    if [[ " $ARCHS " != *" $expected "* ]]; then
+      echo "error: $binary is missing required architecture $expected (found: $ARCHS)" >&2
+      exit 1
+    fi
+  done
+done
 
 echo "==> Done: $APP"
+echo "    commit: $GIT_COMMIT"
+echo "    build:  $BUILD_NUMBER"
+echo "    arch:   $EXPECTED_ARCHS"
 echo "    open \"$APP\""

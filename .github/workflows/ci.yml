@@ -1,0 +1,88 @@
+name: Core release gates
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: core-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-and-macos:
+    name: Rust, Swift, security, package
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Select current stable Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Require the supported macOS SDK
+        run: |
+          SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
+          test "${SDK_VERSION%%.*}" -ge 26 || { echo "macOS 26 SDK required, found $SDK_VERSION" >&2; exit 1; }
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97"
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Fetch locked Rust dependencies
+        run: cargo fetch --locked
+
+      - name: Validate tracked text and product language
+        run: |
+          git diff --check
+          ./scripts/check-actrealm-language.sh
+          plutil -lint apps/macos/Resources/Info.plist
+
+      - name: Rust format
+        run: cargo fmt --all -- --check
+
+      - name: Rust Clippy
+        run: cargo clippy --workspace --all-targets --offline -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --workspace --offline
+
+      - name: Rust release build
+        run: cargo build --workspace --release --offline
+
+      - name: Swift tests
+        run: apps/macos/Scripts/test.sh
+
+      - name: Install RustSec audit tool
+        run: cargo install cargo-audit --locked
+
+      - name: RustSec audit
+        run: cargo audit --deny warnings
+
+      - name: Assemble and verify local QA app
+        env:
+          ACTREALM_SKIP_RUST_BUILD: "1"
+          ACTREALM_EXPECTED_ARCHS: arm64
+        run: |
+          apps/macos/Scripts/package-app.sh apps/macos/ci-dist
+          codesign --verify --deep --strict --verbose=2 apps/macos/ci-dist/ActRealm.app
+          test "$(/usr/libexec/PlistBuddy -c 'Print :ActRealmGitCommit' apps/macos/ci-dist/ActRealm.app/Contents/Info.plist)" = "$GITHUB_SHA"
+
+      - name: Upload verified QA package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ActRealm-${{ github.sha }}-unsigned-qa
+          path: apps/macos/ci-dist/ActRealm.app
+          if-no-files-found: error
+          retention-days: 7

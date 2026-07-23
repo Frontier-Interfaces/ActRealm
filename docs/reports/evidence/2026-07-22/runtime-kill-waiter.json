@@ -1,0 +1,10 @@
+{
+  "hook_event_name": "PermissionRequest",
+  "session_id": "launch-audit-runtime-kill-20260722",
+  "cwd": "/tmp/actrealm-launch-audit",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "touch /tmp/actrealm-runtime-kill"
+  },
+  "model": "claude-sonnet-5"
+}

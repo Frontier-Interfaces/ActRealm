@@ -270,6 +270,35 @@ private struct AgentSettingsPage: View {
                     }
                     .disabled(model.isSettingsBusy || model.claudeQuotaBridge?.status == "config_malformed")
 
+                    HStack {
+                        SettingsLabel(
+                            "主动更新额度",
+                            detail: "额度长时间不变或电脑唤醒后可立即请求；若凭证不可用，请先启动 Claude Code CLI 并开始一次会话"
+                        )
+                        Spacer(minLength: 12)
+                        Button(
+                            model.isQuotaRefreshBusy ? "正在更新…" : "立即更新",
+                            systemImage: "arrow.clockwise"
+                        ) {
+                            Task { await model.refreshQuotaNow() }
+                        }
+                        .disabled(
+                            !model.bridgeStatus.isListening
+                                || model.isQuotaRefreshBusy
+                        )
+                    }
+                    if let message = model.quotaRefreshMessage {
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(
+                                message.contains("失败") || message.contains("未连接")
+                                    ? Color.red
+                                    : Color.secondary
+                            )
+                            .textSelection(.enabled)
+                            .accessibilityLabel("额度更新结果：\(message)")
+                    }
+
                     Toggle(isOn: Binding(
                         get: { model.uiSettings.codexEnhancedActivity },
                         set: { enabled in model.updateUISettings { $0.codexEnhancedActivity = enabled } }
@@ -363,7 +392,7 @@ private struct AgentSettingsPage: View {
 
     private var bridgeStatusText: String {
         switch model.claudeQuotaBridge?.status {
-        case "installed": "已开启；下一次 Claude 响应后更新"
+        case "installed": "已开启；支持自动同步和主动更新"
         case "not_installed": "未开启"
         case "helper_missing": "相关文件缺失，可以安全修复"
         case "custom_conflict": "检测到自定义状态栏；开启时会保留原显示"

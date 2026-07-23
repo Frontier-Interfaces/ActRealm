@@ -450,9 +450,20 @@ private struct TaskRow: View {
         }
     }
     private var controlText: String {
-        task.session.controlCapability == "managed"
-            ? "app-server 托管，可回答提问"
-            : "外部 Hook，仅观察 / 授权"
+        guard task.session.controlCapability == "managed" else {
+            return "外部 Hook，仅观察 / 授权"
+        }
+        let directRequestOpen = model.derived.openOutbox.contains {
+            $0.attention.sessionId == task.id
+                && $0.kind == .approval
+                && $0.attention.requestId != nil
+        }
+        if directRequestOpen {
+            return "托管请求已接入，可直接审批"
+        }
+        return model.client.snapshot.capabilities?.codexConnector?.managedApprovals == true
+            ? "app-server 已连接；原生审批仍需在 Codex 处理"
+            : "app-server 已连接；当前版本审批需原界面"
     }
     private var metaLine: String {
         var parts = [providerName]

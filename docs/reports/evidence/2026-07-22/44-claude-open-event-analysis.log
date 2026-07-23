@@ -1,0 +1,57 @@
+=== schemas ===
+CREATE TABLE events (
+              id TEXT PRIMARY KEY, request_id TEXT,
+              session_id TEXT NOT NULL, turn_id TEXT, provider TEXT NOT NULL,
+              type TEXT NOT NULL, tool_name TEXT, summary TEXT,
+              occurred_at INTEGER NOT NULL, ingest_seq INTEGER NOT NULL,
+              FOREIGN KEY(session_id) REFERENCES sessions(id),
+              FOREIGN KEY(turn_id) REFERENCES turns(id)
+            );
+CREATE INDEX events_session_time
+              ON events(session_id, occurred_at);
+=== latest claude sessions ===
+provider_session_id                   coalesce(project,'')  coalesce(title,'')  coalesce(model,'')  exec_state  coalesce(activity,'')  started              last_event
+------------------------------------  --------------------  ------------------  ------------------  ----------  ---------------------  -------------------  -------------------
+19785bb9-e3d0-4689-9376-e125fa6e944b  apple                                                         idle        子 Agent 已结束        2026-07-22 17:21:02  2026-07-22 17:21:05
+2c76362d-7aca-4175-8971-4f2abffb7c23  apple                                                         idle        子 Agent 已结束        2026-07-22 17:21:02  2026-07-22 17:21:04
+71efd640-f7f7-4ad7-9269-0278bda028c7  AI-Display                                                    idle        子 Agent 已结束        2026-07-22 17:21:02  2026-07-22 17:21:03
+0cb8480b-d024-4c65-8c77-02d8bf8dc65e  AI-Display            n好去                                   idle        子 Agent 已结束        2026-07-20 17:05:17  2026-07-22 17:20:30
+23b27170-c6ac-4986-ac12-f519766e82a6  AI-Display            好的                                    idle        子 Agent 已结束        2026-07-22 09:57:09  2026-07-22 17:20:28
+00371986-07f7-4c27-bfa2-732dc78be85a  AI-Display                                                    idle        子 Agent 已结束        2026-07-20 17:02:20  2026-07-22 17:20:28
+ed540dfc-4827-4883-9903-4ee73ab4f365  AI-Display                                                    idle        子 Agent 已结束        2026-07-20 17:05:15  2026-07-22 17:20:28
+fdfbc770-8e3d-4e09-8bde-5873932d4918  AI-Display                                                    idle        子 Agent 已结束        2026-07-20 17:05:14  2026-07-22 17:20:28
+11f905a9-9238-4934-9e40-e4331256cdd9  AI-Display            你好                                    idle        子 Agent 已结束        2026-07-20 17:02:20  2026-07-22 17:20:28
+10f28064-4c67-4756-9f3f-208a12c0c296  AI-Display                                                    idle        子 Agent 已结束        2026-07-22 17:19:06  2026-07-22 17:19:09
+f2b30451-8079-4732-98a8-6bb7f0862524  apple                                                         idle        子 Agent 已结束        2026-07-22 17:19:06  2026-07-22 17:19:09
+5caaa6f0-9336-4ffa-a393-d1ee19c8cc92  AI-Display                                                    idle        子 Agent 已结束        2026-07-22 17:05:23  2026-07-22 17:05:24
+=== latest claude event kinds ===
+=== per-session events since 17:15 ===
+=== latest claude event types ===
+type             count  first                last
+---------------  -----  -------------------  -------------------
+session.ended    11     2026-07-22 17:19:09  2026-07-22 17:21:05
+session.started  10     2026-07-22 17:19:06  2026-07-22 17:21:02
+=== per-session events since 17:15 ===
+session   type             count  first                last
+--------  ---------------  -----  -------------------  -------------------
+10f28064  session.started  1      2026-07-22 17:19:06  2026-07-22 17:19:06
+f2b30451  session.started  1      2026-07-22 17:19:06  2026-07-22 17:19:06
+0cb8480b  session.started  1      2026-07-22 17:19:09  2026-07-22 17:19:09
+10f28064  session.ended    1      2026-07-22 17:19:09  2026-07-22 17:19:09
+f2b30451  session.ended    1      2026-07-22 17:19:09  2026-07-22 17:19:09
+11f905a9  session.started  1      2026-07-22 17:19:10  2026-07-22 17:19:10
+fdfbc770  session.started  1      2026-07-22 17:19:10  2026-07-22 17:19:10
+ed540dfc  session.started  1      2026-07-22 17:19:11  2026-07-22 17:19:11
+00371986  session.started  1      2026-07-22 17:19:13  2026-07-22 17:19:13
+00371986  session.ended    1      2026-07-22 17:20:28  2026-07-22 17:20:28
+11f905a9  session.ended    1      2026-07-22 17:20:28  2026-07-22 17:20:28
+23b27170  session.ended    1      2026-07-22 17:20:28  2026-07-22 17:20:28
+ed540dfc  session.ended    1      2026-07-22 17:20:28  2026-07-22 17:20:28
+fdfbc770  session.ended    1      2026-07-22 17:20:28  2026-07-22 17:20:28
+0cb8480b  session.ended    1      2026-07-22 17:20:30  2026-07-22 17:20:30
+19785bb9  session.started  1      2026-07-22 17:21:02  2026-07-22 17:21:02
+2c76362d  session.started  1      2026-07-22 17:21:02  2026-07-22 17:21:02
+71efd640  session.started  1      2026-07-22 17:21:02  2026-07-22 17:21:02
+71efd640  session.ended    1      2026-07-22 17:21:03  2026-07-22 17:21:03
+2c76362d  session.ended    1      2026-07-22 17:21:04  2026-07-22 17:21:04
+19785bb9  session.ended    1      2026-07-22 17:21:05  2026-07-22 17:21:05

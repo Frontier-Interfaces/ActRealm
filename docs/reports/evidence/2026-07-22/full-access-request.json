@@ -1,0 +1,8 @@
+{
+  "hook_event_name": "PermissionRequest",
+  "session_id": "launch-audit-full-access-20260722",
+  "turn_id": "turn-full",
+  "cwd": "/tmp/actrealm-launch-audit",
+  "tool_name": "Bash",
+  "permission_mode": "danger-full-access"
+}

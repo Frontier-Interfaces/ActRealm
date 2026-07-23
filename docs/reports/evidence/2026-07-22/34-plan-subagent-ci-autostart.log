@@ -1,0 +1,42 @@
+=== plan/subagent schema ===
+0|session_id|TEXT|1||1
+1|provider_turn_id|TEXT|1||2
+2|step_index|INTEGER|1||3
+3|step|TEXT|1||0
+4|detail|TEXT|0||0
+5|status|TEXT|1||0
+6|source|TEXT|1||0
+7|updated_at|INTEGER|1||0
+0|session_id|TEXT|1||1
+1|agent_id|TEXT|1||2
+2|active|INTEGER|1|1|0
+3|started_at|INTEGER|1||0
+4|stopped_at|INTEGER|0||0
+5|agent_type|TEXT|0||0
+6|status|TEXT|1|'running'|0
+7|source|TEXT|0||0
+=== aggregate ===
+sessions|49
+plan_steps|0
+subagents|5
+=== subagent status versus parent ===
+completed|idle|1
+running|idle|4
+=== workflows ===
+.github/workflows/actrealm-language.yml
+.github/workflows/pages.yml
+=== workflow gates ===
+.github/workflows/actrealm-language.yml:1:name: ActRealm language guard
+.github/workflows/actrealm-language.yml:4:  push:
+.github/workflows/actrealm-language.yml:5:  pull_request:
+.github/workflows/actrealm-language.yml:10:jobs:
+.github/workflows/actrealm-language.yml:11:  language:
+.github/workflows/pages.yml:1:name: Deploy website to GitHub Pages
+.github/workflows/pages.yml:4:  push:
+.github/workflows/pages.yml:11:  workflow_dispatch:
+.github/workflows/pages.yml:22:jobs:
+.github/workflows/pages.yml:23:  deploy:
+=== release lifecycle implementation references ===
+none
+completed|0|idle|1
+running|0|idle|4

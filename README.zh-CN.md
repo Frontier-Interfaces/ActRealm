@@ -147,8 +147,10 @@ apps/macos/Scripts/package-app.sh
 open apps/macos/dist/ActRealm.app
 ```
 
-当前原生界面使用 Swift tools 6.2 和 macOS 26 API。生成的 App 仅用于本地开发，
-采用 ad-hoc 签名；目前还没有经过公证、可公开下载的安装包。
+当前原生界面使用 Swift tools 6.2 和 macOS 26 API，并暂时只支持 Apple Silicon。
+本地生成的 App 仍是 ad-hoc 签名的 QA 产物。仓库已经加入 Developer ID 签名、
+公证、staple、DMG、校验和及 GitHub Release 流程；在该流程使用正式凭证跑通，
+且产物通过全新 Mac 安装门禁前，仍不能宣称已有公开安装包。
 
 ## 当前边界与路线图
 
@@ -156,12 +158,12 @@ open apps/macos/dist/ActRealm.app
 | --- | --- | --- |
 | 本地 Runtime 与 Web 控制界面 | 当前测试候选版 | 功能实现到 M14 并包含实时状态/恢复优化；M13 真实 Provider 验收和 48 小时稳定性门禁仍待完成 |
 | Claude Code 与 Codex | 当前构建 | 只覆盖本机会话；直接操作取决于事件是否带有真实回复通道 |
-| 原生 macOS 客户端 | 可测试源码 | 已能在本地打包；智能聚焦、台前调度状态恢复与窗口激活仍需更广泛的人工验收 |
+| 原生 macOS 客户端 | 可测试源码 | 支持 macOS 26+、Apple Silicon；本地打包可用，全新 Mac 发布验收仍未完成 |
 | ActRealm 工作区自动排布 | 实验性能力 | 需要 macOS 辅助功能权限，失败时不得修改 Runtime 任务状态 |
 | ActRealm Review | 开发中 | 规划包含测试、diff、证据与检查点审阅；不属于当前构建 |
 | Gemini CLI 适配器 | 开发中 | 尚未作为当前正式支持的 Provider 交付 |
 | Windows 客户端 | 路线图 | 必须先完成 Runtime 平台抽象，再开发 WinUI 客户端 |
-| 公开签名安装包 | 路线图 | 当前不承诺可下载的 M1 安装包 |
+| 公开签名安装包 | 发布门禁中 | 流程已具备；仍需正式签名/公证凭证和全新 Mac 验收 |
 
 官网中标记为 Roadmap 的内容属于目标体验，不代表已经交付。详细的实现与发布事实
 以 [`docs/STATUS.md`](docs/STATUS.md) 为准。

@@ -1,0 +1,10 @@
+^D   Compiling actrealm v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/app)
+    Finished `release` profile [optimized] target(s) in 0.87s
+     Running tests/m6_m8_resource.rs (target/release/deps/m6_m8_resource-3076701098d43a99)
+
+running 1 test
+test two_minute_release_candidate_resource_gate has been running for over 60 seconds
+{"schemaVersion":1,"durationSeconds":120,"sampleCount":118,"idleCpuAveragePct":0.000,"runtimeRssMaxKiB":6288,"cpuBudgetPct":0.5,"rssBudgetKiB":81920}
+test two_minute_release_candidate_resource_gate ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 124.04s

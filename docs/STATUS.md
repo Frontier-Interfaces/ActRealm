@@ -1,10 +1,10 @@
 # ActRealm current status
 
-Last reviewed: 2026-07-20
+Last reviewed: 2026-07-23
 
 Source branch: `agent/v1-full`
 
-Current functional baseline: M14 plus the post-M14 live-state and controlled
+Current functional baseline: M15 plus the post-M14 live-state and controlled
 Runtime-recovery refinements on `agent/v1-full`. A subsequent usage/OAuth
 hardening candidate has passed its automated/resource gates and awaits exact
 local installation and user acceptance. The first-run/setup-center candidate
@@ -21,10 +21,29 @@ provide the detailed requirements and evidence.
 
 - **Committed functional implementation:** delivered through M14 plus the
   ActRealm design alignment on `agent/v1-full`.
+- **P0 release-remediation candidate (uncommitted):** the 2026-07-22 global
+  release audit is being addressed on frozen baseline `50b891a`. The candidate
+  binds OUTBOX selection to stable Attention IDs, renders Claude questions and
+  Elicitation in the native primary card, disables stale controls while the
+  Runtime is offline, adds supervised Runtime restart and safe abandoned-child
+  takeover, releases sessions atomically when their reply channel ends, moves
+  the Codex app-server Connector to directly owned stdio transport, and pauses
+  background native projection/animation work while the workspace is hidden.
+  Local automated and targeted resource gates are recorded in the P0
+  remediation report; remote GitHub CI, Developer ID notarization, clean-Mac
+  install, and the continuous 48-hour soak remain external release gates.
 - **M14 acceptance:** automated/local gates passed; the exact release was
   installed with a matching SHA-256, live session/OAuth records were verified,
   and the user accepted the candidate and authorized the local commit on
   2026-07-18. Push remains separately gated.
+- **M15 managed Codex approvals candidate:** request-keyed command,
+  file-change, and permission approvals arriving on the ActRealm-owned
+  app-server channel can be answered after the generated 0.144 schema gate
+  passes. Merely attaching an independently running Codex Desktop Thread does
+  not transfer its current Turn or native approval sheet. Such requests remain
+  visible and actionable only through truthful “open Codex / handled / snooze”
+  controls. One-turn allow/deny, least-privilege responses and Provider
+  reconciliation have automated coverage.
 - **Post-M14 UI refinement:** the redundant simulated macOS menu bar and
   traffic lights were removed; Notification & Data, local time, and Runtime
   state now share the single ActRealm toolbar. Focused checks and local visual
@@ -123,6 +142,7 @@ provide the detailed requirements and evidence.
 | M12 | Codex Connector and restart recovery | Complete within the recorded boundary | [M10-M12](M10_M12_VERIFICATION.md) |
 | M13 | Provider-owned approval-state coordination | Code and automated gates complete; real-Provider acceptance pending | [M13](M13_PROVIDER_STATE_COORDINATION.md) |
 | M14 | Live usage, context, price, and OAuth quota | Complete; exact release installed and accepted locally | [M14](M14_USAGE_CONTEXT_QUOTA.md) |
+| M15 | Version-gated Codex managed approvals | Code and automated gates complete; real Codex acceptance pending | [M15](M15_CODEX_MANAGED_APPROVALS.md) |
 | Post-M14 | Stable live rendering and controlled Runtime recovery | Implemented; merged with the ActRealm identity baseline | [verification](POST_M14_REALTIME_RECOVERY.md) |
 | Post-M14 | Usage, pricing, and OAuth hardening | Full automated/resource gates pass; exact local installation and user acceptance pending | [verification](POST_M14_USAGE_OAUTH_HARDENING.md) |
 | Post-M14 | First-run workspace and Agent setup center | Visual acceptance passed; real-Provider install/function gates pending | [verification](POST_M14_FIRST_RUN_ONBOARDING.md) |
@@ -135,7 +155,7 @@ development. Later functional milestones may be implemented while M5's
 long-running release gate remains open; that does not make the final v1 release
 complete.
 
-## Capability boundary after M14
+## Capability boundary after M15
 
 ActRealm can directly respond only when it owns a live, official reply
 channel:
@@ -143,34 +163,45 @@ channel:
 - request-keyed Claude/Codex Hook `PermissionRequest` allow, deny, or
   pass-through;
 - Claude `AskUserQuestion` and `Elicitation` Hook replies;
-- Codex app-server `item/tool/requestUserInput` after explicit managed attach.
+- Codex app-server `item/tool/requestUserInput` when the request arrives on
+  the ActRealm-owned connection after explicit managed attach;
+- Codex app-server command, file-change, and permission approvals when the
+  request arrives on that same connection and passes the versioned gate.
 
 When Codex or Claude exposes an approval only in its own native interface,
 ActRealm observes and synchronizes the waiting/resolved state. It must not show
 fake allow/deny controls or infer whether the user approved, denied, or ran the
 command.
 
-## Later candidate, not implemented
+## M15 implemented: version-gated Codex managed approvals
 
-M15 is reserved for version-gated managed Codex app-server approval methods:
+M15 implements the three current Codex app-server approval methods:
 
 - `item/commandExecution/requestApproval`;
 - `item/fileChange/requestApproval`;
 - `item/permissions/requestApproval`;
-- official available-decision rendering and response;
-- `serverRequest/resolved` and item completion reconciliation;
+- one-turn allow/deny responses that never grant more than the requested
+  permission profile;
+- `serverRequest/resolved` and Provider item completion reconciliation;
 - explicit UI capability labels and compatibility tests.
 
-M15 does not promise control of an arbitrary independently running Codex
-Desktop conversation. It requires a supported, explicitly attached managed
-Thread and must be separately planned, implemented, tested, and approved.
+The currently verified schema family is Codex app-server 0.144.5–0.144.x.
+Unknown earlier or later protocol families disable the direct controls and
+truthfully fall back to observation. M15 does not promise control of an
+arbitrary independently running Codex Desktop conversation: explicit attach
+is necessary but is not sufficient to take ownership of an already-running
+Turn or an approval request delivered to Codex Desktop's own connection.
 
 ## Remaining release work
 
 1. Complete M13 manual reproduction against the real Provider surfaces and
    record the user's result.
-2. Run and retain the continuous 48-hour Runtime RSS soak on the exact frozen
+2. Run the new required GitHub core-gate workflow and protect the release
+   branch after the P0 remediation candidate is reviewed and pushed.
+3. Run Developer ID signing/notarization and clean-macOS-26 installation for
+   the exact release artifact; the current support target is Apple Silicon.
+4. Run and retain the continuous 48-hour Runtime RSS soak on the exact frozen
    release candidate.
-3. Re-run the full release gate after any resulting change.
-4. Obtain separate approval before bumping the version, tagging, publishing a
+5. Re-run the full release gate after any resulting change.
+6. Obtain separate approval before bumping the version, tagging, publishing a
    release, or changing the default branch again.

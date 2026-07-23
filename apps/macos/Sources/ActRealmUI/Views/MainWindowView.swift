@@ -85,6 +85,12 @@ public struct MainWindowView: View {
                     }
             }
         }
+        .background {
+            WindowActivityProbe { active in
+                model.updateWorkspaceAnimationActive(active)
+            }
+            .frame(width: 0, height: 0)
+        }
         .modifier(WindowGlassBackground())
         .ignoresSafeArea(.container, edges: .top)
         .overlay(alignment: .bottom) {

@@ -226,6 +226,14 @@ impl QuotaCollector {
         if self.oauth_credential.is_none() {
             self.oauth_credential = read_oauth_credential();
         }
+        // Claude Desktop/Code may be signed in while no readable credential
+        // has been materialized yet (for example after wake or a provider
+        // update). Ask the official CLI to reconcile its auth state once,
+        // then retry the same bounded credential discovery used for expiry
+        // and 401 recovery.
+        if self.oauth_credential.is_none() {
+            self.refresh_oauth_credential_from_provider(now_ms);
+        }
         if self
             .oauth_credential
             .as_ref()

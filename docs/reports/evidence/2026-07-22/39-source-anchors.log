@@ -1,0 +1,309 @@
+=== Outbox stable selection ===
+6-    @Environment(\.snapshotRendering) private var snapshotRendering
+7-
+8-    private var entries: [OutboxEntry] { model.derived.openOutbox }
+9-    private var selectedIndex: Int {
+10-        guard !entries.isEmpty else { return 0 }
+11:        return min(model.outboxPageIndex, entries.count - 1)
+12-    }
+13-
+14-    var body: some View {
+15-        VStack(alignment: .leading, spacing: 0) {
+16-            HStack(alignment: .firstTextBaseline, spacing: 8) {
+--
+89-                    .padding(.top, 16)
+90-                    .padding(.bottom, 8)
+91-                ForEach(rest, id: \.element.id) { index, entry in
+92-                    QueueRow(entry: entry) {
+93-                        withAnimation(.easeOut(duration: 0.2)) {
+94:                            model.outboxPageIndex = index
+95-                            model.revealSession(for: entry)
+96-                        }
+97-                    }
+98-                    .padding(.bottom, 7)
+99-                }
+=== Runtime termination and restart ===
+52-    private let repoPath: URL?
+53-    private var process: Process?
+54-    private var stdoutBuffer = Data()
+55-    private var stdoutTail = ""
+56-    private var stderrTail = ""
+57-    private var endpoint: URL?
+58:    private var onBootstrap: ((URL, String) -> Void)?
+59-
+60-    /// - Parameter repoPath: dev checkout of the Rust workspace used as a
+61-    ///   fallback when the app bundle does not contain a helper binary.
+62-    public init(repoPath: URL? = nil) {
+63-        self.repoPath = repoPath
+64-    }
+--
+111-
+112-        return candidateDevice == mainDevice && candidateFile == mainFile
+113-    }
+114-
+115-    /// Ensures a backend binary exists (bundled helper, or a cargo release
+116-    /// build of the dev checkout), launches `actrealm serve`, and invokes
+117:    /// `onBootstrap` exactly once with the base URL and one-time token
+118-    /// parsed from its stdout.
+119:    public func start(onBootstrap: @escaping (URL, String) -> Void) async {
+120:        self.onBootstrap = onBootstrap
+121-        refreshDiagnostics()
+122-
+123-        if let bundled = Self.bundledHelper() {
+124-            state = .launching
+125-            launch(binary: bundled, workingDirectory: nil)
+126-            return
+--
+141-        }
+142-        state = .launching
+143-        launch(binary: binary, workingDirectory: repoPath)
+144-    }
+145-
+146-    public func stop() {
+147:        onBootstrap = nil
+148:        guard let process, process.isRunning else { return }
+149-        process.terminate()
+150-        state = .stopped
+151-        refreshDiagnostics()
+152-    }
+153-
+154-    /// Restarts the app-managed Runtime. If an earlier copy of this app left
+155-    /// its bundled helper holding `runtime.lock`, the lock owner is stopped
+156-    /// only after its executable path is verified as a known actrealm path.
+157-    @discardableResult
+158:    public func restart(onBootstrap: @escaping (URL, String) -> Void) async -> String? {
+159-        state = .restarting
+160:        self.onBootstrap = nil
+161-        refreshDiagnostics()
+162-
+163-        if await bootOutOutdatedLaunchAgent() {
+164-            stdoutTail = String((stdoutTail + "已停止参数过期的 com.frontier.actrealm.runtime LaunchAgent\n").suffix(4000))
+165-        }
+166-
+167:        if let process, process.isRunning {
+168-            await terminate(processID: process.processIdentifier)
+169-        }
+170-        process = nil
+171-
+172-        if let owner = Self.lockOwnerPID(), Self.isProcessAlive(owner) {
+173-            let ownerPath = Self.processPath(owner)
+--
+188-        }
+189-
+190-        stdoutBuffer.removeAll(keepingCapacity: true)
+191-        stdoutTail = ""
+192-        stderrTail = ""
+193-        endpoint = nil
+194:        await start(onBootstrap: onBootstrap)
+195-        return nil
+196-    }
+197-
+198-    private nonisolated static func buildRelease(repoPath: URL) async -> Bool {
+199-        await withCheckedContinuation { continuation in
+200-            let proc = Process()
+201-            proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+202-            proc.arguments = ["cargo", "build", "--release", "-p", "actrealm"]
+203-            proc.currentDirectoryURL = repoPath
+204:            proc.terminationHandler = { finished in
+205-                continuation.resume(returning: finished.terminationStatus == 0)
+206-            }
+207-            do {
+208-                try proc.run()
+209-            } catch {
+210-                continuation.resume(returning: false)
+--
+221-        }
+222-        let stdout = Pipe()
+223-        let stderr = Pipe()
+224-        proc.standardOutput = stdout
+225-        proc.standardError = stderr
+226-
+227:        proc.terminationHandler = { [weak self] finished in
+228-            let status = finished.terminationStatus
+229-            Task { @MainActor in
+230-                guard let self, self.process === proc else { return }
+231-                if status == 0 {
+232-                    self.state = .stopped
+233-                } else {
+--
+283-            }
+284-        }
+285-        refreshDiagnostics()
+286-    }
+287-
+288-    private func consume(line: String) {
+289:        guard onBootstrap != nil, let parsed = Self.parseBootstrapLine(line) else { return }
+290:        let callback = onBootstrap
+291:        onBootstrap = nil
+292-        state = .running
+293-        endpoint = parsed.baseURL
+294-        refreshDiagnostics()
+295-        callback?(parsed.baseURL, parsed.token)
+296-    }
+297-
+298-    public func refreshDiagnostics() {
+299-        let owner = Self.lockOwnerPID()
+300-        let ownerAlive = owner.map(Self.isProcessAlive) ?? false
+301-        diagnostics = Diagnostics(
+302-            checkedAt: Date(),
+303:            managedPID: process.flatMap { $0.isRunning ? $0.processIdentifier : nil },
+304-            lockOwnerPID: owner,
+305-            lockOwnerPath: owner.flatMap(Self.processPath),
+306-            lockOwnerIsAlive: ownerAlive,
+307-            socketExists: FileManager.default.fileExists(atPath: Self.bridgeSocketURL.path),
+308-            helperPath: resolvedHelper()?.path,
+309-            endpoint: endpoint?.absoluteString,
+--
+358-        return await withCheckedContinuation { continuation in
+359-            let proc = Process()
+360-            proc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+361-            proc.arguments = ["bootout", "gui/\(getuid())/com.frontier.actrealm.runtime"]
+362-            proc.standardOutput = Pipe()
+363-            proc.standardError = Pipe()
+364:            proc.terminationHandler = { finished in
+365-                continuation.resume(returning: finished.terminationStatus == 0)
+366-            }
+367-            do {
+368-                try proc.run()
+369-            } catch {
+370-                continuation.resume(returning: false)
+=== detached app server ===
+76-    pending: Mutex<HashMap<String, mpsc::Sender<Result<Value, String>>>>,
+77-    next_id: AtomicU64,
+78-}
+79-
+80-impl Drop for Inner {
+81-    fn drop(&mut self) {
+82-        if let Ok(child) = self.child.get_mut() {
+83-            let _ = child.kill();
+84:            let _ = child.wait();
+85-        }
+86-    }
+87-}
+88-
+89-impl CodexConnector {
+90-    pub fn connect(
+91-        executable: &Path,
+92-        socket_path: &Path,
+93-    ) -> Result<(Self, ConnectorChannels), ConnectorError> {
+94:        ensure_app_server(executable, socket_path)?;
+95-        Self::connect_proxy(executable, socket_path)
+96-    }
+97-
+98-    fn connect_proxy(
+99-        executable: &Path,
+100-        socket_path: &Path,
+101-    ) -> Result<(Self, ConnectorChannels), ConnectorError> {
+102:        let mut child = Command::new(executable)
+103-            .args(["app-server", "proxy", "--sock"])
+104-            .arg(socket_path)
+105-            .stdin(Stdio::piped())
+106-            .stdout(Stdio::piped())
+107-            .stderr(Stdio::null())
+108-            .spawn()?;
+109-        let writer = child
+110-            .stdin
+--
+291-        if let Ok(mut pending) = self.inner.pending.lock() {
+292-            for (_, sender) in pending.drain() {
+293-                let _ = sender.send(Err(reason.to_owned()));
+294-            }
+295-        }
+296-    }
+297-}
+298-
+299:fn ensure_app_server(executable: &Path, socket_path: &Path) -> Result<(), ConnectorError> {
+300-    if UnixStream::connect(socket_path).is_ok() {
+301-        return Ok(());
+302-    }
+303-    if let Ok(metadata) = fs::symlink_metadata(socket_path) {
+304-        if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
+305-            return Err(ConnectorError::Process(
+306-                "refusing unsafe app-server socket path".to_owned(),
+307-            ));
+--
+309-        fs::remove_file(socket_path)?;
+310-    }
+311-    let parent = socket_path
+312-        .parent()
+313-        .ok_or_else(|| ConnectorError::Process("app-server socket has no parent".to_owned()))?;
+314-    fs::create_dir_all(parent)?;
+315-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+316-    let endpoint = format!("unix://{}", socket_path.display());
+317:    let mut child = Command::new(executable)
+318-        .args(["app-server", "--listen"])
+319-        .arg(endpoint)
+320-        .stdin(Stdio::null())
+321-        .stdout(Stdio::null())
+322-        .stderr(Stdio::null())
+323-        .spawn()?;
+324-    let deadline = Instant::now() + CONTROL_TIMEOUT;
+325-    loop {
+326:        if let Some(status) = child.try_wait()? {
+327-            return Err(ConnectorError::Process(format!(
+328-                "app-server exited before socket became ready: {status}"
+329-            )));
+330-        }
+331-        if UnixStream::connect(socket_path).is_ok() {
+332-            let _ = fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600));
+333:            thread::spawn(move || {
+334:                let _ = child.wait();
+335-            });
+336-            return Ok(());
+337-        }
+338-        if Instant::now() >= deadline {
+339-            let _ = child.kill();
+340:            let _ = child.wait();
+341-            return Err(ConnectorError::Timeout);
+342-        }
+343-        thread::sleep(Duration::from_millis(20));
+344-    }
+345-}
+346-
+347-fn id_key(id: &Value) -> String {
+348-    id.as_u64()
+=== animation lifecycle ===
+apps/macos/Sources/ActRealmUI/Views/ForegroundSchedulingView.swift-935-
+apps/macos/Sources/ActRealmUI/Views/ForegroundSchedulingView.swift-936-private struct FlowTrack: View {
+apps/macos/Sources/ActRealmUI/Views/ForegroundSchedulingView.swift-937-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+apps/macos/Sources/ActRealmUI/Views/ForegroundSchedulingView.swift-938-    @Environment(\.snapshotRendering) private var snapshotRendering
+apps/macos/Sources/ActRealmUI/Views/ForegroundSchedulingView.swift-939-
+apps/macos/Sources/ActRealmUI/Views/ForegroundSchedulingView.swift-940-    var body: some View {
+apps/macos/Sources/ActRealmUI/Views/ForegroundSchedulingView.swift:941:        TimelineView(.animation(
+apps/macos/Sources/ActRealmUI/Views/ForegroundSchedulingView.swift:942:            minimumInterval: 1 / 30,
+apps/macos/Sources/ActRealmUI/Views/ForegroundSchedulingView.swift:943:            paused: reduceMotion || snapshotRendering
+apps/macos/Sources/ActRealmUI/Views/ForegroundSchedulingView.swift-944-        )) { timeline in
+apps/macos/Sources/ActRealmUI/Views/ForegroundSchedulingView.swift-945-            GeometryReader { proxy in
+apps/macos/Sources/ActRealmUI/Views/ForegroundSchedulingView.swift-946-                let glowWidth = min(84, max(54, proxy.size.width * 0.24))
+apps/macos/Sources/ActRealmUI/Views/ForegroundSchedulingView.swift-947-                let phase = flowPhase(at: timeline.date)
+apps/macos/Sources/ActRealmUI/Views/ForegroundSchedulingView.swift-948-
+apps/macos/Sources/ActRealmUI/Views/ForegroundSchedulingView.swift-949-                ZStack(alignment: .leading) {
+=== acceptance incomplete gates ===
+docs/V1_ACCEPTANCE.md-117-- [x] Hook non-blocking p95 is below 50ms; event-to-UI p95 below 300ms.
+docs/V1_ACCEPTANCE.md-118-- [x] Idle runtime CPU is below 0.5%; short Runtime/browser resource gates are
+docs/V1_ACCEPTANCE.md-119-      within budget.
+docs/V1_ACCEPTANCE.md:120:- [ ] Runtime RSS remains below 80MB throughout a continuous 48-hour soak on
+docs/V1_ACCEPTANCE.md-121-      the exact frozen release candidate.
+docs/V1_ACCEPTANCE.md-122-- [x] Every pass-through path leaves the Provider interface usable.
+docs/V1_ACCEPTANCE.md-123-
+--
+docs/V1_ACCEPTANCE.md-224-- [x] Exact candidate is installed locally and accepted by the user on
+docs/V1_ACCEPTANCE.md-225-      2026-07-17 before any commit or GitHub push.
+docs/V1_ACCEPTANCE.md-226-
+docs/V1_ACCEPTANCE.md:227:### M13 - Provider-owned approval-state coordination
+docs/V1_ACCEPTANCE.md-228-
+docs/V1_ACCEPTANCE.md-229-- [x] Codex auto-review/guardian ownership avoids a competing ActRealm
+docs/V1_ACCEPTANCE.md-230-      blocking waiter.
+--
+docs/V1_ACCEPTANCE.md-454-Each milestone is implemented test-first. A test-candidate branch push requires
+docs/V1_ACCEPTANCE.md-455-its automated/local gates and explicit user authorization. A milestone is not
+docs/V1_ACCEPTANCE.md-456-marked accepted until its required manual evidence also passes. Failed or
+docs/V1_ACCEPTANCE.md:457:incomplete gates remain visible and are never represented as complete in
+docs/V1_ACCEPTANCE.md-458-documentation, tags, or releases. Merging to `main`, changing the default
+docs/V1_ACCEPTANCE.md-459-branch, versioning, tagging, and publishing a release require separate user
+docs/V1_ACCEPTANCE.md-460-approval.
+=== package minimum/version ===
+apps/macos/Package.swift:6:    platforms: [
+apps/macos/Resources/Info.plist:17:    <key>CFBundleShortVersionString</key>
+apps/macos/Resources/Info.plist:19:    <key>CFBundleVersion</key>
+apps/macos/Resources/Info.plist:21:    <key>LSMinimumSystemVersion</key>

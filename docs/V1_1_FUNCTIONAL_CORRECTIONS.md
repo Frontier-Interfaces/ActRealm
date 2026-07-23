@@ -99,10 +99,13 @@ Adopted lessons:
   payload display or export path.
 - Claude direct answers use official blocking Hook output. Secret content is
   validated and forwarded from memory, then released with the waiter.
-- Codex direct answers exist only after explicit app-server attach. The
-  Connector initializes an official persistent private Unix-Socket app-server
-  plus proxy transport with experimental API capability, resumes saved Thread IDs, and handles
-  `item/tool/requestUserInput`. Hook-only Codex stays observe/approval-only.
+- Codex direct answers and managed approvals exist only after explicit
+  app-server attach. The Connector owns an official `app-server --stdio`
+  child, resumes saved Thread IDs, handles `item/tool/requestUserInput`, and
+  enables command/file/permissions approval only for the verified 0.144
+  schema family. Hook-only Codex keeps its own request-keyed Hook controls or
+  observation-only native state; ActRealm never upgrades an arbitrary
+  independent Desktop conversation.
 - Runtime restart restores SQLite session presentation and reconnects saved
   managed Threads, but every old permission/question waiter expires first.
   A fresh Provider request is required before the UI becomes actionable again.

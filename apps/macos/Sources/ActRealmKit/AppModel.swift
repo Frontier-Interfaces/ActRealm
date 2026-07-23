@@ -9,6 +9,61 @@ public enum BridgeStatus: Equatable, Sendable {
     public var isListening: Bool { self == .listening }
 }
 
+enum RuntimeStatusMessagePolicy {
+    static let waitingForControl = "Runtime 已启动，但控制连接尚未恢复"
+    static let reconnected = "Runtime 已重新启动并恢复连接"
+
+    static func reconciled(_ message: String?, status: BridgeStatus) -> String? {
+        switch status {
+        case .listening:
+            if message == waitingForControl {
+                return reconnected
+            }
+            if message?.hasPrefix("唤醒后恢复失败：") == true {
+                return "Runtime 已恢复实时连接"
+            }
+            return message
+        case .starting, .absent:
+            if message == reconnected
+                || message == "Runtime 已恢复实时连接"
+                || message == "已恢复实时连接并请求额度更新"
+            {
+                return nil
+            }
+            return message
+        }
+    }
+}
+
+/// Keeps OUTBOX selection attached to a stable Runtime identity instead of a
+/// transient array position. Runtime snapshots may reorder attention items as
+/// priorities or timestamps change, so an index can silently select the wrong
+/// request after any insert or resolution.
+public enum OutboxSelection {
+    public static func resolvedID(
+        currentID: String?,
+        previousEntries: [OutboxEntry] = [],
+        entries: [OutboxEntry]
+    ) -> String? {
+        if let currentID,
+           let current = entries.first(where: { $0.id == currentID })
+        {
+            let previousIDs = Set(previousEntries.map(\.id))
+            if !previousEntries.isEmpty,
+               let urgentArrival = entries.first(where: {
+                !previousIDs.contains($0.id)
+                    && $0.state == .open
+                    && $0.kind.sortRank < current.kind.sortRank
+               })
+            {
+                return urgentArrival.id
+            }
+            return currentID
+        }
+        return entries.first?.id
+    }
+}
+
 /// Mutually-exclusive policy used when an eligible event enters Agent Focus.
 public enum ForegroundArrivalStrategy: String, CaseIterable, Codable, Sendable, Hashable {
     case immediate
@@ -356,6 +411,19 @@ private struct ForegroundQueuedArrival: Equatable, Sendable {
     let receivedAt: Date
 }
 
+enum SnapshotProjectionPolicy {
+    /// Background Agent work may change token counters every second. Those
+    /// snapshots remain cached, but they must not invalidate the whole
+    /// SwiftUI tree while the window is minimized or genuinely occluded.
+    /// Merely focusing Codex beside a visible ActRealm window is not a reason
+    /// to pause. Attention/command changes always project immediately.
+    static func shouldApply(previous: Snapshot, next: Snapshot, workspaceVisible: Bool) -> Bool {
+        workspaceVisible
+            || previous.attention != next.attention
+            || previous.commands != next.commands
+    }
+}
+
 /// Top-level observable state for every scene (main window, HUD, menu bar,
 /// settings). Owns the runtime supervisor + client and projects snapshots
 /// into `DerivedState`.
@@ -377,6 +445,10 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var claudeQuotaBridge: ClaudeQuotaBridge?
     @Published public private(set) var isSetupBusy = false
     @Published public private(set) var isSettingsBusy = false
+    @Published public private(set) var isQuotaRefreshBusy = false
+    /// Persistent result shown in Settings. A main-window toast alone is not
+    /// visible while the separate Settings scene is frontmost.
+    @Published public private(set) var quotaRefreshMessage: String?
     @Published public private(set) var eventUIP95Ms: UInt64?
     /// Monotonic event observed by the AppKit shell to play the optional local
     /// arrival sound without moving platform UI code into ActRealmKit.
@@ -388,9 +460,12 @@ public final class AppModel: ObservableObject {
     /// Live main-window aspect ratio used by Settings to preview the same
     /// scaled-to-fill crop the user will see in the workspace.
     @Published public private(set) var mainWindowAspectRatio = 1440.0 / 820.0
+    /// AppKit-projected window visibility. Continuous visual effects pause
+    /// only while the workspace is minimized or genuinely occluded.
+    @Published public private(set) var isWorkspaceAnimationActive = true
 
-    /// Index of the approval card currently shown in the OUTBOX stack.
-    @Published public var outboxPageIndex: Int = 0
+    /// Stable Runtime attention identity currently shown in the OUTBOX stack.
+    @Published public private(set) var selectedOutboxID: String?
     /// Session pinned by tapping an OUTBOX card (spec §3.7 cross-column link).
     @Published public var pinnedSessionId: String?
     /// Expanded row in the interaction model's AGENT TASKS column.
@@ -441,10 +516,12 @@ public final class AppModel: ObservableObject {
     private var foregroundQueue: [ForegroundQueuedArrival] = []
     private var lastSetupRefreshEventCount: UInt64 = 0
     private var latestSnapshot: Snapshot = .empty
+    private var hasDeferredSnapshotProjection = false
     private var persistedUISettings: UISettings = .defaults
     private var renderedEventCount: UInt64 = 0
     private var eventUILatenciesMs: [UInt64] = []
     private var started = false
+    private var wakeRecoveryTask: Task<Void, Never>?
 
     public init(
         repoPath: URL? = nil,
@@ -508,7 +585,7 @@ public final class AppModel: ObservableObject {
         client.$snapshot
             .receive(on: RunLoop.main)
             .sink { [weak self] snapshot in
-                self?.apply(snapshot: snapshot)
+                self?.receive(snapshot: snapshot)
             }
             .store(in: &cancellables)
         client.$connectionState
@@ -533,6 +610,7 @@ public final class AppModel: ObservableObject {
         hudPreviewTask?.cancel()
         settingsSaveTask?.cancel()
         setupRefreshTask?.cancel()
+        wakeRecoveryTask?.cancel()
     }
 
     // MARK: - Lifecycle
@@ -577,6 +655,25 @@ public final class AppModel: ObservableObject {
         supervisor.refreshDiagnostics()
     }
 
+    public func handleSystemWake() {
+        guard !isDemo, started else { return }
+        wakeRecoveryTask?.cancel()
+        wakeRecoveryTask = Task { [weak self] in
+            guard let self else { return }
+            // Give loopback networking a short window to resume before
+            // replacing the suspended WebSocket.
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled else { return }
+            if let error = await client.recoverAfterSystemWake() {
+                runtimeActionMessage = "唤醒后恢复失败：\(error)"
+                restartRuntime()
+            } else {
+                runtimeActionMessage = "已恢复实时连接并请求额度更新"
+                supervisor.refreshDiagnostics()
+            }
+        }
+    }
+
     public func restartRuntime() {
         guard !isDemo, !isRestartingRuntime else { return }
         isRestartingRuntime = true
@@ -608,9 +705,9 @@ public final class AppModel: ObservableObject {
             }
             supervisor.refreshDiagnostics()
             if bridgeStatus.isListening {
-                runtimeActionMessage = "Runtime 已重新启动并恢复连接"
+                runtimeActionMessage = RuntimeStatusMessagePolicy.reconnected
             } else if runtimeActionMessage == nil {
-                runtimeActionMessage = "Runtime 已启动，但控制连接尚未恢复"
+                runtimeActionMessage = RuntimeStatusMessagePolicy.waitingForControl
             }
             isRestartingRuntime = false
         }
@@ -715,6 +812,48 @@ public final class AppModel: ObservableObject {
         }
     }
 
+    public func refreshQuotaNow() async {
+        guard !isDemo, !isQuotaRefreshBusy else { return }
+        guard canControlRuntime else {
+            let message = "Runtime 未连接，暂时无法刷新额度"
+            quotaRefreshMessage = message
+            showToast(message)
+            return
+        }
+        isQuotaRefreshBusy = true
+        defer { isQuotaRefreshBusy = false }
+        quotaRefreshMessage = "正在通过 Anthropic 官方接口更新…"
+        let previousCapture = Self.latestClaudeQuotaCapture(in: client.snapshot)
+        if let error = await client.requestQuotaRefresh() {
+            let message = "额度刷新失败：\(error)"
+            quotaRefreshMessage = message
+            showToast(message)
+            return
+        }
+        for _ in 0..<12 {
+            if let currentCapture = Self.latestClaudeQuotaCapture(in: client.snapshot),
+               previousCapture.map({ currentCapture > $0 }) ?? true
+            {
+                let message = "Claude 额度已主动更新"
+                quotaRefreshMessage = message
+                showToast(message)
+                return
+            }
+            try? await Task.sleep(for: .seconds(1))
+            await client.refreshSnapshot()
+        }
+        let message = "已请求刷新，但 Claude 暂未返回新额度；请启动 Claude Code CLI 并开始一次会话后重试"
+        quotaRefreshMessage = message
+        showToast(message)
+    }
+
+    nonisolated static func latestClaudeQuotaCapture(in snapshot: Snapshot) -> UInt64? {
+        snapshot.quota
+            .filter { $0.provider == "claude" }
+            .compactMap(\.capturedAt)
+            .max()
+    }
+
     public func exportLocalData(metricsOnly: Bool) async -> Data? {
         let (data, error) = await client.exportData(metricsOnly: metricsOnly)
         if data == nil { showToast("导出失败：\(error ?? "未知错误")") }
@@ -741,6 +880,10 @@ public final class AppModel: ObservableObject {
         action: String,
         answers: [String: JSONValue]? = nil
     ) async -> Bool {
+        guard canControlRuntime else {
+            showToast("Runtime 控制通道已断开；请恢复连接后再回答")
+            return false
+        }
         guard let requestId = entry.attention.requestId else {
             showToast("这个问题没有可用的回复通道")
             return false
@@ -784,7 +927,7 @@ public final class AppModel: ObservableObject {
         if let error = await client.manageSession(task.id) {
             showToast("托管连接失败：\(error)")
         } else {
-            showToast("Codex 对话已由 ActRealm app-server Connector 接管")
+            showToast("已连接 ActRealm app-server；Codex 原生窗口仍保留当前 Turn 的控制权")
         }
     }
 
@@ -802,20 +945,38 @@ public final class AppModel: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 guard let self else { return }
-                self.now = Date()
-                self.advanceForegroundDispatch(at: self.now)
-                if let deadline = self.hudArrivalDeadline, self.now >= deadline {
+                let tick = Date()
+                if self.isWorkspaceAnimationActive {
+                    self.now = tick
+                }
+                self.advanceForegroundDispatch(at: tick)
+                if let deadline = self.hudArrivalDeadline, tick >= deadline {
                     self.hudArrivalID = nil
                     self.hudArrivalDeadline = nil
                 }
-                if self.isDemo {
-                    self.derived = DemoData.derivedState(now: self.now)
+                if self.isDemo, self.isWorkspaceAnimationActive {
+                    self.derived = DemoData.derivedState(now: tick)
                 }
             }
         }
     }
 
     // MARK: - Snapshot handling
+
+    func receive(snapshot: Snapshot) {
+        let previous = latestSnapshot
+        latestSnapshot = snapshot
+        guard SnapshotProjectionPolicy.shouldApply(
+            previous: previous,
+            next: snapshot,
+            workspaceVisible: isWorkspaceAnimationActive
+        ) else {
+            hasDeferredSnapshotProjection = true
+            return
+        }
+        hasDeferredSnapshotProjection = false
+        apply(snapshot: snapshot)
+    }
 
     private func apply(snapshot: Snapshot, emitArrivals: Bool = true) {
         latestSnapshot = snapshot
@@ -880,7 +1041,13 @@ public final class AppModel: ObservableObject {
         }
         if emitArrivals { seededNotifications = true }
 
+        let previousOutbox = derived.openOutbox
         derived = next
+        selectedOutboxID = OutboxSelection.resolvedID(
+            currentID: selectedOutboxID,
+            previousEntries: previousOutbox,
+            entries: next.openOutbox
+        )
         if shouldStartNextFocus {
             startNextForegroundArrivalIfNeeded(at: Date())
         }
@@ -902,7 +1069,6 @@ public final class AppModel: ObservableObject {
             }
             renderedEventCount = snapshot.stats.eventCount
         }
-        clampOutboxPage()
         if snapshot.stats.eventCount != lastSetupRefreshEventCount {
             lastSetupRefreshEventCount = snapshot.stats.eventCount
             scheduleSetupRefresh()
@@ -923,55 +1089,78 @@ public final class AppModel: ObservableObject {
         backend: RuntimeSupervisor.State
     ) {
         if isDemo { return }
-        switch (backend, connection) {
+        let nextStatus: BridgeStatus = switch (backend, connection) {
         case (_, .live):
-            bridgeStatus = .listening
+            .listening
         case (.failed(let message), _):
-            bridgeStatus = .absent(message)
+            .absent(message)
         case (.stopped, _):
-            bridgeStatus = .absent("Runtime 已退出")
+            .absent("Runtime 已退出")
         case (.buildingBackend, _), (.launching, _), (.restarting, _), (.idle, _), (_, .connecting), (_, .idle):
-            bridgeStatus = .starting
+            .starting
         case (_, .error(let message)):
-            bridgeStatus = .absent(message)
+            .absent(message)
         }
-    }
-
-    private func clampOutboxPage() {
-        let count = derived.openOutbox.count
-        if outboxPageIndex >= count {
-            outboxPageIndex = max(0, count - 1)
-        }
+        bridgeStatus = nextStatus
+        runtimeActionMessage = RuntimeStatusMessagePolicy.reconciled(
+            runtimeActionMessage,
+            status: nextStatus
+        )
     }
 
     // MARK: - User actions
 
+    public var canControlRuntime: Bool { isDemo || bridgeStatus.isListening }
+
+    public func selectOutbox(id: String) {
+        guard derived.openOutbox.contains(where: { $0.id == id }) else { return }
+        selectedOutboxID = id
+    }
+
     public func approve(_ entry: OutboxEntry) {
-        guard entry.state == .open else { return }
+        guard canControlRuntime, entry.state == .open else { return }
         send(.approve, entry: entry)
     }
 
     public func deny(_ entry: OutboxEntry) {
-        guard entry.state == .open else { return }
+        guard canControlRuntime, entry.state == .open else { return }
         send(.deny, entry: entry)
     }
 
     /// "去原窗口核对 / 处理" — hands the decision back to the CLI window.
     public func passThrough(_ entry: OutboxEntry) {
+        guard canControlRuntime else { return }
         send(.passThrough, entry: entry)
     }
 
     /// "标记已处理 / 确认完成" for question, error, completion items.
     public func acknowledge(_ entry: OutboxEntry) {
-        send(.ack, entry: entry)
+        guard canControlRuntime else { return }
+        guard !isDemo else { return }
+        let requestId = entry.attention.requestId
+        Task {
+            if let error = await client.send(
+                action: .ack,
+                attentionId: entry.id,
+                requestId: requestId
+            ) {
+                showToast("处理失败：\(error)")
+            } else {
+                showToast(Self.acknowledgementToast(for: entry))
+            }
+        }
     }
 
     public func snooze(_ entry: OutboxEntry) {
+        guard canControlRuntime else { return }
         send(.snooze, entry: entry)
     }
 
     public func undoPendingDecision() {
-        guard let pending = derived.pendingDecision, case .undoable = pending.phase else { return }
+        guard canControlRuntime,
+              let pending = derived.pendingDecision,
+              case .undoable = pending.phase
+        else { return }
         guard !isDemo else { return }
         Task { await client.undo(commandId: pending.commandId) }
     }
@@ -985,9 +1174,9 @@ public final class AppModel: ObservableObject {
     /// Cross-column link: jump the OUTBOX pager to a task's first open item.
     public func revealOutbox(for task: LaneTask) {
         guard let target = task.firstOpenOutboxId,
-              let index = derived.openOutbox.firstIndex(where: { $0.id == target })
+              derived.openOutbox.contains(where: { $0.id == target })
         else { return }
-        outboxPageIndex = index
+        selectedOutboxID = target
         outboxHighlighted = true
         showToast("已定位到 OUTBOX 待处理事项")
         outboxHighlightTask?.cancel()
@@ -1186,6 +1375,17 @@ public final class AppModel: ObservableObject {
         let ratio = Double(size.width / size.height)
         guard abs(ratio - mainWindowAspectRatio) > 0.001 else { return }
         mainWindowAspectRatio = ratio
+    }
+
+    public func updateWorkspaceAnimationActive(_ active: Bool) {
+        guard active != isWorkspaceAnimationActive else { return }
+        isWorkspaceAnimationActive = active
+        guard active else { return }
+        now = Date()
+        if hasDeferredSnapshotProjection {
+            hasDeferredSnapshotProjection = false
+            apply(snapshot: latestSnapshot)
+        }
     }
 
     private static func clampedLaneOpacity(_ value: Double) -> Double {
@@ -1527,8 +1727,21 @@ public final class AppModel: ObservableObject {
     }
 
     private func send(_ action: AttentionAction, entry: OutboxEntry) {
-        guard !isDemo else { return }
+        guard canControlRuntime, !isDemo else { return }
         let requestId = entry.attention.requestId
-        Task { await client.send(action: action, attentionId: entry.id, requestId: requestId) }
+        Task {
+            _ = await client.send(action: action, attentionId: entry.id, requestId: requestId)
+        }
+    }
+
+    nonisolated static func acknowledgementToast(for entry: OutboxEntry) -> String {
+        let subject = entry.taskTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let suffix = subject.flatMap { $0.isEmpty ? nil : "：\($0)" } ?? ""
+        return switch entry.kind {
+        case .completion: "已确认任务完成\(suffix)"
+        case .error: "已标记问题解决\(suffix)"
+        case .question: "已标记提问处理\(suffix)"
+        case .approval, .nativeApproval: "已确认处理\(suffix)"
+        }
     }
 }
