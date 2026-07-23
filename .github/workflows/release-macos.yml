@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   package:
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +32,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.85"
+          toolchain: "1.97"
 
       - uses: Swatinem/rust-cache@v2
 
