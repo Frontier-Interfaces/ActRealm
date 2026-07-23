@@ -18,9 +18,11 @@ not weaken or replace the full plan.
   approve, deny, or pass-through. Multiple sessions may wait concurrently, but
   every waiter is request-keyed and receives exactly one outcome. v1.1 adds
   Claude's official AskUserQuestion/Elicitation Hook replies and an explicit,
-  version-gated Codex app-server Connector for requestUserInput and Thread
-  recovery. Interrupt, steer, Coach, cloud accounts, and telemetry remain out
-  of scope.
+  version-gated Codex app-server Connector for requestUserInput,
+  request-keyed command/file/permissions approval delivered on the
+  ActRealm-owned connection, and Thread recovery. Explicit attach alone does
+  not transfer an already-running Codex Desktop Turn. Interrupt, steer,
+  Coach, cloud accounts, and telemetry remain out of scope.
 
 ## Milestone gates
 

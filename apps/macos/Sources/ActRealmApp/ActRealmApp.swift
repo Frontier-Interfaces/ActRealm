@@ -34,6 +34,13 @@ struct ActRealmApp: App {
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                     Task { await model.refreshSetup() }
                 }
+                .onReceive(
+                    NSWorkspace.shared.notificationCenter.publisher(
+                        for: NSWorkspace.didWakeNotification
+                    )
+                ) { _ in
+                    model.handleSystemWake()
+                }
         }
         .defaultSize(width: 1440, height: 820)
         .windowStyle(.hiddenTitleBar)

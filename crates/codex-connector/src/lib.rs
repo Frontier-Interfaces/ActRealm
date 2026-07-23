@@ -74,7 +74,14 @@ struct Inner {
     writer: Mutex<ChildStdin>,
     child: Mutex<Option<Child>>,
     pending: Mutex<HashMap<String, mpsc::Sender<Result<Value, String>>>>,
+    protocol: Mutex<ProtocolSupport>,
     next_id: AtomicU64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProtocolSupport {
+    server_user_agent: Option<String>,
+    managed_approvals: bool,
 }
 
 impl Drop for Inner {
@@ -132,6 +139,7 @@ impl CodexConnector {
                 writer: Mutex::new(writer),
                 child: Mutex::new(Some(child)),
                 pending: Mutex::new(HashMap::new()),
+                protocol: Mutex::new(ProtocolSupport::default()),
                 next_id: AtomicU64::new(1),
             }),
         };
@@ -202,7 +210,7 @@ impl CodexConnector {
     }
 
     fn initialize(&self) -> Result<(), ConnectorError> {
-        self.call(
+        let result = self.call(
             "initialize",
             json!({
                 "clientInfo": {
@@ -217,7 +225,35 @@ impl CodexConnector {
             }),
             RPC_TIMEOUT,
         )?;
+        let user_agent = result
+            .get("userAgent")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let managed_approvals = user_agent
+            .as_deref()
+            .and_then(codex_version)
+            .is_some_and(managed_approval_schema_supported);
+        if let Ok(mut protocol) = self.inner.protocol.lock() {
+            protocol.server_user_agent = user_agent;
+            protocol.managed_approvals = managed_approvals;
+        }
         self.notify("initialized", json!({}))
+    }
+
+    pub fn supports_managed_approvals(&self) -> bool {
+        self.inner
+            .protocol
+            .lock()
+            .map(|protocol| protocol.managed_approvals)
+            .unwrap_or(false)
+    }
+
+    pub fn server_user_agent(&self) -> Option<String> {
+        self.inner
+            .protocol
+            .lock()
+            .ok()
+            .and_then(|protocol| protocol.server_user_agent.clone())
     }
 
     pub fn list_threads(&self) -> Result<Vec<CodexThread>, ConnectorError> {
@@ -437,6 +473,26 @@ fn protocol_variant(value: Option<&Value>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn codex_version(user_agent: &str) -> Option<(u64, u64, u64)> {
+    user_agent
+        .split(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .find_map(|candidate| {
+            let mut parts = candidate.split('.');
+            let major = parts.next()?.parse().ok()?;
+            let minor = parts.next()?.parse().ok()?;
+            let patch = parts.next()?.parse().ok()?;
+            Some((major, minor, patch))
+        })
+}
+
+fn managed_approval_schema_supported(version: (u64, u64, u64)) -> bool {
+    // These request/response shapes are generated and verified against the
+    // installed 0.144 app-server schema. A later minor must be sampled before
+    // controls are exposed; unsupported versions degrade to truthful
+    // observation instead of guessing a response contract.
+    ((0, 144, 5)..(0, 145, 0)).contains(&version)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -462,7 +518,7 @@ fi
 while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*)
-      printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex","platformFamily":"unix","platformOs":"macos","userAgent":"fake"}}'
+      printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex","platformFamily":"unix","platformOs":"macos","userAgent":"codex_cli_rs/0.144.6"}}'
       ;;
     *'"method":"thread/list"'*)
       printf '%s\n' '{"id":2,"result":{"data":[{"id":"thread-1","sessionId":"session-1","cwd":"/tmp/project","name":"Recovered thread","status":{"type":"active","activeFlags":["waitingOnUserInput"]},"turns":[],"updatedAt":100}]}}'
@@ -482,6 +538,11 @@ done
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
 
         let (connector, channels) = CodexConnector::connect_stdio(&executable).unwrap();
+        assert!(connector.supports_managed_approvals());
+        assert_eq!(
+            connector.server_user_agent().as_deref(),
+            Some("codex_cli_rs/0.144.6")
+        );
         let weak_connector = connector.downgrade();
         let child_id = connector.managed_child_id();
         let threads = connector.list_threads().unwrap();
@@ -530,5 +591,15 @@ p101\nccodex\nn/Users/test/.codex/app-server.sock\n\
 p102\ncother\nn/Users/test/.actrealm/run/codex-app-server.sock\n\
 p100\nccodex\nn/Users/test/.actrealm/run/codex-app-server.sock\n";
         assert_eq!(legacy_listener_pids(fields, socket), vec![100]);
+    }
+
+    #[test]
+    fn managed_approval_gate_tracks_versioned_app_server_schema() {
+        assert_eq!(codex_version("codex_cli_rs/0.144.6"), Some((0, 144, 6)));
+        assert_eq!(codex_version("codex-cli 1.2.3"), Some((1, 2, 3)));
+        assert_eq!(codex_version("fake"), None);
+        assert!(managed_approval_schema_supported((0, 144, 6)));
+        assert!(!managed_approval_schema_supported((0, 144, 4)));
+        assert!(!managed_approval_schema_supported((0, 145, 0)));
     }
 }

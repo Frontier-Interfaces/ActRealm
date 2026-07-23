@@ -545,6 +545,18 @@ fn pass_through_ack_snooze_and_websocket_snapshot_are_real() {
             now_millis(),
         ))
         .unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"UserPromptSubmit",
+                "session_id":"titled-session",
+                "cwd":"/tmp/real-project",
+                "prompt":"真实的新任务"
+            }),
+            now_millis(),
+        ))
+        .unwrap();
     let items = store.snapshot().unwrap().attention;
     let error = items.iter().find(|item| item.provider == "claude").unwrap();
     let snooze = items

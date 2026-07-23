@@ -117,7 +117,7 @@ fn existing_v1_database_adds_task_titles_without_losing_sessions() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        10
+        11
     );
     let usage_columns = connection
         .prepare("PRAGMA table_info(session_usage)")
@@ -876,6 +876,115 @@ fn codex_auto_review_is_observed_without_creating_a_competing_waiter() {
 }
 
 #[test]
+fn codex_noninteractive_modes_are_not_labeled_as_auto_approval() {
+    let root = temp_root("codex-full-access");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    for (index, mode) in [
+        "danger-full-access",
+        "bypassPermissions",
+        "fullAccess",
+        "full_access",
+        "never",
+        "dontAsk",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Codex,
+                json!({
+                    "hook_event_name":"PermissionRequest",
+                    "session_id":format!("noninteractive-{index}"),
+                    "turn_id":"turn-1",
+                    "tool_name":"Bash",
+                    "permission_mode":mode
+                }),
+                1_000 + index as u64,
+            ))
+            .unwrap();
+    }
+    let snapshot = store.snapshot().unwrap();
+    assert!(snapshot.attention.is_empty());
+    assert!(snapshot
+        .sessions
+        .iter()
+        .all(|session| session.approval_owner.is_none()));
+    for session in snapshot
+        .sessions
+        .iter()
+        .filter(|session| session.permission_mode.as_deref() != Some("dontAsk"))
+    {
+        assert_eq!(
+            session.activity.as_deref(),
+            Some("Codex 完全访问模式，无需用户审批")
+        );
+    }
+    assert_eq!(
+        snapshot
+            .sessions
+            .iter()
+            .find(|session| session.permission_mode.as_deref() == Some("dontAsk"))
+            .and_then(|session| session.activity.as_deref()),
+        Some("Codex 非交互模式，不会请求用户审批")
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn managed_codex_approval_replaces_observation_only_native_attention() {
+    let root = temp_root("managed-codex-native-dedupe");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"SessionStart",
+                "session_id":"managed-thread"
+            }),
+            1_000,
+        ))
+        .unwrap();
+    store
+        .sync_native_approval(Provider::Codex, "managed-thread", true, true, 1_100)
+        .unwrap();
+    store
+        .ingest(
+            BridgeRequest::codex_approval_at(
+                "item/fileChange/requestApproval",
+                json!({
+                    "threadId":"managed-thread",
+                    "turnId":"turn-1",
+                    "itemId":"item-1",
+                    "startedAtMs":1_200,
+                    "reason":"write a fixture",
+                    "grantRoot":"/tmp/project"
+                }),
+                1_200,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(
+        snapshot
+            .attention
+            .iter()
+            .filter(|item| item.kind == "approval" && item.state == "open")
+            .count(),
+        1
+    );
+    assert!(snapshot.attention.iter().any(|item| {
+        item.kind == "native_approval"
+            && item.state == "resolved"
+            && item.resolution.as_deref() == Some("direct_channel_available")
+    }));
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn native_provider_approval_is_visible_and_resolves_with_the_provider_state() {
     let root = temp_root("native-provider-approval");
     let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
@@ -998,8 +1107,8 @@ fn codex_request_permissions_hook_tracks_native_request_without_claiming_a_decis
     );
     assert_eq!(preserved.attention[0].state, "open");
 
-    // PostToolUse means only that Codex finished handling the request. It does
-    // not reveal whether the user approved or denied it.
+    // Real Codex Desktop sends PostToolUse(request_permissions) and Stop while
+    // its permission sheet is still visible. Neither event is a user decision.
     store
         .ingest(BridgeRequest::from_hook_at(
             Provider::Codex,
@@ -1014,22 +1123,175 @@ fn codex_request_permissions_hook_tracks_native_request_without_claiming_a_decis
             100_002,
         ))
         .unwrap();
-    let handled = store.snapshot().unwrap();
-    assert_eq!(handled.attention[0].state, "resolved");
+    let post_tool = store.snapshot().unwrap();
+    assert_eq!(post_tool.attention[0].state, "open");
+    assert_eq!(post_tool.sessions[0].exec_state, "awaiting_approval");
     assert_eq!(
-        handled.attention[0].resolution.as_deref(),
-        Some("provider_handled")
+        post_tool.sessions[0].approval_owner.as_deref(),
+        Some("terminal")
     );
-    assert_eq!(handled.sessions[0].exec_state, "thinking");
+
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"Stop",
+                "session_id":"codex-desktop-native",
+                "turn_id":"turn-native"
+            }),
+            100_003,
+        ))
+        .unwrap();
+    let stopped_but_waiting = store.snapshot().unwrap();
+    assert_eq!(stopped_but_waiting.attention[0].state, "open");
+    assert_eq!(
+        stopped_but_waiting.sessions[0].exec_state,
+        "awaiting_approval"
+    );
+    assert!(!stopped_but_waiting
+        .attention
+        .iter()
+        .any(|item| item.kind == "completion" && item.state == "open"));
+
+    // Only the explicit Provider waiting flag ending resolves the neutral
+    // observation. An inactive Thread then produces the normal completion.
+    store
+        .sync_native_approval(
+            Provider::Codex,
+            "codex-desktop-native",
+            false,
+            false,
+            100_004,
+        )
+        .unwrap();
+    let handled = store.snapshot().unwrap();
+    let native = handled
+        .attention
+        .iter()
+        .find(|item| item.kind == "native_approval")
+        .unwrap();
+    assert_eq!(native.state, "resolved");
+    assert_eq!(native.resolution.as_deref(), Some("provider_handled"));
+    assert_eq!(handled.sessions[0].exec_state, "response_finished");
     assert_eq!(handled.sessions[0].approval_owner, None);
     assert!(handled.sessions[0]
         .activity
         .as_deref()
-        .is_some_and(|activity| activity.contains("Codex 原界面处理")));
+        .is_some_and(|activity| activity.contains("Codex 原界面权限请求已处理")));
     assert!(!handled.sessions[0]
         .activity
         .as_deref()
         .is_some_and(|activity| activity.contains("批准") || activity.contains("拒绝")));
+    assert!(handled
+        .attention
+        .iter()
+        .any(|item| item.kind == "completion" && item.state == "open"));
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn codex_plugin_install_hook_surfaces_provider_owned_attention_until_codex_advances() {
+    let root = temp_root("codex-plugin-install-native");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let start = BridgeRequest::from_hook_at(
+        Provider::Codex,
+        json!({
+            "hook_event_name":"PreToolUse",
+            "session_id":"codex-plugin-session",
+            "turn_id":"turn-plugin",
+            "cwd":"/tmp/example-project",
+            "tool_name":"request_plugin_install",
+            "tool_use_id":"plugin-install-github",
+            "tool_input":{
+                "plugin_id":"github@openai-curated-remote",
+                "suggest_reason":"GitHub 插件可连接仓库、PR 和工作流。"
+            }
+        }),
+        110_000,
+    );
+    assert!(!start.needs_reply);
+    let ingested = store.ingest(start).unwrap();
+    assert_eq!(ingested.kind, actrealm_core::EventKind::PermissionRequested);
+
+    let waiting = store.snapshot().unwrap();
+    let native = waiting
+        .attention
+        .iter()
+        .find(|item| item.kind == "native_approval")
+        .unwrap();
+    assert_eq!(native.title, "Codex 请求安装或连接 GitHub");
+    assert_eq!(
+        native.detail.as_deref(),
+        Some("GitHub 插件可连接仓库、PR 和工作流。 请回到 Codex 原界面确认或取消。")
+    );
+    assert_eq!(native.request_id, None);
+    assert_eq!(waiting.sessions[0].exec_state, "awaiting_approval");
+    assert_eq!(
+        waiting.sessions[0].approval_owner.as_deref(),
+        Some("terminal")
+    );
+    assert_eq!(
+        waiting.sessions[0].activity.as_deref(),
+        Some("等待你在 Codex 中确认安装或连接 GitHub")
+    );
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"Notification",
+                "session_id":"codex-plugin-session",
+                "turn_id":"turn-plugin",
+                "message":"waiting for the native plugin dialog"
+            }),
+            110_001,
+        ))
+        .unwrap();
+    let still_waiting = store.snapshot().unwrap();
+    assert_eq!(still_waiting.sessions[0].exec_state, "awaiting_approval");
+    assert!(still_waiting
+        .attention
+        .iter()
+        .any(|item| item.kind == "native_approval" && item.state == "open"));
+
+    // Codex emits the plugin function output only after the native dialog
+    // resolves. A declined request remains neutral: ActRealm observes that it
+    // was handled, but never invents an approve or deny decision.
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"PostToolUse",
+                "session_id":"codex-plugin-session",
+                "turn_id":"turn-plugin",
+                "tool_name":"request_plugin_install",
+                "tool_use_id":"plugin-install-github",
+                "tool_response":{
+                    "completed":false,
+                    "user_confirmed":false,
+                    "tool_name":"GitHub"
+                }
+            }),
+            110_002,
+        ))
+        .unwrap();
+    let handled = store.snapshot().unwrap();
+    assert_eq!(handled.sessions[0].exec_state, "thinking");
+    assert_eq!(handled.sessions[0].approval_owner, None);
+    assert_eq!(
+        handled.sessions[0].activity.as_deref(),
+        Some("Codex 原界面请求已处理，继续运行")
+    );
+    assert!(!handled.sessions[0]
+        .activity
+        .as_deref()
+        .is_some_and(|activity| activity.contains("批准") || activity.contains("拒绝")));
+    assert!(handled.attention.iter().any(|item| {
+        item.kind == "native_approval"
+            && item.state == "resolved"
+            && item.resolution.as_deref() == Some("provider_advanced")
+    }));
 
     drop(store);
     fs::remove_dir_all(root).unwrap();
@@ -2027,6 +2289,91 @@ fn successful_turn_without_write_tools_still_creates_completion_attention() {
     assert_eq!(completion.state, "open");
     assert_eq!(completion.title, "任务已完成，等你确认");
     drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn lifecycle_replay_does_not_create_a_task_completion_or_meaningful_activity() {
+    let root = temp_root("lifecycle-only");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    for (event, at) in [("SessionStart", 80_000), ("SessionEnd", 80_001)] {
+        store
+            .ingest(request_at(
+                Provider::Claude,
+                event,
+                "historical-session",
+                None,
+                None,
+                at,
+            ))
+            .unwrap();
+    }
+    let snapshot = store.snapshot().unwrap();
+    assert!(snapshot.attention.is_empty());
+    assert_eq!(snapshot.sessions[0].last_meaningful_activity_at, None);
+    assert_eq!(snapshot.sessions[0].activity.as_deref(), Some("会话已结束"));
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn opening_an_old_database_normalizes_inconsistent_subagent_rows() {
+    let root = temp_root("subagent-normalization");
+    let database = root.join("data.sqlite");
+    let store = RuntimeStore::open(&database).unwrap();
+    store
+        .ingest(request_at(
+            Provider::Claude,
+            "UserPromptSubmit",
+            "subagent-migration",
+            Some("turn-1"),
+            None,
+            90_000,
+        ))
+        .unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"SubagentStart",
+                "session_id":"subagent-migration",
+                "agent_id":"child-1",
+                "agent_type":"Explore"
+            }),
+            90_001,
+        ))
+        .unwrap();
+    drop(store);
+
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE session_subagents SET active = 0, status = 'running', stopped_at = NULL",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = RuntimeStore::open(&database).unwrap();
+    drop(store);
+    let connection = Connection::open(&database).unwrap();
+    let (active, status, stopped_at) = connection
+        .query_row(
+            "SELECT active, status, stopped_at FROM session_subagents WHERE agent_id = 'child-1'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(active, 0);
+    assert_eq!(status, "completed");
+    assert!(stopped_at.is_some());
+    drop(connection);
     fs::remove_dir_all(root).unwrap();
 }
 

@@ -450,7 +450,61 @@ fn codex_native_permission_hook_lifecycle_is_observed_neutrally_for_five_rounds(
         assert_success(&output);
         assert!(output.stdout.is_empty());
 
-        wait_until("native permission neutral resolution", || {
+        let stopped = json!({
+            "hook_event_name":"Stop",
+            "session_id":provider_session_id,
+            "turn_id":"desktop-turn",
+            "cwd":"/tmp/example-project"
+        });
+        let output = spawn_hook(&socket, &stopped).wait_with_output().unwrap();
+        assert_success(&output);
+        assert!(output.stdout.is_empty());
+
+        // Codex Desktop can emit both events above while its native sheet is
+        // still open. The end-to-end transport must preserve the request just
+        // like the reducer-level regression test and packaged UI acceptance.
+        wait_until(
+            "native permission preserved after PostToolUse and Stop",
+            || {
+                let Ok(store) = RuntimeStore::open(&database) else {
+                    return false;
+                };
+                let Ok(snapshot) = store.snapshot() else {
+                    return false;
+                };
+                let Some(session) = snapshot
+                    .sessions
+                    .iter()
+                    .find(|session| session.provider_session_id == provider_session_id)
+                else {
+                    return false;
+                };
+                session.exec_state == "awaiting_approval"
+                    && session.approval_owner.as_deref() == Some("terminal")
+                    && snapshot.attention.iter().any(|item| {
+                        item.session_id == session.id
+                            && item.kind == "native_approval"
+                            && item.state == "open"
+                    })
+            },
+        );
+
+        // A later, different real tool is authoritative evidence that Codex
+        // left the native permission sheet and continued the Turn.
+        let continued = json!({
+            "hook_event_name":"PreToolUse",
+            "session_id":provider_session_id,
+            "turn_id":"desktop-turn",
+            "cwd":"/tmp/example-project",
+            "tool_name":"Bash",
+            "tool_use_id":format!("continued-tool-{round}"),
+            "tool_input":{"command":"printf local-regression"}
+        });
+        let output = spawn_hook(&socket, &continued).wait_with_output().unwrap();
+        assert_success(&output);
+        assert!(output.stdout.is_empty());
+
+        wait_until("native permission authoritative resolution", || {
             let Ok(store) = RuntimeStore::open(&database) else {
                 return false;
             };
@@ -470,10 +524,11 @@ fn codex_native_permission_hook_lifecycle_is_observed_neutrally_for_five_rounds(
                         && item.kind == "native_approval"
                         && matches!(item.state.as_str(), "open" | "snoozed")
                 })
-                && session.activity.as_deref().is_some_and(|activity| {
-                    activity.contains("Codex 原界面处理")
-                        && !activity.contains("批准")
-                        && !activity.contains("拒绝")
+                && snapshot.attention.iter().any(|item| {
+                    item.session_id == session.id
+                        && item.kind == "native_approval"
+                        && item.state == "resolved"
+                        && item.resolution.as_deref() == Some("provider_advanced")
                 })
         });
     }
@@ -495,7 +550,7 @@ fn codex_native_permission_hook_lifecycle_is_observed_neutrally_for_five_rounds(
         .iter()
         .filter(|item| item.kind == "native_approval")
         .all(|item| item.state == "resolved"
-            && item.resolution.as_deref() == Some("provider_handled")));
+            && item.resolution.as_deref() == Some("provider_advanced")));
     drop(store);
     fs::remove_dir_all(root).unwrap();
 }

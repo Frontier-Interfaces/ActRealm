@@ -89,18 +89,74 @@ public final class RuntimeClient: ObservableObject {
         }
     }
 
+    /// macOS may leave an apparently live URLSession WebSocket suspended
+    /// across sleep. Recreate only the transport, retain the authenticated
+    /// local session, and explicitly invalidate Runtime's monotonic quota
+    /// cache so Claude OAuth is refreshed without waiting for a CLI event.
+    public func recoverAfterSystemWake() async -> String? {
+        guard baseURL != nil, sessionCookie != nil, csrfToken != nil else {
+            return RuntimeClientError.notConnected.localizedDescription
+        }
+        streamTask?.cancel()
+        streamTask = nil
+        webSocketTask?.cancel(with: .goingAway, reason: nil)
+        webSocketTask = nil
+        connectionState = .connecting
+        do {
+            _ = try await sendEmpty(
+                "api/v1/quota/refresh",
+                method: "POST",
+                as: JSONValue.self
+            )
+            try await refreshSnapshotThrowing()
+            startStreaming()
+            return nil
+        } catch {
+            connectionState = .error(error.localizedDescription)
+            return error.localizedDescription
+        }
+    }
+
+    /// Explicit user recovery path for stale Provider quota. Runtime performs
+    /// the authenticated collection; the client never reads OAuth credentials.
+    public func requestQuotaRefresh() async -> String? {
+        guard baseURL != nil, sessionCookie != nil, csrfToken != nil else {
+            return RuntimeClientError.notConnected.localizedDescription
+        }
+        do {
+            _ = try await sendEmpty(
+                "api/v1/quota/refresh-now",
+                method: "POST",
+                as: JSONValue.self
+            )
+            try await refreshSnapshotThrowing()
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
     private func refreshSnapshotThrowing() async throws {
         snapshot = try await get("api/v1/snapshot", as: Snapshot.self)
     }
 
     // MARK: - Attention and sessions
 
-    public func send(action: AttentionAction, attentionId: String, requestId: UUID?) async {
+    /// Returns nil only after Runtime accepted the command. Callers must not
+    /// present a success confirmation before this method completes.
+    public func send(
+        action: AttentionAction,
+        attentionId: String,
+        requestId: UUID?
+    ) async -> String? {
         let command = CommandRequest(attentionId: attentionId, requestId: requestId, action: action.rawValue)
         do {
             _ = try await sendCommand(command)
+            try await refreshSnapshotThrowing()
+            return nil
         } catch {
             connectionState = .error(error.localizedDescription)
+            return error.localizedDescription
         }
     }
 

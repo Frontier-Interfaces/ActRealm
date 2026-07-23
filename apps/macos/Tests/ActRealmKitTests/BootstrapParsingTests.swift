@@ -21,6 +21,14 @@ struct BootstrapParsingTests {
         #expect(RuntimeSupervisor.parseBootstrapLine("") == nil)
     }
 
+    @Test func diagnosticTextNeverRetainsBootstrapCredential() {
+        let token = "0199b3b2-1a2b-7c3d-8e4f-abcdef123456"
+        let line = "ActRealm control panel: http://127.0.0.1:54321/#bootstrap=\(token)"
+        let redacted = RuntimeSupervisor.redactedDiagnosticText(line)
+        #expect(!redacted.contains(token))
+        #expect(redacted == "ActRealm control panel: http://127.0.0.1:54321/#bootstrap=<redacted>")
+    }
+
     @Test func parsesRuntimeLockOwnerPID() {
         #expect(RuntimeSupervisor.parseLockOwnerPID("27489\n") == 27489)
         #expect(RuntimeSupervisor.parseLockOwnerPID("  42  ") == 42)

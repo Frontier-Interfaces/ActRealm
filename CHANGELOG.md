@@ -6,6 +6,27 @@ published a final v1 release; entries below describe development milestones on
 
 ## Unreleased - M14 accepted candidate
 
+### Post-P0 - OUTBOX lifecycle and quota recovery
+
+- Keeps Codex Desktop native permission requests in OUTBOX across the
+  synthetic `request_permissions` tool end and `Stop`; completion is deferred
+  until an authoritative Provider transition clears the wait.
+- Moves a newly arrived higher-priority approval into the visible primary card
+  without losing stable Attention-ID selection, and scrolls that card back
+  into view.
+- Adds truthful native actions: open Provider, mark handled, and snooze.
+  Direct allow/deny appears only for a live request delivered to an
+  ActRealm-owned reply channel.
+- Adds Settings → Provider Data → manual Claude quota refresh. It waits for
+  the OAuth request and reports missing/rejected credentials, rate limiting,
+  or Provider failure without exposing secrets.
+- Aligns local and GitHub CI on Rust 1.97 for the locked SQLite dependency.
+
+Focused Runtime/Server tests, the 83-test Swift suite, workspace Clippy,
+release build, language/plist checks, local RustSec audit, and arm64 package
+codesign pass. The current managed sandbox blocks listener/resource tests at
+Socket `bind`; packaged user acceptance and remote CI remain open.
+
 ### Post-M14 - First-run workspace and Agent setup center candidate
 
 - Adds an honest first-run state to the main three-column workspace when no

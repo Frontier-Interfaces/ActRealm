@@ -2,9 +2,20 @@ import AppKit
 import Combine
 import SwiftUI
 
-/// Projects the real AppKit window visibility into SwiftUI. `scenePhase`
-/// alone remains active for some minimized/occluded macOS windows, which lets
-/// TimelineView continue consuming CPU in the background.
+enum WindowRenderPolicy {
+    static func shouldRender(
+        isVisible: Bool,
+        isMiniaturized: Bool,
+        isOcclusionVisible: Bool
+    ) -> Bool {
+        isVisible && !isMiniaturized && isOcclusionVisible
+    }
+}
+
+/// Projects real AppKit window visibility into SwiftUI. App activation is
+/// deliberately not part of this signal: a visible ActRealm window must keep
+/// its timers and live task projection current while the user works in Codex
+/// beside it. Only minimized or genuinely occluded windows pause rendering.
 struct WindowActivityProbe: NSViewRepresentable {
     let onChange: (Bool) -> Void
 
@@ -34,7 +45,6 @@ struct WindowActivityProbe: NSViewRepresentable {
 
         init(onChange: @escaping (Bool) -> Void) {
             self.onChange = onChange
-            observeApplication()
         }
 
         func attach(to window: NSWindow?) {
@@ -49,36 +59,24 @@ struct WindowActivityProbe: NSViewRepresentable {
 
         func evaluate() {
             let active = window.map {
-                NSApplication.shared.isActive
-                    && $0.isVisible
-                    && !$0.isMiniaturized
-                    && $0.occlusionState.contains(.visible)
+                WindowRenderPolicy.shouldRender(
+                    isVisible: $0.isVisible,
+                    isMiniaturized: $0.isMiniaturized,
+                    isOcclusionVisible: $0.occlusionState.contains(.visible)
+                )
             } ?? false
             guard active != lastValue else { return }
             lastValue = active
             onChange(active)
         }
 
-        private func observeApplication() {
-            Publishers.Merge(
-                NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification),
-                NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)
-            )
-            .receive(on: RunLoop.main)
-            .sink { [weak self] _ in self?.evaluate() }
-            .store(in: &cancellables)
-        }
-
         private func observeWindow(_ window: NSWindow?) {
             cancellables.removeAll()
-            observeApplication()
             guard let window else { return }
             Publishers.MergeMany([
                 NSWindow.didMiniaturizeNotification,
                 NSWindow.didDeminiaturizeNotification,
                 NSWindow.didChangeOcclusionStateNotification,
-                NSWindow.didBecomeKeyNotification,
-                NSWindow.didResignKeyNotification,
             ].map {
                 NotificationCenter.default.publisher(for: $0, object: window).eraseToAnyPublisher()
             })

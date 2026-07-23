@@ -162,6 +162,8 @@ struct ModelDecodingTests {
               "enabled": true,
               "status": "connected",
               "managedThreads": 1,
+              "managedApprovals": true,
+              "serverUserAgent": "codex_cli_rs/0.144.6",
               "error": null
             }
           }
@@ -198,6 +200,8 @@ struct ModelDecodingTests {
         #expect(snapshot.stats.eventCount == 12)
         #expect(snapshot.stats.metrics.approvalRequests == 4)
         #expect(snapshot.capabilities?.codexConnector?.managedThreads == 1)
+        #expect(snapshot.capabilities?.codexConnector?.managedApprovals == true)
+        #expect(snapshot.capabilities?.codexConnector?.serverUserAgent == "codex_cli_rs/0.144.6")
     }
 
     @Test func decodesSnapshotWebSocketEnvelope() throws {

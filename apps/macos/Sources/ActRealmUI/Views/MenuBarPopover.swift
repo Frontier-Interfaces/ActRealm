@@ -370,6 +370,10 @@ private struct CompactApprovalCard: View {
             Button("允许") { model.approve(entry) }
                 .buttonStyle(PillButtonStyle(rank: .primary, fontSize: 11.5, horizontalPadding: 14))
         case .nativeApproval:
+            Button("稍后提醒") { model.snooze(entry) }
+                .buttonStyle(PillButtonStyle(rank: .secondary, fontSize: 11.5, horizontalPadding: 14))
+            Button("已处理") { model.acknowledge(entry) }
+                .buttonStyle(PillButtonStyle(rank: .secondary, fontSize: 11.5, horizontalPadding: 14))
             Button("打开应用") { Task { await model.jump(to: entry) } }
                 .buttonStyle(PillButtonStyle(rank: .primary, fontSize: 11.5, horizontalPadding: 14))
         case .question:

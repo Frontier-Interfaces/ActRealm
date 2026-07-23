@@ -46,9 +46,17 @@ struct OutboxSection: View {
             } else if snapshotRendering {
                 outboxContent
             } else {
-                ScrollView(.vertical, showsIndicators: true) { outboxContent }
-                    .contentMargins(.horizontal, 0)
-                    .scrollBounceBehavior(.basedOnSize)
+                ScrollViewReader { proxy in
+                    ScrollView(.vertical, showsIndicators: true) { outboxContent }
+                        .contentMargins(.horizontal, 0)
+                        .scrollBounceBehavior(.basedOnSize)
+                        .onChange(of: selectedEntry?.id) { _, selectedID in
+                            guard let selectedID else { return }
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                proxy.scrollTo(primaryAnchor(selectedID), anchor: .top)
+                            }
+                        }
+                }
             }
 
             if let pending = model.derived.pendingDecision {
@@ -83,7 +91,7 @@ struct OutboxSection: View {
         LazyVStack(alignment: .leading, spacing: 0) {
             if let selectedEntry {
                 OutboxPrimaryCard(entry: selectedEntry)
-                    .id(selectedEntry.id)
+                    .id(primaryAnchor(selectedEntry.id))
                     .padding(.top, 14)
 
                 let rest = entries.filter { $0.id != selectedEntry.id }
@@ -111,6 +119,10 @@ struct OutboxSection: View {
     private var subtitle: String {
         guard let wait = model.derived.longestWait else { return "暂无需要处理的事项" }
         return "最久等待 \(max(0, Int(wait / 60))) 分钟"
+    }
+
+    private func primaryAnchor(_ id: String) -> String {
+        "outbox-primary-\(id)"
     }
 }
 
@@ -315,10 +327,22 @@ private struct OutboxPrimaryCard: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(DT.amberBg.opacity(0.62), in: RoundedRectangle(cornerRadius: 10))
                 .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(DT.amberStroke, lineWidth: 1))
-            Button("打开应用") {
-                Task { await model.jump(to: entry) }
+            HStack(spacing: 8) {
+                Button("打开应用") {
+                    Task { await model.jump(to: entry) }
+                }
+                .buttonStyle(ActionButtonStyle(kind: .primary, compact: true))
+                Button("已在原界面处理") {
+                    model.acknowledge(entry)
+                }
+                .buttonStyle(ActionButtonStyle(kind: .secondary, compact: true))
+                .disabled(!model.canControlRuntime)
+                Button("稍后提醒") {
+                    model.snooze(entry)
+                }
+                .buttonStyle(ActionButtonStyle(kind: .tertiary, compact: true))
+                .disabled(!model.canControlRuntime)
             }
-            .buttonStyle(ActionButtonStyle(kind: .primary, compact: true))
         }
         .padding(.top, 10)
     }

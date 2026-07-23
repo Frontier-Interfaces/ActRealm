@@ -70,6 +70,38 @@ private func makeSnapshot(
         #expect(OutboxSelection.resolvedID(currentID: "gone", entries: []) == nil)
     }
 
+    @Test func newHigherPriorityArrivalReplacesAVisibleCompletion() {
+        let previous = DerivedState.derive(from: makeSnapshot(attention: [
+            makeAttention(id: "done", kind: "completion", createdAt: 100)
+        ])).openOutbox
+        let next = DerivedState.derive(from: makeSnapshot(attention: [
+            makeAttention(id: "done", kind: "completion", createdAt: 100),
+            makeAttention(id: "approval", kind: "approval", createdAt: 200),
+        ])).openOutbox
+
+        #expect(OutboxSelection.resolvedID(
+            currentID: "done",
+            previousEntries: previous,
+            entries: next
+        ) == "approval")
+    }
+
+    @Test func lowerPriorityArrivalDoesNotInterruptAnApprovalBeingReviewed() {
+        let previous = DerivedState.derive(from: makeSnapshot(attention: [
+            makeAttention(id: "approval", kind: "approval", createdAt: 100)
+        ])).openOutbox
+        let next = DerivedState.derive(from: makeSnapshot(attention: [
+            makeAttention(id: "approval", kind: "approval", createdAt: 100),
+            makeAttention(id: "done", kind: "completion", createdAt: 200),
+        ])).openOutbox
+
+        #expect(OutboxSelection.resolvedID(
+            currentID: "approval",
+            previousEntries: previous,
+            entries: next
+        ) == "approval")
+    }
+
     @Test func errorsBeatApprovalsBeatQuestionsBeatCompletions() {
         let snapshot = makeSnapshot(attention: [
             makeAttention(id: "done", kind: "completion", createdAt: 100),
@@ -145,6 +177,38 @@ private func makeSnapshot(
     }
 }
 
+@Suite struct AcknowledgementSemanticsTests {
+    @Test func completionAndErrorConfirmationsNameTheAcceptedOutcome() throws {
+        let completion = try #require(DerivedState.derive(from: makeSnapshot(
+            sessions: [makeSession(id: "s")],
+            attention: [makeAttention(
+                id: "done",
+                kind: "completion",
+                createdAt: 1,
+                sessionId: "s"
+            )]
+        )).openOutbox.first)
+        #expect(
+            AppModel.acknowledgementToast(for: completion)
+                == "已确认任务完成：任务 s"
+        )
+
+        let error = try #require(DerivedState.derive(from: makeSnapshot(
+            sessions: [makeSession(id: "s")],
+            attention: [makeAttention(
+                id: "error",
+                kind: "error",
+                createdAt: 1,
+                sessionId: "s"
+            )]
+        )).openOutbox.first)
+        #expect(
+            AppModel.acknowledgementToast(for: error)
+                == "已标记问题解决：任务 s"
+        )
+    }
+}
+
 @Suite struct BackgroundSnapshotProjectionTests {
     @Test func sessionOnlyUpdatesWaitUntilTheWorkspaceIsVisible() {
         let next = makeSnapshot(sessions: [makeSession(
@@ -157,12 +221,12 @@ private func makeSnapshot(
         #expect(!SnapshotProjectionPolicy.shouldApply(
             previous: .empty,
             next: next,
-            workspaceActive: false
+            workspaceVisible: false
         ))
         #expect(SnapshotProjectionPolicy.shouldApply(
             previous: .empty,
             next: next,
-            workspaceActive: true
+            workspaceVisible: true
         ))
     }
 
@@ -173,7 +237,7 @@ private func makeSnapshot(
         #expect(SnapshotProjectionPolicy.shouldApply(
             previous: .empty,
             next: nextAttention,
-            workspaceActive: false
+            workspaceVisible: false
         ))
 
         let nextCommand = makeSnapshot(commands: [
@@ -185,12 +249,56 @@ private func makeSnapshot(
         #expect(SnapshotProjectionPolicy.shouldApply(
             previous: .empty,
             next: nextCommand,
-            workspaceActive: false
+            workspaceVisible: false
         ))
     }
 }
 
+@Suite struct RuntimeStatusMessageTests {
+    @Test func delayedControlRecoveryReplacesTheTemporaryWarning() {
+        #expect(RuntimeStatusMessagePolicy.reconciled(
+            RuntimeStatusMessagePolicy.waitingForControl,
+            status: .listening
+        ) == RuntimeStatusMessagePolicy.reconnected)
+    }
+
+    @Test func aLaterDisconnectCannotKeepAStaleSuccessClaim() {
+        #expect(RuntimeStatusMessagePolicy.reconciled(
+            RuntimeStatusMessagePolicy.reconnected,
+            status: .absent("连接已断开")
+        ) == nil)
+    }
+
+    @Test func anUnrelatedFailureMessageIsNotHidden() {
+        #expect(RuntimeStatusMessagePolicy.reconciled(
+            "重启失败：端口被占用",
+            status: .absent("端口被占用")
+        ) == "重启失败：端口被占用")
+    }
+}
+
 @Suite struct QuotaSlotTests {
+    @Test func manualRefreshTracksNewestClaudeCaptureOnly() {
+        let snapshot = makeSnapshot(quota: [
+            QuotaEntry(
+                provider: "claude", window: "5h", status: "available",
+                usedPct: 10, remainingPct: 90, resetsAt: nil, source: "oauth",
+                capturedAt: 1_000, reason: nil
+            ),
+            QuotaEntry(
+                provider: "claude", window: "7d", status: "available",
+                usedPct: 20, remainingPct: 80, resetsAt: nil, source: "oauth",
+                capturedAt: 2_000, reason: nil
+            ),
+            QuotaEntry(
+                provider: "codex", window: "7d", status: "available",
+                usedPct: 30, remainingPct: 70, resetsAt: nil, source: "session",
+                capturedAt: 9_000, reason: nil
+            ),
+        ])
+        #expect(AppModel.latestClaudeQuotaCapture(in: snapshot) == 2_000)
+    }
+
     @Test func missingQuotaDoesNotInventFixedWindows() {
         let derived = DerivedState.derive(from: makeSnapshot())
         #expect(derived.quotaSlots.isEmpty)

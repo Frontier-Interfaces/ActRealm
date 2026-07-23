@@ -2,7 +2,10 @@ use crate::fsutil::ensure_private_directory;
 use crate::title::{
     resolve_codex_session_titles, resolve_event_title, resolve_session_title, ProviderTitle,
 };
-use actrealm_core::{BridgeRequest, Decision, EventKind, Provider, PERMISSION_COMMIT_DELAY_MS};
+use actrealm_core::{
+    is_codex_native_attention_tool, BridgeRequest, Decision, EventKind, Provider,
+    PERMISSION_COMMIT_DELAY_MS,
+};
 use actrealm_providers::parse_hook;
 use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -20,7 +23,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
+const SNAPSHOT_CACHE_MAX_AGE_MS: u64 = 2_000;
 const MAX_TASK_TITLE_CHARS: usize = 64;
 const MAX_PLAN_STEPS: usize = 64;
 const MAX_PLAN_STEP_CHARS: usize = 500;
@@ -226,6 +230,8 @@ pub struct SessionRecord {
     #[serde(skip)]
     pub provider_pid: Option<u32>,
     pub last_event_at: u64,
+    #[serde(skip)]
+    pub last_meaningful_activity_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -409,6 +415,11 @@ enum StoreMessage {
         active: bool,
         now: u64,
         reply: mpsc::SyncSender<Result<NativeApprovalSyncResult, StoreError>>,
+    },
+    ResolveManagedRequest {
+        request_id: Uuid,
+        now: u64,
+        reply: mpsc::SyncSender<Result<bool, StoreError>>,
     },
     Snapshot {
         reply: mpsc::SyncSender<Result<StoreSnapshot, StoreError>>,
@@ -620,6 +631,16 @@ impl RuntimeStore {
         receive(receiver)
     }
 
+    pub fn resolve_managed_request(&self, request_id: Uuid, now: u64) -> Result<bool, StoreError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send(StoreMessage::ResolveManagedRequest {
+            request_id,
+            now,
+            reply,
+        })?;
+        receive(receiver)
+    }
+
     pub fn snapshot(&self) -> Result<StoreSnapshot, StoreError> {
         let (reply, receiver) = mpsc::sync_channel(1);
         self.send(StoreMessage::Snapshot { reply })?;
@@ -731,7 +752,18 @@ fn writer_loop(
     receiver: mpsc::Receiver<StoreMessage>,
 ) {
     let mut last_provider_title_refresh_at = 0;
+    let mut snapshot_cache: Option<(u64, StoreSnapshot)> = None;
     while let Ok(message) = receiver.recv() {
+        if !matches!(
+            &message,
+            StoreMessage::Snapshot { .. }
+                | StoreMessage::ReadSetting { .. }
+                | StoreMessage::Export { .. }
+                | StoreMessage::ExportMetrics { .. }
+                | StoreMessage::Shutdown
+        ) {
+            snapshot_cache = None;
+        }
         match message {
             StoreMessage::Ingest { request, reply } => {
                 let _ = reply.send(ingest_transaction(&mut connection, *request));
@@ -840,17 +872,40 @@ fn writer_loop(
                     now,
                 ));
             }
+            StoreMessage::ResolveManagedRequest {
+                request_id,
+                now,
+                reply,
+            } => {
+                let _ = reply.send(resolve_managed_request_transaction(
+                    &mut connection,
+                    request_id,
+                    now,
+                ));
+            }
             StoreMessage::Snapshot { reply } => {
                 let now = now_millis();
-                let result = reopen_due_snoozed(&mut connection, now).and_then(|_| {
-                    if now.saturating_sub(last_provider_title_refresh_at)
-                        >= PROVIDER_TITLE_REFRESH_INTERVAL_MS
-                    {
-                        refresh_provider_titles(&mut connection, now)?;
-                        last_provider_title_refresh_at = now;
-                    }
-                    read_snapshot(&connection)
+                let cache_is_fresh = snapshot_cache.as_ref().is_some_and(|(built_at, _)| {
+                    now.saturating_sub(*built_at) < SNAPSHOT_CACHE_MAX_AGE_MS
                 });
+                let result = if cache_is_fresh {
+                    Ok(snapshot_cache
+                        .as_ref()
+                        .map(|(_, snapshot)| snapshot.clone())
+                        .unwrap_or_default())
+                } else {
+                    reopen_due_snoozed(&mut connection, now).and_then(|_| {
+                        if now.saturating_sub(last_provider_title_refresh_at)
+                            >= PROVIDER_TITLE_REFRESH_INTERVAL_MS
+                        {
+                            refresh_provider_titles(&mut connection, now)?;
+                            last_provider_title_refresh_at = now;
+                        }
+                        let snapshot = read_snapshot(&connection)?;
+                        snapshot_cache = Some((now, snapshot.clone()));
+                        Ok(snapshot)
+                    })
+                };
                 let _ = reply.send(result);
             }
             StoreMessage::ReadSetting { key, reply } => {
@@ -1346,6 +1401,7 @@ fn initialize(connection: &mut Connection) -> Result<(), StoreError> {
               plan_done INTEGER, plan_total INTEGER,
               token_total INTEGER, context_window_tokens INTEGER,
               started_at INTEGER NOT NULL, last_event_at INTEGER NOT NULL,
+              last_meaningful_activity_at INTEGER,
               ended_at INTEGER,
               UNIQUE(provider, provider_session_id)
             );
@@ -1479,8 +1535,10 @@ fn initialize(connection: &mut Connection) -> Result<(), StoreError> {
     ensure_session_usage_columns(connection)?;
     ensure_session_usage_model_column(connection)?;
     ensure_session_locator_columns(connection)?;
+    ensure_session_activity_columns(connection)?;
     ensure_session_task_content_columns(connection)?;
     ensure_session_subagent_columns(connection)?;
+    normalize_legacy_subagent_rows(connection)?;
     suppress_existing_codex_internal_sessions(connection)?;
     connection
         .pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -1595,6 +1653,52 @@ fn ensure_session_locator_columns(connection: &Connection) -> Result<(), StoreEr
     Ok(())
 }
 
+fn ensure_session_activity_columns(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(sessions)")
+        .map_err(storage_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    if !columns
+        .iter()
+        .any(|column| column == "last_meaningful_activity_at")
+    {
+        connection
+            .execute(
+                "ALTER TABLE sessions ADD COLUMN last_meaningful_activity_at INTEGER",
+                [],
+            )
+            .map_err(storage_error)?;
+    }
+    // Lifecycle-only events are deliberately excluded: merely opening the
+    // Claude app may replay SessionStart/SessionEnd for historical sessions.
+    connection
+        .execute(
+            "UPDATE sessions
+             SET last_meaningful_activity_at = (
+               SELECT MAX(events.occurred_at) FROM events
+               WHERE events.session_id = sessions.id
+                 AND events.type IN (
+                   'prompt.submitted', 'tool.started', 'tool.finished',
+                   'tool.failed', 'approval.requested', 'approval.denied',
+                   'question.requested', 'elicitation.requested',
+                   'subagent.started', 'subagent.stopped',
+                   'task.created', 'task.completed', 'plan.updated',
+                   'approval.auto_review.started',
+                   'approval.auto_review.completed', 'session.compacting',
+                   'turn.interrupted', 'turn.failed'
+                 )
+             )
+             WHERE last_meaningful_activity_at IS NULL",
+            [],
+        )
+        .map_err(storage_error)?;
+    Ok(())
+}
+
 fn ensure_session_task_content_columns(connection: &Connection) -> Result<(), StoreError> {
     let mut statement = connection
         .prepare("PRAGMA table_info(session_tasks)")
@@ -1640,6 +1744,36 @@ fn ensure_session_subagent_columns(connection: &Connection) -> Result<(), StoreE
                 .map_err(storage_error)?;
         }
     }
+    Ok(())
+}
+
+fn normalize_legacy_subagent_rows(connection: &Connection) -> Result<(), StoreError> {
+    connection
+        .execute(
+            "UPDATE session_subagents
+             SET status = 'completed',
+                 stopped_at = COALESCE(stopped_at, started_at)
+             WHERE active = 0 AND status = 'running'",
+            [],
+        )
+        .map_err(storage_error)?;
+    connection
+        .execute(
+            "UPDATE session_subagents
+             SET active = 0,
+                 status = CASE
+                   WHEN sessions.exec_state = 'failed' THEN 'interrupted'
+                   ELSE 'completed'
+                 END,
+                 stopped_at = COALESCE(stopped_at, sessions.last_event_at)
+             FROM sessions
+             WHERE session_subagents.session_id = sessions.id
+               AND session_subagents.active = 1
+               AND sessions.exec_state IN ('idle', 'response_finished', 'failed')
+               AND sessions.ended_at IS NOT NULL",
+            [],
+        )
+        .map_err(storage_error)?;
     Ok(())
 }
 
@@ -1823,6 +1957,23 @@ fn ingest_transaction(
         )
         .map_err(storage_error)?;
 
+    let meaningful_activity = is_meaningful_activity(parsed.kind, &request.raw);
+    if meaningful_activity {
+        transaction
+            .execute(
+                "UPDATE sessions
+                 SET last_meaningful_activity_at =
+                   MAX(COALESCE(last_meaningful_activity_at, 0), ?2)
+                 WHERE id = ?1",
+                params![session_id, occurred_at],
+            )
+            .map_err(storage_error)?;
+    }
+    let turn_has_meaningful_activity = turn_id
+        .as_deref()
+        .map(|turn_id| turn_contains_meaningful_activity(&transaction, turn_id))
+        .transpose()?
+        .unwrap_or(false);
     let completed_without_background =
         parsed.kind == EventKind::Stopped && !has_background_work(&request.raw);
     let plan_progress = update_plan_progress(
@@ -1847,6 +1998,17 @@ fn ingest_transaction(
         occurred_at,
     )?;
     let observed_native_permission = is_observed_codex_permission_start(&request);
+    let native_permission_open = transaction
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM attention_items
+               WHERE session_id = ?1 AND kind = 'native_approval'
+                 AND state IN ('open', 'snoozed')
+             )",
+            [&session_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(storage_error)?;
     let attention_id = match parsed.kind {
         EventKind::PermissionRequested if observed_native_permission => {
             Some(insert_native_permission_attention(
@@ -1952,22 +2114,28 @@ fn ingest_transaction(
                 },
             )?)
         }
-        EventKind::Stopped if completed_without_background => Some(insert_nonapproval_attention(
-            &transaction,
-            &session_id,
-            turn_id.as_deref(),
-            &request,
-            NonApprovalSpec {
-                kind: "completion",
-                title: "任务已完成，等你确认",
-                detail: None,
-                dedupe_key: format!(
-                    "{}:{}:completion",
-                    session_id,
-                    turn_id.as_deref().unwrap_or("none")
-                ),
-            },
-        )?),
+        EventKind::Stopped
+            if completed_without_background
+                && turn_has_meaningful_activity
+                && !native_permission_open =>
+        {
+            Some(insert_nonapproval_attention(
+                &transaction,
+                &session_id,
+                turn_id.as_deref(),
+                &request,
+                NonApprovalSpec {
+                    kind: "completion",
+                    title: "任务已完成，等你确认",
+                    detail: None,
+                    dedupe_key: format!(
+                        "{}:{}:completion",
+                        session_id,
+                        turn_id.as_deref().unwrap_or("none")
+                    ),
+                },
+            )?)
+        }
         _ => None,
     };
 
@@ -1997,6 +2165,17 @@ fn ingest_transaction(
         occurred_at,
     )?;
 
+    let preserves_native_request = current_state == "awaiting_approval"
+        && current_owner.as_deref() == Some("terminal")
+        && !native_permission_resolved
+        && !matches!(
+            parsed.kind,
+            EventKind::PromptSubmitted
+                | EventKind::PermissionDenied
+                | EventKind::Interrupted
+                | EventKind::Failed
+                | EventKind::SessionEnded
+        );
     let may_update = occurred_at >= last_event_at
         && (!terminal
             || matches!(
@@ -2004,22 +2183,11 @@ fn ingest_transaction(
                 EventKind::PromptSubmitted | EventKind::SessionStarted | EventKind::SessionEnded
             ));
     if may_update {
-        let preserves_native_request = current_state == "awaiting_approval"
-            && current_owner.as_deref() == Some("terminal")
-            && !native_permission_resolved
-            && !matches!(
-                parsed.kind,
-                EventKind::PromptSubmitted
-                    | EventKind::Stopped
-                    | EventKind::Interrupted
-                    | EventKind::Failed
-                    | EventKind::SessionEnded
-            );
         let (next_state, owner, default_activity) = if observed_native_permission {
             (
                 "awaiting_approval",
                 Some("terminal"),
-                "Codex 正在请求批准，请在原界面处理".to_owned(),
+                native_attention_activity(&request),
             )
         } else if preserves_native_request {
             (
@@ -2027,21 +2195,17 @@ fn ingest_transaction(
                 current_owner.as_deref(),
                 current_activity
                     .clone()
-                    .unwrap_or_else(|| "Codex 正在请求批准，请在原界面处理".to_owned()),
+                    .unwrap_or_else(|| native_attention_activity(&request)),
             )
         } else if request.provider_handles_approval && parsed.kind == EventKind::PermissionRequested
         {
-            (
-                "thinking",
-                Some("provider"),
-                "Codex 正在自动审批".to_owned(),
-            )
+            provider_handled_permission_state(parsed.permission_mode.as_deref(), &request.raw)
         } else {
             let (state, owner, activity) = project_event(parsed.kind, &request.raw, &current_state);
             if native_permission_resolved
                 && matches!(parsed.kind, EventKind::ToolFinished | EventKind::ToolFailed)
             {
-                (state, owner, "权限请求已在 Codex 原界面处理".to_owned())
+                (state, owner, "Codex 原界面请求已处理，继续运行".to_owned())
             } else {
                 (state, owner, activity)
             }
@@ -2052,11 +2216,13 @@ fn ingest_transaction(
             plan_progress
                 .map(|(done, total)| format!("计划进度 {done}/{total}"))
                 .or_else(|| {
-                    active_subagents.map(|active| {
-                        if active == 0 {
-                            "子 Agent 已结束".to_owned()
+                    active_subagents.and_then(|active| {
+                        if active == 0 && parsed.kind == EventKind::SubagentStopped {
+                            Some("子 Agent 已结束".to_owned())
+                        } else if active > 0 {
+                            Some(format!("派了 {active} 个子 Agent"))
                         } else {
-                            format!("派了 {active} 个子 Agent")
+                            None
                         }
                     })
                 })
@@ -2081,6 +2247,7 @@ fn ingest_transaction(
                    term_bundle_id = COALESCE(?18, term_bundle_id),
                    term_surface = COALESCE(?19, term_surface),
                    provider_pid = COALESCE(?20, provider_pid),
+                   permission_mode = COALESCE(?21, permission_mode),
                    ended_at = CASE WHEN ?6 = 1 THEN ?5 ELSE ended_at END
                  WHERE id = ?1",
                 params![
@@ -2120,6 +2287,7 @@ fn ingest_transaction(
                         .as_ref()
                         .and_then(|value| value.provider_pid)
                         .map(i64::from),
+                    parsed.permission_mode.as_deref(),
                 ],
             )
             .map_err(storage_error)?;
@@ -2128,7 +2296,8 @@ fn ingest_transaction(
     if matches!(
         parsed.kind,
         EventKind::Stopped | EventKind::Interrupted | EventKind::Failed | EventKind::SessionEnded
-    ) {
+    ) && !(parsed.kind == EventKind::Stopped && preserves_native_request)
+    {
         if let Some(turn_id) = turn_id.as_deref() {
             transaction
                 .execute(
@@ -2805,6 +2974,61 @@ fn expire_approval_transaction(
     Ok(true)
 }
 
+fn resolve_managed_request_transaction(
+    connection: &mut Connection,
+    request_id: Uuid,
+    now: u64,
+) -> Result<bool, StoreError> {
+    let transaction = connection.transaction().map_err(storage_error)?;
+    let attention = transaction
+        .query_row(
+            "SELECT id, session_id FROM attention_items
+             WHERE request_id = ?1
+               AND state IN ('open', 'committing', 'decision_sent', 'snoozed')",
+            [request_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(storage_error)?;
+    let Some((attention_id, session_id)) = attention else {
+        return Ok(false);
+    };
+    transaction
+        .execute(
+            "UPDATE commands
+             SET state = CASE
+                   WHEN state = 'decision_sent' THEN 'confirmed'
+                   ELSE 'failed'
+                 END,
+                 confirmed_at = ?2,
+                 error_code = CASE
+                   WHEN state = 'decision_sent' THEN NULL
+                   ELSE 'provider_resolved_before_decision'
+                 END
+             WHERE attention_id = ?1
+               AND state IN ('pending_commit', 'decision_sent')",
+            params![attention_id, to_i64(now)],
+        )
+        .map_err(storage_error)?;
+    transaction
+        .execute(
+            "UPDATE attention_items
+             SET state = 'resolved', resolved_at = ?2,
+                 resolution = 'provider_resolved', expires_at = NULL
+             WHERE id = ?1",
+            params![attention_id, to_i64(now)],
+        )
+        .map_err(storage_error)?;
+    release_session_if_unblocked(
+        &transaction,
+        &session_id,
+        "Codex 已接收审批结果，继续运行",
+        now,
+    )?;
+    transaction.commit().map_err(storage_error)?;
+    Ok(true)
+}
+
 fn release_session_if_unblocked(
     transaction: &Transaction<'_>,
     session_id: &str,
@@ -3015,6 +3239,18 @@ fn sync_native_approval_transaction(
             )
             .map_err(storage_error)?;
     } else {
+        let native_turn_id = transaction
+            .query_row(
+                "SELECT turn_id FROM attention_items
+                 WHERE session_id = ?1 AND kind = 'native_approval'
+                   AND state IN ('open', 'snoozed')
+                 ORDER BY created_at DESC LIMIT 1",
+                [&session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .flatten();
         let hook_approvals = {
             let mut statement = transaction
                 .prepare(
@@ -3117,6 +3353,47 @@ fn sync_native_approval_transaction(
                     ],
                 )
                 .map_err(storage_error)?;
+            if !active {
+                let meaningful: bool = transaction
+                    .query_row(
+                        "SELECT last_meaningful_activity_at IS NOT NULL
+                         FROM sessions WHERE id = ?1",
+                        [&session_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(storage_error)?;
+                if meaningful {
+                    let completion_id = Uuid::now_v7().to_string();
+                    let completion_key = format!(
+                        "{}:{}:completion",
+                        session_id,
+                        native_turn_id.as_deref().unwrap_or("none")
+                    );
+                    transaction
+                        .execute(
+                            "INSERT INTO attention_items (
+                               id, session_id, provider, project, turn_id, request_id,
+                               kind, title, detail, command_preview, risk, risk_notes,
+                               dedupe_key, state, created_at
+                             ) VALUES (
+                               ?1, ?2, ?3, ?4, ?5, NULL, 'completion',
+                               '任务已完成，等你确认', NULL, NULL, 'unknown', '[]',
+                               ?6, 'open', ?7
+                             )
+                             ON CONFLICT(dedupe_key) DO NOTHING",
+                            params![
+                                completion_id,
+                                session_id,
+                                provider_name,
+                                project.as_deref(),
+                                native_turn_id,
+                                completion_key,
+                                to_i64(now),
+                            ],
+                        )
+                        .map_err(storage_error)?;
+                }
+            }
         }
     }
     transaction.commit().map_err(storage_error)?;
@@ -3266,7 +3543,8 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
                         usage.context_used_tokens, usage.context_used_percent,
                         usage.estimated_cost_usd_micros, usage.cost_kind,
                         usage.pricing_source, usage.usage_source,
-                        usage.usage_quality, usage.captured_at
+                        usage.usage_quality, usage.captured_at,
+                        sessions.last_meaningful_activity_at
                  FROM sessions
                  LEFT JOIN session_usage AS usage
                    ON usage.provider = sessions.provider
@@ -3361,6 +3639,7 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
                     term_surface,
                     provider_pid,
                     last_event_at: from_i64(row.get(24)?),
+                    last_meaningful_activity_at: row.get::<_, Option<i64>>(43)?.map(from_i64),
                 })
             })
             .map_err(storage_error)?
@@ -3682,6 +3961,18 @@ fn insert_approval_attention(
     if let Some(existing) = attention_id_for_request(transaction, request_id)? {
         return Ok(existing);
     }
+    // A managed app-server request is the authoritative reply channel. If a
+    // preceding thread status notification created an observation-only row,
+    // retire it before exposing the directly actionable approval.
+    transaction
+        .execute(
+            "UPDATE attention_items SET state = 'resolved', resolved_at = ?2,
+               resolution = 'direct_channel_available', expires_at = NULL
+             WHERE session_id = ?1 AND kind = 'native_approval'
+               AND state IN ('open', 'snoozed')",
+            params![session_id, to_i64(request.received_at)],
+        )
+        .map_err(storage_error)?;
     let id = Uuid::now_v7().to_string();
     let command = request
         .raw
@@ -3763,6 +4054,59 @@ fn insert_native_permission_attention(
         .get("cwd")
         .and_then(Value::as_str)
         .and_then(project_name);
+    let (title, detail) = native_attention_copy(request);
+    transaction
+        .execute(
+            "INSERT INTO attention_items (
+               id, session_id, provider, project, turn_id, request_id, kind,
+               title, detail, command_preview, risk, risk_notes, dedupe_key,
+               state, expires_at, created_at
+             ) VALUES (
+               ?1, ?2, ?3, ?4, ?5, NULL, 'native_approval',
+               ?6, ?7, NULL, 'unknown', '[]', ?8,
+               'open', NULL, ?9
+             )",
+            params![
+                id,
+                session_id,
+                request.provider.to_string(),
+                project,
+                turn_id,
+                title,
+                detail,
+                dedupe_key,
+                to_i64(request.received_at),
+            ],
+        )
+        .map_err(storage_error)?;
+    Ok(id)
+}
+
+fn native_attention_copy(request: &BridgeRequest) -> (String, String) {
+    let tool_name = request.raw.get("tool_name").and_then(Value::as_str);
+    if tool_name == Some("request_plugin_install") {
+        let plugin = request
+            .raw
+            .pointer("/tool_input/plugin_name")
+            .or_else(|| request.raw.pointer("/tool_input/name"))
+            .or_else(|| request.raw.pointer("/tool_input/plugin_id"))
+            .and_then(Value::as_str)
+            .and_then(sanitized_plugin_label);
+        let subject = plugin.as_deref().unwrap_or("插件");
+        let title = format!("Codex 请求安装或连接 {subject}");
+        let reason = request
+            .raw
+            .pointer("/tool_input/suggest_reason")
+            .or_else(|| request.raw.pointer("/tool_input/reason"))
+            .and_then(Value::as_str)
+            .and_then(sanitized_attention_text);
+        let detail = reason.map_or_else(
+            || format!("Codex 正在显示 {subject} 的原生确认窗口；请回到对应对话确认或取消。"),
+            |reason| format!("{reason} 请回到 Codex 原界面确认或取消。"),
+        );
+        return (title, detail);
+    }
+
     let detail = request
         .raw
         .pointer("/tool_input/reason")
@@ -3772,30 +4116,50 @@ fn insert_native_permission_attention(
         .unwrap_or_else(|| {
             "Codex 客户端或终端正在显示原生权限请求；请回到对应对话查看并处理。".to_owned()
         });
-    transaction
-        .execute(
-            "INSERT INTO attention_items (
-               id, session_id, provider, project, turn_id, request_id, kind,
-               title, detail, command_preview, risk, risk_notes, dedupe_key,
-               state, expires_at, created_at
-             ) VALUES (
-               ?1, ?2, ?3, ?4, ?5, NULL, 'native_approval',
-               'Codex 正在请求批准', ?6, NULL, 'unknown', '[]', ?7,
-               'open', NULL, ?8
-             )",
-            params![
-                id,
-                session_id,
-                request.provider.to_string(),
-                project,
-                turn_id,
-                detail,
-                dedupe_key,
-                to_i64(request.received_at),
-            ],
-        )
-        .map_err(storage_error)?;
-    Ok(id)
+    ("Codex 正在请求批准".to_owned(), detail)
+}
+
+fn native_attention_activity(request: &BridgeRequest) -> String {
+    if request.raw.get("tool_name").and_then(Value::as_str) == Some("request_plugin_install") {
+        let plugin = request
+            .raw
+            .pointer("/tool_input/plugin_name")
+            .or_else(|| request.raw.pointer("/tool_input/name"))
+            .or_else(|| request.raw.pointer("/tool_input/plugin_id"))
+            .and_then(Value::as_str)
+            .and_then(sanitized_plugin_label)
+            .unwrap_or_else(|| "插件".to_owned());
+        format!("等待你在 Codex 中确认安装或连接 {plugin}")
+    } else {
+        "Codex 正在请求批准，请在原界面处理".to_owned()
+    }
+}
+
+fn sanitized_plugin_label(value: &str) -> Option<String> {
+    let identifier = value.split('@').next().unwrap_or(value);
+    match identifier.to_ascii_lowercase().as_str() {
+        "github" => return Some("GitHub".to_owned()),
+        "gmail" => return Some("Gmail".to_owned()),
+        "google-drive" | "google_drive" => return Some("Google Drive".to_owned()),
+        _ => {}
+    }
+    let words = identifier
+        .split(['-', '_'])
+        .filter(|word| !word.is_empty())
+        .take(5)
+        .map(|word| {
+            let mut characters = word.chars().filter(|character| character.is_alphanumeric());
+            let first = characters.next()?;
+            let mut normalized = first.to_uppercase().collect::<String>();
+            normalized.extend(characters);
+            Some(normalized)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if words.is_empty() {
+        None
+    } else {
+        Some(words.join(" "))
+    }
 }
 
 struct NonApprovalSpec<'a> {
@@ -3923,7 +4287,7 @@ fn command_claim(
 fn is_observed_codex_permission_start(request: &BridgeRequest) -> bool {
     request.provider == Provider::Codex
         && request.event_name() == Some("PreToolUse")
-        && request.raw.get("tool_name").and_then(Value::as_str) == Some("request_permissions")
+        && is_codex_native_attention_tool(request.raw.get("tool_name").and_then(Value::as_str))
         && !request.needs_reply
         && !request.provider_handles_approval
 }
@@ -4005,16 +4369,23 @@ fn reconcile_observed_native_permission(
     if request.provider != Provider::Codex {
         return Ok(false);
     }
-    let exact_tool_end = matches!(
-        request.event_name(),
-        Some("PostToolUse" | "PostToolUseFailure")
-    ) && request.raw.get("tool_name").and_then(Value::as_str)
-        == Some("request_permissions");
-    let closes_actionable_state = exact_tool_end
+    // Codex Desktop's request_permissions helper can emit PostToolUse and Stop
+    // while its sheet is still visible, so that exact helper end is not a user
+    // decision. request_plugin_install differs: its function output is emitted
+    // only after the native install/connect dialog resolves, so PostToolUse is
+    // authoritative evidence that the request left the screen.
+    let request_permissions_tool =
+        request.raw.get("tool_name").and_then(Value::as_str) == Some("request_permissions");
+    let provider_advanced = matches!(
+        kind,
+        EventKind::ToolStarted | EventKind::ToolFinished | EventKind::ToolFailed
+    ) && !request_permissions_tool;
+    let closes_actionable_state = provider_advanced
         || matches!(
             kind,
             EventKind::PromptSubmitted
-                | EventKind::Stopped
+                | EventKind::PermissionDenied
+                | EventKind::Interrupted
                 | EventKind::Failed
                 | EventKind::SessionEnded
         );
@@ -4022,29 +4393,31 @@ fn reconcile_observed_native_permission(
         return Ok(false);
     }
 
-    let tool_use_id = request
-        .raw
-        .get("tool_use_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && value.len() <= 256);
-    transaction
+    let scope_to_turn = provider_advanced || kind == EventKind::PermissionDenied;
+    let resolution = if kind == EventKind::PermissionDenied {
+        "provider_denied"
+    } else if provider_advanced {
+        "provider_advanced"
+    } else {
+        "provider_closed"
+    };
+    let updated = transaction
         .execute(
             "UPDATE attention_items SET state = 'resolved', resolved_at = ?2,
-               resolution = 'provider_handled', expires_at = NULL
+               resolution = ?3, expires_at = NULL
              WHERE session_id = ?1 AND kind = 'native_approval'
                AND state IN ('open', 'snoozed')
-               AND (?3 = 0 OR ?4 IS NULL OR turn_id = ?4)
-               AND (?5 IS NULL OR dedupe_key = 'native-request:' || ?1 || ':' || ?5)",
+               AND (?4 = 0 OR ?5 IS NULL OR turn_id = ?5)",
             params![
                 session_id,
                 occurred_at,
-                i64::from(exact_tool_end),
+                resolution,
+                i64::from(scope_to_turn),
                 turn_id,
-                tool_use_id,
             ],
         )
         .map_err(storage_error)?;
-    Ok(true)
+    Ok(updated != 0)
 }
 
 fn reconcile_provider_handled_approval(
@@ -4515,6 +4888,81 @@ fn has_background_work(raw: &Value) -> bool {
     })
 }
 
+fn is_meaningful_activity(kind: EventKind, raw: &Value) -> bool {
+    match kind {
+        EventKind::SessionStarted | EventKind::SessionEnded | EventKind::Stopped => false,
+        EventKind::Notification => is_structured_question(raw),
+        EventKind::Unknown => false,
+        _ => true,
+    }
+}
+
+fn turn_contains_meaningful_activity(
+    transaction: &Transaction<'_>,
+    turn_id: &str,
+) -> Result<bool, StoreError> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM events
+               WHERE turn_id = ?1
+                 AND type IN (
+                   'prompt.submitted', 'tool.started', 'tool.finished',
+                   'tool.failed', 'approval.requested', 'approval.denied',
+                   'question.requested', 'elicitation.requested',
+                   'subagent.started', 'subagent.stopped',
+                   'task.created', 'task.completed', 'plan.updated',
+                   'approval.auto_review.started',
+                   'approval.auto_review.completed', 'session.compacting',
+                   'turn.interrupted', 'turn.failed'
+                 )
+             )",
+            [turn_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(storage_error)
+}
+
+fn provider_handled_permission_state(
+    permission_mode: Option<&str>,
+    raw: &Value,
+) -> (&'static str, Option<&'static str>, String) {
+    let full_access = matches!(
+        permission_mode,
+        Some(
+            "bypassPermissions"
+                | "danger-full-access"
+                | "full-access"
+                | "fullAccess"
+                | "full_access"
+                | "never"
+        )
+    ) || raw
+        .get("approval_policy")
+        .or_else(|| raw.get("approvalPolicy"))
+        .and_then(Value::as_str)
+        .is_some_and(|policy| policy == "never");
+    if full_access {
+        (
+            "thinking",
+            None,
+            "Codex 完全访问模式，无需用户审批".to_owned(),
+        )
+    } else if permission_mode == Some("dontAsk") {
+        (
+            "thinking",
+            None,
+            "Codex 非交互模式，不会请求用户审批".to_owned(),
+        )
+    } else {
+        (
+            "thinking",
+            Some("provider"),
+            "Codex 正在自动审批".to_owned(),
+        )
+    }
+}
+
 fn normalized_token_usage(raw: &Value) -> (Option<u64>, Option<u64>) {
     let total = first_u64(
         raw,
@@ -4603,9 +5051,8 @@ fn project_event<'a>(
     current: &'a str,
 ) -> (&'a str, Option<&'static str>, String) {
     match kind {
-        EventKind::SessionStarted | EventKind::SessionEnded => {
-            ("idle", None, "等待新任务".to_owned())
-        }
+        EventKind::SessionStarted => ("idle", None, "等待新任务".to_owned()),
+        EventKind::SessionEnded => ("idle", None, "会话已结束".to_owned()),
         EventKind::PromptSubmitted => ("thinking", None, "正在思考".to_owned()),
         EventKind::ToolStarted => (
             "tool_running",
@@ -4807,7 +5254,8 @@ fn sanitized_tool_name(name: &str) -> String {
         | "WebSearch"
         | "apply_patch"
         | "MultiEdit"
-        | "request_permissions" => name.to_owned(),
+        | "request_permissions"
+        | "request_plugin_install" => name.to_owned(),
         _ => "Unknown".to_owned(),
     }
 }
@@ -4818,6 +5266,8 @@ fn event_summary(raw: &Value, kind: EventKind) -> Option<String> {
             raw.get("tool_name").and_then(Value::as_str).map(|tool| {
                 if tool == "request_permissions" {
                     "Codex 原界面请求批准".to_owned()
+                } else if tool == "request_plugin_install" {
+                    "Codex 原界面请求安装或连接插件".to_owned()
                 } else {
                     format!("请求运行 {}", sanitized_tool_name(tool))
                 }

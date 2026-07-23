@@ -1,6 +1,6 @@
 //! Provider-specific hook parsing.
 
-use actrealm_core::{EventKind, Provider};
+use actrealm_core::{is_codex_native_attention_tool, EventKind, Provider};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -65,12 +65,12 @@ fn normalize_event(provider: Provider, event_name: &str, raw: &Value) -> EventKi
         }
         "PreToolUse"
             if provider == Provider::Codex
-                && raw.get("tool_name").and_then(Value::as_str) == Some("request_permissions") =>
+                && is_codex_native_attention_tool(raw.get("tool_name").and_then(Value::as_str)) =>
         {
-            // Codex Desktop 0.144.x exposes its native permission sheet as a
-            // non-blocking tool lifecycle, not as a replyable PermissionRequest
-            // hook. Treat it as observed provider UI; BridgeRequest still keeps
-            // `needs_reply = false` because the hook event is PreToolUse.
+            // Codex Desktop exposes permission and plugin confirmation sheets
+            // as non-blocking tool lifecycles, not as replyable
+            // PermissionRequest hooks. Treat them as observed Provider UI;
+            // BridgeRequest keeps `needs_reply = false`.
             EventKind::PermissionRequested
         }
         "PreToolUse" => EventKind::ToolStarted,

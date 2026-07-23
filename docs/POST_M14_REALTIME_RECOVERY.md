@@ -9,8 +9,9 @@ Provider control boundary:
    changing; and
 2. recovering the local Runtime and Hook socket required separate manual steps.
 
-It is not M15. M15 remains reserved for version-gated managed Codex app-server
-approval methods.
+This document records the earlier post-M14 recovery change. M15 was delivered
+later; its current capability boundary is documented in `STATUS.md` and
+`M15_CODEX_MANAGED_APPROVALS.md`.
 
 ## Delivered behavior
 

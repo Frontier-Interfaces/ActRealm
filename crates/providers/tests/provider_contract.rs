@@ -70,6 +70,29 @@ fn codex_request_permissions_tool_is_an_observed_native_request() {
 }
 
 #[test]
+fn codex_plugin_install_tool_is_an_observed_native_request() {
+    let event = parse_hook(
+        Provider::Codex,
+        json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "codex-desktop-plugin-session",
+            "turn_id": "turn-plugin",
+            "tool_name": "request_plugin_install",
+            "tool_use_id": "call-plugin",
+            "tool_input": {
+                "plugin_id": "github@openai-curated-remote",
+                "suggest_reason": "Connect GitHub repositories and pull requests."
+            }
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(event.kind, EventKind::PermissionRequested);
+    assert_eq!(event.tool_name.as_deref(), Some("request_plugin_install"));
+    assert_eq!(event.provider_turn_id.as_deref(), Some("turn-plugin"));
+}
+
+#[test]
 fn supported_lifecycle_events_map_to_normalized_kinds() {
     let cases = [
         ("SessionStart", EventKind::SessionStarted),

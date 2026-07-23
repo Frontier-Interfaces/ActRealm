@@ -273,7 +273,9 @@ public final class RuntimeSupervisor: ObservableObject {
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
             Task { @MainActor in
                 guard let self else { return }
-                self.stderrTail = String((self.stderrTail + text).suffix(4000))
+                self.stderrTail = String(
+                    (self.stderrTail + Self.redactedDiagnosticText(text)).suffix(4000)
+                )
                 self.refreshDiagnostics()
             }
         }
@@ -308,11 +310,27 @@ public final class RuntimeSupervisor: ObservableObject {
             let lineData = stdoutBuffer[stdoutBuffer.startIndex..<newline]
             stdoutBuffer.removeSubrange(stdoutBuffer.startIndex...newline)
             if let line = String(data: lineData, encoding: .utf8) {
-                stdoutTail = String((stdoutTail + line + "\n").suffix(4000))
                 consume(line: line)
+                stdoutTail = String(
+                    (stdoutTail + Self.redactedDiagnosticText(line) + "\n").suffix(4000)
+                )
             }
         }
         refreshDiagnostics()
+    }
+
+    /// Bootstrap credentials are one-time secrets. Diagnostics may retain the
+    /// endpoint for support, but must never persist or render the token.
+    public nonisolated static func redactedDiagnosticText(_ text: String) -> String {
+        guard let expression = try? NSRegularExpression(
+            pattern: #"(?i)([#?&]bootstrap=)[^\s"'<>]+"#
+        ) else { return text }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return expression.stringByReplacingMatches(
+            in: text,
+            range: range,
+            withTemplate: "$1<redacted>"
+        )
     }
 
     private func consume(line: String) {
