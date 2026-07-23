@@ -12,6 +12,7 @@ struct InteractiveQuestionView: View {
     @State private var textValues: [String: String] = [:]
     @State private var selectedValues: [String: Set<String>] = [:]
     @State private var otherValues: [String: String] = [:]
+    @State private var validationErrors: [String: String] = [:]
     @State private var busy = false
 
     var body: some View {
@@ -111,6 +112,12 @@ struct InteractiveQuestionView: View {
                     .textFieldStyle(.roundedBorder)
                 }
             }
+
+            if let validationError = validationErrors[question.id] {
+                Label(validationError, systemImage: "exclamationmark.circle.fill")
+                    .font(.system(size: 9.5, weight: .semibold))
+                    .foregroundStyle(DT.redText)
+            }
         }
         .padding(10)
         .background(DT.cardStrong.opacity(0.72), in: RoundedRectangle(cornerRadius: 11))
@@ -130,6 +137,7 @@ struct InteractiveQuestionView: View {
                 values = [option.label]
             }
             selectedValues[question.id] = values
+            validationErrors[question.id] = nil
         } label: {
             HStack(spacing: 9) {
                 Image(systemName: question.multiSelect
@@ -165,7 +173,10 @@ struct InteractiveQuestionView: View {
     ) -> Binding<String> {
         Binding(
             get: { dictionary.wrappedValue[key, default: ""] },
-            set: { dictionary.wrappedValue[key] = $0 }
+            set: {
+                dictionary.wrappedValue[key] = $0
+                validationErrors[key] = nil
+            }
         )
     }
 
@@ -179,6 +190,7 @@ struct InteractiveQuestionView: View {
         }
 
         var answers: [String: JSONValue] = [:]
+        validationErrors = [:]
         for question in prompt.questions {
             switch question.inputType {
             case "choice":
@@ -187,7 +199,7 @@ struct InteractiveQuestionView: View {
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if !other.isEmpty { values.append(other) }
                 if values.isEmpty, question.required {
-                    model.showToast("请回答“\(question.label)”")
+                    validationErrors[question.id] = "请选择一个答案。"
                     return
                 }
                 if ["claude_question", "codex_user_input"].contains(prompt.kind) {
@@ -198,7 +210,7 @@ struct InteractiveQuestionView: View {
             case "boolean":
                 let value = textValues[question.id, default: ""]
                 if value.isEmpty, question.required {
-                    model.showToast("请回答“\(question.label)”")
+                    validationErrors[question.id] = "请选择“是”或“否”。"
                     return
                 }
                 if !value.isEmpty {
@@ -210,14 +222,14 @@ struct InteractiveQuestionView: View {
                 let value = textValues[question.id, default: ""]
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if value.isEmpty, question.required {
-                    model.showToast("请填写“\(question.label)”")
+                    validationErrors[question.id] = "请输入回答。"
                     return
                 }
                 guard !value.isEmpty else { continue }
                 let normalized: JSONValue
                 if question.inputType == "number" {
                     guard let number = Double(value), number.isFinite else {
-                        model.showToast("请在“\(question.label)”中输入有效数字")
+                        validationErrors[question.id] = "请输入有效数字。"
                         return
                     }
                     normalized = .number(number)

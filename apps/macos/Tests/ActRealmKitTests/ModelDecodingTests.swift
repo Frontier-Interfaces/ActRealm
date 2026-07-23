@@ -236,11 +236,14 @@ struct ModelDecodingTests {
         #expect(settings.taskCardFields.contains("reasoningTokens"))
         #expect(settings.taskCardFields.contains("cost"))
         #expect(settings.displayFieldsVersion == 3)
+        #expect(settings.quotaDisplayMode == .full)
+        #expect(QuotaDisplayMode.singleLine.rawValue == "compact")
         settings.notificationRules.question = .ignore
         settings.providerMuted.codex = true
         settings.retentionDays = 180
         settings.displayProfile = "developer"
         settings.taskCardFields = ["task", "providerTurnId"]
+        settings.quotaDisplayMode = .compact
 
         let data = try JSONEncoder().encode(settings)
         let object = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -250,6 +253,54 @@ struct ModelDecodingTests {
         #expect(muted["codex"] as? Bool == true)
         #expect(object["retentionDays"] as? Int == 180)
         #expect(object["taskCardFields"] as? [String] == ["task", "providerTurnId"])
+        #expect(object["quotaDisplayMode"] as? String == "twoLine")
+    }
+
+    @Test func legacySettingsDefaultQuotaDisplayModeToFull() throws {
+        let legacy = Data(#"""
+        {
+          "notificationRules": {
+            "approval": "banner",
+            "question": "list",
+            "error": "banner",
+            "completion": "list"
+          },
+          "soundEnabled": true,
+          "providerMuted": { "claude": false, "codex": false },
+          "codexEnhancedActivity": true,
+          "retentionDays": 90,
+          "displayProfile": "detailed",
+          "taskCardFields": ["project", "task"],
+          "displayFieldsVersion": 3
+        }
+        """#.utf8)
+
+        let settings = try JSONDecoder().decode(UISettings.self, from: legacy)
+        #expect(settings.quotaDisplayMode == .full)
+    }
+
+    @Test func previousCompactQuotaModeRemainsTheSingleLineMode() throws {
+        let legacy = Data(#"""
+        {
+          "notificationRules": {
+            "approval": "banner",
+            "question": "list",
+            "error": "banner",
+            "completion": "list"
+          },
+          "soundEnabled": true,
+          "providerMuted": { "claude": false, "codex": false },
+          "codexEnhancedActivity": true,
+          "retentionDays": 90,
+          "displayProfile": "detailed",
+          "taskCardFields": ["project", "task"],
+          "displayFieldsVersion": 3,
+          "quotaDisplayMode": "compact"
+        }
+        """#.utf8)
+
+        let settings = try JSONDecoder().decode(UISettings.self, from: legacy)
+        #expect(settings.quotaDisplayMode == .singleLine)
     }
 
     @Test func conciseTaskCardPresetAddsFourUsefulFieldsToTheCoreThree() {

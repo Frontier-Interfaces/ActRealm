@@ -408,6 +408,11 @@ without making the final v1 release complete.
       Codex Connector action.
 - [x] Native quota renders the Runtime's arbitrary windows and metadata; it no
       longer invents fixed three-window placeholders when no quota exists.
+- [x] Runtime-backed quota display mode defaults to full, preserves the prior
+      one-line setting, and lets macOS/Web render full, compact two-line, or
+      single-line cards without changing quota source, freshness, or
+      availability semantics. The workspace keeps a 300-point quota minimum
+      while all three columns and progress tracks expand with wider windows.
 - [x] Native settings use the shared settings, Claude quota bridge, export,
       metrics, clear-data, and controlled Runtime-restart contracts.
 - [x] Web task visibility/clear, reminder-ignore, sound, retention, and

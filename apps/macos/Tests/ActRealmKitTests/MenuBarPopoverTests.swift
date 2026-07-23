@@ -1,9 +1,15 @@
+import AppKit
 import Foundation
 import Testing
 @testable import ActRealmKit
 @testable import ActRealmUI
 
 @Suite struct MenuBarPopoverTests {
+    @Test @MainActor func menuBarMarkUsesAFixedTemplateImage() {
+        #expect(MenuBarMark.templateImage.size == NSSize(width: 16, height: 14))
+        #expect(MenuBarMark.templateImage.isTemplate)
+    }
+
     @Test func notificationTonesMatchTheMainOutboxSemantics() {
         #expect(MenuBarStatusTone(kind: .approval) == .amber)
         #expect(MenuBarStatusTone(kind: .nativeApproval) == .amber)
@@ -34,10 +40,28 @@ import Testing
             now: Date(timeIntervalSince1970: 4)
         )
 
-        #expect(presentation.title == "等待处理任务")
+        #expect(presentation.title == "Claude")
         #expect(presentation.subtitle == "Claude · 等待处理")
         #expect(presentation.trailing == "1 项待处理")
         #expect(presentation.tone == .amber)
+    }
+
+    @Test func activeLaneTitleUsesTheAgentNameInsteadOfTheProjectDirectory() {
+        let snapshot = makeMenuBarSnapshot(sessions: [
+            makeMenuBarSession(
+                id: "codex-running",
+                provider: "codex",
+                project: "jian",
+                execState: "tool_running",
+                lastEventAt: 3_000
+            ),
+        ])
+        let lane = DerivedState.derive(from: snapshot).lanes.first { $0.provider == .codex }!
+
+        let presentation = MenuBarLanePresentation(lane: lane, now: .now)
+
+        #expect(presentation.title == "Codex")
+        #expect(presentation.trailing == "1 项运行中")
     }
 
     @Test func emptyLaneUsesOneNeutralMessage() {
@@ -56,13 +80,14 @@ import Testing
 
 private func makeMenuBarSession(
     id: String,
+    provider: String = "claude",
     project: String,
     execState: String,
     lastEventAt: UInt64
 ) -> SessionRecord {
     SessionRecord(
         id: id,
-        provider: "claude",
+        provider: provider,
         providerSessionId: id,
         project: project,
         title: "任务 \(id)",

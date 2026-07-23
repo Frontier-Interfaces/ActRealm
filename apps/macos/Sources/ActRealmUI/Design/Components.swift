@@ -4,35 +4,46 @@ import SwiftUI
 
 // MARK: - Logo
 
-/// Three rounded vertical bars — the actrealm mark.
+@MainActor
+private enum ActRealmBrandAsset {
+    static let image: NSImage = {
+        if let packaged = Bundle.main.url(
+            forResource: "ActRealmIcon",
+            withExtension: "png"
+        ), let image = NSImage(contentsOf: packaged) {
+            return image
+        }
+
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<4 { root.deleteLastPathComponent() }
+        let developmentAsset = root
+            .appendingPathComponent("Resources", isDirectory: true)
+            .appendingPathComponent("ActRealmIcon.png")
+        return NSImage(contentsOf: developmentAsset)
+            ?? NSApplication.shared.applicationIconImage
+    }()
+}
+
+/// ActRealm's app icon, used anywhere the product itself is represented.
 struct LogoMark: View {
-    var barWidth: CGFloat = 3
-    var heights: [CGFloat] = [6, 11, 8]
-    var color: Color = DT.logoTint
+    var size: CGFloat = 18
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 2) {
-            ForEach(heights.indices, id: \.self) { index in
-                RoundedRectangle(cornerRadius: 2)
-                    .fill(color)
-                    .frame(width: barWidth, height: heights[index])
-            }
-        }
+        Image(nsImage: ActRealmBrandAsset.image)
+            .resizable()
+            .interpolation(.high)
+            .scaledToFit()
+            .frame(width: size, height: size)
+            .accessibilityHidden(true)
     }
 }
 
-/// Compact toolbar app icon. The filled tile gives the mark a clear icon
-/// silhouette while the unified title bar supplies the native glass layer.
+/// Larger variant for surfaces that need a standalone app tile.
 struct AppMark: View {
+    var size: CGFloat = 27
+
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(DT.logoTint.gradient)
-            LogoMark(barWidth: 2.7, heights: [7, 14, 10], color: .white)
-        }
-        .frame(width: 27, height: 27)
-        .shadow(color: DT.logoTint.opacity(0.2), radius: 4, y: 2)
-        .accessibilityHidden(true)
+        LogoMark(size: size)
     }
 }
 

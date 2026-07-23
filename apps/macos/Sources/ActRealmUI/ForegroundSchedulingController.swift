@@ -110,6 +110,22 @@ struct StageManagerLease: Equatable {
     }
 }
 
+enum ForegroundWorkspacePresence {
+    static func isActive(
+        boundApplications: [ForegroundWorkspaceApp],
+        visibleApplications: [ForegroundWorkspaceApp]
+    ) -> Bool {
+        let boundIdentifiers = Set(boundApplications.map {
+            $0.bundleIdentifier.lowercased()
+        })
+        guard !boundIdentifiers.isEmpty else { return false }
+        let visibleIdentifiers = Set(visibleApplications.map {
+            $0.bundleIdentifier.lowercased()
+        })
+        return !boundIdentifiers.isDisjoint(with: visibleIdentifiers)
+    }
+}
+
 /// Executes the AppKit half of Agent Focus: foregrounding a matching Agent,
 /// observing the bound workspace and pointer, and restoring any Stage Manager
 /// state that this focus session changed. ActRealmKit owns policy and timers.
@@ -332,7 +348,7 @@ public final class ForegroundSchedulingController: ObservableObject {
     private func refreshWorkspaceStatus() {
         let window = actRealmWorkspaceWindow
         let provider = model.foregroundDispatch?.provider
-        let workspaceActive = isBoundWorkspaceActive(for: provider)
+        let workspaceActive = isBoundWorkspaceActive
         model.updateForegroundWorkspaceStatus(ForegroundWorkspaceStatus(
             isActRealmWorkspaceReady: window != nil,
             isAgentAvailable: agentTarget(for: provider) != nil,
@@ -341,15 +357,11 @@ public final class ForegroundSchedulingController: ObservableObject {
         ))
     }
 
-    private func isBoundWorkspaceActive(for provider: ProviderKind?) -> Bool {
-        let bound = Set(model.foregroundScheduling.workspaceApps.filter {
-            workspaceApplication($0, matches: provider)
-        }.map(\.bundleIdentifier))
-        guard !bound.isEmpty else { return false }
-        let visible = Set(visibleApplications(
-            on: resolvedBoundDisplayID
-        ).map(\.bundleIdentifier))
-        return !bound.isDisjoint(with: visible)
+    private var isBoundWorkspaceActive: Bool {
+        ForegroundWorkspacePresence.isActive(
+            boundApplications: model.foregroundScheduling.workspaceApps,
+            visibleApplications: visibleApplications(on: resolvedBoundDisplayID)
+        )
     }
 
     private var isPointerInsideBoundDisplay: Bool {

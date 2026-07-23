@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light">
     <title>ActRealm</title>
+    <link rel="icon" type="image/png" href="/assets/actrealm-icon.png">
+    <link rel="apple-touch-icon" href="/assets/actrealm-icon.png">
     <link rel="stylesheet" href="/app.css">
   </head>
   <body class="app-booting">
@@ -16,7 +18,7 @@
 
     <main class="actrealm-workspace" id="actrealm-workspace" aria-label="ActRealm 工作区">
       <header class="window-toolbar">
-        <span class="signal-bars brand-signal" aria-hidden="true"><i></i><i></i><i></i></span>
+        <img class="brand-icon" src="/assets/actrealm-icon.png" alt="" aria-hidden="true">
         <strong>ActRealm</strong>
         <button class="agent-connection-state" id="agent-status-trigger" type="button" aria-label="打开 Agent 接入中心">
           <span class="agent-status-dot" aria-hidden="true"></span>
@@ -128,6 +130,10 @@
         </div>
         <span class="local-pill"><i></i>本机 · 不发送遥测</span>
       </header>
+      <div class="settings-save-feedback" id="settings-save-feedback" role="status" hidden>
+        <span id="settings-save-message"></span>
+        <button id="settings-save-retry" type="button" hidden>重试</button>
+      </div>
 
       <section class="settings-glass runtime-card">
         <div class="runtime-icon"><i></i></div>
@@ -140,6 +146,7 @@
           <button id="runtime-monitor" type="button">查看监控</button>
           <button class="primary" id="runtime-restart" type="button">重启 Runtime</button>
         </div>
+        <div class="event-channel runtime-action-feedback" id="runtime-action-feedback" role="status" hidden></div>
         <div class="event-channel" id="runtime-monitor-details" hidden>
           <div class="monitor-heading">
             <div><strong>本机健康监控</strong><span>实时读取，不发送遥测</span></div>
@@ -152,41 +159,46 @@
       </section>
 
       <section class="settings-glass reminder-settings">
-        <div class="settings-section-heading"><h3>什么时候提醒</h3><span>为每类事件选择到达方式</span></div>
+        <div class="settings-section-heading"><h3>进入 Outbox 的事件</h3><span>选择哪些事件需要出现在 Outbox 中，提醒你处理。</span></div>
         <div class="reminder-list">
           <article class="reminder-row" data-rule="approval">
             <span class="reminder-dot approval"><i></i></span>
-            <div><strong>等待批准</strong><p>Agent 请求运行命令，等待批准</p></div>
-            <div class="segmented-options">
-              <button type="button" data-value="ignore">关闭</button><button type="button" data-value="list">仅列表</button>
-            </div>
+            <div><strong>等待批准</strong><p>Agent 请求执行操作，需要你的批准</p></div>
+            <label class="switch"><input id="notify-approval" type="checkbox" aria-label="等待批准进入 Outbox"><span></span></label>
           </article>
           <article class="reminder-row" data-rule="question">
             <span class="reminder-dot question"><i></i></span>
-            <div><strong>Agent 提问</strong><p>Agent 发出需要回答的问题</p></div>
-            <div class="segmented-options">
-              <button type="button" data-value="ignore">关闭</button><button type="button" data-value="list">仅列表</button>
-            </div>
+            <div><strong>等待回答</strong><p>Agent 提出了需要你回答的问题</p></div>
+            <label class="switch"><input id="notify-question" type="checkbox" aria-label="等待回答进入 Outbox"><span></span></label>
           </article>
           <article class="reminder-row" data-rule="error">
             <span class="reminder-dot error"><i></i></span>
-            <div><strong>出错 / 卡住</strong><p>Agent 报错或长时间无进展</p></div>
-            <div class="segmented-options">
-              <button type="button" data-value="ignore">关闭</button><button type="button" data-value="list">仅列表</button>
-            </div>
+            <div><strong>需要处理</strong><p>Agent 执行出错，或长时间没有进展</p></div>
+            <label class="switch"><input id="notify-error" type="checkbox" aria-label="需要处理进入 Outbox"><span></span></label>
           </article>
           <article class="reminder-row" data-rule="completion">
             <span class="reminder-dot completion"><i></i></span>
-            <div><strong>任务完成</strong><p>本轮修改完成，等待确认</p></div>
-            <div class="segmented-options">
-              <button type="button" data-value="ignore">关闭</button><button type="button" data-value="list">仅列表</button>
-            </div>
+            <div><strong>等待确认</strong><p>Agent 已完成本轮任务，需要你的确认</p></div>
+            <label class="switch"><input id="notify-completion" type="checkbox" aria-label="等待确认进入 Outbox"><span></span></label>
           </article>
           <article class="reminder-row sound-row">
             <span class="reminder-dot question"><i></i></span>
-            <div><strong>提示音</strong><p>新事件进入列表时播放轻提示音</p></div>
+            <div><strong>提示音</strong><p>新事件进入 Outbox 时播放轻提示音</p></div>
             <label class="switch"><input id="sound-enabled" type="checkbox"><span></span></label>
           </article>
+        </div>
+        <p class="settings-section-note">关闭某项后，此类事件仍会保留在任务记录中，但不会出现在 Outbox。</p>
+      </section>
+
+      <section class="settings-glass display-settings">
+        <div class="settings-section-heading"><h3>显示</h3><span>调整任务与额度信息密度</span></div>
+        <div class="retention-row quota-display-row">
+          <div><strong>额度卡片</strong><p>完整保留全部信息；紧凑使用双行；单行把核心额度排在一行</p></div>
+          <div class="segmented-options quota-display-options" role="group" aria-label="额度卡片显示模式">
+            <button type="button" data-value="standard">完整</button>
+            <button type="button" data-value="twoLine">紧凑</button>
+            <button type="button" data-value="compact">单行</button>
+          </div>
         </div>
       </section>
 
@@ -223,10 +235,6 @@
       </section>
 
       <div class="legacy-only" aria-hidden="true">
-        <select id="notify-approval"><option value="list">仅列表</option><option value="ignore">关闭</option></select>
-        <select id="notify-question"><option value="list">仅列表</option><option value="ignore">关闭</option></select>
-        <select id="notify-error"><option value="list">仅列表</option><option value="ignore">关闭</option></select>
-        <select id="notify-completion"><option value="list">仅列表</option><option value="ignore">关闭</option></select>
         <input id="mute-claude" type="checkbox">
         <input id="mute-codex" type="checkbox">
         <input id="codex-enhanced" type="checkbox">

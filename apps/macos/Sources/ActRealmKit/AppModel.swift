@@ -35,6 +35,15 @@ enum RuntimeStatusMessagePolicy {
     }
 }
 
+public enum ToastPriority: Int, Comparable, Sendable {
+    case informational
+    case error
+
+    public static func < (lhs: ToastPriority, rhs: ToastPriority) -> Bool {
+        lhs.rawValue < rhs.rawValue
+    }
+}
+
 /// Keeps OUTBOX selection attached to a stable Runtime identity instead of a
 /// transient array position. Runtime snapshots may reorder attention items as
 /// priorities or timestamps change, so an index can silently select the wrong
@@ -436,6 +445,7 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var isRestartingRuntime = false
     @Published public private(set) var runtimeActionMessage: String?
     @Published public private(set) var toastMessage: String?
+    @Published public private(set) var isSettingsVisible = false
     @Published public private(set) var isHUDPreviewActive = false
     /// Ticks once per second so waiting timers and countdown rings advance.
     @Published public private(set) var now: Date = Date()
@@ -445,6 +455,8 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var claudeQuotaBridge: ClaudeQuotaBridge?
     @Published public private(set) var isSetupBusy = false
     @Published public private(set) var isSettingsBusy = false
+    @Published public private(set) var settingsSaveError: String?
+    @Published public private(set) var settingsSaveNotice: String?
     @Published public private(set) var isQuotaRefreshBusy = false
     /// Persistent result shown in Settings. A main-window toast alone is not
     /// visible while the separate Settings scene is frontmost.
@@ -494,6 +506,21 @@ public final class AppModel: ObservableObject {
             !["connected", "not_installed", "provider_missing", "cli_missing"].contains($0.status)
         }.count ?? 0
     }
+    /// The single user-visible task feed shared by the main window and menu bar.
+    /// Runtime sessions remain intact, while locally cleared task versions stay
+    /// out of every compact UI until a newer event makes them visible again.
+    public var visibleAgentTasks: [LaneTask] {
+        let cutoff = now.addingTimeInterval(-30 * 60)
+        return derived.agentTasks.filter { task in
+            guard !isTaskDismissed(task) else { return false }
+            return task.status == .running || task.status == .waiting
+                || task.hasVisibleAttention || task.lastEventAt >= cutoff
+        }
+    }
+
+    public func visibleAgentTasks(for provider: ProviderKind) -> [LaneTask] {
+        visibleAgentTasks.filter { ProviderKind(record: $0.session.provider) == provider }
+    }
 
     private static let legacyApprovalPolicyKey = "actrealm.approvalPolicy"
     private static let dismissedTasksKey = "actrealm.dismissedTaskVersions"
@@ -510,6 +537,8 @@ public final class AppModel: ObservableObject {
     private var outboxHighlightTask: Task<Void, Never>?
     private var hudPreviewTask: Task<Void, Never>?
     private var settingsSaveTask: Task<Void, Never>?
+    private var failedUISettings: UISettings?
+    private var activeToastPriority = ToastPriority.informational
     private var setupRefreshTask: Task<Void, Never>?
     private var seededForegroundArrivals = false
     private var seededNotifications = false
@@ -747,7 +776,12 @@ public final class AppModel: ObservableObject {
 
     public func refreshSettings() async {
         guard !isDemo else { return }
-        guard let response = await client.fetchSettings() else { return }
+        guard let response = await client.fetchSettings() else {
+            settingsSaveNotice = nil
+            settingsSaveError = "无法读取本机设置，请检查 Runtime 连接后重试。"
+            return
+        }
+        settingsSaveError = nil
         acceptSettings(response)
     }
 
@@ -759,6 +793,9 @@ public final class AppModel: ObservableObject {
         update(&next)
         guard next != uiSettings else { return }
         uiSettings = next
+        failedUISettings = nil
+        settingsSaveError = nil
+        settingsSaveNotice = nil
         apply(snapshot: latestSnapshot, emitArrivals: false)
         settingsSaveTask?.cancel()
         settingsSaveTask = Task { [weak self] in
@@ -776,16 +813,29 @@ public final class AppModel: ObservableObject {
         let (response, error) = await client.updateSettings(settings)
         if let response {
             acceptSettings(response)
+            failedUISettings = nil
+            settingsSaveError = nil
             if previousCodexMode != response.settings.codexEnhancedActivity {
-                showToast("Codex Hook 已更新，请在 Codex 中运行 /hooks 重新检查信任")
+                settingsSaveNotice = "Codex Hook 已更新，请在 Codex 中运行 /hooks 重新检查信任。"
                 await refreshSetup()
             } else {
-                showToast("设置已保存到本机")
+                settingsSaveNotice = nil
             }
         } else {
-            showToast("设置保存失败：\(error ?? "未知错误")")
+            failedUISettings = settings
+            settingsSaveNotice = nil
+            let message = "设置保存失败：\(error ?? "未知错误")"
             await refreshSettings()
+            settingsSaveError = message
         }
+    }
+
+    public func retrySettingsSave() {
+        guard !isDemo, !isSettingsBusy, let settings = failedUISettings else { return }
+        uiSettings = settings
+        settingsSaveError = nil
+        apply(snapshot: latestSnapshot, emitArrivals: false)
+        Task { await persistSettings(settings) }
     }
 
     private func acceptSettings(_ response: SettingsResponse) {
@@ -817,7 +867,6 @@ public final class AppModel: ObservableObject {
         guard canControlRuntime else {
             let message = "Runtime 未连接，暂时无法刷新额度"
             quotaRefreshMessage = message
-            showToast(message)
             return
         }
         isQuotaRefreshBusy = true
@@ -827,7 +876,6 @@ public final class AppModel: ObservableObject {
         if let error = await client.requestQuotaRefresh() {
             let message = "额度刷新失败：\(error)"
             quotaRefreshMessage = message
-            showToast(message)
             return
         }
         for _ in 0..<12 {
@@ -836,7 +884,6 @@ public final class AppModel: ObservableObject {
             {
                 let message = "Claude 额度已主动更新"
                 quotaRefreshMessage = message
-                showToast(message)
                 return
             }
             try? await Task.sleep(for: .seconds(1))
@@ -844,7 +891,6 @@ public final class AppModel: ObservableObject {
         }
         let message = "已请求刷新，但 Claude 暂未返回新额度；请启动 Claude Code CLI 并开始一次会话后重试"
         quotaRefreshMessage = message
-        showToast(message)
     }
 
     nonisolated static func latestClaudeQuotaCapture(in snapshot: Snapshot) -> UInt64? {
@@ -1178,7 +1224,7 @@ public final class AppModel: ObservableObject {
         else { return }
         selectedOutboxID = target
         outboxHighlighted = true
-        showToast("已定位到 OUTBOX 待处理事项")
+        showToast("已定位到 Outbox 待处理事项")
         outboxHighlightTask?.cancel()
         outboxHighlightTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(1_600))
@@ -1212,7 +1258,7 @@ public final class AppModel: ObservableObject {
         if expandedTaskId == task.id { expandedTaskId = nil }
         if pinnedSessionId == task.id { pinnedSessionId = nil }
         if failed > 0 {
-            showToast("任务已清除；\(failed) 项仍需在 OUTBOX 或 Agent 原界面处理")
+            showToast("任务已清除；\(failed) 项仍需在 Outbox 或 Agent 原界面处理")
         } else if !related.isEmpty {
             showToast("任务已清除，并交还 \(related.count) 项待处理事项")
         } else {
@@ -1225,14 +1271,30 @@ public final class AppModel: ObservableObject {
         return dismissedAt >= task.session.lastEventAt
     }
 
-    public func showToast(_ message: String) {
+    public func setSettingsVisible(_ visible: Bool) {
+        isSettingsVisible = visible
+    }
+
+    public func showToast(_ message: String, priority: ToastPriority? = nil) {
+        let resolvedPriority = priority ?? Self.inferredToastPriority(for: message)
+        if toastMessage != nil, resolvedPriority < activeToastPriority { return }
         toastTask?.cancel()
+        activeToastPriority = resolvedPriority
         toastMessage = message
         toastTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(2.4))
+            try? await Task.sleep(for: .seconds(3.2))
             guard !Task.isCancelled else { return }
             self?.toastMessage = nil
+            self?.activeToastPriority = .informational
         }
+    }
+
+    private static func inferredToastPriority(for message: String) -> ToastPriority {
+        let errorMarkers = [
+            "失败", "无法", "不能", "未连接", "没有可用", "没有找到", "未找到",
+            "已过期", "请输入", "请回答", "请填写", "仍需在",
+        ]
+        return errorMarkers.contains(where: message.contains) ? .error : .informational
     }
 
     /// Applies one atomic edit and persists it immediately. The page calls this

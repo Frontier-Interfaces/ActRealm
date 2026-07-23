@@ -5,6 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>ActRealm — Manage Agents and Bring Task Context Forward</title>
 <meta name="description" content="ActRealm brings agent tasks, status, approval requests and workspaces into one local control layer, then returns you to the right terminal, diff and preview when action is needed.">
+<meta name="theme-color" content="#315bd4">
+<meta property="og:image" content="https://www.getactrealm.com/assets/actrealm-icon-1024.png">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
+<link rel="icon" type="image/png" sizes="192x192" href="assets/actrealm-icon-192.png">
+<link rel="apple-touch-icon" sizes="180x180" href="assets/apple-touch-icon.png">
 <style>
 :root{
   --txt:#1d1d1f; --txt2:#6e6e73; --txt3:#86868b;
@@ -35,9 +40,7 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em;background:#ececf1
 .lnav{position:sticky;top:0;z-index:100;background:rgba(255,255,255,.72);backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);border-bottom:1px solid rgba(0,0,0,.08)}
 .lnav-in{display:flex;align-items:center;justify-content:space-between;height:52px;gap:14px}
 .lnav .name{display:flex;align-items:center;gap:8px;font-size:19px;font-weight:600}
-.mark{width:22px;height:22px;border-radius:6px;background:var(--grad);position:relative;flex:none}
-.mark::before{content:"";position:absolute;right:4px;top:5px;bottom:5px;width:9px;border-radius:2.5px;background:#fff}
-.mark::after{content:"";position:absolute;left:4px;top:5px;width:4px;height:3px;border-radius:1px;background:#fff;box-shadow:0 4.5px 0 #fff,0 9px 0 #fff}
+.mark{display:block;width:22px;height:22px;object-fit:contain;flex:none}
 .lnav .links{display:flex;gap:24px;font-size:13px;color:var(--txt2)}
 .lnav .links a:hover{color:var(--txt)}
 .lnav .right{display:flex;align-items:center;gap:12px}
@@ -50,9 +53,7 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em;background:#ececf1
 /* ---------- hero ---------- */
 .hero{padding:72px 0 0;text-align:center}
 .hero>.wrap{max-width:1280px}
-.hero .appicon{width:88px;height:88px;border-radius:22px;background:var(--grad);margin:0 auto;position:relative;box-shadow:0 14px 34px rgba(110,90,224,.35)}
-.hero .appicon::before{content:"";position:absolute;right:18px;top:22px;bottom:22px;width:34px;border-radius:8px;background:#fff;box-shadow:0 4px 14px rgba(0,0,0,.14)}
-.hero .appicon::after{content:"";position:absolute;left:18px;top:22px;width:16px;height:12px;border-radius:4px;background:rgba(255,255,255,.92);box-shadow:0 16px 0 rgba(255,255,255,.66),0 32px 0 rgba(255,255,255,.4)}
+.hero .appicon{display:block;width:96px;height:96px;object-fit:contain;margin:0 auto;filter:drop-shadow(0 14px 24px rgba(33,65,157,.28))}
 .hero h1{font-size:28px;font-weight:600;margin-top:22px;letter-spacing:.5px}
 .hero .cat{display:inline-block;margin-top:14px;padding:8px 20px;border-radius:980px;font-size:14.5px;font-weight:700;letter-spacing:.5px;border:1.5px solid rgba(110,90,224,.35);background:rgba(110,90,224,.06)}
 .hero .cat span{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
@@ -362,7 +363,7 @@ footer{border-top:1px solid var(--line);padding:32px 0 44px;font-size:12.5px;col
 
 <!-- ============ local nav ============ -->
 <nav class="lnav"><div class="wrap-wide lnav-in">
-  <span style="display:inline-flex;align-items:center;gap:12px"><a class="name" href="#top"><span class="mark"></span>ActRealm</a><span class="duty"><span class="ddot"></span><span data-i="nav.duty"></span></span></span>
+  <span style="display:inline-flex;align-items:center;gap:12px"><a class="name" href="#top"><img class="mark" src="assets/actrealm-icon-192.png" alt="">ActRealm</a><span class="duty"><span class="ddot"></span><span data-i="nav.duty"></span></span></span>
   <div class="links">
     <a href="#highlights" data-i="nav.hl"></a><a href="#now" data-i="nav.now"></a><a href="#ws" data-i="nav.ws"></a><a href="#stage" data-i="nav.st"></a><a href="#notify" data-i="nav.nf"></a><a href="#report" data-i="nav.rp"></a><a href="#faq" data-i="nav.faq"></a>
   </div>
@@ -377,7 +378,7 @@ footer{border-top:1px solid var(--line);padding:32px 0 44px;font-size:12.5px;col
 <!-- ============ hero ============ -->
 <header class="hero" id="top">
   <div class="wrap">
-    <div class="appicon reveal"></div>
+    <img class="appicon reveal" src="assets/actrealm-icon-1024.png" alt="">
     <h1 class="reveal d1" data-i="brand.name">ActRealm</h1>
     <div class="reveal d1"><div class="cat"><span data-i="hero.cat"></span></div></div>
     <div class="slogan reveal d1" data-i="hero.slogan"></div>
@@ -778,7 +779,7 @@ footer{border-top:1px solid var(--line);padding:32px 0 44px;font-size:12.5px;col
 
 <footer><div class="wrap">
   <div class="foot-in">
-    <span style="display:flex;align-items:center;gap:8px"><span class="mark" style="width:18px;height:18px"></span><b style="font-size:13px">ActRealm</b></span>
+    <span style="display:flex;align-items:center;gap:8px"><img class="mark" src="assets/actrealm-icon-192.png" alt="" style="width:18px;height:18px"><b style="font-size:13px">ActRealm</b></span>
     <span data-i="foot.line"></span>
   </div>
   <p class="footnote" data-i="foot.note"></p>
