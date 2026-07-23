@@ -92,8 +92,8 @@ let settingsState = {
   codexEnhancedActivity: true,
   retentionDays: 90,
   displayProfile: "detailed",
-  displayFieldsVersion: 2,
-  taskCardFields: ["project", "task", "model", "activity", "plan", "tokens", "cost", "context", "tool", "subagents", "environment", "recovery", "control", "jump"],
+  displayFieldsVersion: 3,
+  taskCardFields: ["project", "task", "model", "activity", "plan", "sessionTokens", "turnTokens", "inputOutputTokens", "cacheTokens", "reasoningTokens", "cost", "context", "tool", "subagents", "environment", "recovery", "control", "jump"],
 };
 let displayCatalog = [];
 let claudeBridge = { status: "not_installed" };
@@ -126,10 +126,17 @@ const SNAPSHOT_FALLBACK_AFTER_MS = 15 * 1000;
 const SETUP_FOCUS_REFRESH_AFTER_MS = 5 * 1000;
 const USER_GUIDE_URL = "https://github.com/Frontier-Interfaces/ActRealm/blob/agent/v1-full/docs/USER_GUIDE_zh-CN.md";
 const DISPLAY_PRESETS = {
-  concise: ["project", "task", "activity"],
-  detailed: ["project", "task", "model", "activity", "plan", "tokens", "cost", "context", "tool", "subagents", "environment", "recovery", "control", "jump"],
-  developer: ["project", "task", "model", "activity", "plan", "tokens", "cost", "context", "tool", "permissionMode", "subagents", "environment", "recovery", "control", "jump", "titleSource", "sessionId", "providerSessionId", "providerTurnId", "lastEventAt"],
+  concise: ["project", "task", "model", "activity", "plan", "sessionTokens", "context"],
+  detailed: ["project", "task", "model", "activity", "plan", "sessionTokens", "turnTokens", "inputOutputTokens", "cacheTokens", "reasoningTokens", "cost", "context", "tool", "subagents", "environment", "recovery", "control", "jump"],
+  developer: ["project", "task", "model", "activity", "plan", "sessionTokens", "turnTokens", "inputOutputTokens", "cacheTokens", "reasoningTokens", "cost", "context", "tool", "permissionMode", "subagents", "environment", "recovery", "control", "jump", "titleSource", "sessionId", "providerSessionId", "providerTurnId", "lastEventAt"],
 };
+const DISPLAY_FIELD_GROUPS = [
+  { id: "headline", title: "主标题与状态", detail: "折叠任务卡的第一、二行" },
+  { id: "subtitle", title: "副标题与进度", detail: "折叠任务卡的身份信息与计划" },
+  { id: "overview", title: "用量概览", detail: "折叠任务卡中的用量胶囊" },
+  { id: "details", title: "展开详情", detail: "点击任务卡后显示" },
+  { id: "developer", title: "开发者信息", detail: "展开详情中的来源与内部标识" },
+];
 
 function updateClock() {
   const now = new Date();
@@ -543,15 +550,29 @@ function renderFieldSelector() {
   ui.taskCardFields.replaceChildren();
   const selected = new Set(settingsState.taskCardFields || []);
   const profile = settingsState.displayProfile || "detailed";
-  for (const field of displayCatalog) {
-    const label = element("label", `field-option field-${field.level || "detailed"}`);
-    const input = document.createElement("input");
-    input.type = "checkbox";
-    input.value = field.id;
-    input.checked = selected.has(field.id);
-    input.disabled = profile !== "custom";
-    label.append(input, element("span", "", field.label));
-    ui.taskCardFields.append(label);
+  for (const group of DISPLAY_FIELD_GROUPS) {
+    const fields = displayCatalog.filter((field) => (field.placement || (field.level === "developer" ? "developer" : "details")) === group.id);
+    if (!fields.length) continue;
+    const section = element("section", "field-group");
+    const heading = element("div", "field-group-heading");
+    heading.append(element("strong", "", group.title), element("span", "", group.detail));
+    section.append(heading);
+    const options = element("div", "field-group-options");
+    for (const field of fields) {
+      const label = element("label", `field-option field-${field.level || "detailed"}`);
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.value = field.id;
+      input.checked = selected.has(field.id);
+      input.disabled = profile !== "custom";
+      const copy = element("span", "field-option-copy");
+      copy.append(element("strong", "", field.label));
+      if (field.description) copy.append(element("small", "", field.description));
+      label.append(input, copy);
+      options.append(label);
+    }
+    section.append(options);
+    ui.taskCardFields.append(section);
   }
 }
 
@@ -582,7 +603,7 @@ function settingsFromForm() {
     codexEnhancedActivity: ui.codexEnhanced.checked,
     retentionDays: Number(ui.retentionDays.value),
     displayProfile: ui.displayProfile.value,
-    displayFieldsVersion: settingsState.displayFieldsVersion || 2,
+    displayFieldsVersion: settingsState.displayFieldsVersion || 3,
     taskCardFields: [...ui.taskCardFields.querySelectorAll("input:checked")].map((input) => input.value),
   };
 }
@@ -1192,7 +1213,7 @@ function estimatedCostText(session) {
 }
 
 function appendUsageStrip(container, session) {
-  const total = cardFieldVisible("tokens") && session.tokenTotal != null
+  const total = cardFieldVisible("sessionTokens") && session.tokenTotal != null
     ? compactCount(session.tokenTotal)
     : undefined;
   const context = contextUsage(session);
@@ -1253,20 +1274,20 @@ function openSessionDetail(session) {
     fields.has("plan") && Number.isInteger(session.planTotal) && session.planTotal > 0
       ? detailPair("计划", `${session.planDone || 0}/${session.planTotal}`)
       : undefined,
-    fields.has("tokens") && session.tokenTotal !== undefined && session.tokenTotal !== null
+    fields.has("sessionTokens") && session.tokenTotal !== undefined && session.tokenTotal !== null
       ? detailPair("会话累计 Token", compactCount(session.tokenTotal))
       : undefined,
     fields.has("context") && Number(session.contextWindowTokens) > 0
       ? detailPair("本轮上下文", contextUsageText(session))
       : undefined,
-    fields.has("tokens") ? detailPair("输入 / 输出", session.inputTokens == null && session.outputTokens == null
+    fields.has("inputOutputTokens") ? detailPair("输入 / 输出", session.inputTokens == null && session.outputTokens == null
       ? undefined
       : `${compactCount(session.inputTokens || 0)} / ${compactCount(session.outputTokens || 0)}`) : undefined,
-    fields.has("tokens") ? detailPair("缓存读取 / 写入", session.cacheReadTokens == null && session.cacheCreationTokens == null
+    fields.has("cacheTokens") ? detailPair("缓存读取 / 写入", session.cacheReadTokens == null && session.cacheCreationTokens == null
       ? undefined
       : `${compactCount(session.cacheReadTokens || 0)} / ${compactCount(session.cacheCreationTokens || 0)}`) : undefined,
-    fields.has("tokens") ? detailPair("推理 Token", session.reasoningTokens == null ? undefined : compactCount(session.reasoningTokens)) : undefined,
-    fields.has("tokens") ? detailPair("本轮 Token", session.lastTurnTokens == null ? undefined : compactCount(session.lastTurnTokens)) : undefined,
+    fields.has("reasoningTokens") ? detailPair("推理 Token", session.reasoningTokens == null ? undefined : compactCount(session.reasoningTokens)) : undefined,
+    fields.has("turnTokens") ? detailPair("本轮 Token", session.lastTurnTokens == null ? undefined : compactCount(session.lastTurnTokens)) : undefined,
     fields.has("cost") ? detailPair("估算 API 价格", estimatedCostText(session)) : undefined,
     fields.has("tool") ? detailPair("当前工具", session.currentTool) : undefined,
     fields.has("permissionMode") ? detailPair("权限模式", session.permissionMode) : undefined,
@@ -1454,10 +1475,12 @@ function sessionRenderSignature(session) {
     session,
     attention: pendingAttentionForSession(session),
     selected: session.id === selectedSessionId,
+    fields: settingsState.taskCardFields || [],
   });
 }
 
 function buildSessionRow(session) {
+    const fields = new Set(settingsState.taskCardFields || []);
     const status = sessionStatus(session);
     const row = element("article", `session-row${session.id === selectedSessionId ? " selected" : ""}`);
     row.dataset.sessionId = session.id;
@@ -1478,20 +1501,27 @@ function buildSessionRow(session) {
     const copy = element("div", "row-copy");
     const title = element("div", "row-title");
     const clientTitle = session.providerTitle || session.title || "等待下一条任务";
-    title.append(element("strong", "", clientTitle));
+    title.append(element("strong", "", fields.has("task") ? clientTitle : providerName(session.provider)));
     title.append(element("span", `state-pill ${status.className}`.trim(), status.label));
-    const activity = activityDisplay(session);
-    const activityNode = element("span", `task-right ${activity.className}`, activity.text);
-    sessionActivityRefs.set(session.id, { root: activityNode });
-    title.append(activityNode);
-    const taskContent = session.providerTitle && session.title && session.providerTitle !== session.title
+    if (fields.has("activity")) {
+      const activity = activityDisplay(session);
+      const activityNode = element("span", `task-right ${activity.className}`, activity.text);
+      sessionActivityRefs.set(session.id, { root: activityNode });
+      title.append(activityNode);
+    }
+    const taskContent = fields.has("task") && session.providerTitle && session.title && session.providerTitle !== session.title
       ? element("div", "session-question", session.title)
       : undefined;
     copy.append(title);
     if (taskContent) copy.append(taskContent);
-    copy.append(element("div", "session-meta", `${providerName(session.provider)} · ${session.model || "模型未知"}`));
+    const meta = [providerName(session.provider)];
+    if (fields.has("project") && session.project) meta.push(session.project);
+    if (fields.has("model")) meta.push(session.model || "模型未知");
+    if (fields.has("project") || fields.has("model")) {
+      copy.append(element("div", "session-meta", meta.join(" · ")));
+    }
     appendUsageStrip(copy, session);
-    if (Number.isInteger(session.planDone) && Number.isInteger(session.planTotal) && session.planTotal > 0) {
+    if (fields.has("plan") && Number.isInteger(session.planDone) && Number.isInteger(session.planTotal) && session.planTotal > 0) {
       const progress = element("div", "plan-progress");
       const label = element("span", "", `计划 ${session.planDone}/${session.planTotal}`);
       const track = element("div", "plan-track");
@@ -1502,7 +1532,10 @@ function buildSessionRow(session) {
       const fill = element("div", "plan-fill");
       fill.style.width = `${Math.max(0, Math.min(100, session.planDone / session.planTotal * 100))}%`;
       track.append(fill);
-      progress.append(label, track, element("span", "", `${session.activeSubagents || 0} 个子 Agent 正在运行`));
+      progress.append(label, track);
+      if (fields.has("subagents")) {
+        progress.append(element("span", "", `${session.activeSubagents || 0} 个子 Agent 正在运行`));
+      }
       copy.append(progress);
     }
     const clear = element("button", "session-clear", "清除");
@@ -1519,13 +1552,31 @@ function buildSessionRow(session) {
       const details = element("div", "task-expanded");
       const plan = Number(session.planTotal || 0) > 0 ? `${session.planDone || 0}/${session.planTotal}（进行中）` : "未提供";
       const pairs = [
-        ["工作区", session.environment || session.project || `${providerName(session.provider)} 客户端`],
-        ["本轮上下文", contextUsageText(session)],
-        ["计划", plan],
-        ["会话累计 Token", session.tokenTotal == null ? "—" : compactCount(session.tokenTotal)],
-        ["本轮 Token", session.lastTurnTokens == null ? "—" : compactCount(session.lastTurnTokens)],
-        ["估算 API 价格", estimatedCostText(session) || "—"],
-      ];
+        fields.has("environment") ? ["工作区", session.environment || session.project || `${providerName(session.provider)} 客户端`] : undefined,
+        fields.has("context") ? ["本轮上下文", contextUsageText(session)] : undefined,
+        fields.has("plan") ? ["计划", plan] : undefined,
+        fields.has("sessionTokens") ? ["会话累计 Token", session.tokenTotal == null ? "—" : compactCount(session.tokenTotal)] : undefined,
+        fields.has("turnTokens") ? ["本轮 Token", session.lastTurnTokens == null ? "—" : compactCount(session.lastTurnTokens)] : undefined,
+        fields.has("inputOutputTokens") ? ["输入 / 输出 Token", session.inputTokens == null && session.outputTokens == null
+          ? "—"
+          : `${compactCount(session.inputTokens || 0)} / ${compactCount(session.outputTokens || 0)}`] : undefined,
+        fields.has("cacheTokens") ? ["缓存读取 / 写入 Token", session.cacheReadTokens == null && session.cacheCreationTokens == null
+          ? "—"
+          : `${compactCount(session.cacheReadTokens || 0)} / ${compactCount(session.cacheCreationTokens || 0)}`] : undefined,
+        fields.has("reasoningTokens") ? ["推理 Token", session.reasoningTokens == null ? "—" : compactCount(session.reasoningTokens)] : undefined,
+        fields.has("cost") ? ["估算 API 价格", estimatedCostText(session) || "—"] : undefined,
+        fields.has("tool") ? ["当前工具", session.currentTool || "—"] : undefined,
+        fields.has("permissionMode") ? ["权限模式", session.permissionMode || "—"] : undefined,
+        fields.has("subagents") ? ["运行中的子 Agent", String(session.activeSubagents || 0)] : undefined,
+        fields.has("recovery") ? ["恢复状态", recoveryDisplay(session).label] : undefined,
+        fields.has("control") ? ["托管能力", session.controlCapability === "managed" ? "Codex app-server 托管，可回答提问" : "外部 Hook，仅观察/授权"] : undefined,
+        fields.has("jump") ? ["打开应用", session.jumpLabel || "当前环境不支持"] : undefined,
+        fields.has("titleSource") ? ["标题来源", session.providerTitleSource || "—"] : undefined,
+        fields.has("sessionId") ? ["ActRealm Session ID", session.id] : undefined,
+        fields.has("providerSessionId") ? ["Provider Session ID", session.providerSessionId] : undefined,
+        fields.has("providerTurnId") ? ["Provider Turn ID", session.providerTurnId || "—"] : undefined,
+        fields.has("lastEventAt") ? ["最后事件", new Date(session.lastEventAt).toLocaleString()] : undefined,
+      ].filter(Boolean);
       for (const [label, value] of pairs) {
         const pair = element("div", "task-detail-pair");
         pair.append(element("span", "", label), element("strong", "", value));

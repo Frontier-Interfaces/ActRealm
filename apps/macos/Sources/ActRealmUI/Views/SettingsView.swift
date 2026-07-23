@@ -948,20 +948,79 @@ private struct ThemeLanePreview: View {
     }
 }
 
+private struct DisplayFieldPlacement: Identifiable {
+    let id: String
+    let title: String
+    let detail: String
+}
+
+private struct TaskCardFieldGuide: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("任务卡位置示意")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(DT.textSecondary)
+            HStack(spacing: 8) {
+                Text("主标题")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(DT.textStrong)
+                Text("状态")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(DT.amberText)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(DT.amberBg, in: Capsule())
+                Spacer(minLength: 4)
+                Text("实时状态")
+                    .font(.system(size: 9.5, weight: .semibold))
+                    .foregroundStyle(DT.textWeak)
+            }
+            Text("任务摘要 · 主标题不同时显示在第二行")
+                .font(.system(size: 10))
+                .foregroundStyle(DT.textSecondary)
+            Text("副标题 · 项目 · 模型 · 计划进度")
+                .font(.system(size: 9.5))
+                .foregroundStyle(DT.textWeak)
+            HStack(spacing: 6) {
+                guideChip("Token")
+                guideChip("上下文")
+                guideChip("估算价格")
+            }
+            Divider()
+            Label("点击任务后展开详细信息与开发者信息", systemImage: "chevron.down")
+                .font(.system(size: 9.5))
+                .foregroundStyle(DT.textFaint)
+        }
+        .padding(11)
+        .background(DT.neutralChipBg.opacity(0.75), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .strokeBorder(DT.neutralChipStroke, lineWidth: 1)
+        )
+    }
+
+    private func guideChip(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 8.5, weight: .medium))
+            .foregroundStyle(DT.textWeak)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(DT.cardStrong.opacity(0.7), in: Capsule())
+            .overlay(Capsule().strokeBorder(DT.neutralChipStroke, lineWidth: 1))
+    }
+}
+
 private struct DisplaySettingsPage: View {
     @EnvironmentObject private var model: AppModel
 
-    private let presets: [String: [String]] = [
-        "concise": ["project", "task", "activity"],
-        "detailed": [
-            "project", "task", "model", "activity", "plan", "tokens", "cost", "context",
-            "tool", "subagents", "environment", "recovery", "control", "jump",
-        ],
-        "developer": [
-            "project", "task", "model", "activity", "plan", "tokens", "cost", "context",
-            "tool", "permissionMode", "subagents", "environment", "recovery", "control",
-            "jump", "titleSource", "sessionId", "providerSessionId", "providerTurnId", "lastEventAt",
-        ],
+    private let presets = TaskCardDisplayPresets.all
+
+    private let placements = [
+        DisplayFieldPlacement(id: "headline", title: "主标题与状态", detail: "折叠任务卡的第一、二行"),
+        DisplayFieldPlacement(id: "subtitle", title: "副标题与进度", detail: "折叠任务卡的身份信息与计划"),
+        DisplayFieldPlacement(id: "overview", title: "用量概览", detail: "折叠任务卡中的用量胶囊"),
+        DisplayFieldPlacement(id: "details", title: "展开详情", detail: "点击任务卡后显示"),
+        DisplayFieldPlacement(id: "developer", title: "开发者信息", detail: "展开详情中的来源与内部标识"),
     ]
 
     var body: some View {
@@ -995,23 +1054,53 @@ private struct DisplaySettingsPage: View {
                         ProgressView("正在读取可用字段…")
                             .controlSize(.small)
                     } else {
-                        LazyVGrid(
-                            columns: [GridItem(.flexible()), GridItem(.flexible())],
-                            alignment: .leading,
-                            spacing: 10
-                        ) {
-                            ForEach(model.displayCatalog) { field in
-                                Toggle(field.label, isOn: fieldBinding(field))
-                                    .toggleStyle(.checkbox)
-                                    .disabled(model.uiSettings.displayProfile != "custom")
+                        TaskCardFieldGuide()
+                            .padding(.bottom, 4)
+
+                        ForEach(placements) { placement in
+                            let fields = fields(in: placement.id)
+                            if !fields.isEmpty {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(placement.title)
+                                            .font(.system(size: 11, weight: .semibold))
+                                            .foregroundStyle(DT.textSecondary)
+                                        Text(placement.detail)
+                                            .font(.system(size: 9.5))
+                                            .foregroundStyle(DT.textFaint)
+                                    }
+
+                                    LazyVGrid(
+                                        columns: [GridItem(.flexible()), GridItem(.flexible())],
+                                        alignment: .leading,
+                                        spacing: 10
+                                    ) {
+                                        ForEach(fields) { field in
+                                            Toggle(isOn: fieldBinding(field)) {
+                                                VStack(alignment: .leading, spacing: 2) {
+                                                    Text(field.label)
+                                                        .font(.system(size: 11))
+                                                    if let description = field.description, !description.isEmpty {
+                                                        Text(description)
+                                                            .font(.system(size: 9))
+                                                            .foregroundStyle(DT.textFaint)
+                                                            .fixedSize(horizontal: false, vertical: true)
+                                                    }
+                                                }
+                                            }
+                                            .toggleStyle(.checkbox)
+                                            .disabled(model.uiSettings.displayProfile != "custom")
+                                        }
+                                    }
+                                }
+                                .padding(.vertical, 5)
                             }
                         }
-                        .padding(.vertical, 4)
                     }
                 } header: {
                     Text("任务卡字段")
                 } footer: {
-                    Text("三个预设提供固定字段组合；开启“自定义字段”后可逐项调整。原始提示、命令和文件内容不会因此显示。")
+                    Text("三个预设提供固定字段组合；简洁模式默认显示 7 项关键信息。开启“自定义字段”后可按显示位置逐项调整。原始提示、命令和文件内容不会因此显示。")
                 }
             }
             .formStyle(.grouped)
@@ -1054,6 +1143,14 @@ private struct DisplaySettingsPage: View {
                 }
             }
         )
+    }
+
+    private func fields(in placement: String) -> [DisplayField] {
+        model.displayCatalog.filter { field in
+            let resolvedPlacement = field.placement
+                ?? (field.level == "developer" ? "developer" : "details")
+            return resolvedPlacement == placement
+        }
     }
 }
 

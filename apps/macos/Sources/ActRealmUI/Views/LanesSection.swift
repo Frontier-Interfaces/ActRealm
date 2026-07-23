@@ -376,11 +376,11 @@ private struct TaskRow: View {
 
     @ViewBuilder
     private var usageStrip: some View {
-        if (fieldVisible("tokens") && task.totalTokens != nil)
+        if (fieldVisible("sessionTokens") && task.totalTokens != nil)
             || (fieldVisible("cost") && task.estimatedCostUsdMicros != nil)
             || (fieldVisible("context") && task.contextUsageFraction != nil) {
             HStack(spacing: 6) {
-                if fieldVisible("tokens"), let total = task.totalTokens {
+                if fieldVisible("sessionTokens"), let total = task.totalTokens {
                     usageChip("累计 \(ZhFormat.tokenCount(total)) Token", tone: .neutral)
                 }
                 if fieldVisible("context"), let fraction = task.contextUsageFraction {
@@ -479,9 +479,9 @@ private struct TaskRow: View {
         if fieldVisible("environment") { items.append(("工作区", workspace, false)) }
         if fieldVisible("context") { items.append(("本轮上下文", contextText, contextIsTight)) }
         if fieldVisible("plan") { items.append(("计划", planText, false)) }
-        if fieldVisible("tokens") {
-            items.append(("会话累计 Token", tokenText, tokenIsHigh))
-            items.append(("本轮 Token", lastTurnTokenText, false))
+        if fieldVisible("sessionTokens") { items.append(("会话累计 Token", tokenText, tokenIsHigh)) }
+        if fieldVisible("turnTokens") { items.append(("本轮 Token", lastTurnTokenText, false)) }
+        if fieldVisible("inputOutputTokens") {
             if task.inputTokens != nil || task.outputTokens != nil {
                 items.append((
                     "输入 / 输出",
@@ -489,6 +489,8 @@ private struct TaskRow: View {
                     false
                 ))
             }
+        }
+        if fieldVisible("cacheTokens") {
             if task.session.cacheReadTokens != nil || task.session.cacheCreationTokens != nil {
                 items.append((
                     "缓存读取 / 写入",
@@ -496,6 +498,8 @@ private struct TaskRow: View {
                     false
                 ))
             }
+        }
+        if fieldVisible("reasoningTokens") {
             if let reasoning = task.session.reasoningTokens {
                 items.append(("推理 Token", ZhFormat.tokenCount(reasoning), false))
             }

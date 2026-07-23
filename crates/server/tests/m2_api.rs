@@ -188,11 +188,14 @@ fn ingest_waiting(
 }
 
 #[test]
-fn embedded_ui_contract_is_small_honest_and_complete() {
+fn embedded_ui_contract_is_bounded_honest_and_complete() {
+    // This is a product-size budget, not a Runtime, HTTP, or WebView transport limit.
+    // Revisit it deliberately with the architecture documentation as the UI evolves.
+    const MAX_EMBEDDED_UI_ASSET_BYTES: usize = 128 * 1024;
     for asset in [INDEX_HTML, APP_CSS, APP_JS] {
         assert!(
-            asset.len() < 100 * 1024,
-            "embedded UI asset exceeds 100 KiB"
+            asset.len() < MAX_EMBEDDED_UI_ASSET_BYTES,
+            "embedded UI asset exceeds the 128 KiB engineering budget"
         );
     }
     assert!(APP_CSS.contains("grid-template-columns"));

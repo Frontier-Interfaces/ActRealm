@@ -178,7 +178,7 @@ PermissionRequest 的额外铁律：
 | 日志 | tracing + tracing-subscriber（文件轮转） | 默认脱敏（§17） |
 | 静态资源 | rust-embed（直接嵌入 web 文件） | 单文件交付 |
 | 系统交互 | std::process 调 `osascript`（跳回终端）、`open`（开浏览器） | Open Island 同方案 |
-| Web UI | **原生 HTML/CSS/JS，零框架、零构建**（延续原型） | v1 界面复杂度不需要 React；无 node 工具链，Claude Code 开发调试最快；文件 <100KB |
+| Web UI | **原生 HTML/CSS/JS，零框架、零构建**（延续原型） | v1 界面复杂度不需要 React；无 node 工具链，Claude Code 开发调试最快；单个嵌入资源以 <128 KiB 作为可随产品复杂度和验证结果调整的工程预算，并非 Runtime、HTTP 或 WebView 的技术限制 |
 | Web↔Runtime | fetch + WebSocket + 单一全局 store（手写 ~50 行观察者） | — |
 | 进程通信 | Unix Domain Socket（mac/linux）；Windows 用 127.0.0.1 环回 TCP + token（P2） | Open Island / CodeIsland 验证 |
 

@@ -229,9 +229,13 @@ struct ModelDecodingTests {
 
     @Test func settingsEncodeTheCompleteRuntimeContract() throws {
         var settings = UISettings.defaults
-        #expect(settings.taskCardFields.contains("tokens"))
+        #expect(settings.taskCardFields.contains("sessionTokens"))
+        #expect(settings.taskCardFields.contains("turnTokens"))
+        #expect(settings.taskCardFields.contains("inputOutputTokens"))
+        #expect(settings.taskCardFields.contains("cacheTokens"))
+        #expect(settings.taskCardFields.contains("reasoningTokens"))
         #expect(settings.taskCardFields.contains("cost"))
-        #expect(settings.displayFieldsVersion == 2)
+        #expect(settings.displayFieldsVersion == 3)
         settings.notificationRules.question = .ignore
         settings.providerMuted.codex = true
         settings.retentionDays = 180
@@ -248,19 +252,25 @@ struct ModelDecodingTests {
         #expect(object["taskCardFields"] as? [String] == ["task", "providerTurnId"])
     }
 
-    @Test func tokenAndEstimatedCostFieldsEncodeIndependently() throws {
+    @Test func conciseTaskCardPresetAddsFourUsefulFieldsToTheCoreThree() {
+        #expect(TaskCardDisplayPresets.concise.count == 7)
+        #expect(TaskCardDisplayPresets.concise == [
+            "project", "task", "model", "activity", "plan", "sessionTokens", "context",
+        ])
+    }
+
+    @Test func tokenBreakdownAndEstimatedCostFieldsEncodeIndependently() throws {
         var settings = UISettings.defaults
         settings.displayProfile = "custom"
-        settings.taskCardFields = ["tokens"]
-
-        let tokenData = try JSONEncoder().encode(settings)
-        let tokenObject = try #require(try JSONSerialization.jsonObject(with: tokenData) as? [String: Any])
-        #expect(tokenObject["taskCardFields"] as? [String] == ["tokens"])
-
-        settings.taskCardFields = ["cost"]
-        let costData = try JSONEncoder().encode(settings)
-        let costObject = try #require(try JSONSerialization.jsonObject(with: costData) as? [String: Any])
-        #expect(costObject["taskCardFields"] as? [String] == ["cost"])
+        for field in [
+            "sessionTokens", "turnTokens", "inputOutputTokens", "cacheTokens",
+            "reasoningTokens", "cost",
+        ] {
+            settings.taskCardFields = [field]
+            let data = try JSONEncoder().encode(settings)
+            let object = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+            #expect(object["taskCardFields"] as? [String] == [field])
+        }
     }
 
     private var emptySnapshotJSON: String {
