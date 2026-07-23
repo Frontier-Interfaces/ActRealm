@@ -6,7 +6,7 @@ use actrealm_installer::{
     discover_provider_availability, BinaryHealth, ClaudeStatuslineStatus, CodexTrustStatus,
     ConfigHealth, HookProvider, InstallIntent, InstallOptions, InstallPaths, Installer,
 };
-use actrealm_quota::{QuotaCollector, QuotaEntry, QuotaPaths};
+use actrealm_quota::{QuotaCollector, QuotaEntry, QuotaError, QuotaPaths};
 use actrealm_runtime::{
     ApprovalAction, AttentionAction, CommandState, MetricEvent, QuotaRecord, RuntimeStore,
     SessionRecord, SessionUsageRecord, StoreError, WaiterError, WaiterRegistry,
@@ -103,6 +103,10 @@ impl Default for ApiServerConfig {
             runtime_started_at: now_millis(),
             restart_count: 0,
             commit_delay: Duration::from_secs(3),
+            // Runtime mutations invalidate the shared snapshot cache
+            // immediately, so the 100 ms transport cadence keeps the
+            // event-to-UI p95 gate while unchanged large histories are read
+            // from the writer-thread cache instead of querying SQLite 10x/s.
             snapshot_interval: Duration::from_millis(100),
             heartbeat_interval: Duration::from_secs(10),
             quota_poll_interval: Duration::from_secs(60),
@@ -275,6 +279,7 @@ impl ApiServer {
             codex,
             runtime_restart: config.runtime_restart,
         };
+        let quota_scheduler_state = state.clone();
         let router = router(state);
         let (shutdown, shutdown_receiver) = oneshot::channel();
         let api_thread = thread::Builder::new()
@@ -285,7 +290,9 @@ impl ApiServer {
                     .build();
                 let Ok(runtime) = runtime else { return };
                 runtime.block_on(async move {
+                    let quota_scheduler = tokio::spawn(quota_refresh_loop(quota_scheduler_state));
                     let Ok(listener) = tokio::net::TcpListener::from_std(listener) else {
+                        quota_scheduler.abort();
                         return;
                     };
                     let _ = axum::serve(listener, router)
@@ -293,6 +300,7 @@ impl ApiServer {
                             let _ = shutdown_receiver.await;
                         })
                         .await;
+                    quota_scheduler.abort();
                 });
             })
             .map_err(|error| ApiServerError::Thread(error.to_string()))?;
@@ -379,6 +387,7 @@ struct CodexManagerState {
     native_synced: HashSet<String>,
     auto_reviewing: HashSet<String>,
     auto_review_escalated: HashSet<String>,
+    managed_request_ids: HashMap<String, (Uuid, String)>,
 }
 
 struct QuotaState {
@@ -475,38 +484,16 @@ impl CodexManager {
                 .collect();
         }
         for thread in &listed_for_sync {
-            let waiting = thread_waiting_on_approval(thread);
-            if let Ok(mut current) = state.lock() {
-                current.native_waiting.insert(thread.id.clone(), waiting);
-            }
-            sync_codex_native_attention(
-                &state,
-                &store,
-                &waiters,
-                &thread.id,
-                waiting,
-                thread.status == "active",
-            );
+            sync_initial_codex_native_attention(&state, &store, &waiters, thread);
         }
         for thread_id in &managed {
             if let Ok(thread) = connector.resume_thread(thread_id) {
-                let waiting = thread_waiting_on_approval(&thread);
+                let resumed = thread.clone();
                 if let Ok(mut current) = state.lock() {
                     current.resume_failed.remove(thread_id);
-                    current.native_waiting.insert(thread.id.clone(), waiting);
                     current.threads.insert(thread.id.clone(), thread);
                 }
-                let active = state
-                    .lock()
-                    .ok()
-                    .and_then(|current| {
-                        current
-                            .threads
-                            .get(thread_id)
-                            .map(|thread| thread.status == "active")
-                    })
-                    .unwrap_or(false);
-                sync_codex_native_attention(&state, &store, &waiters, thread_id, waiting, active);
+                sync_initial_codex_native_attention(&state, &store, &waiters, &resumed);
             } else if let Ok(mut current) = state.lock() {
                 current.resume_failed.insert(thread_id.clone());
             }
@@ -534,8 +521,6 @@ impl CodexManager {
         let thread = connector
             .resume_thread(thread_id)
             .map_err(|error| error.to_string())?;
-        let waiting = thread_waiting_on_approval(&thread);
-        let active = thread.status == "active";
         let managed = {
             let mut state = self
                 .state
@@ -543,7 +528,6 @@ impl CodexManager {
                 .map_err(|_| "Connector 状态不可用".to_owned())?;
             state.managed.insert(thread_id.to_owned());
             state.resume_failed.remove(thread_id);
-            state.native_waiting.insert(thread.id.clone(), waiting);
             state.threads.insert(thread.id.clone(), thread.clone());
             let mut managed = state.managed.iter().cloned().collect::<Vec<_>>();
             managed.sort();
@@ -555,14 +539,7 @@ impl CodexManager {
                 serde_json::to_string(&managed).map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?;
-        sync_codex_native_attention(
-            &self.state,
-            &self.store,
-            &self.waiters,
-            thread_id,
-            waiting,
-            active,
-        );
+        sync_initial_codex_native_attention(&self.state, &self.store, &self.waiters, &thread);
         Ok(thread)
     }
 
@@ -575,7 +552,15 @@ impl CodexManager {
             "error": state.error,
             "managedThreads": state.managed.len(),
             "protocol": "app-server",
-            "experimentalUserInput": true
+            "experimentalUserInput": true,
+            "managedApprovals": self
+                .connector
+                .as_ref()
+                .is_some_and(CodexConnector::supports_managed_approvals),
+            "serverUserAgent": self
+                .connector
+                .as_ref()
+                .and_then(CodexConnector::server_user_agent)
         })
     }
 
@@ -659,14 +644,17 @@ fn spawn_codex_handlers(
     store: RuntimeStore,
     waiters: WaiterRegistry,
 ) {
-    let request_connector = connector.clone();
+    let request_connector = connector.downgrade();
     let request_state = Arc::clone(&state);
     let request_store = store.clone();
     let request_waiters = waiters.clone();
     thread::spawn(move || {
         for request in channels.requests {
+            let Some(connector) = request_connector.upgrade() else {
+                break;
+            };
             handle_codex_server_request(
-                request_connector.clone(),
+                connector,
                 Arc::clone(&request_state),
                 request_store.clone(),
                 request_waiters.clone(),
@@ -697,6 +685,15 @@ fn handle_codex_server_request(
     waiters: WaiterRegistry,
     request: ServerRequest,
 ) {
+    if matches!(
+        request.method.as_str(),
+        "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+    ) {
+        handle_codex_approval_request(connector, state, store, waiters, request);
+        return;
+    }
     if request.method != "item/tool/requestUserInput" {
         let _ =
             connector.respond_error(request.id, -32601, "Unsupported ActRealm connector request");
@@ -712,6 +709,7 @@ fn handle_codex_server_request(
         return;
     };
     let request_id = bridge_request.request_id.unwrap_or(bridge_request.id);
+    let _ = store.sync_native_approval(Provider::Codex, &thread_id, false, true, now_millis());
     let registration = match waiters.register_at(&bridge_request, now_millis()) {
         Ok(registration) => registration,
         Err(_) => {
@@ -787,6 +785,159 @@ fn handle_codex_server_request(
             }
         }
     });
+}
+
+fn handle_codex_approval_request(
+    connector: CodexConnector,
+    state: Arc<Mutex<CodexManagerState>>,
+    store: RuntimeStore,
+    waiters: WaiterRegistry,
+    request: ServerRequest,
+) {
+    if !connector.supports_managed_approvals() {
+        let _ = connector.respond_error(
+            request.id,
+            -32601,
+            "Codex app-server version is not enabled for managed approvals",
+        );
+        return;
+    }
+    let Some(bridge_request) =
+        BridgeRequest::codex_approval_at(&request.method, request.params.clone(), now_millis())
+    else {
+        let _ = connector.respond_error(request.id, -32602, "Invalid approval params");
+        return;
+    };
+    let Some(thread_id) = bridge_request.provider_session_id.clone() else {
+        let _ = connector.respond_error(request.id, -32602, "Missing threadId");
+        return;
+    };
+    let managed = state
+        .lock()
+        .map(|current| current.managed.contains(&thread_id))
+        .unwrap_or(false);
+    if !managed {
+        let _ = connector.respond_error(
+            request.id,
+            -32001,
+            "Thread is not explicitly managed by ActRealm",
+        );
+        return;
+    }
+    let request_id = bridge_request.request_id.unwrap_or(bridge_request.id);
+    let registration = match waiters.register_at(&bridge_request, now_millis()) {
+        Ok(registration) => registration,
+        Err(_) => {
+            let _ = connector.respond_error(request.id, -32000, "Approval waiter unavailable");
+            return;
+        }
+    };
+    match store.ingest(bridge_request.clone()) {
+        Ok(result) if result.suppressed => {
+            let _ = waiters.pass_through(request_id, "provider_internal");
+            let _ = connector.respond_error(
+                request.id,
+                -32001,
+                "Internal Codex session is not exposed to ActRealm",
+            );
+            return;
+        }
+        Ok(_) => {}
+        Err(_) => {
+            let _ = waiters.pass_through(request_id, "runtime_error");
+            let _ = connector.respond_error(request.id, -32000, "ActRealm storage unavailable");
+            return;
+        }
+    }
+    let rpc_key = rpc_id_key(&request.id);
+    if let Ok(mut current) = state.lock() {
+        current
+            .managed_request_ids
+            .insert(rpc_key.clone(), (request_id, thread_id));
+    }
+    thread::spawn(move || {
+        let wait_for = bridge_request
+            .deadline_at
+            .map(|deadline| Duration::from_millis(deadline.saturating_sub(now_millis())))
+            .unwrap_or(Duration::from_secs(60));
+        match registration.ticket.recv_timeout(wait_for) {
+            Ok(response) => {
+                let result =
+                    codex_approval_response(&request.method, &request.params, response.action);
+                let sent = match result {
+                    Some(result) => connector.respond(request.id, result),
+                    None => connector.respond_error(
+                        request.id,
+                        -32001,
+                        "Approval was returned to the provider without a decision",
+                    ),
+                };
+                if sent.is_err() {
+                    if let Ok(mut current) = state.lock() {
+                        current.managed_request_ids.remove(&rpc_key);
+                    }
+                    let _ = store.expire_approval(
+                        request_id,
+                        "connector_response_failed",
+                        now_millis(),
+                    );
+                }
+            }
+            Err(_) => {
+                if let Ok(mut current) = state.lock() {
+                    current.managed_request_ids.remove(&rpc_key);
+                }
+                let _ = waiters.pass_through(request_id, "deadline");
+                let _ = store.expire_approval(request_id, "deadline", now_millis());
+                let _ = connector.respond_error(request.id, -32001, "Approval expired");
+            }
+        }
+    });
+}
+
+fn codex_approval_response(method: &str, params: &Value, action: ReplyAction) -> Option<Value> {
+    match (method, action) {
+        (
+            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval",
+            ReplyAction::Allow,
+        ) => Some(json!({"decision":"accept"})),
+        (
+            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval",
+            ReplyAction::Deny,
+        ) => Some(json!({"decision":"decline"})),
+        ("item/permissions/requestApproval", ReplyAction::Allow) => Some(json!({
+            "permissions": granted_permission_profile(params),
+            "scope": "turn"
+        })),
+        ("item/permissions/requestApproval", ReplyAction::Deny) => Some(json!({
+            "permissions": {},
+            "scope": "turn"
+        })),
+        _ => None,
+    }
+}
+
+fn granted_permission_profile(params: &Value) -> Value {
+    let Some(requested) = params.get("permissions").and_then(Value::as_object) else {
+        return json!({});
+    };
+    Value::Object(
+        requested
+            .iter()
+            .filter(|(key, value)| {
+                matches!(key.as_str(), "network" | "fileSystem") && !value.is_null()
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+}
+
+fn rpc_id_key(id: &Value) -> String {
+    id.as_u64()
+        .map(|value| value.to_string())
+        .or_else(|| id.as_i64().map(|value| value.to_string()))
+        .or_else(|| id.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| id.to_string())
 }
 
 fn ingest_codex_provider_events(store: &RuntimeStore, notification: &ServerNotification) {
@@ -961,6 +1112,24 @@ fn update_codex_notification(
     notification: ServerNotification,
 ) {
     ingest_codex_provider_events(store, &notification);
+    if notification.method == "serverRequest/resolved" {
+        let local_request_id = notification
+            .params
+            .get("requestId")
+            .map(rpc_id_key)
+            .and_then(|key| {
+                state
+                    .lock()
+                    .ok()
+                    .and_then(|mut current| current.managed_request_ids.remove(&key))
+                    .map(|(request_id, _)| request_id)
+            });
+        if let Some(request_id) = local_request_id {
+            let _ = waiters.pass_through(request_id, "provider_resolved");
+            let _ = store.resolve_managed_request(request_id, now_millis());
+        }
+        return;
+    }
     let started_thread = (notification.method == "thread/started")
         .then(|| notification.params.get("thread").and_then(parse_thread))
         .flatten();
@@ -1086,6 +1255,13 @@ fn thread_waiting_for_user_approval(
     thread_id: &str,
     thread: &CodexThread,
 ) -> bool {
+    if state
+        .managed_request_ids
+        .values()
+        .any(|(_, managed_thread_id)| managed_thread_id == thread_id)
+    {
+        return false;
+    }
     if !thread_has_waiting_approval_flag(thread) {
         return false;
     }
@@ -1157,6 +1333,35 @@ fn sync_codex_native_attention(
     }
 }
 
+/// A fresh app-server listing is a snapshot, not an observed transition. In
+/// particular, an independently spawned app-server can list a Codex Desktop
+/// Thread without seeing the already-open native permission sheet. Therefore
+/// startup/attach may affirm `waitingOnApproval`, but absence of that flag must
+/// not clear a Hook-observed OUTBOX request. Once a waiting=true baseline is
+/// synced, later live notifications use `sync_codex_native_attention` to
+/// resolve the request on an authoritative true -> false transition.
+fn sync_initial_codex_native_attention(
+    state: &Arc<Mutex<CodexManagerState>>,
+    store: &RuntimeStore,
+    waiters: &WaiterRegistry,
+    thread: &CodexThread,
+) {
+    let waiting = thread_waiting_on_approval(thread);
+    if let Ok(mut current) = state.lock() {
+        current.native_waiting.insert(thread.id.clone(), waiting);
+    }
+    if waiting {
+        sync_codex_native_attention(
+            state,
+            store,
+            waiters,
+            &thread.id,
+            true,
+            thread.status == "active",
+        );
+    }
+}
+
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
@@ -1172,6 +1377,8 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/setup", get(setup).post(change_setup))
         .route("/api/v1/settings", get(settings).put(update_settings))
         .route("/api/v1/quota/claude-bridge", post(change_claude_bridge))
+        .route("/api/v1/quota/refresh", post(refresh_quota))
+        .route("/api/v1/quota/refresh-now", post(refresh_quota_now))
         .route("/api/v1/export", get(export_data))
         .route("/api/v1/metrics", post(record_metric))
         .route("/api/v1/metrics/export", get(export_metrics))
@@ -1204,6 +1411,149 @@ async fn claude_icon() -> Response {
 
 async fn codex_icon() -> Response {
     static_binary_response("image/png", CODEX_ICON)
+}
+
+async fn refresh_quota(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized_mutation(&state, &headers) {
+        return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_MUTATION");
+    }
+    let reset = state.quota.lock().map(|mut quota| {
+        quota.refreshed_at = None;
+        quota.claude_cache_modified_at = None;
+    });
+    if reset.is_err() {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "QUOTA_STATE_UNAVAILABLE");
+    }
+    match quota_entries(&state) {
+        Ok(entries) => Json(json!({
+            "accepted": true,
+            "entries": entries.len(),
+            "oauthRefreshInProgress": state
+                .quota
+                .lock()
+                .map(|quota| quota.oauth_refresh_in_progress)
+                .unwrap_or(false)
+        }))
+        .into_response(),
+        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "QUOTA_REFRESH_FAILED"),
+    }
+}
+
+async fn refresh_quota_now(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized_mutation(&state, &headers) {
+        return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_MUTATION");
+    }
+    if !state.claude_oauth_quota {
+        return api_error_detail(
+            StatusCode::CONFLICT,
+            "CLAUDE_OAUTH_DISABLED",
+            "Claude OAuth 额度同步未启用",
+        );
+    }
+    let paths = match state.quota.lock() {
+        Ok(quota) if quota.oauth_refresh_in_progress => {
+            return api_error_detail(
+                StatusCode::CONFLICT,
+                "QUOTA_REFRESH_IN_PROGRESS",
+                "已有额度刷新正在进行，请稍后重试",
+            );
+        }
+        Ok(mut quota) => {
+            quota.oauth_refresh_in_progress = true;
+            quota.collector.paths().clone()
+        }
+        Err(_) => {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "QUOTA_STATE_UNAVAILABLE");
+        }
+    };
+    let refreshed = tokio::task::spawn_blocking(move || {
+        let now = now_millis();
+        let mut collector = QuotaCollector::new(paths);
+        collector.refresh_claude_oauth(now).map(|mut entries| {
+            entries.extend(collector.collect_codex(now));
+            entries
+        })
+    })
+    .await;
+    let mut quota = match state.quota.lock() {
+        Ok(quota) => quota,
+        Err(_) => {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "QUOTA_STATE_UNAVAILABLE");
+        }
+    };
+    quota.oauth_refresh_in_progress = false;
+    let entries = match refreshed {
+        Ok(Ok(entries)) => entries,
+        Ok(Err(error)) => {
+            return api_error_detail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "CLAUDE_QUOTA_REFRESH_FAILED",
+                &quota_refresh_error_detail(&error),
+            );
+        }
+        Err(_) => {
+            return api_error_detail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "CLAUDE_QUOTA_REFRESH_FAILED",
+                "额度刷新任务异常终止，请重启 ActRealm 后重试",
+            );
+        }
+    };
+    quota.entries = entries.clone();
+    quota.refreshed_at = Some(Instant::now());
+    quota.claude_cache_modified_at = fs::metadata(quota.collector.paths().claude_cache())
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    drop(quota);
+    let persisted = entries.iter().filter_map(quota_record).collect::<Vec<_>>();
+    if let Err(error) = state.store.replace_quota_snapshots(persisted) {
+        return api_error_detail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "QUOTA_PERSIST_FAILED",
+            &error.to_string(),
+        );
+    }
+    let claude_captured_at = entries
+        .iter()
+        .filter(|entry| entry.provider == "claude")
+        .filter_map(|entry| entry.captured_at)
+        .max();
+    Json(json!({
+        "accepted": true,
+        "completed": true,
+        "claudeCapturedAt": claude_captured_at
+    }))
+    .into_response()
+}
+
+fn quota_refresh_error_detail(error: &QuotaError) -> String {
+    match error {
+        QuotaError::OAuthUnavailable => {
+            "未找到可读取的 Claude Code 登录凭证；请启动 Claude Code CLI，完成登录或开始一次会话，再回到 ActRealm 点击“立即更新”".to_owned()
+        }
+        QuotaError::OAuthRequest(message) if message == "credential was rejected" => {
+            "Claude 登录凭证需要由官方 CLI 刷新；请启动 Claude Code CLI，完成登录或开始一次会话，再回到 ActRealm 点击“立即更新”".to_owned()
+        }
+        QuotaError::OAuthRequest(message) if message == "temporarily rate limited" => {
+            "Claude 额度接口暂时限流，请稍后重试".to_owned()
+        }
+        QuotaError::OAuthRequest(message) => {
+            format!("Claude 额度接口暂时不可用：{message}")
+        }
+        _ => "本机额度缓存无法更新，请检查 Claude 登录状态后重试".to_owned(),
+    }
+}
+
+async fn quota_refresh_loop(state: AppState) {
+    loop {
+        tokio::time::sleep(state.quota_poll_interval).await;
+        if state.shutdown_flag.load(Ordering::Acquire) {
+            return;
+        }
+        // Quota freshness must not depend on a healthy WebSocket client.
+        // Sleep/wake can suspend that client while Runtime remains alive.
+        let _ = quota_entries(&state);
+    }
 }
 
 fn static_response(content_type: &'static str, body: &'static str) -> Response {
@@ -2666,15 +3016,9 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
         .map(|item| item.session_id.as_str())
         .collect::<HashSet<_>>();
     let cutoff = now.saturating_sub(SESSION_LIST_RETENTION_MS);
-    snapshot.sessions.retain(|session| {
-        let active = !matches!(
-            session.exec_state.as_str(),
-            "idle" | "response_finished" | "failed"
-        );
-        active
-            || session.last_event_at >= cutoff
-            || visible_attention_sessions.contains(session.id.as_str())
-    });
+    snapshot
+        .sessions
+        .retain(|session| session_is_visible(session, &visible_attention_sessions, cutoff));
     let mut sessions = serde_json::to_value(&snapshot.sessions)
         .map_err(|error| StoreError::Storage(error.to_string()))?;
     if let Some(items) = sessions.as_array_mut() {
@@ -2751,6 +3095,22 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
             "codexConnector": state.codex.capability_value()
         }
     }))
+}
+
+fn session_is_visible(
+    session: &SessionRecord,
+    visible_attention_sessions: &HashSet<&str>,
+    cutoff: u64,
+) -> bool {
+    let active = !matches!(
+        session.exec_state.as_str(),
+        "idle" | "response_finished" | "failed"
+    );
+    active
+        || session
+            .last_meaningful_activity_at
+            .is_some_and(|last| last >= cutoff)
+        || visible_attention_sessions.contains(session.id.as_str())
 }
 
 fn refresh_session_usage(state: &AppState, now: u64) -> Result<(), StoreError> {
@@ -2989,6 +3349,7 @@ mod tests {
     use axum::http::Request;
     use serde_json::Value;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use tower::ServiceExt;
 
     fn authorized_request(method: &str, uri: &str, body: Value) -> Request<Body> {
@@ -3315,7 +3676,11 @@ mod tests {
             ),
             (
                 "recent-idle",
-                json!({"hook_event_name":"SessionStart","session_id":"recent-idle"}),
+                json!({
+                    "hook_event_name":"UserPromptSubmit",
+                    "session_id":"recent-idle",
+                    "prompt":"recent meaningful task"
+                }),
                 now.saturating_sub(29 * 60 * 1_000),
             ),
             (
@@ -3391,6 +3756,97 @@ mod tests {
         assert_eq!(claude[0]["usedPct"], 2.0);
         assert_eq!(claude[1]["usedPct"], 0.0);
 
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_quota_refresh_is_authenticated_and_invalidates_the_runtime_cache() {
+        let root = std::env::temp_dir().join(format!(
+            "actrealm-server-quota-wake-refresh-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        {
+            let mut auth = state.auth.lock().unwrap();
+            auth.bootstrap_token = None;
+            auth.session_token = Some("test-session".to_owned());
+            auth.csrf_token = Some("test-csrf".to_owned());
+        }
+        {
+            let mut quota = state.quota.lock().unwrap();
+            quota.refreshed_at = Some(Instant::now());
+            quota.claude_cache_modified_at = Some(SystemTime::UNIX_EPOCH);
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let response = router(state.clone())
+                .oneshot(authorized_request(
+                    "POST",
+                    "/api/v1/quota/refresh",
+                    Value::Null,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_body(response).await;
+            assert_eq!(body["accepted"], true);
+        });
+        let quota = state.quota.lock().unwrap();
+        assert!(quota.refreshed_at.is_some());
+        assert_ne!(quota.claude_cache_modified_at, Some(SystemTime::UNIX_EPOCH));
+        drop(quota);
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manual_quota_refresh_requires_authentication_and_enabled_oauth() {
+        let root = std::env::temp_dir().join(format!(
+            "actrealm-server-quota-manual-auth-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let unauthorized = Request::builder()
+                .method("POST")
+                .uri("/api/v1/quota/refresh-now")
+                .body(Body::empty())
+                .unwrap();
+            let response = router(state.clone()).oneshot(unauthorized).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+            {
+                let mut auth = state.auth.lock().unwrap();
+                auth.bootstrap_token = None;
+                auth.session_token = Some("test-session".to_owned());
+                auth.csrf_token = Some("test-csrf".to_owned());
+            }
+            let response = router(state.clone())
+                .oneshot(authorized_request(
+                    "POST",
+                    "/api/v1/quota/refresh-now",
+                    Value::Null,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = json_body(response).await;
+            assert_eq!(body["error"]["code"], "CLAUDE_OAUTH_DISABLED");
+        });
         drop(state);
         drop(store);
         fs::remove_dir_all(root).unwrap();
@@ -3909,6 +4365,13 @@ mod tests {
             .unwrap()
             .iter()
             .all(|item| item.get("interaction").is_none()));
+        let recovered = store.snapshot().unwrap();
+        assert_eq!(recovered.sessions[0].exec_state, "waiting_for_event");
+        assert_eq!(recovered.sessions[0].approval_owner, None);
+        assert_eq!(
+            recovered.sessions[0].activity.as_deref(),
+            Some("待处理事项已结束，等待 Agent 后续事件")
+        );
         let exported = serde_json::to_string(&store.export_json(now_millis()).unwrap()).unwrap();
         assert!(!exported.contains("secret-48291"));
         drop(state);
@@ -4077,6 +4540,110 @@ mod tests {
             .unwrap()
             .native_synced
             .contains("thread-native"));
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn initial_codex_listing_without_waiting_flag_preserves_hook_native_approval() {
+        let root = std::env::temp_dir().join(format!(
+            "actrealm-server-native-restart-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Codex,
+                json!({
+                    "hook_event_name":"PreToolUse",
+                    "session_id":"thread-native-restart",
+                    "turn_id":"turn-1",
+                    "tool_name":"request_permissions",
+                    "tool_use_id":"native-restart-request",
+                    "tool_input":{"reason":"等待 Codex 原界面决定"}
+                }),
+                1_000,
+            ))
+            .unwrap();
+        let state = Arc::new(Mutex::new(CodexManagerState::default()));
+        let waiters = WaiterRegistry::default();
+        let listed = CodexThread {
+            id: "thread-native-restart".to_owned(),
+            name: Some("restart fixture".to_owned()),
+            cwd: Some("/tmp/example".to_owned()),
+            status: "active".to_owned(),
+            active_flags: Vec::new(),
+            updated_at: None,
+            approval_policy: None,
+            approvals_reviewer: None,
+            sandbox_mode: None,
+        };
+        state
+            .lock()
+            .unwrap()
+            .threads
+            .insert(listed.id.clone(), listed.clone());
+
+        // A fresh app-server process may not project the already-running
+        // Desktop Turn. Absence of waitingOnApproval in this first listing is
+        // not proof that the native sheet was handled.
+        sync_initial_codex_native_attention(&state, &store, &waiters, &listed);
+        let preserved = store.snapshot().unwrap();
+        assert_eq!(preserved.attention.len(), 1);
+        assert_eq!(preserved.attention[0].kind, "native_approval");
+        assert_eq!(preserved.attention[0].state, "open");
+        assert_eq!(preserved.sessions[0].exec_state, "awaiting_approval");
+        assert_eq!(
+            preserved.sessions[0].approval_owner.as_deref(),
+            Some("terminal")
+        );
+        assert!(!state
+            .lock()
+            .unwrap()
+            .native_synced
+            .contains("thread-native-restart"));
+
+        // After the Connector has positively observed waiting=true, its later
+        // false transition is authoritative and may resolve the request.
+        update_codex_notification(
+            &state,
+            &store,
+            &waiters,
+            ServerNotification {
+                method: "thread/status/changed".to_owned(),
+                params: json!({
+                    "threadId":"thread-native-restart",
+                    "status":{"type":"active","activeFlags":["waitingOnApproval"]}
+                }),
+            },
+        );
+        assert!(state
+            .lock()
+            .unwrap()
+            .native_synced
+            .contains("thread-native-restart"));
+        update_codex_notification(
+            &state,
+            &store,
+            &waiters,
+            ServerNotification {
+                method: "thread/status/changed".to_owned(),
+                params: json!({
+                    "threadId":"thread-native-restart",
+                    "status":{"type":"active","activeFlags":[]}
+                }),
+            },
+        );
+        let resolved = store.snapshot().unwrap();
+        assert_eq!(resolved.attention[0].state, "resolved");
+        assert_eq!(
+            resolved.attention[0].resolution.as_deref(),
+            Some("provider_handled")
+        );
+        assert_eq!(resolved.sessions[0].exec_state, "thinking");
+        assert_eq!(resolved.sessions[0].approval_owner, None);
 
         drop(store);
         fs::remove_dir_all(root).unwrap();
@@ -4258,6 +4825,52 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_only_sessions_are_hidden_until_meaningful_activity_arrives() {
+        let root = std::env::temp_dir().join(format!(
+            "actrealm-server-session-visibility-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                json!({
+                    "hook_event_name":"SessionStart",
+                    "session_id":"history-only"
+                }),
+                1_000,
+            ))
+            .unwrap();
+        let lifecycle = store.snapshot().unwrap();
+        assert!(!session_is_visible(
+            &lifecycle.sessions[0],
+            &HashSet::new(),
+            0
+        ));
+
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                json!({
+                    "hook_event_name":"UserPromptSubmit",
+                    "session_id":"history-only",
+                    "prompt":"现在开始真实任务"
+                }),
+                2_000,
+            ))
+            .unwrap();
+        let active = store.snapshot().unwrap();
+        assert!(session_is_visible(
+            &active.sessions[0],
+            &HashSet::new(),
+            1_500
+        ));
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn codex_auto_review_and_full_access_do_not_impersonate_user_approval() {
         let root = std::env::temp_dir().join(format!(
             "actrealm-server-auto-review-{}-{}",
@@ -4350,5 +4963,143 @@ mod tests {
             .any(|item| { item.kind == "native_approval" && item.state == "open" }));
         drop(store);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_codex_approval_round_trip_is_scoped_and_resolved() {
+        let root = std::env::temp_dir().join(format!(
+            "actrealm-server-managed-approval-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("fake-codex");
+        fs::write(
+            &executable,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{"userAgent":"codex_cli_rs/0.144.6"}}'
+      ;;
+    *'"id":"approval-1"'*)
+      printf '%s\n' '{"method":"serverRequest/resolved","params":{"threadId":"thread-1","requestId":"approval-1"}}'
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = root.join("unused.sock");
+        let (connector, channels) = CodexConnector::connect(&executable, &socket).unwrap();
+        assert!(connector.supports_managed_approvals());
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let waiters = WaiterRegistry::default();
+        let state = Arc::new(Mutex::new(CodexManagerState {
+            managed: HashSet::from(["thread-1".to_owned()]),
+            ..CodexManagerState::default()
+        }));
+        handle_codex_server_request(
+            connector.clone(),
+            Arc::clone(&state),
+            store.clone(),
+            waiters.clone(),
+            ServerRequest {
+                id: json!("detached-approval"),
+                method: "item/fileChange/requestApproval".to_owned(),
+                params: json!({
+                    "threadId":"not-managed",
+                    "turnId":"turn-1",
+                    "itemId":"item-detached",
+                    "startedAtMs":1_000,
+                    "grantRoot":"/tmp/project"
+                }),
+            },
+        );
+        assert!(store.snapshot().unwrap().attention.is_empty());
+        handle_codex_server_request(
+            connector.clone(),
+            Arc::clone(&state),
+            store.clone(),
+            waiters.clone(),
+            ServerRequest {
+                id: json!("approval-1"),
+                method: "item/commandExecution/requestApproval".to_owned(),
+                params: json!({
+                    "threadId":"thread-1",
+                    "turnId":"turn-1",
+                    "itemId":"item-1",
+                    "startedAtMs":1_000,
+                    "command":"cargo test",
+                    "cwd":"/tmp/project"
+                }),
+            },
+        );
+        let request_id = store.snapshot().unwrap().attention[0].request_id.unwrap();
+        waiters
+            .decide(request_id, actrealm_core::Decision::Allow)
+            .unwrap();
+        let notification = channels
+            .notifications
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        update_codex_notification(&state, &store, &waiters, notification);
+        let resolved = store.snapshot().unwrap();
+        assert_eq!(resolved.attention[0].state, "resolved");
+        assert_eq!(
+            resolved.attention[0].resolution.as_deref(),
+            Some("provider_resolved")
+        );
+
+        let granted = codex_approval_response(
+            "item/permissions/requestApproval",
+            &json!({
+                "permissions":{
+                    "network":{"enabled":true},
+                    "fileSystem":null,
+                    "unknownFuturePermission":{"enabled":true}
+                }
+            }),
+            ReplyAction::Allow,
+        )
+        .unwrap();
+        assert_eq!(
+            granted.pointer("/permissions/network/enabled"),
+            Some(&json!(true))
+        );
+        assert!(granted.pointer("/permissions/fileSystem").is_none());
+        assert!(granted
+            .pointer("/permissions/unknownFuturePermission")
+            .is_none());
+        let denied = codex_approval_response(
+            "item/permissions/requestApproval",
+            &json!({"permissions":{"network":{"enabled":true}}}),
+            ReplyAction::Deny,
+        )
+        .unwrap();
+        assert_eq!(denied["permissions"], json!({}));
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manual_quota_refresh_errors_are_actionable_without_exposing_credentials() {
+        assert_eq!(
+            quota_refresh_error_detail(&QuotaError::OAuthUnavailable),
+            "未找到可读取的 Claude Code 登录凭证；请启动 Claude Code CLI，完成登录或开始一次会话，再回到 ActRealm 点击“立即更新”"
+        );
+        assert_eq!(
+            quota_refresh_error_detail(&QuotaError::OAuthRequest(
+                "credential was rejected".to_owned()
+            )),
+            "Claude 登录凭证需要由官方 CLI 刷新；请启动 Claude Code CLI，完成登录或开始一次会话，再回到 ActRealm 点击“立即更新”"
+        );
+        assert_eq!(
+            quota_refresh_error_detail(&QuotaError::OAuthRequest(
+                "temporarily rate limited".to_owned()
+            )),
+            "Claude 额度接口暂时限流，请稍后重试"
+        );
     }
 }

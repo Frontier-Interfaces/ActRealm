@@ -21,10 +21,70 @@ struct BootstrapParsingTests {
         #expect(RuntimeSupervisor.parseBootstrapLine("") == nil)
     }
 
+    @Test func diagnosticTextNeverRetainsBootstrapCredential() {
+        let token = "0199b3b2-1a2b-7c3d-8e4f-abcdef123456"
+        let line = "ActRealm control panel: http://127.0.0.1:54321/#bootstrap=\(token)"
+        let redacted = RuntimeSupervisor.redactedDiagnosticText(line)
+        #expect(!redacted.contains(token))
+        #expect(redacted == "ActRealm control panel: http://127.0.0.1:54321/#bootstrap=<redacted>")
+    }
+
     @Test func parsesRuntimeLockOwnerPID() {
         #expect(RuntimeSupervisor.parseLockOwnerPID("27489\n") == 27489)
         #expect(RuntimeSupervisor.parseLockOwnerPID("  42  ") == 42)
         #expect(RuntimeSupervisor.parseLockOwnerPID("not-a-pid") == nil)
+    }
+
+    @Test func automaticRestartUsesBoundedExponentialBackoff() {
+        #expect(RuntimeSupervisor.automaticRestartDelay(attempt: 0) == 0.5)
+        #expect(RuntimeSupervisor.automaticRestartDelay(attempt: 1) == 1)
+        #expect(RuntimeSupervisor.automaticRestartDelay(attempt: 2) == 2)
+        #expect(RuntimeSupervisor.automaticRestartDelay(attempt: 3) == 4)
+        #expect(RuntimeSupervisor.automaticRestartDelay(attempt: 4) == 8)
+        #expect(RuntimeSupervisor.automaticRestartDelay(attempt: 5) == nil)
+    }
+
+    @Test func movedRuntimeHelperRequiresTheSameSignedOrLocallyOwnedAppIdentity() {
+        #expect(RuntimeSupervisor.isCompatibleAppHelperIdentity(
+            currentBundleID: "com.frontierinterfaces.actrealm",
+            candidateBundleID: "com.frontierinterfaces.actrealm",
+            currentTeamID: "TEAM123",
+            candidateTeamID: "TEAM123",
+            candidateOwnerID: 0,
+            currentUserID: 501
+        ))
+        #expect(!RuntimeSupervisor.isCompatibleAppHelperIdentity(
+            currentBundleID: "com.frontierinterfaces.actrealm",
+            candidateBundleID: "com.frontierinterfaces.actrealm",
+            currentTeamID: "TEAM123",
+            candidateTeamID: "OTHER",
+            candidateOwnerID: 501,
+            currentUserID: 501
+        ))
+        #expect(RuntimeSupervisor.isCompatibleAppHelperIdentity(
+            currentBundleID: "com.frontierinterfaces.actrealm",
+            candidateBundleID: "com.frontierinterfaces.actrealm",
+            currentTeamID: nil,
+            candidateTeamID: nil,
+            candidateOwnerID: 501,
+            currentUserID: 501
+        ))
+        #expect(!RuntimeSupervisor.isCompatibleAppHelperIdentity(
+            currentBundleID: "com.frontierinterfaces.actrealm",
+            candidateBundleID: "com.frontierinterfaces.actrealm",
+            currentTeamID: nil,
+            candidateTeamID: nil,
+            candidateOwnerID: 502,
+            currentUserID: 501
+        ))
+        #expect(!RuntimeSupervisor.isCompatibleAppHelperIdentity(
+            currentBundleID: "com.frontierinterfaces.actrealm",
+            candidateBundleID: "com.example.spoof",
+            currentTeamID: nil,
+            candidateTeamID: nil,
+            candidateOwnerID: 501,
+            currentUserID: 501
+        ))
     }
 
     @Test func packagedHelperWinsOverAuxiliaryExecutableLookup() throws {

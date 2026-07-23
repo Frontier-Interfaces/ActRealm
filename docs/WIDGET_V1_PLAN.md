@@ -61,11 +61,11 @@
 
 ### 1.4 明确不做（v1 拒绝清单）
 
-Coach、多 Agent 接力、决策记忆的语义匹配（仅做同类命令计数）、自动授权规则、灵动岛/三分栏视图、云端/账号/遥测、移动端、历史回放页、Gemini 批准应答、interrupt/steer/任意消息注入。v1.1 已把 Claude 官方问题 Hook、显式 Codex app-server Connector、Thread 恢复和 requestUserInput 纳入 M10-M12，并在 M13 加入 Provider 原生批准状态同步；这些能力不扩大 Hook-only 会话的所有权。Codex app-server 的 command/file/permissions 三类直接批准保留为拟议 M15，当前未实现。
+Coach、多 Agent 接力、决策记忆的语义匹配（仅做同类命令计数）、自动授权规则、灵动岛/三分栏视图、云端/账号/遥测、移动端、历史回放页、Gemini 批准应答、interrupt/steer/任意消息注入。v1.1 已把 Claude 官方问题 Hook、显式 Codex app-server Connector、Thread 恢复和 requestUserInput 纳入 M10-M12，并在 M13 加入 Provider 原生批准状态同步；这些能力不扩大 Hook-only 会话的所有权。M15 已加入经过版本门禁的 Codex app-server command/file/permissions 三类直接批准，仅适用于请求本身到达 ActRealm 所拥有连接的显式托管 Thread；仅枚举、attach 或 resume 一个由 Codex Desktop 独立运行的 Thread，不会转移其当前 Turn 或原生批准窗口的回复权。
 
 ### 1.5 能力边界（必须在 UI 中诚实呈现）
 
-External Hook Control Mode 不等于 Managed Mode：它不拥有 Agent 会话本身。可直接回复的能力只来自当前事件的官方 reply channel：Hook `PermissionRequest`、Claude AskUserQuestion/Elicitation，或显式 managed Codex 的 `requestUserInput`。Provider 原生批准只观察 waiting/resolved。Session 与 Attention 投影必须携带 capability，而不是由前端按 Provider 猜测：
+External Hook Control Mode 不等于 Managed Mode：它不拥有 Agent 会话本身。可直接回复的能力只来自当前事件的官方 reply channel：Hook `PermissionRequest`、Claude AskUserQuestion/Elicitation，或显式 managed Codex 的 `requestUserInput` 与通过版本门禁的 command/file/permissions approval。其他 Provider 原生批准只观察 waiting/resolved。Session 与 Attention 投影必须携带 capability，而不是由前端按 Provider 猜测：
 
 ```json
 {
@@ -178,7 +178,7 @@ PermissionRequest 的额外铁律：
 | 日志 | tracing + tracing-subscriber（文件轮转） | 默认脱敏（§17） |
 | 静态资源 | rust-embed（直接嵌入 web 文件） | 单文件交付 |
 | 系统交互 | std::process 调 `osascript`（跳回终端）、`open`（开浏览器） | Open Island 同方案 |
-| Web UI | **原生 HTML/CSS/JS，零框架、零构建**（延续原型） | v1 界面复杂度不需要 React；无 node 工具链，Claude Code 开发调试最快；文件 <100KB |
+| Web UI | **原生 HTML/CSS/JS，零框架、零构建**（延续原型） | v1 界面复杂度不需要 React；无 node 工具链，Claude Code 开发调试最快；单个嵌入资源以 <128 KiB 作为可随产品复杂度和验证结果调整的工程预算，并非 Runtime、HTTP 或 WebView 的技术限制 |
 | Web↔Runtime | fetch + WebSocket + 单一全局 store（手写 ~50 行观察者） | — |
 | 进程通信 | Unix Domain Socket（mac/linux）；Windows 用 127.0.0.1 环回 TCP + token（P2） | Open Island / CodeIsland 验证 |
 
@@ -800,8 +800,8 @@ actrealm/
 交付：Claude/Codex 会话累计与本轮 Token、真实当前上下文占用、缓存/推理拆分、明确标注的估算 API 价、Claude OAuth 动态额度（含 Fable/额外用量）、一分钟后台刷新、旧值持续展示和凭据零持久化。
 验收：Claude 流式消息和子 Agent 记录不重复计数；Codex cache/reasoning 不重复计数；上下文不使用 lifetime Token 冒充；未知模型不显示假价格；OAuth 不阻塞 UI 且 token 不进入 SQLite/缓存/日志/argv；161 项测试、Clippy、格式、release、2 分钟资源门禁、精确 release 安装和本机用户验收均已通过。
 
-**M15 · Codex managed approvals（候选，未实现）**
-拟议范围：version-gated `item/commandExecution/requestApproval`、`item/fileChange/requestApproval`、`item/permissions/requestApproval`、availableDecisions、响应与 `serverRequest/resolved` 对账。只有显式 attach 且能力握手成功的 Thread 才能显示直接审批；不得承诺控制任意独立 Codex Desktop 会话。
+**M15 · Codex managed approvals（已实现，真实 Provider 复验待完成）**
+交付：version-gated `item/commandExecution/requestApproval`、`item/fileChange/requestApproval`、`item/permissions/requestApproval`，一次性允许/拒绝响应、最小权限回传、`serverRequest/resolved` 对账、原生观察卡去重和真实能力标签。只有显式 attach 且 0.144.5–0.144.x 协议门禁成功的 Thread 才显示直接审批；未知版本静默降级，不承诺控制任意独立 Codex Desktop 会话。
 
 ---
 
@@ -850,7 +850,7 @@ actrealm/
 | osascript 权限被拒 | 跳回降级为复制路径提示 |
 | 用户配置文件被其他工具并发修改 | 安装器文件锁 + 校验后写 + 失败回滚备份 |
 | SQLite 损坏 | 启动 integrity_check，失败则归档旧库重建；活动 Hook 因 Runtime 断开立即 pass-through |
-| Codex app-server approval schema/version 不兼容 | M13 只观察 native waiting；M15 三类 managed approval 必须经过显式能力握手、版本门禁和 fixture 后才能显示控制按钮 |
+| Codex app-server approval schema/version 不兼容 | M15 三类 managed approval 只有经过显式 attach、版本门禁和生成 Schema 测试后才显示控制按钮；未知版本降级为 native waiting 观察 |
 
 ---
 

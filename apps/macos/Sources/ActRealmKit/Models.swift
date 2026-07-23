@@ -414,6 +414,8 @@ public struct CodexConnectorCapability: Codable, Equatable, Sendable {
     public let status: String?
     public let managedThreads: UInt64?
     public let error: String?
+    public let managedApprovals: Bool?
+    public let serverUserAgent: String?
 }
 
 public struct SnapshotCapabilities: Codable, Equatable, Sendable {

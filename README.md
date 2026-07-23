@@ -64,7 +64,9 @@ The current build includes:
   overview/safety background work at Runtime ingest while preserving ordinary
   user sessions, fail-open behavior, and aggregate metrics truth;
 - **a capability-aware approval loop** with risk labels, allow/deny/pass-through
-  where supported, and a three-second undo window before a decision commits;
+  where supported, a three-second undo window before a decision commits, and
+  direct command/file/permission decisions only when the request arrives on
+  ActRealm's owned Codex app-server channel and passes the version gate;
 - **honest return-to-task behavior** that reports the best available level:
   exact Codex conversation, matching Terminal/iTerm session, application only,
   or unsupported;
@@ -80,8 +82,8 @@ The current build includes:
 - **an authenticated local control surface** backed by a single Rust Runtime,
   SQLite persistence, WebSocket updates, diagnostics, and local export;
 - **stable live updates and controlled recovery** with heartbeats, stale-channel
-  fallback, in-place elapsed-time updates, a local health monitor, and a
-  one-button same-port Runtime restart;
+  fallback, in-place elapsed-time updates, a diagnostic manual Claude quota
+  refresh, a local health monitor, and a one-button same-port Runtime restart;
 - **a native macOS client codebase** with menu-bar UI, HUD, Runtime supervision,
   and experimental foreground scheduling.
 
@@ -171,9 +173,12 @@ apps/macos/Scripts/package-app.sh
 open apps/macos/dist/ActRealm.app
 ```
 
-The current native UI uses Swift tools 6.2 and macOS 26 APIs. The generated app
-is ad-hoc signed for local development; a notarized public installer is not yet
-available.
+The current native UI uses Swift tools 6.2 and macOS 26 APIs and currently
+targets Apple Silicon. Local packages remain ad-hoc signed QA artifacts. The
+repository now contains a Developer ID signing, notarization, stapling, DMG,
+checksum, and GitHub release workflow, but a public installer is not considered
+available until that workflow runs with release credentials and the resulting
+DMG passes a clean-Mac install gate.
 
 ## Current boundaries and roadmap
 
@@ -181,12 +186,12 @@ available.
 | --- | --- | --- |
 | Local Runtime and web control surface | Current test candidate | Functional through M14 plus live-state/recovery refinements; M13 real-Provider acceptance and the 48-hour soak remain open |
 | Claude Code and Codex | Current build | Local sessions only; direct actions depend on the actual reply channel |
-| Native macOS client | Testable source | Packaging works locally; foreground/window activation still needs broader manual acceptance |
+| Native macOS client | Testable source | macOS 26+ on Apple Silicon; local packaging works, while clean-Mac release acceptance remains open |
 | Automatic ActRealm Workspace arrangement | Experimental | Requires macOS Accessibility permission and must fail without changing Runtime state |
 | ActRealm Review | In development | Planned test, diff, evidence, and checkpoint review; not part of the current build |
 | Gemini CLI adapter | In development | Not shipped as a current supported Provider |
 | Windows client | Roadmap | Runtime platform abstractions must land before the WinUI shell |
-| Public signed installer | Roadmap | No packaged M1 download is promised yet |
+| Public signed installer | Release-gated | Pipeline exists; Developer ID/notarization credentials and clean-Mac acceptance are still required |
 
 Roadmap-tagged capabilities on the website are target experiences, not evidence
 of shipped behavior. The detailed implementation and release truth lives in
@@ -250,6 +255,8 @@ change how those tools handle data.
 - [Native macOS/Windows architecture](docs/NATIVE_CLIENT_ARCHITECTURE.md)
 - [Executable v1 acceptance contract](docs/V1_ACCEPTANCE.md)
 - [M14 live usage, context, price, and quota evidence](docs/M14_USAGE_CONTEXT_QUOTA.md)
+- [M15 managed Codex approval boundary](docs/M15_CODEX_MANAGED_APPROVALS.md)
+- [OUTBOX and quota regression remediation](docs/reports/ACTREALM_OUTBOX_QUOTA_REGRESSION_2026-07-23.md)
 - [Post-M14 live-state and Runtime-recovery evidence](docs/POST_M14_REALTIME_RECOVERY.md)
 - [Post-M14 usage, pricing, and OAuth hardening](docs/POST_M14_USAGE_OAUTH_HARDENING.md)
 - [Post-M14 first-run onboarding and setup center](docs/POST_M14_FIRST_RUN_ONBOARDING.md)

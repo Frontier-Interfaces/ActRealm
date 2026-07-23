@@ -1,0 +1,141 @@
+=== stdout tail ingestion ===
+apps/macos/Sources/ActRealmUI/Views/RuntimeMonitorView.swift-357-        pid.map { "PID \($0)" } ?? "未运行"
+apps/macos/Sources/ActRealmUI/Views/RuntimeMonitorView.swift-358-    }
+apps/macos/Sources/ActRealmUI/Views/RuntimeMonitorView.swift-359-
+apps/macos/Sources/ActRealmUI/Views/RuntimeMonitorView.swift-360-    private var logText: String {
+apps/macos/Sources/ActRealmUI/Views/RuntimeMonitorView.swift:361:        let stdout = model.runtimeDiagnostics.stdoutTail.trimmingCharacters(in: .whitespacesAndNewlines)
+apps/macos/Sources/ActRealmUI/Views/RuntimeMonitorView.swift-362-        let stderr = model.runtimeDiagnostics.stderrTail.trimmingCharacters(in: .whitespacesAndNewlines)
+apps/macos/Sources/ActRealmUI/Views/RuntimeMonitorView.swift-363-        let combined = [stdout, stderr].filter { !$0.isEmpty }.joined(separator: "\n")
+apps/macos/Sources/ActRealmUI/Views/RuntimeMonitorView.swift-364-        return combined.isEmpty ? "等待 Runtime 输出…" : combined
+apps/macos/Sources/ActRealmUI/Views/RuntimeMonitorView.swift-365-    }
+--
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-26-        public let lockOwnerIsAlive: Bool
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-27-        public let socketExists: Bool
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-28-        public let helperPath: String?
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-29-        public let endpoint: String?
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift:30:        public let stdoutTail: String
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-31-        public let stderrTail: String
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-32-        public let launchAgentWarning: String?
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-33-
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-34-        public static let empty = Diagnostics(
+--
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-39-            lockOwnerIsAlive: false,
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-40-            socketExists: false,
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-41-            helperPath: nil,
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-42-            endpoint: nil,
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift:43:            stdoutTail: "",
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-44-            stderrTail: "",
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-45-            launchAgentWarning: nil
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-46-        )
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-47-    }
+--
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-51-
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-52-    private let repoPath: URL?
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-53-    private var process: Process?
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-54-    private var stdoutBuffer = Data()
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift:55:    private var stdoutTail = ""
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-56-    private var stderrTail = ""
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-57-    private var endpoint: URL?
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-58-    private var onBootstrap: ((URL, String) -> Void)?
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-59-
+--
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-160-        self.onBootstrap = nil
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-161-        refreshDiagnostics()
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-162-
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-163-        if await bootOutOutdatedLaunchAgent() {
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift:164:            stdoutTail = String((stdoutTail + "已停止参数过期的 com.frontier.actrealm.runtime LaunchAgent\n").suffix(4000))
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-165-        }
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-166-
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-167-        if let process, process.isRunning {
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-168-            await terminate(processID: process.processIdentifier)
+--
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-187-            }
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-188-        }
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-189-
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-190-        stdoutBuffer.removeAll(keepingCapacity: true)
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift:191:        stdoutTail = ""
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-192-        stderrTail = ""
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-193-        endpoint = nil
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-194-        await start(onBootstrap: onBootstrap)
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-195-        return nil
+--
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-277-        while let newline = stdoutBuffer.firstIndex(of: 0x0A) {
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-278-            let lineData = stdoutBuffer[stdoutBuffer.startIndex..<newline]
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-279-            stdoutBuffer.removeSubrange(stdoutBuffer.startIndex...newline)
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-280-            if let line = String(data: lineData, encoding: .utf8) {
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift:281:                stdoutTail = String((stdoutTail + line + "\n").suffix(4000))
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-282-                consume(line: line)
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-283-            }
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-284-        }
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-285-        refreshDiagnostics()
+--
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-306-            lockOwnerIsAlive: ownerAlive,
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-307-            socketExists: FileManager.default.fileExists(atPath: Self.bridgeSocketURL.path),
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-308-            helperPath: resolvedHelper()?.path,
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-309-            endpoint: endpoint?.absoluteString,
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift:310:            stdoutTail: stdoutTail,
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-311-            stderrTail: stderrTail,
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-312-            launchAgentWarning: Self.launchAgentWarning()
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-313-        )
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-314-    }
+--
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-420-        }
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-421-        return nil
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-422-    }
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-423-
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift:424:    /// Parses `ActRealm control panel: http://127.0.0.1:<port>/#bootstrap=<token>`.
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-425-    public nonisolated static func parseBootstrapLine(_ line: String) -> (baseURL: URL, token: String)? {
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-426-        guard let prefixRange = line.range(of: "ActRealm control panel: ") else { return nil }
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-427-        let rest = line[prefixRange.upperBound...]
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift:428:        guard let markerRange = rest.range(of: "/#bootstrap=") else { return nil }
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-429-        let baseURLString = String(rest[rest.startIndex..<markerRange.lowerBound])
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-430-        let token = String(rest[markerRange.upperBound...])
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-431-            .trimmingCharacters(in: .whitespacesAndNewlines)
+apps/macos/Sources/ActRealmKit/RuntimeSupervisor.swift-432-        guard let baseURL = URL(string: baseURLString), !token.isEmpty else { return nil }
+=== runtime auth bootstrap parsing ===
+3-import Foundation
+4-
+5-/// Locates the `actrealm` Rust backend (bundled helper first, then a dev
+6-/// checkout), supervises it as a child process, and extracts the one-time
+7:/// bootstrap URL/token it prints on startup so a `RuntimeClient` can hand
+8-/// off into an authenticated session.
+9-@MainActor
+10-public final class RuntimeSupervisor: ObservableObject {
+11-    public enum State: Equatable, Sendable {
+--
+113-    }
+114-
+115-    /// Ensures a backend binary exists (bundled helper, or a cargo release
+116-    /// build of the dev checkout), launches `actrealm serve`, and invokes
+117:    /// `onBootstrap` exactly once with the base URL and one-time token
+118-    /// parsed from its stdout.
+119-    public func start(onBootstrap: @escaping (URL, String) -> Void) async {
+120-        self.onBootstrap = onBootstrap
+121-        refreshDiagnostics()
+--
+291-        onBootstrap = nil
+292-        state = .running
+293-        endpoint = parsed.baseURL
+294-        refreshDiagnostics()
+295:        callback?(parsed.baseURL, parsed.token)
+296-    }
+297-
+298-    public func refreshDiagnostics() {
+299-        let owner = Self.lockOwnerPID()
+--
+420-        }
+421-        return nil
+422-    }
+423-
+424:    /// Parses `ActRealm control panel: http://127.0.0.1:<port>/#bootstrap=<token>`.
+425:    public nonisolated static func parseBootstrapLine(_ line: String) -> (baseURL: URL, token: String)? {
+426-        guard let prefixRange = line.range(of: "ActRealm control panel: ") else { return nil }
+427-        let rest = line[prefixRange.upperBound...]
+428:        guard let markerRange = rest.range(of: "/#bootstrap=") else { return nil }
+429-        let baseURLString = String(rest[rest.startIndex..<markerRange.lowerBound])
+430:        let token = String(rest[markerRange.upperBound...])
+431-            .trimmingCharacters(in: .whitespacesAndNewlines)
+432:        guard let baseURL = URL(string: baseURLString), !token.isEmpty else { return nil }
+433:        return (baseURL, token)
+434-    }
+435-}

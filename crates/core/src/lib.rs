@@ -533,6 +533,65 @@ impl BridgeRequest {
         })
     }
 
+    /// Builds a blocking request from the versioned Codex app-server approval
+    /// protocol. This constructor is only used by an explicitly attached
+    /// managed Thread; ordinary Hook/Desktop observations never call it.
+    pub fn codex_approval_at(method: &str, raw_params: Value, received_at: u64) -> Option<Self> {
+        let tool_name = match method {
+            "item/commandExecution/requestApproval" => "Bash",
+            "item/fileChange/requestApproval" => "apply_patch",
+            "item/permissions/requestApproval" => "request_permissions",
+            _ => return None,
+        };
+        let provider_session_id = owned_raw_string(&raw_params, "threadId")?;
+        let provider_turn_id = owned_raw_string(&raw_params, "turnId");
+        let item_id = owned_raw_string(&raw_params, "itemId")?;
+        if provider_session_id.len() > 256 || item_id.len() > 256 {
+            return None;
+        }
+        let request_id = Uuid::now_v7();
+        let mut raw = raw_params;
+        let tool_input = match method {
+            "item/commandExecution/requestApproval" => serde_json::json!({
+                "command": raw.get("command").cloned().unwrap_or(Value::Null),
+                "cwd": raw.get("cwd").cloned().unwrap_or(Value::Null)
+            }),
+            "item/fileChange/requestApproval" => serde_json::json!({
+                "path": raw.get("grantRoot").cloned().unwrap_or(Value::Null)
+            }),
+            "item/permissions/requestApproval" => serde_json::json!({
+                "permissions": raw.get("permissions").cloned().unwrap_or_else(|| serde_json::json!({}))
+            }),
+            _ => return None,
+        };
+        raw["hook_event_name"] = Value::String("PermissionRequest".to_owned());
+        raw["session_id"] = Value::String(provider_session_id.clone());
+        raw["tool_name"] = Value::String(tool_name.to_owned());
+        raw["_codex_server_request_method"] = Value::String(method.to_owned());
+        raw["_codex_item_id"] = Value::String(item_id);
+        raw["tool_input"] = tool_input;
+        if let Some(turn_id) = provider_turn_id.as_ref() {
+            raw["turn_id"] = Value::String(turn_id.clone());
+        }
+        Some(Self {
+            v: PROTOCOL_VERSION,
+            id: Uuid::now_v7(),
+            request_id: Some(request_id),
+            provider: Provider::Codex,
+            provider_session_id: Some(provider_session_id),
+            provider_turn_id,
+            prompt_id: None,
+            role: "managed".to_owned(),
+            received_at,
+            deadline_at: Some(received_at.saturating_add(CODEX_PERMISSION_DEADLINE_MS)),
+            needs_reply: true,
+            provider_handles_approval: false,
+            blocking_kind: Some(BlockingRequestKind::Permission),
+            term: None,
+            raw,
+        })
+    }
+
     pub fn event_name(&self) -> Option<&str> {
         self.raw.get("hook_event_name").and_then(Value::as_str)
     }
@@ -638,6 +697,17 @@ impl BridgeResponse {
             ReplyAction::PassThrough | ReplyAction::Ping | ReplyAction::Answer => None,
         }
     }
+}
+
+/// Codex Desktop exposes some user-confirmation surfaces as ordinary
+/// non-blocking tool lifecycle events. They are observable by Hooks but do
+/// not provide a request-keyed reply channel, so Runtime must surface them as
+/// Provider-owned attention instead of manufacturing an allow/deny response.
+pub fn is_codex_native_attention_tool(tool_name: Option<&str>) -> bool {
+    matches!(
+        tool_name,
+        Some("request_permissions" | "request_plugin_install")
+    )
 }
 
 fn owned_raw_string(raw: &Value, key: &str) -> Option<String> {
@@ -908,6 +978,101 @@ mod tests {
         assert_eq!(request.blocking_kind, None);
         assert_eq!(request.request_id, None);
         assert!(!request.provider_handles_approval);
+    }
+
+    #[test]
+    fn codex_plugin_install_is_a_provider_owned_native_attention_tool() {
+        assert!(is_codex_native_attention_tool(Some(
+            "request_plugin_install"
+        )));
+        assert!(is_codex_native_attention_tool(Some("request_permissions")));
+        assert!(!is_codex_native_attention_tool(Some("Bash")));
+
+        let request = BridgeRequest::from_hook_at(
+            Provider::Codex,
+            serde_json::json!({
+                "hook_event_name":"PreToolUse",
+                "session_id":"desktop-plugin-request",
+                "turn_id":"turn-plugin",
+                "tool_name":"request_plugin_install",
+                "tool_input":{"plugin_id":"github@openai-curated-remote"}
+            }),
+            1_000,
+        );
+        assert!(!request.needs_reply);
+        assert_eq!(request.request_id, None);
+        assert_eq!(request.blocking_kind, None);
+        assert!(!request.provider_handles_approval);
+    }
+
+    #[test]
+    fn managed_codex_approval_is_blocking_and_preserves_protocol_identity() {
+        let request = BridgeRequest::codex_approval_at(
+            "item/commandExecution/requestApproval",
+            serde_json::json!({
+                "threadId":"thread-1",
+                "turnId":"turn-1",
+                "itemId":"item-1",
+                "startedAtMs":1_000,
+                "command":"cargo test",
+                "cwd":"/tmp/project"
+            }),
+            1_000,
+        )
+        .unwrap();
+        assert!(request.needs_reply);
+        assert_eq!(request.role, "managed");
+        assert_eq!(request.blocking_kind, Some(BlockingRequestKind::Permission));
+        assert_eq!(
+            request.raw["_codex_server_request_method"],
+            "item/commandExecution/requestApproval"
+        );
+        assert_eq!(
+            request.raw.pointer("/tool_input/command"),
+            Some(&serde_json::json!("cargo test"))
+        );
+        assert!(BridgeRequest::codex_approval_at(
+            "item/unknown/requestApproval",
+            serde_json::json!({"threadId":"thread-1","itemId":"item-1"}),
+            1_000
+        )
+        .is_none());
+        let file = BridgeRequest::codex_approval_at(
+            "item/fileChange/requestApproval",
+            serde_json::json!({
+                "threadId":"thread-1",
+                "turnId":"turn-1",
+                "itemId":"item-2",
+                "startedAtMs":1_000,
+                "grantRoot":"/tmp/project"
+            }),
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(file.raw["tool_name"], "apply_patch");
+        assert_eq!(
+            file.raw.pointer("/tool_input/path"),
+            Some(&serde_json::json!("/tmp/project"))
+        );
+        let permissions = BridgeRequest::codex_approval_at(
+            "item/permissions/requestApproval",
+            serde_json::json!({
+                "threadId":"thread-1",
+                "turnId":"turn-1",
+                "itemId":"item-3",
+                "startedAtMs":1_000,
+                "permissions":{"network":{"enabled":true}}
+            }),
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(permissions.raw["tool_name"], "request_permissions");
+        assert_eq!(
+            permissions
+                .raw
+                .pointer("/tool_input/permissions/network/enabled"),
+            Some(&serde_json::json!(true))
+        );
     }
 
     #[test]

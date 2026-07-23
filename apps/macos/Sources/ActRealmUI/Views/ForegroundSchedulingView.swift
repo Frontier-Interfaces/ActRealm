@@ -934,13 +934,14 @@ private struct TokenFlow: View {
 }
 
 private struct FlowTrack: View {
+    @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.snapshotRendering) private var snapshotRendering
 
     var body: some View {
         TimelineView(.animation(
-            minimumInterval: 1 / 30,
-            paused: reduceMotion || snapshotRendering
+            minimumInterval: 1 / 15,
+            paused: reduceMotion || snapshotRendering || !model.isWorkspaceAnimationActive
         )) { timeline in
             GeometryReader { proxy in
                 let glowWidth = min(84, max(54, proxy.size.width * 0.24))
@@ -967,7 +968,7 @@ private struct FlowTrack: View {
     }
 
     private func flowPhase(at date: Date) -> CGFloat {
-        if reduceMotion || snapshotRendering { return 0.42 }
+        if reduceMotion || snapshotRendering || !model.isWorkspaceAnimationActive { return 0.42 }
         let duration = 1.75
         return CGFloat(
             date.timeIntervalSinceReferenceDate

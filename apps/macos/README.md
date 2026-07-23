@@ -17,7 +17,9 @@ the Rust Runtime at the repository root.
 
 ## Development
 
-The current UI uses macOS 26 APIs and Swift tools 6.2 or newer.
+The current UI uses macOS 26 APIs and Swift tools 6.2 or newer. The current
+release target is Apple Silicon (`arm64`); Intel is not part of the declared
+support matrix.
 
 ```bash
 swift build --package-path apps/macos
@@ -41,6 +43,22 @@ apps/macos/Scripts/package-app.sh
 
 The result is written to `apps/macos/dist/ActRealm.app`. Build output, Xcode
 user state, snapshots, and packaged apps are ignored by Git.
+
+Local packaging uses an ad-hoc signature. Release packaging must provide a
+Developer ID identity and reject ad-hoc output:
+
+```bash
+ACTREALM_SIGN_IDENTITY="Developer ID Application: Example (TEAMID)" \
+ACTREALM_REQUIRE_RELEASE_SIGNING=1 \
+ACTREALM_VERSION=1.0.0 \
+apps/macos/Scripts/package-app.sh apps/macos/release-dist
+```
+
+`.github/workflows/release-macos.yml` imports the release certificate from
+GitHub Secrets, builds the signed app, creates and notarizes a DMG, staples the
+ticket, runs Gatekeeper assessment, and publishes a SHA-256 checksum. A release
+is not qualified until the resulting DMG also passes install and first-run on a
+clean macOS 26 Apple Silicon account or VM.
 
 ## Source layout
 

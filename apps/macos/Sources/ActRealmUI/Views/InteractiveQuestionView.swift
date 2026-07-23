@@ -52,6 +52,7 @@ struct InteractiveQuestionView: View {
             }
         }
         .padding(.top, 10)
+        .disabled(!model.canControlRuntime)
     }
 
     @ViewBuilder

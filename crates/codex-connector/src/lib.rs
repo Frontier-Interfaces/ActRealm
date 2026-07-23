@@ -1,19 +1,19 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+#[cfg(target_os = "macos")]
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::os::unix::net::UnixStream;
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thiserror::Error;
 
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
@@ -72,17 +72,35 @@ pub struct CodexConnector {
 
 struct Inner {
     writer: Mutex<ChildStdin>,
-    child: Mutex<Child>,
+    child: Mutex<Option<Child>>,
     pending: Mutex<HashMap<String, mpsc::Sender<Result<Value, String>>>>,
+    protocol: Mutex<ProtocolSupport>,
     next_id: AtomicU64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProtocolSupport {
+    server_user_agent: Option<String>,
+    managed_approvals: bool,
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        if let Ok(child) = self.child.get_mut() {
+        if let Ok(Some(child)) = self.child.get_mut().map(Option::as_mut) {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct WeakCodexConnector {
+    inner: Weak<Inner>,
+}
+
+impl WeakCodexConnector {
+    pub fn upgrade(&self) -> Option<CodexConnector> {
+        self.inner.upgrade().map(|inner| CodexConnector { inner })
     }
 }
 
@@ -91,17 +109,17 @@ impl CodexConnector {
         executable: &Path,
         socket_path: &Path,
     ) -> Result<(Self, ConnectorChannels), ConnectorError> {
-        ensure_app_server(executable, socket_path)?;
-        Self::connect_proxy(executable, socket_path)
+        cleanup_legacy_socket_listeners(socket_path);
+        Self::connect_stdio(executable)
     }
 
-    fn connect_proxy(
-        executable: &Path,
-        socket_path: &Path,
-    ) -> Result<(Self, ConnectorChannels), ConnectorError> {
+    fn connect_stdio(executable: &Path) -> Result<(Self, ConnectorChannels), ConnectorError> {
+        // Codex app-server natively supports stdio. Keeping it as the direct
+        // child of Runtime avoids a detached Unix-socket listener: if Runtime
+        // is killed, the OS closes stdin and app-server exits on EOF instead
+        // of surviving as a PPID-1 orphan.
         let mut child = Command::new(executable)
-            .args(["app-server", "proxy", "--sock"])
-            .arg(socket_path)
+            .args(["app-server", "--stdio"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -119,12 +137,13 @@ impl CodexConnector {
         let connector = Self {
             inner: Arc::new(Inner {
                 writer: Mutex::new(writer),
-                child: Mutex::new(child),
+                child: Mutex::new(Some(child)),
                 pending: Mutex::new(HashMap::new()),
+                protocol: Mutex::new(ProtocolSupport::default()),
                 next_id: AtomicU64::new(1),
             }),
         };
-        let reader_connector = connector.clone();
+        let reader_connector = connector.downgrade();
         thread::Builder::new()
             .name("actrealm-codex-reader".to_owned())
             .spawn(move || {
@@ -149,11 +168,18 @@ impl CodexConnector {
                                 params: message.get("params").cloned().unwrap_or(Value::Null),
                             });
                         }
-                        (None, Some(id)) => reader_connector.complete_response(id, message),
+                        (None, Some(id)) => {
+                            let Some(connector) = reader_connector.upgrade() else {
+                                break;
+                            };
+                            connector.complete_response(id, message);
+                        }
                         (None, None) => {}
                     }
                 }
-                reader_connector.fail_all_pending("transport_closed");
+                if let Some(connector) = reader_connector.upgrade() {
+                    connector.fail_all_pending("transport_closed");
+                }
             })
             .map_err(|error| ConnectorError::Process(error.to_string()))?;
         connector.initialize()?;
@@ -166,8 +192,25 @@ impl CodexConnector {
         ))
     }
 
+    pub fn downgrade(&self) -> WeakCodexConnector {
+        WeakCodexConnector {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
+    #[cfg(test)]
+    fn managed_child_id(&self) -> u32 {
+        self.inner
+            .child
+            .lock()
+            .expect("child lock")
+            .as_ref()
+            .expect("managed app-server")
+            .id()
+    }
+
     fn initialize(&self) -> Result<(), ConnectorError> {
-        self.call(
+        let result = self.call(
             "initialize",
             json!({
                 "clientInfo": {
@@ -182,7 +225,35 @@ impl CodexConnector {
             }),
             RPC_TIMEOUT,
         )?;
+        let user_agent = result
+            .get("userAgent")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let managed_approvals = user_agent
+            .as_deref()
+            .and_then(codex_version)
+            .is_some_and(managed_approval_schema_supported);
+        if let Ok(mut protocol) = self.inner.protocol.lock() {
+            protocol.server_user_agent = user_agent;
+            protocol.managed_approvals = managed_approvals;
+        }
         self.notify("initialized", json!({}))
+    }
+
+    pub fn supports_managed_approvals(&self) -> bool {
+        self.inner
+            .protocol
+            .lock()
+            .map(|protocol| protocol.managed_approvals)
+            .unwrap_or(false)
+    }
+
+    pub fn server_user_agent(&self) -> Option<String> {
+        self.inner
+            .protocol
+            .lock()
+            .ok()
+            .and_then(|protocol| protocol.server_user_agent.clone())
     }
 
     pub fn list_threads(&self) -> Result<Vec<CodexThread>, ConnectorError> {
@@ -296,52 +367,63 @@ impl CodexConnector {
     }
 }
 
-fn ensure_app_server(executable: &Path, socket_path: &Path) -> Result<(), ConnectorError> {
-    if UnixStream::connect(socket_path).is_ok() {
-        return Ok(());
+/// Releases listeners created by pre-stdio ActRealm builds. The private
+/// ActRealm socket path is the ownership boundary: ordinary Codex CLI/Desktop
+/// sessions never bind it, and no process with another command name is
+/// touched. Cleanup is best-effort so a missing `lsof` cannot disable Codex.
+#[cfg(target_os = "macos")]
+fn cleanup_legacy_socket_listeners(socket_path: &Path) {
+    if let Ok(output) = Command::new("/usr/sbin/lsof")
+        .args(["-n", "-P", "-U", "-F", "pcn"])
+        .output()
+    {
+        let fields = String::from_utf8_lossy(&output.stdout);
+        for pid in legacy_listener_pids(&fields, socket_path) {
+            if pid != std::process::id() {
+                let _ = Command::new("/bin/kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
     }
-    if let Ok(metadata) = fs::symlink_metadata(socket_path) {
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
-            return Err(ConnectorError::Process(
-                "refusing unsafe app-server socket path".to_owned(),
-            ));
-        }
-        fs::remove_file(socket_path)?;
+
+    if fs::symlink_metadata(socket_path).is_ok_and(|metadata| metadata.file_type().is_socket()) {
+        let _ = fs::remove_file(socket_path);
     }
-    let parent = socket_path
-        .parent()
-        .ok_or_else(|| ConnectorError::Process("app-server socket has no parent".to_owned()))?;
-    fs::create_dir_all(parent)?;
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-    let endpoint = format!("unix://{}", socket_path.display());
-    let mut child = Command::new(executable)
-        .args(["app-server", "--listen"])
-        .arg(endpoint)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let deadline = Instant::now() + CONTROL_TIMEOUT;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Err(ConnectorError::Process(format!(
-                "app-server exited before socket became ready: {status}"
-            )));
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cleanup_legacy_socket_listeners(_socket_path: &Path) {}
+
+#[cfg(target_os = "macos")]
+fn legacy_listener_pids(fields: &str, socket_path: &Path) -> Vec<u32> {
+    let expected_path = socket_path.to_string_lossy();
+    let mut current_pid = None;
+    let mut current_command = None;
+    let mut matches = Vec::new();
+    for field in fields.lines() {
+        let Some((kind, value)) = field.split_at_checked(1) else {
+            continue;
+        };
+        match kind {
+            "p" => {
+                current_pid = value.parse::<u32>().ok();
+                current_command = None;
+            }
+            "c" => current_command = Some(value),
+            "n" if value == expected_path && current_command == Some("codex") => {
+                if let Some(pid) = current_pid {
+                    matches.push(pid);
+                }
+            }
+            _ => {}
         }
-        if UnixStream::connect(socket_path).is_ok() {
-            let _ = fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600));
-            thread::spawn(move || {
-                let _ = child.wait();
-            });
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(ConnectorError::Timeout);
-        }
-        thread::sleep(Duration::from_millis(20));
     }
+    matches.sort_unstable();
+    matches.dedup();
+    matches
 }
 
 fn id_key(id: &Value) -> String {
@@ -391,14 +473,35 @@ fn protocol_variant(value: Option<&Value>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn codex_version(user_agent: &str) -> Option<(u64, u64, u64)> {
+    user_agent
+        .split(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .find_map(|candidate| {
+            let mut parts = candidate.split('.');
+            let major = parts.next()?.parse().ok()?;
+            let minor = parts.next()?.parse().ok()?;
+            let patch = parts.next()?.parse().ok()?;
+            Some((major, minor, patch))
+        })
+}
+
+fn managed_approval_schema_supported(version: (u64, u64, u64)) -> bool {
+    // These request/response shapes are generated and verified against the
+    // installed 0.144 app-server schema. A later minor must be sampled before
+    // controls are exposed; unsupported versions degrade to truthful
+    // observation instead of guessing a response contract.
+    ((0, 144, 5)..(0, 145, 0)).contains(&version)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
 
     #[test]
-    fn persistent_proxy_initializes_lists_resumes_and_routes_server_requests() {
+    fn persistent_stdio_initializes_lists_resumes_and_routes_server_requests() {
         let root = std::env::temp_dir().join(format!(
             "actrealm-codex-connector-{}-{}",
             std::process::id(),
@@ -415,7 +518,7 @@ fi
 while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*)
-      printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex","platformFamily":"unix","platformOs":"macos","userAgent":"fake"}}'
+      printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex","platformFamily":"unix","platformOs":"macos","userAgent":"codex_cli_rs/0.144.6"}}'
       ;;
     *'"method":"thread/list"'*)
       printf '%s\n' '{"id":2,"result":{"data":[{"id":"thread-1","sessionId":"session-1","cwd":"/tmp/project","name":"Recovered thread","status":{"type":"active","activeFlags":["waitingOnUserInput"]},"turns":[],"updatedAt":100}]}}'
@@ -434,8 +537,14 @@ done
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let socket = root.join("fake.sock");
-        let (connector, channels) = CodexConnector::connect_proxy(&executable, &socket).unwrap();
+        let (connector, channels) = CodexConnector::connect_stdio(&executable).unwrap();
+        assert!(connector.supports_managed_approvals());
+        assert_eq!(
+            connector.server_user_agent().as_deref(),
+            Some("codex_cli_rs/0.144.6")
+        );
+        let weak_connector = connector.downgrade();
+        let child_id = connector.managed_child_id();
         let threads = connector.list_threads().unwrap();
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].status, "active");
@@ -459,6 +568,38 @@ done
             .unwrap();
         assert_eq!(notification.method, "test/responseSeen");
         drop(connector);
+        assert!(weak_connector.upgrade().is_none());
+        assert!(
+            !Command::new("/bin/kill")
+                .args(["-0", &child_id.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success(),
+            "managed app-server child must be reaped when the connector drops"
+        );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn legacy_listener_parser_only_accepts_codex_on_the_private_socket() {
+        let socket = Path::new("/Users/test/.actrealm/run/codex-app-server.sock");
+        let fields = "p100\nccodex\nn/Users/test/.actrealm/run/codex-app-server.sock\n\
+p101\nccodex\nn/Users/test/.codex/app-server.sock\n\
+p102\ncother\nn/Users/test/.actrealm/run/codex-app-server.sock\n\
+p100\nccodex\nn/Users/test/.actrealm/run/codex-app-server.sock\n";
+        assert_eq!(legacy_listener_pids(fields, socket), vec![100]);
+    }
+
+    #[test]
+    fn managed_approval_gate_tracks_versioned_app_server_schema() {
+        assert_eq!(codex_version("codex_cli_rs/0.144.6"), Some((0, 144, 6)));
+        assert_eq!(codex_version("codex-cli 1.2.3"), Some((1, 2, 3)));
+        assert_eq!(codex_version("fake"), None);
+        assert!(managed_approval_schema_supported((0, 144, 6)));
+        assert!(!managed_approval_schema_supported((0, 144, 4)));
+        assert!(!managed_approval_schema_supported((0, 145, 0)));
     }
 }

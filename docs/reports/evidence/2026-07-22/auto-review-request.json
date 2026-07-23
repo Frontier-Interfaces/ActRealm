@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PermissionRequest",
+  "session_id": "launch-audit-auto-review-20260722",
+  "turn_id": "turn-auto",
+  "cwd": "/tmp/actrealm-launch-audit",
+  "tool_name": "Bash",
+  "approvals_reviewer": "auto_review",
+  "permission_mode": "default"
+}

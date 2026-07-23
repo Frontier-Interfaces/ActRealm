@@ -1,0 +1,999 @@
+^D   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.46
+   Compiling unicode-ident v1.0.24
+   Compiling libc v0.2.186
+    Checking itoa v1.0.18
+   Compiling serde_core v1.0.228
+   Compiling thiserror v2.0.18
+   Compiling zmij v1.0.23
+   Compiling serde v1.0.228
+   Compiling serde_json v1.0.150
+    Checking memchr v2.8.3
+    Checking cfg-if v1.0.4
+   Compiling getrandom v0.4.3
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.9
+   Compiling cc v1.2.67
+   Compiling vcpkg v0.2.15
+   Compiling pkg-config v0.3.33
+    Checking bytes v1.12.1
+    Checking smallvec v1.15.2
+   Compiling libsqlite3-sys v0.38.1
+   Compiling version_check v0.9.5
+    Checking pin-project-lite v0.2.17
+   Compiling generic-array v0.14.7
+    Checking futures-core v0.3.32
+    Checking http v1.4.2
+    Checking fallible-iterator v0.3.0
+    Checking equivalent v1.0.2
+    Checking fallible-streaming-iterator v0.1.9
+   Compiling getrandom v0.3.4
+    Checking typenum v1.20.1
+    Checking bitflags v2.13.0
+    Checking hashbrown v0.17.1
+   Compiling zerocopy v0.8.54
+    Checking indexmap v2.14.0
+    Checking toml_write v0.1.2
+   Compiling httparse v1.10.1
+    Checking toml_datetime v0.6.11
+    Checking winnow v0.7.15
+    Checking toml_edit v0.22.27
+    Checking mio v1.2.2
+    Checking socket2 v0.6.5
+    Checking log v0.4.33
+    Checking http-body v1.1.0
+    Checking once_cell v1.21.4
+    Checking cpufeatures v0.2.17
+    Checking tracing-core v0.1.36
+    Checking futures-task v0.3.32
+    Checking futures-sink v0.3.32
+    Checking tower-service v0.3.3
+    Checking slab v0.4.12
+    Checking tracing v0.1.44
+    Checking futures-channel v0.3.32
+    Checking atomic-waker v1.1.2
+    Checking sync_wrapper v1.0.2
+    Checking data-encoding v2.11.0
+    Checking httpdate v1.0.3
+    Checking tower-layer v0.3.3
+    Checking percent-encoding v2.3.2
+    Checking form_urlencoded v1.2.2
+    Checking http-body-util v0.1.4
+   Compiling syn v2.0.119
+    Checking ryu v1.0.23
+    Checking mime v0.3.17
+    Checking serde_path_to_error v0.1.20
+    Checking axum-core v0.5.6
+    Checking matchit v0.8.4
+    Checking base64 v0.22.1
+    Checking utf8parse v0.2.2
+    Checking anstyle-parse v1.0.0
+    Checking colorchoice v1.0.5
+    Checking anstyle v1.0.14
+    Checking anstyle-query v1.1.5
+    Checking is_terminal_polyfill v1.70.2
+    Checking anstream v1.0.0
+   Compiling anyhow v1.0.103
+    Checking strsim v0.11.1
+    Checking clap_lex v1.1.0
+   Compiling heck v0.5.0
+    Checking clap_builder v4.6.0
+    Checking uuid v1.23.5
+   Compiling thiserror-impl v2.0.18
+   Compiling serde_derive v1.0.228
+   Compiling tokio-macros v2.7.0
+   Compiling futures-macro v0.3.32
+    Checking tokio v1.52.3
+    Checking futures-util v0.3.32
+    Checking block-buffer v0.10.4
+    Checking crypto-common v0.1.7
+    Checking digest v0.10.7
+    Checking sha1 v0.10.7
+   Compiling clap_derive v4.6.1
+    Checking rand_core v0.9.5
+    Checking clap v4.6.1
+    Checking rusqlite v0.40.1
+    Checking ppv-lite86 v0.2.21
+    Checking rand_chacha v0.9.0
+    Checking rand v0.9.5
+    Checking tungstenite v0.29.0
+    Checking hyper v1.10.1
+    Checking tower v0.5.3
+    Checking tokio-tungstenite v0.29.0
+    Checking actrealm-core v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/core)
+    Checking actrealm-installer v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/installer)
+    Checking serde_urlencoded v0.7.1
+    Checking actrealm-usage v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/usage)
+    Checking actrealm-codex-connector v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/codex-connector)
+    Checking hyper-util v0.1.20
+    Checking axum v0.8.9
+    Checking actrealm-providers v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/providers)
+    Checking actrealm-bridge v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/bridge)
+    Checking actrealm-quota v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/quota)
+    Checking actrealm-runtime v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/runtime)
+    Checking actrealm-server v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/server)
+    Checking actrealm v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/app)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.53s
+   Compiling itoa v1.0.18
+   Compiling memchr v2.8.3
+   Compiling libc v0.2.186
+   Compiling serde_core v1.0.228
+   Compiling zmij v1.0.23
+   Compiling cfg-if v1.0.4
+   Compiling smallvec v1.15.2
+   Compiling thiserror v2.0.18
+   Compiling bytes v1.12.1
+   Compiling equivalent v1.0.2
+   Compiling pin-project-lite v0.2.17
+   Compiling hashbrown v0.17.1
+   Compiling libsqlite3-sys v0.38.1
+   Compiling winnow v0.7.15
+   Compiling toml_datetime v0.6.11
+   Compiling bitflags v2.13.0
+   Compiling toml_write v0.1.2
+   Compiling fallible-iterator v0.3.0
+   Compiling futures-core v0.3.32
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling typenum v1.20.1
+   Compiling getrandom v0.4.3
+   Compiling zerocopy v0.8.54
+   Compiling getrandom v0.3.4
+   Compiling http v1.4.2
+   Compiling rusqlite v0.40.1
+   Compiling mio v1.2.2
+   Compiling socket2 v0.6.5
+   Compiling log v0.4.33
+   Compiling indexmap v2.14.0
+   Compiling rand_core v0.9.5
+   Compiling tokio v1.52.3
+   Compiling httparse v1.10.1
+   Compiling generic-array v0.14.7
+   Compiling once_cell v1.21.4
+   Compiling http-body v1.1.0
+   Compiling tracing-core v0.1.36
+   Compiling cpufeatures v0.2.17
+   Compiling slab v0.4.12
+   Compiling tower-service v0.3.3
+   Compiling futures-sink v0.3.32
+   Compiling futures-task v0.3.32
+   Compiling futures-channel v0.3.32
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling futures-util v0.3.32
+   Compiling tracing v0.1.44
+   Compiling httpdate v1.0.3
+   Compiling digest v0.10.7
+   Compiling sync_wrapper v1.0.2
+   Compiling toml_edit v0.22.27
+   Compiling sha1 v0.10.7
+   Compiling data-encoding v2.11.0
+   Compiling percent-encoding v2.3.2
+   Compiling tower-layer v0.3.3
+   Compiling atomic-waker v1.1.2
+   Compiling http-body-util v0.1.4
+   Compiling form_urlencoded v1.2.2
+   Compiling ryu v1.0.23
+   Compiling mime v0.3.17
+   Compiling serde v1.0.228
+   Compiling serde_json v1.0.150
+   Compiling uuid v1.23.5
+   Compiling axum-core v0.5.6
+   Compiling serde_path_to_error v0.1.20
+   Compiling serde_urlencoded v0.7.1
+   Compiling base64 v0.22.1
+   Compiling matchit v0.8.4
+   Compiling utf8parse v0.2.2
+   Compiling anstyle-parse v1.0.0
+   Compiling anstyle v1.0.14
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling colorchoice v1.0.5
+   Compiling anstyle-query v1.1.5
+   Compiling clap_lex v1.1.0
+   Compiling strsim v0.11.1
+   Compiling anyhow v1.0.103
+   Compiling actrealm-core v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/core)
+   Compiling actrealm-usage v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/usage)
+   Compiling actrealm-codex-connector v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/codex-connector)
+   Compiling anstream v1.0.0
+   Compiling actrealm-installer v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/installer)
+   Compiling actrealm-providers v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/providers)
+   Compiling actrealm-runtime v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/runtime)
+   Compiling actrealm-bridge v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/bridge)
+   Compiling clap_builder v4.6.0
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.9.0
+   Compiling rand v0.9.5
+   Compiling hyper v1.10.1
+   Compiling tower v0.5.3
+   Compiling actrealm-quota v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/quota)
+   Compiling tungstenite v0.29.0
+   Compiling hyper-util v0.1.20
+   Compiling tokio-tungstenite v0.29.0
+   Compiling clap v4.6.1
+   Compiling axum v0.8.9
+   Compiling actrealm-server v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/server)
+   Compiling actrealm v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.24s
+     Running unittests src/main.rs (target/debug/deps/actrealm-ba6ab56a2510c4de)
+
+running 4 tests
+test tests::p0_permission_deadlines_allow_real_human_response_time ... ok
+test tests::restart_state_never_changes_a_custom_socket_parent_mode ... ok
+test tests::private_restart_state_restores_exact_runtime_contract ... ok
+test tests::stale_or_public_restart_state_is_rejected ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/m0_hook.rs (target/debug/deps/m0_hook-25a313047c8dbeb8)
+
+running 10 tests
+test skip_hooks_exits_before_parsing_provider_input ... ok
+test claude_elicitation_writes_the_official_accept_shape ... ok
+test explicit_pass_through_keeps_stdout_empty ... ok
+test codex_auto_review_is_forwarded_as_observation_without_blocking_or_directive ... ok
+test claude_ask_user_question_writes_updated_input_with_answers ... ok
+test codex_auto_review_profile_config_is_used_when_the_hook_omits_the_reviewer ... ok
+test codex_allow_writes_only_the_official_minimal_shape ... ok
+test prompt_decision_can_be_undone_without_reaching_provider ... ok
+test stdin_that_never_closes_fails_open_within_its_own_budget ... ok
+test deadline_and_socket_eof_both_fail_open ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.18s
+
+     Running tests/m1_runtime_integration.rs (target/debug/deps/m1_runtime_integration-b5898cea5aa5a317)
+
+running 5 tests
+test non_permission_event_spools_offline_and_replays_once_on_startup ... ok
+test second_runtime_cannot_replace_the_live_instance_or_its_socket ... ok
+test codex_native_permission_hook_lifecycle_is_observed_neutrally_for_five_rounds ... ok
+test duplicate_permission_passes_old_waiter_and_decides_only_the_new_one ... ok
+test provider_side_tool_progress_releases_widget_waiters_for_claude_and_codex ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.51s
+
+     Running tests/m2_widget_e2e.rs (target/debug/deps/m2_widget_e2e-856a432fee733de6)
+
+running 1 test
+test real_claude_and_codex_fixtures_are_controlled_through_the_widget_api ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.64s
+
+     Running tests/m3_install_cli.rs (target/debug/deps/m3_install_cli-78d967c480790626)
+
+running 8 tests
+test doctor_runtime_probe_round_trips_without_creating_a_provider_event ... ok
+test cli_refuses_to_create_configuration_for_a_missing_provider ... ok
+test doctor_json_reports_versions_config_trust_runtime_and_silent_pass_through ... ok
+test cli_all_installs_and_uninstalls_without_losing_user_hooks ... ok
+test desktop_apps_install_without_global_provider_clis ... ok
+test doctor_accepts_a_slow_but_healthy_provider_version_command ... ok
+test overlong_socket_path_blocks_install_before_provider_configuration_is_touched ... ok
+test onboarding_api_uses_the_installer_and_requires_a_post_install_real_event ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.85s
+
+     Running tests/m4_cli.rs (target/debug/deps/m4_cli-7dd22e5ec1902936)
+
+running 3 tests
+test malformed_statusline_input_is_nonfatal_and_never_creates_a_cache ... ok
+test statusline_command_caches_only_quota_and_prints_remaining_windows ... ok
+test export_command_emits_every_local_table_as_json ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/m5_pass_through.rs (target/debug/deps/m5_pass_through-2fa9df048d7a3605)
+
+running 1 test
+test every_transport_failure_and_explicit_handoff_leaves_provider_terminal_usable ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+     Running tests/m5_performance.rs (target/debug/deps/m5_performance-f27da34e3e39ce02)
+
+running 1 test
+test nonblocking_hook_process_p95_is_below_50_ms ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/m5_security.rs (target/debug/deps/m5_security-73983cccb4463af6)
+
+running 4 tests
+test oversized_and_deep_hook_json_fail_open_without_spooling_or_output ... ok
+test metrics_export_command_contains_only_aggregate_daily_counts ... ok
+test diagnostic_cli_requires_explicit_bounded_enable_and_can_clear_everything ... ok
+test default_runtime_output_never_contains_hook_session_path_prompt_or_command ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/m6_m8_resource.rs (target/debug/deps/m6_m8_resource-325680bb7b50bcd7)
+
+running 1 test
+test two_minute_release_candidate_resource_gate ... ignored, explicit release-candidate resource gate
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/actrealm_bridge-9dfd40b78fdba6cc)
+
+running 1 test
+test unix::tests::round_trips_a_blocking_request ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/m0_transport.rs (target/debug/deps/m0_transport-ef896ed3bab36dda)
+
+running 5 tests
+test overlong_socket_path_is_reported_before_connect_or_bind ... ok
+test missing_runtime_fails_open_within_connection_budget ... ok
+test client_write_half_close_still_receives_the_permission_decision ... ok
+test mismatched_request_id_is_rejected ... ok
+test silent_runtime_honors_the_hook_owned_deadline ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running tests/m5_security.rs (target/debug/deps/m5_security-d5f62b597394c822)
+
+running 2 tests
+test deeply_nested_bridge_json_is_rejected_without_panicking ... ok
+test socket_and_created_parent_are_private_and_oversize_frame_is_rejected ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/actrealm_codex_connector-1f2fec109cad2b34)
+
+running 1 test
+test tests::persistent_proxy_initializes_lists_resumes_and_routes_server_requests ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.95s
+
+     Running unittests src/lib.rs (target/debug/deps/actrealm_core-ee4cd8c0db42061b)
+
+running 7 tests
+test tests::gemini_has_no_v1_permission_directive ... ok
+test tests::encodes_provider_permission_directive ... ok
+test tests::codex_request_permissions_pre_tool_is_observed_but_never_replyable ... ok
+test tests::claude_elicitation_directive_supports_accept_decline_and_cancel ... ok
+test tests::codex_auto_review_and_noninteractive_modes_remain_provider_owned ... ok
+test tests::detects_supported_hook_reply_requests_as_blocking ... ok
+test tests::claude_question_answer_preserves_original_input_and_adds_answers ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/m0_contract.rs (target/debug/deps/m0_contract-55a0b9e36380100c)
+
+running 10 tests
+test another_codex_hook_denial_cannot_make_our_allow_look_confirmed ... ok
+test pass_through_wins_before_a_decision_is_sent ... ok
+test late_tool_events_do_not_revive_a_finished_turn ... ok
+test decision_sent_requires_later_provider_evidence_to_confirm ... ok
+test provider_denial_confirms_a_sent_deny_and_clears_widget_ownership ... ok
+test undo_before_commit_writes_no_decision ... ok
+test v1_permission_timing_is_provider_aligned ... ok
+test runtime_reply_frame_represents_pass_through_explicitly ... ok
+test permission_envelope_has_request_id_and_hard_deadline ... ok
+test provider_permission_directives_are_exact_minimal_json ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/actrealm_installer-04a1b1d2e74f9f94)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/m3_installer.rs (target/debug/deps/m3_installer-5538ef7b38c2f80c)
+
+running 13 tests
+test inspection_is_read_only_for_malformed_configuration ... ok
+test codex_inline_definitions_are_detected_without_creating_duplicate_hooks ... ok
+test malformed_json_is_backed_up_and_never_rewritten ... ok
+test malformed_codex_toml_is_backed_up_and_blocks_hooks_json_mutation ... ok
+test concurrent_installs_are_serialized_and_leave_one_valid_definition_set ... ok
+test codex_inspection_distinguishes_review_from_trusted_state_and_feature_modes ... ok
+test symbolic_link_configuration_is_refused_without_touching_target ... ok
+test enhanced_codex_activity_is_explicit_and_idempotent ... ok
+test claude_install_backs_up_and_preserves_user_semantics ... ok
+test codex_uses_custom_home_keeps_state_table_and_defaults_to_low_noise_events ... ok
+test repair_can_restore_only_the_binary_when_managed_hooks_are_complete ... ok
+test install_then_uninstall_restores_original_semantics_and_removes_only_ours ... ok
+test repair_respects_untouched_uninstalled_and_manual_removal ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+     Running tests/m4_statusline.rs (target/debug/deps/m4_statusline-f80816bf0c45fa83)
+
+running 4 tests
+test existing_custom_statusline_is_never_replaced_or_backed_up_as_if_managed ... ok
+test managed_statusline_round_trip_preserves_user_json_and_file_modes ... ok
+test explicit_wrapper_mode_preserves_runs_and_restores_the_custom_statusline ... ok
+test hook_uninstall_keeps_the_binary_needed_by_an_enabled_statusline ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running unittests src/lib.rs (target/debug/deps/actrealm_providers-41508ea607b2a4d0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/provider_contract.rs (target/debug/deps/provider_contract-61ae0f0f27a7118f)
+
+running 7 tests
+test claude_permission_request_does_not_require_tool_use_id ... ok
+test unknown_event_is_visible_and_missing_session_is_an_error ... ok
+test codex_permission_request_preserves_turn_id ... ok
+test codex_request_permissions_tool_is_an_observed_native_request ... ok
+test m0_fixture_sets_must_be_confirmed_by_live_probes ... ok
+test supported_lifecycle_events_map_to_normalized_kinds ... ok
+test versioned_fixture_sets_match_provider_contracts ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/actrealm_quota-60f8c8ca38c70ee2)
+
+running 12 tests
+test tests::keychain_service_discovery_is_deduplicated_and_bounded_to_claude ... ok
+test tests::oauth_credentials_parse_expiry_and_refresh_before_deadline ... ok
+test tests::oauth_usage_parses_dynamic_scoped_limits_and_null_resets ... ok
+test tests::codex_0_144_5_weekly_fixture_matches_the_local_rollout_schema ... ok
+test tests::current_codex_rollout_fixture_matches_the_gated_adapter ... ok
+test tests::codex_0_144_2_desktop_fixture_matches_the_local_rollout_schema ... ok
+test tests::codex_rollout_is_shape_validated_and_returns_every_limit_window ... ok
+test tests::claude_capture_persists_only_valid_rate_limit_fields ... ok
+test tests::oauth_cache_contains_only_validated_usage_not_credentials ... ok
+test tests::old_claude_cache_preserves_last_value_but_incompatible_data_stays_unavailable ... ok
+test tests::rollout_scan_cap_prefers_newest_lexical_session_paths ... ok
+test tests::claude_auth_status_runner_requires_a_successful_process ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running unittests src/lib.rs (target/debug/deps/actrealm_runtime-b9bab1f4e7f929dc)
+
+running 7 tests
+test title::tests::official_claude_session_title_is_bounded_and_preferred ... ok
+test waiter::tests::elicitation_secret_is_password_typed_and_never_retained_after_submit ... ok
+test waiter::tests::invalid_or_expired_interactive_submissions_are_rejected ... ok
+test waiter::tests::codex_request_user_input_uses_question_ids_and_secret_capability ... ok
+test waiter::tests::claude_question_is_sanitized_validated_and_released_after_answer ... ok
+test title::tests::claude_custom_title_wins_over_ai_title_without_persisting_transcript ... ok
+test title::tests::codex_index_prefers_latest_matching_thread_name ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/m1_runtime.rs (target/debug/deps/m1_runtime-d73a8bf017d553ac)
+
+running 35 tests
+test codex_plan_updates_persist_real_steps_and_progress ... ok
+test different_commands_in_the_same_turn_are_not_false_duplicates ... ok
+test duplicate_waiter_replaces_old_continuation_and_resolution_has_one_winner ... ok
+test codex_provider_owned_permission_never_opens_a_user_approval_item ... ok
+test codex_auto_review_is_observed_without_creating_a_competing_waiter ... ok
+test independent_sessions_can_wait_and_resolve_concurrently ... ok
+test approval_race_has_exactly_one_transactional_winner ... ok
+test a_new_prompt_closes_attention_left_open_by_the_previous_turn ... ok
+test current_task_title_is_a_bounded_prompt_summary_with_live_activity_time ... ok
+test delayed_commit_undo_and_provider_confirmation_are_honest ... ok
+test codex_request_permissions_hook_tracks_native_request_without_claiming_a_decision ... ok
+test claude_task_progress_uses_only_stable_task_ids_and_never_invents_a_percentage ... ok
+test local_usage_snapshots_join_existing_sessions_without_prompt_content ... ok
+test native_provider_signal_does_not_duplicate_a_live_hook_approval ... ok
+test normalized_usage_is_exposed_only_when_provider_supplies_real_token_fields ... ok
+test native_provider_approval_is_visible_and_resolves_with_the_provider_state ... ok
+test previews_are_redacted_and_risk_never_uses_history_to_downgrade ... ok
+test provider_denied_event_resolves_unhandled_attention ... ok
+test runtime_lock_allows_only_one_instance_and_is_reusable_after_drop ... ok
+test codex_internal_background_sessions_are_discarded_without_visibility_state ... ok
+test new_activity_resolves_stale_completion_and_error_without_hiding_running_state ... ok
+test factual_error_question_and_completion_attention_support_local_actions ... ok
+test spool_is_bounded_replayed_and_never_accepts_permissions ... ok
+test existing_v1_database_adds_task_titles_without_losing_sessions ... ok
+test provider_handled_approval_resolves_attention_and_session_waiting_state ... ok
+test waiter_deadline_passes_through_and_releases_raw_payload ... ok
+test provider_titles_are_separate_from_the_live_task_and_follow_claude_updates ... ok
+test restart_expires_every_approval_without_a_live_waiter ... ok
+test stale_waiter_can_never_commit_a_persisted_decision ... ok
+test successful_turn_without_write_tools_still_creates_completion_attention ... ok
+test restart_restores_running_session_and_keeps_private_jump_locator_out_of_json ... ok
+test tool_completion_before_stop_confirms_only_an_allow ... ok
+test subagent_counts_and_background_stop_state_are_fact_based ... ok
+test stop_is_turn_end_until_process_liveness_marks_the_session_idle ... ok
+test versioned_fixtures_replay_idempotently_into_wal ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests/m4_data.rs (target/debug/deps/m4_data-e5b130e1baf89531)
+
+running 5 tests
+test retention_and_quota_validation_reject_ambiguous_values ... ok
+test interactive_question_schema_and_secret_answers_never_enter_persistent_export ... ok
+test design_retention_options_support_180_days_and_forever ... ok
+test settings_quota_pruning_and_export_are_transactional_and_local ... ok
+test destructive_clear_recreates_the_database_and_removes_every_record ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/m5_diagnostics.rs (target/debug/deps/m5_diagnostics-de2db7e72d52e365)
+
+running 3 tests
+test capture_refuses_a_symbolic_link_root_without_reading_its_target ... ok
+test capture_refuses_a_symbolic_link_without_touching_its_target ... ok
+test capture_is_explicit_sanitized_private_bounded_and_expires ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+
+     Running tests/m5_metrics.rs (target/debug/deps/m5_metrics-fa453e18754f8b83)
+
+running 1 test
+test factual_metrics_are_idempotent_and_export_the_plan_definitions ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/m5_redaction.rs (target/debug/deps/m5_redaction-7195260c8ea6575f)
+
+running 1 test
+test persisted_command_previews_are_categories_not_truncated_raw_commands ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/lib.rs (target/debug/deps/actrealm_server-e7ab32fb4a70d8f4)
+
+running 15 tests
+test server::tests::m10_display_settings_migrate_and_reject_fields_outside_the_safe_catalog ... ok
+test server::tests::corrupt_settings_block_reconfiguration_before_provider_files_are_touched ... ok
+test server::tests::auth_contract_rejects_missing_cookie_forged_origin_and_missing_csrf ... ok
+test server::tests::codex_native_waiting_flag_opens_and_resolves_attention ... ok
+test server::tests::codex_native_resolution_releases_a_competing_hook_waiter ... ok
+test server::tests::jump_capabilities_map_only_to_targets_the_runtime_can_really_open ... ok
+test server::tests::codex_connector_plan_completion_and_subagents_reach_runtime ... ok
+test server::tests::agent_list_keeps_recent_and_attention_sessions_but_hides_older_idle_history ... ok
+test server::tests::codex_auto_review_and_full_access_do_not_impersonate_user_approval ... ok
+test server::tests::interactive_question_is_ephemeral_answerable_and_removed_from_snapshot ... ok
+test server::tests::m5_ui_metrics_are_authenticated_local_and_visible_in_snapshot_and_export ... ok
+test server::tests::m5_api_rejects_bodies_over_64_kib_before_deserialization ... ok
+test server::tests::recovery_snapshot_distinguishes_observing_lost_and_managed_sessions ... ok
+test server::tests::new_claude_cache_refreshes_immediately_after_an_unavailable_snapshot ... ok
+test server::tests::m4_settings_quota_export_and_clear_follow_the_authenticated_ui_path ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/m2_api.rs (target/debug/deps/m2_api-a3ccb9a8dffedb01)
+
+running 4 tests
+test embedded_ui_contract_is_small_honest_and_complete ... ok
+test health_monitor_is_authenticated_and_restart_input_is_strict ... ok
+test pass_through_ack_snooze_and_websocket_snapshot_are_real ... ok
+test authenticated_api_controls_approval_and_preserves_three_second_undo_semantics ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests/m5_performance.rs (target/debug/deps/m5_performance-6ee9137eb6f92c8d)
+
+running 1 test
+test event_to_websocket_render_entry_p95_is_below_300_ms ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.23s
+
+     Running tests/manual_preview.rs (target/debug/deps/manual_preview-2e047fca58aaae4b)
+
+running 2 tests
+test first_run_onboarding_preview ... ignored, manual first-run browser preview
+test seeded_m10_m12_control_panel_preview ... ignored, manual local browser preview
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/actrealm_usage-28064de22552bc91)
+
+running 11 tests
+test tests::unknown_models_do_not_claim_zero_cost ... ok
+test tests::claude_sonnet_5_uses_dated_official_introductory_price ... ok
+test tests::pricing_snapshot_matches_aliases_but_not_unknown_future_models ... ok
+test tests::recent_claude_replacement_updates_the_incremental_accumulator ... ok
+test tests::mixed_missing_official_cost_falls_back_to_complete_computed_cost ... ok
+test tests::zero_token_synthetic_entry_does_not_hide_known_model_cost ... ok
+test tests::codex_price_accumulates_each_model_delta_at_its_own_rate ... ok
+test tests::parses_codex_cumulative_and_last_turn_without_double_counting_cache ... ok
+test tests::incrementally_deduplicates_claude_streamed_messages ... ok
+test tests::captures_official_statusline_context_without_prompt_data ... ok
+test tests::claude_usage_compacts_old_entries_without_changing_totals ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+   Doc-tests actrealm_bridge
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests actrealm_codex_connector
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests actrealm_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests actrealm_installer
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests actrealm_providers
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests actrealm_quota
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests actrealm_runtime
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests actrealm_server
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests actrealm_usage
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.46
+   Compiling libc v0.2.186
+   Compiling itoa v1.0.18
+   Compiling serde_core v1.0.228
+   Compiling cfg-if v1.0.4
+   Compiling thiserror v2.0.18
+   Compiling serde v1.0.228
+   Compiling zmij v1.0.23
+   Compiling serde_json v1.0.150
+   Compiling bytes v1.12.1
+   Compiling memchr v2.8.3
+   Compiling pin-project-lite v0.2.17
+   Compiling version_check v0.9.5
+   Compiling futures-core v0.3.32
+   Compiling http v1.4.2
+   Compiling generic-array v0.14.7
+   Compiling zerocopy v0.8.54
+   Compiling getrandom v0.3.4
+   Compiling typenum v1.20.1
+   Compiling httparse v1.10.1
+   Compiling getrandom v0.4.3
+   Compiling find-msvc-tools v0.1.9
+   Compiling shlex v2.0.1
+   Compiling log v0.4.33
+   Compiling cc v1.2.67
+   Compiling http-body v1.1.0
+   Compiling once_cell v1.21.4
+   Compiling smallvec v1.15.2
+   Compiling vcpkg v0.2.15
+   Compiling pkg-config v0.3.33
+   Compiling tracing-core v0.1.36
+   Compiling syn v2.0.119
+   Compiling libsqlite3-sys v0.38.1
+   Compiling slab v0.4.12
+   Compiling hashbrown v0.17.1
+   Compiling futures-task v0.3.32
+   Compiling equivalent v1.0.2
+   Compiling futures-sink v0.3.32
+   Compiling tower-service v0.3.3
+   Compiling futures-util v0.3.32
+   Compiling indexmap v2.14.0
+   Compiling mio v1.2.2
+   Compiling socket2 v0.6.5
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling cpufeatures v0.2.17
+   Compiling rand_core v0.9.5
+   Compiling digest v0.10.7
+   Compiling sha1 v0.10.7
+   Compiling tracing v0.1.44
+   Compiling futures-channel v0.3.32
+   Compiling winnow v0.7.15
+   Compiling toml_write v0.1.2
+   Compiling toml_datetime v0.6.11
+   Compiling sync_wrapper v1.0.2
+   Compiling percent-encoding v2.3.2
+   Compiling httpdate v1.0.3
+   Compiling thiserror-impl v2.0.18
+   Compiling serde_derive v1.0.228
+   Compiling tokio-macros v2.7.0
+   Compiling data-encoding v2.11.0
+   Compiling uuid v1.23.5
+   Compiling tower-layer v0.3.3
+   Compiling atomic-waker v1.1.2
+   Compiling utf8parse v0.2.2
+   Compiling tokio v1.52.3
+   Compiling anstyle-parse v1.0.0
+   Compiling form_urlencoded v1.2.2
+   Compiling http-body-util v0.1.4
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling bitflags v2.13.0
+   Compiling anstyle v1.0.14
+   Compiling colorchoice v1.0.5
+   Compiling ryu v1.0.23
+   Compiling anstyle-query v1.1.5
+   Compiling mime v0.3.17
+   Compiling fallible-iterator v0.3.0
+   Compiling toml_edit v0.22.27
+   Compiling axum-core v0.5.6
+   Compiling anstream v1.0.0
+   Compiling serde_path_to_error v0.1.20
+   Compiling base64 v0.22.1
+   Compiling anyhow v1.0.103
+   Compiling heck v0.5.0
+   Compiling matchit v0.8.4
+   Compiling clap_lex v1.1.0
+   Compiling strsim v0.11.1
+   Compiling clap_builder v4.6.0
+   Compiling clap_derive v4.6.1
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.9.0
+   Compiling actrealm-core v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/core)
+   Compiling rand v0.9.5
+   Compiling actrealm-installer v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/installer)
+   Compiling tungstenite v0.29.0
+   Compiling actrealm-providers v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/providers)
+   Compiling serde_urlencoded v0.7.1
+   Compiling actrealm-quota v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/quota)
+   Compiling actrealm-usage v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/usage)
+   Compiling actrealm-codex-connector v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/codex-connector)
+   Compiling actrealm-bridge v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/bridge)
+   Compiling hyper v1.10.1
+   Compiling tokio-tungstenite v0.29.0
+   Compiling tower v0.5.3
+   Compiling clap v4.6.1
+   Compiling hyper-util v0.1.20
+   Compiling axum v0.8.9
+   Compiling rusqlite v0.40.1
+   Compiling actrealm-runtime v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/runtime)
+   Compiling actrealm-server v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/server)
+   Compiling actrealm v0.1.0 (/private/tmp/actrealm-global-audit-50b891a/crates/app)
+    Finished `release` profile [optimized] target(s) in 37.19s
+ActRealm language check passed
+Building for debugging...
+[0/18] Write sources
+[5/18] /private/tmp/actrealm-global-audit-50b891a/apps/macos/.build/arm64-apple-macosx/debug/ActRealmMacPackageTests.derived/runner.swift
+[6/18] Write sources
+[7/18] Write ActRealmApp-entitlement.plist
+[8/18] Write SnapshotTool-entitlement.plist
+[9/18] Write swift-version--58304C5D6DBC2206.txt
+[11/26] Compiling ActRealmKit RuntimeClient.swift
+[12/26] Compiling ActRealmKit RuntimeSupervisor.swift
+[13/26] Compiling ActRealmKit Models.swift
+[14/26] Compiling ActRealmKit Formatting.swift
+[15/26] Compiling ActRealmKit DerivedState.swift
+[16/26] Emitting module ActRealmKit
+[17/26] Compiling ActRealmKit DemoData.swift
+[18/26] Compiling ActRealmKit AppModel.swift
+[19/40] Compiling ActRealmUI RuntimeMonitorView.swift
+[20/40] Compiling ActRealmUI HUDPanel.swift
+[21/40] Compiling ActRealmUI InteractiveQuestionView.swift
+[22/41] Compiling ActRealmUI MenuBarPopover.swift
+[23/41] Compiling ActRealmUI MainWindowView.swift
+[24/41] Compiling ActRealmUI LanesSection.swift
+[25/41] Compiling ActRealmUI ThemeMedia.swift
+[26/41] Compiling ActRealmUI ForegroundSchedulingController.swift
+[27/41] Compiling ActRealmUI OutboxSection.swift
+[28/41] Compiling ActRealmUI Components.swift
+[29/41] Compiling ActRealmUI DesignTokens.swift
+[30/41] Compiling ActRealmUI AgentSetupView.swift
+[31/41] Compiling ActRealmUI ForegroundSchedulingView.swift
+[32/41] Emitting module ActRealmUI
+[33/41] Compiling ActRealmUI SettingsView.swift
+[34/54] Compiling ActRealmApp ActRealmApp.swift
+[35/54] Emitting module ActRealmApp
+[35/54] Write Objects.LinkFileList
+[37/54] Compiling SnapshotTool main.swift
+[38/54] Emitting module SnapshotTool
+[38/54] Write Objects.LinkFileList
+[39/54] Linking ActRealmApp
+[40/54] Linking SnapshotTool
+[41/54] Applying ActRealmApp
+[42/54] Applying SnapshotTool
+[44/54] Compiling ActRealmKitTests ModelDecodingTests.swift
+[45/54] Compiling ActRealmKitTests MenuBarPopoverTests.swift
+[46/54] Compiling ActRealmKitTests HUDSettingsTests.swift
+[47/54] Compiling ActRealmKitTests DerivedStateTests.swift
+[48/54] Compiling ActRealmKitTests AgentFocusStageManagerTests.swift
+[49/54] Compiling ActRealmKitTests BootstrapParsingTests.swift
+[50/54] Emitting module ActRealmKitTests
+[51/54] Compiling ActRealmKitTests ForegroundSchedulingTests.swift
+[52/54] Compiling ActRealmKitTests HUDPanelLayoutTests.swift
+[53/56] Compiling ActRealmMacPackageTests runner.swift
+[54/56] Emitting module ActRealmMacPackageTests
+[54/56] Write Objects.LinkFileList
+[55/56] Linking ActRealmMacPackageTests
+Build complete! (15.31s)
+Test Suite 'All tests' started at 2026-07-22 15:16:57.964.
+Test Suite 'All tests' passed at 2026-07-22 15:16:57.966.
+	 Executed 0 tests, with 0 failures (0 unexpected) in 0.000 (0.002) seconds
+◇ Test run started.
+↳ Testing Library Version: 1902
+↳ Target Platform: arm64e-apple-macos14.0
+◇ Suite OutboxOrderingTests started.
+◇ Suite PendingDecisionTests started.
+◇ Suite QuotaSlotTests started.
+◇ Suite HUDPanelLayoutTests started.
+◇ Suite ModelDecodingTests started.
+◇ Suite FormattingTests started.
+◇ Suite ForegroundSchedulingTests started.
+◇ Suite LaneTests started.
+◇ Suite BootstrapParsingTests started.
+◇ Suite AgentFocusStageManagerTests started.
+◇ Test pendingCommitIsUndoable() started.
+◇ Suite MenuBarPopoverTests started.
+◇ Suite HUDSettingsTests started.
+◇ Test snoozedItemsStayOutOfOutboxUntilRuntimeReopensThem() started.
+◇ Test toolNameParsedFromRuntimeTitle() started.
+◇ Test providerNativeApprovalIsNotPresentedAsDirectlyAnswerable() started.
+◇ Test oldConfirmedCommandsProduceNothing() started.
+◇ Test notchSafeAreaMovesCapsuleBelowTopObstruction() started.
+◇ Test below20PercentIsTight() started.
+◇ Test availableEntryMapsRemainingPct() started.
+◇ Test automaticModeUsesActRealmWindowDisplay() started.
+◇ Test errorsBeatApprovalsBeatQuestionsBeatCompletions() started.
+◇ Test missingQuotaDoesNotInventFixedWindows() started.
+◇ Test resolvedItemsAreHidden() started.
+◇ Test hostingViewAcceptsTheFirstClickWithoutMovingThePanel() started.
+◇ Test globalCoordinatesCenterCapsuleOnOffsetDisplay() started.
+◇ Test selectedDisplayFallsBackByNameAfterReconnect() started.
+◇ Test decisionButtonsDisappearImmediatelyAfterOneSubmission() started.
+◇ Test centersCapsuleAtTopOfPrimaryVisibleArea() started.
+◇ Test highAndUnknownRiskNeedVerification() started.
+◇ Test closingPreviewHidesOnlyTheHUDAndKeepsTheOutbox() started.
+◇ Test unavailableSelectedDisplayTemporarilyUsesMainDisplay() started.
+◇ Test decodesSnapshotWebSocketEnvelope() started.
+◇ Test settingsEncodeTheCompleteRuntimeContract() started.
+◇ Test oldestWaitsFirstWithinSameKind() started.
+◇ Test tokenAndEstimatedCostFieldsEncodeIndependently() started.
+◇ Test decodesSnapshotShapeFromServer() started.
+◇ Test waitDurations() started.
+◇ Test keepsEveryRuntimeWindowAndMetadataInServerOrder() started.
+◇ Test shortAges() started.
+◇ Test expiryText() started.
+◇ Test commandRequestEncodesExpectedFieldNames() started.
+◇ Test defaultsMatchRecommendedReferencePolicy() started.
+◇ Test legacyInvisibleAutoApprovalPreferenceIsRemoved() started.
+◇ Test disabledEventTypesStayInActRealmWithoutStartingFocus() started.
+◇ Test liveArrivalMovesThroughReminderOpenWaitAndReturn() started.
+◇ Test closingAgentFocusHUDCancelsTheHiddenSwitchButKeepsTheEvent() started.
+◇ Test editsPersistAndDurationsStayOnSupportedValues() started.
+◇ Test execStatesMapToBadges() started.
+◇ Test systemControllerAppliesPreferenceWithoutRestartingWindowManager() started.
+◇ Test unmatchedAgentDoesNotEnterFocusQueue() started.
+◇ Test unboundWorkspaceKeepsArrivalInListAndDoesNotSuppressHUD() started.
+◇ Test masterSwitchPreventsHUDAndAutomaticFocus() started.
+◇ Test agentTasksAreNewestFirstAcrossProviders() started.
+◇ Test focusEventsAreSerializedAndResolvedReminderCancelsImmediately() started.
+◇ Test parsesRealServeOutputLine() started.
+◇ Test packagedHelperWinsOverAuxiliaryExecutableLookup() started.
+◇ Test newestTaskIsAlwaysLeftmostInsideLane() started.
+◇ Test acceptancePolicyRestoresOnPointerAcceptance() started.
+◇ Test failedEnableDoesNotCreateRestoreAuthority() started.
+◇ Test claudeAndCodexLanesAlwaysExist() started.
+◇ Test neverOwnsOrRestoresUserEnabledStageManager() started.
+◇ Test trimsTrailingNewlineFromToken() started.
+◇ Test legacyThemeSettingsGainDynamicDefaultsAndOpacityIsClamped() started.
+◇ Test ignoresUnrelatedLines() started.
+◇ Test enteringSchedulingWorkspaceStopsReturnWithoutDisablingFocus() started.
+◇ Test completionWaitingForConfirmationMarksFinishedTaskWaiting() started.
+◇ Test mainExecutableIsNeverAcceptedAsRuntimeHelper() started.
+◇ Test customThemeImageIsCopiedPersistedAndReset() started.
+◇ Test keepEnabledNeverRequestsAReset() started.
+◇ Test openQuestionMarksTaskWaiting() started.
+◇ Test restoresOnlyAtConfiguredBoundary() started.
+◇ Test legacySettingsDefaultToSystemMainDisplay() started.
+◇ Test workspaceBindingAndHUDSettingsPersist() started.
+◇ Test parsesRuntimeLockOwnerPID() started.
+◇ Test snoozedAttentionKeepsSessionVisibleWithoutBlockingIt() started.
+◇ Test emptyLaneUsesOneNeutralMessage() started.
+◇ Test disabledAutoReturnLeavesAgentPageAndReleasesQueue() started.
+◇ Test waitingTaskIsFeaturedAheadOfANewerIdleTask() started.
+◇ Test futureProviderGetsItsOwnLaneWithoutNativeClientChanges() started.
+◇ Test unknownFutureDisplayModeSafelyFallsBackToSystemMain() started.
+◇ Test legacySchedulingSettingsGainAgentFocusDefaults() started.
+◇ Test notificationTonesMatchTheMainOutboxSemantics() started.
+✔ Test automaticModeUsesActRealmWindowDisplay() passed after 0.001 seconds.
+✔ Test notchSafeAreaMovesCapsuleBelowTopObstruction() passed after 0.001 seconds.
+✔ Test oldConfirmedCommandsProduceNothing() passed after 0.001 seconds.
+✔ Test errorsBeatApprovalsBeatQuestionsBeatCompletions() passed after 0.001 seconds.
+✔ Test providerNativeApprovalIsNotPresentedAsDirectlyAnswerable() passed after 0.002 seconds.
+✔ Test snoozedItemsStayOutOfOutboxUntilRuntimeReopensThem() passed after 0.002 seconds.
+✔ Test below20PercentIsTight() passed after 0.001 seconds.
+✔ Test toolNameParsedFromRuntimeTitle() passed after 0.002 seconds.
+✔ Test missingQuotaDoesNotInventFixedWindows() passed after 0.001 seconds.
+✔ Test availableEntryMapsRemainingPct() passed after 0.001 seconds.
+✔ Test globalCoordinatesCenterCapsuleOnOffsetDisplay() passed after 0.001 seconds.
+✔ Test resolvedItemsAreHidden() passed after 0.002 seconds.
+✔ Test decisionButtonsDisappearImmediatelyAfterOneSubmission() passed after 0.001 seconds.
+✔ Test centersCapsuleAtTopOfPrimaryVisibleArea() passed after 0.001 seconds.
+✔ Test selectedDisplayFallsBackByNameAfterReconnect() passed after 0.001 seconds.
+✔ Test highAndUnknownRiskNeedVerification() passed after 0.002 seconds.
+✔ Test pendingCommitIsUndoable() passed after 0.002 seconds.
+✔ Test oldestWaitsFirstWithinSameKind() passed after 0.002 seconds.
+✔ Test decodesSnapshotWebSocketEnvelope() passed after 0.002 seconds.
+✔ Test unavailableSelectedDisplayTemporarilyUsesMainDisplay() passed after 0.002 seconds.
+✔ Test expiryText() passed after 0.002 seconds.
+✔ Test waitDurations() passed after 0.002 seconds.
+✔ Test tokenAndEstimatedCostFieldsEncodeIndependently() passed after 0.002 seconds.
+✔ Test commandRequestEncodesExpectedFieldNames() passed after 0.002 seconds.
+✔ Test shortAges() passed after 0.002 seconds.
+✔ Test systemControllerAppliesPreferenceWithoutRestartingWindowManager() passed after 0.001 seconds.
+✔ Test acceptancePolicyRestoresOnPointerAcceptance() passed after 0.001 seconds.
+✔ Test execStatesMapToBadges() passed after 0.001 seconds.
+✔ Test failedEnableDoesNotCreateRestoreAuthority() passed after 0.001 seconds.
+✔ Test settingsEncodeTheCompleteRuntimeContract() passed after 0.002 seconds.
+✔ Test keepsEveryRuntimeWindowAndMetadataInServerOrder() passed after 0.002 seconds.
+✔ Test decodesSnapshotShapeFromServer() passed after 0.002 seconds.
+✔ Test neverOwnsOrRestoresUserEnabledStageManager() passed after 0.001 seconds.
+✔ Test claudeAndCodexLanesAlwaysExist() passed after 0.001 seconds.
+✔ Test parsesRealServeOutputLine() passed after 0.001 seconds.
+✔ Test restoresOnlyAtConfiguredBoundary() passed after 0.001 seconds.
+✔ Test trimsTrailingNewlineFromToken() passed after 0.001 seconds.
+✔ Test openQuestionMarksTaskWaiting() passed after 0.001 seconds.
+✔ Test newestTaskIsAlwaysLeftmostInsideLane() passed after 0.001 seconds.
+✔ Test agentTasksAreNewestFirstAcrossProviders() passed after 0.001 seconds.
+✔ Test parsesRuntimeLockOwnerPID() passed after 0.001 seconds.
+✔ Test emptyLaneUsesOneNeutralMessage() passed after 0.001 seconds.
+✔ Test legacySettingsDefaultToSystemMainDisplay() passed after 0.001 seconds.
+✔ Test waitingTaskIsFeaturedAheadOfANewerIdleTask() passed after 0.001 seconds.
+✔ Test keepEnabledNeverRequestsAReset() passed after 0.001 seconds.
+✔ Test ignoresUnrelatedLines() passed after 0.001 seconds.
+✔ Test futureProviderGetsItsOwnLaneWithoutNativeClientChanges() passed after 0.001 seconds.
+✔ Test notificationTonesMatchTheMainOutboxSemantics() passed after 0.001 seconds.
+✔ Test snoozedAttentionKeepsSessionVisibleWithoutBlockingIt() passed after 0.001 seconds.
+✔ Suite PendingDecisionTests passed after 0.003 seconds.
+✔ Test unknownFutureDisplayModeSafelyFallsBackToSystemMain() passed after 0.001 seconds.
+✔ Suite OutboxOrderingTests passed after 0.003 seconds.
+✔ Test legacySchedulingSettingsGainAgentFocusDefaults() passed after 0.001 seconds.
+✔ Suite FormattingTests passed after 0.003 seconds.
+✔ Suite ModelDecodingTests passed after 0.003 seconds.
+✔ Suite QuotaSlotTests passed after 0.003 seconds.
+✔ Suite AgentFocusStageManagerTests passed after 0.003 seconds.
+✔ Suite MenuBarPopoverTests passed after 0.003 seconds.
+✔ Test completionWaitingForConfirmationMarksFinishedTaskWaiting() passed after 0.001 seconds.
+✔ Suite LaneTests passed after 0.003 seconds.
+✔ Suite HUDSettingsTests passed after 0.003 seconds.
+✔ Test mainExecutableIsNeverAcceptedAsRuntimeHelper() passed after 0.002 seconds.
+✔ Test packagedHelperWinsOverAuxiliaryExecutableLookup() passed after 0.003 seconds.
+✔ Suite BootstrapParsingTests passed after 0.005 seconds.
+✔ Test hostingViewAcceptsTheFirstClickWithoutMovingThePanel() passed after 0.094 seconds.
+✔ Test closingPreviewHidesOnlyTheHUDAndKeepsTheOutbox() passed after 0.101 seconds.
+✔ Suite HUDPanelLayoutTests passed after 0.102 seconds.
+✔ Test defaultsMatchRecommendedReferencePolicy() passed after 0.101 seconds.
+✔ Test legacyInvisibleAutoApprovalPreferenceIsRemoved() passed after 0.102 seconds.
+✔ Test disabledEventTypesStayInActRealmWithoutStartingFocus() passed after 0.103 seconds.
+✔ Test closingAgentFocusHUDCancelsTheHiddenSwitchButKeepsTheEvent() passed after 0.104 seconds.
+✔ Test liveArrivalMovesThroughReminderOpenWaitAndReturn() passed after 0.105 seconds.
+✔ Test unboundWorkspaceKeepsArrivalInListAndDoesNotSuppressHUD() passed after 0.106 seconds.
+✔ Test unmatchedAgentDoesNotEnterFocusQueue() passed after 0.106 seconds.
+✔ Test masterSwitchPreventsHUDAndAutomaticFocus() passed after 0.107 seconds.
+✔ Test focusEventsAreSerializedAndResolvedReminderCancelsImmediately() passed after 0.108 seconds.
+✔ Test editsPersistAndDurationsStayOnSupportedValues() passed after 0.109 seconds.
+✔ Test legacyThemeSettingsGainDynamicDefaultsAndOpacityIsClamped() passed after 0.110 seconds.
+✔ Test workspaceBindingAndHUDSettingsPersist() passed after 0.111 seconds.
+✔ Test customThemeImageIsCopiedPersistedAndReset() passed after 0.113 seconds.
+✔ Test disabledAutoReturnLeavesAgentPageAndReleasesQueue() passed after 0.114 seconds.
+✔ Test enteringSchedulingWorkspaceStopsReturnWithoutDisablingFocus() passed after 0.115 seconds.
+✔ Suite ForegroundSchedulingTests passed after 0.116 seconds.
+✔ Test run with 71 tests in 12 suites passed after 0.117 seconds.
+apps/macos/Resources/Info.plist: OK
+      Loaded 1166 security advisories (from /Users/apple/.cargo/advisory-db)
+    Scanning Cargo.lock for vulnerabilities (132 crate dependencies)
