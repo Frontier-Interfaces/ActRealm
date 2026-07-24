@@ -26,6 +26,7 @@ OUT_DIR="${1:-$PACKAGE_DIR/dist}"
 APP="$OUT_DIR/ActRealm.app"
 INFO_PLIST="$PACKAGE_DIR/Resources/Info.plist"
 APP_ICON="$PACKAGE_DIR/Resources/ActRealm.icns"
+APP_ICON_PNG="$PACKAGE_DIR/Resources/ActRealmIcon.png"
 SIGN_IDENTITY="${ACTREALM_SIGN_IDENTITY:--}"
 REQUIRE_RELEASE_SIGNING="${ACTREALM_REQUIRE_RELEASE_SIGNING:-0}"
 BUNDLE_VERSION="${ACTREALM_VERSION:-}"
@@ -55,6 +56,7 @@ if [[ ! -f "$RUST_REPO/Cargo.toml" ]]; then
 fi
 [[ -f "$INFO_PLIST" ]] || { echo "error: missing $INFO_PLIST" >&2; exit 1; }
 [[ -f "$APP_ICON" ]] || { echo "error: missing $APP_ICON" >&2; exit 1; }
+[[ -f "$APP_ICON_PNG" ]] || { echo "error: missing $APP_ICON_PNG" >&2; exit 1; }
 if [[ "${ACTREALM_SKIP_RUST_BUILD:-0}" == "1" ]]; then
   echo "==> Reusing existing Rust backend (release)"
   [[ -x "$RUST_REPO/target/release/actrealm" ]] || {
@@ -84,6 +86,7 @@ cp "$SWIFT_BIN" "$APP/Contents/MacOS/ActRealm"
 cp "$RUST_REPO/target/release/actrealm" "$APP/Contents/Helpers/actrealm"
 cp "$INFO_PLIST" "$APP/Contents/Info.plist"
 cp "$APP_ICON" "$APP/Contents/Resources/ActRealm.icns"
+cp "$APP_ICON_PNG" "$APP/Contents/Resources/ActRealmIcon.png"
 cp "$REPO_ROOT/web/assets/claude.png" "$APP/Contents/Resources/ProviderIcons/claude.png"
 cp "$REPO_ROOT/web/assets/codex.png" "$APP/Contents/Resources/ProviderIcons/codex.png"
 GIT_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"

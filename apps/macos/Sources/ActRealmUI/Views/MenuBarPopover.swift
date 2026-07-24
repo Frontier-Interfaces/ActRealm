@@ -44,7 +44,7 @@ public struct MenuBarPopoverView: View {
 
     private var header: some View {
         HStack(spacing: 8) {
-            LogoMark()
+            LogoMark(size: 18)
             Text("ActRealm")
                 .font(.system(size: 13, weight: .bold))
                 .foregroundStyle(DT.textStrong)
@@ -115,7 +115,11 @@ public struct MenuBarPopoverView: View {
     }
 
     private func laneRow(_ lane: Lane) -> some View {
-        let presentation = MenuBarLanePresentation(lane: lane, now: model.now)
+        let presentation = MenuBarLanePresentation(
+            provider: lane.provider,
+            tasks: model.visibleAgentTasks(for: lane.provider),
+            now: model.now
+        )
         return HStack(spacing: 9) {
             ProviderAvatar(kind: lane.provider, size: 22)
             VStack(alignment: .leading, spacing: 0) {
@@ -243,25 +247,29 @@ struct MenuBarLanePresentation: Equatable {
     let tone: MenuBarStatusTone
 
     init(lane: Lane, now: Date) {
-        let waiting = lane.tasks.filter { $0.status == .waiting }
-        let failed = lane.tasks.filter { $0.status == .failed }
-        let running = lane.tasks.filter { $0.status == .running }
-        let featured = waiting.first ?? failed.first ?? running.first ?? lane.tasks.first
+        self.init(provider: lane.provider, tasks: lane.tasks, now: now)
+    }
 
-        title = featured?.projectName ?? featured?.title ?? lane.provider.displayName
+    init(provider: ProviderKind, tasks: [LaneTask], now: Date) {
+        let waiting = tasks.filter { $0.status == .waiting }
+        let failed = tasks.filter { $0.status == .failed }
+        let running = tasks.filter { $0.status == .running }
+        let featured = waiting.first ?? failed.first ?? running.first ?? tasks.first
 
-        if lane.provider == .gemini {
-            subtitle = "\(lane.provider.displayName) · 仅通知"
+        title = provider.displayName
+
+        if provider == .gemini {
+            subtitle = "\(provider.displayName) · 仅通知"
         } else if let featured {
             switch featured.status {
-            case .waiting: subtitle = "\(lane.provider.displayName) · 等待处理"
-            case .running: subtitle = "\(lane.provider.displayName) · \(featured.activity ?? "正在运行")"
-            case .failed: subtitle = "\(lane.provider.displayName) · 运行失败"
-            case .done: subtitle = "\(lane.provider.displayName) · 本轮已完成"
-            case .idle: subtitle = "\(lane.provider.displayName) · 空闲"
+            case .waiting: subtitle = "\(provider.displayName) · 等待处理"
+            case .running: subtitle = "\(provider.displayName) · \(featured.activity ?? "正在运行")"
+            case .failed: subtitle = "\(provider.displayName) · 运行失败"
+            case .done: subtitle = "\(provider.displayName) · 本轮已完成"
+            case .idle: subtitle = "\(provider.displayName) · 空闲"
             }
         } else {
-            subtitle = "\(lane.provider.displayName) · 无活动任务"
+            subtitle = "\(provider.displayName) · 无活动任务"
         }
 
         if !waiting.isEmpty {
@@ -407,7 +415,7 @@ public struct MenuBarLabel: View {
     public var body: some View {
         let absent = !model.bridgeStatus.isListening
         HStack(spacing: 3) {
-            Image(nsImage: Self.barsImage)
+            MenuBarMark()
                 .opacity(absent ? 0.28 : 1)
             if let entry = model.derived.openOutbox.first, !absent {
                 let tone = MenuBarStatusTone(kind: entry.kind)
@@ -418,25 +426,44 @@ public struct MenuBarLabel: View {
             }
         }
     }
+}
 
-    /// Three rounded bars as a template image so the menu bar tints it.
-    static let barsImage: NSImage = {
-        let size = NSSize(width: 15, height: 13)
-        let image = NSImage(size: size, flipped: false) { rect in
-            let heights: [CGFloat] = [6, 11, 8]
-            var x: CGFloat = 1
-            for height in heights {
-                let bar = NSBezierPath(
-                    roundedRect: NSRect(x: x, y: 1, width: 3, height: height),
-                    xRadius: 1.5, yRadius: 1.5
-                )
-                NSColor.black.setFill()
-                bar.fill()
-                x += 5
-            }
+/// A menu-bar-specific abstraction of the app icon. The monochrome `>_`
+/// terminal mark stays legible at native status-item size without allowing the
+/// full-color app artwork to influence the menu bar's height.
+struct MenuBarMark: View {
+    static let templateImage: NSImage = {
+        let image = NSImage(size: NSSize(width: 16, height: 14), flipped: false) { _ in
+            NSColor.black.setStroke()
+
+            let terminal = NSBezierPath(
+                roundedRect: NSRect(x: 0.8, y: 0.8, width: 14.4, height: 12.4),
+                xRadius: 3,
+                yRadius: 3
+            )
+            terminal.lineWidth = 1.35
+            terminal.stroke()
+
+            let prompt = NSBezierPath()
+            prompt.lineCapStyle = .round
+            prompt.lineJoinStyle = .round
+            prompt.lineWidth = 1.5
+            prompt.move(to: NSPoint(x: 4.1, y: 4.3))
+            prompt.line(to: NSPoint(x: 6.9, y: 7))
+            prompt.line(to: NSPoint(x: 4.1, y: 9.7))
+            prompt.move(to: NSPoint(x: 9.1, y: 4.3))
+            prompt.line(to: NSPoint(x: 12.6, y: 4.3))
+            prompt.stroke()
             return true
         }
         image.isTemplate = true
         return image
     }()
+
+    var body: some View {
+        Image(nsImage: Self.templateImage)
+            .renderingMode(.template)
+            .frame(width: 16, height: 14)
+            .accessibilityHidden(true)
+    }
 }

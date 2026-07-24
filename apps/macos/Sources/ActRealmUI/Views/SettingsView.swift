@@ -52,6 +52,30 @@ public struct SettingsView: View {
         }
         .frame(width: 920, height: 660)
         .background(Color(nsColor: .windowBackgroundColor))
+        .overlay(alignment: .bottom) {
+            VStack(spacing: 8) {
+                if let error = model.settingsSaveError {
+                    SettingsSaveFeedback(message: error, isError: true) {
+                        model.retrySettingsSave()
+                    }
+                } else if let notice = model.settingsSaveNotice {
+                    SettingsSaveFeedback(message: notice, isError: false)
+                }
+
+                if let toast = model.toastMessage {
+                    StatusToast(text: toast)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                        .allowsHitTesting(false)
+                }
+            }
+            .padding(.horizontal, 24)
+            .padding(.bottom, 16)
+        }
+        .animation(.easeOut(duration: 0.22), value: model.toastMessage)
+        .animation(.easeOut(duration: 0.22), value: model.settingsSaveError)
+        .animation(.easeOut(duration: 0.22), value: model.settingsSaveNotice)
+        .onAppear { model.setSettingsVisible(true) }
+        .onDisappear { model.setSettingsVisible(false) }
         .task {
             model.refreshRuntimeDiagnostics()
             await model.refreshSettings()
@@ -75,6 +99,42 @@ public struct SettingsView: View {
         case .data:
             DataSettingsPage()
         }
+    }
+}
+
+private struct SettingsSaveFeedback: View {
+    let message: String
+    let isError: Bool
+    var retry: (() -> Void)?
+
+    init(message: String, isError: Bool, retry: (() -> Void)? = nil) {
+        self.message = message
+        self.isError = isError
+        self.retry = retry
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: isError ? "exclamationmark.triangle.fill" : "info.circle.fill")
+            Text(message)
+                .font(.system(size: 11.5, weight: .semibold))
+            Spacer(minLength: 8)
+            if let retry {
+                Button("重试", action: retry)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+        }
+        .foregroundStyle(isError ? Color.red : Color.primary)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(isError ? Color.red.opacity(0.35) : Color.secondary.opacity(0.2))
+        )
+        .shadow(color: .black.opacity(0.14), radius: 12, y: 6)
+        .frame(maxWidth: 620)
     }
 }
 
@@ -411,38 +471,38 @@ private struct NotificationSettingsPage: View {
         VStack(spacing: 0) {
             SettingsPageHeader(
                 title: "通知",
-                subtitle: "统一管理事件列表、HUD 胶囊与提示音。"
+                subtitle: "选择哪些事件需要出现在 Outbox 中，提醒你处理。"
             )
             Form {
                 Section {
                     notificationRow(
                         title: "等待批准",
-                        detail: "Agent 请求运行命令，等待批准",
+                        detail: "Agent 请求执行操作，需要你的批准",
                         symbol: "checkmark.shield",
                         kind: "approval"
                     )
                     notificationRow(
-                        title: "Agent 提问",
-                        detail: "Agent 发出需要回答的问题",
+                        title: "等待回答",
+                        detail: "Agent 提出了需要你回答的问题",
                         symbol: "questionmark.bubble",
                         kind: "question"
                     )
                     notificationRow(
-                        title: "出错或卡住",
-                        detail: "Agent 报错或长时间没有进展",
+                        title: "需要处理",
+                        detail: "Agent 执行出错，或长时间没有进展",
                         symbol: "exclamationmark.triangle",
                         kind: "error"
                     )
                     notificationRow(
-                        title: "任务完成",
-                        detail: "本轮任务完成，等待确认",
+                        title: "等待确认",
+                        detail: "Agent 已完成本轮任务，需要你的确认",
                         symbol: "checkmark.circle",
                         kind: "completion"
                     )
                 } header: {
-                    Text("事件")
+                    Text("进入 Outbox 的事件")
                 } footer: {
-                    Text("“关闭”会从通知列表隐藏该类事件，不改变 Runtime 中的任务事实。")
+                    Text("关闭某项后，此类事件仍会保留在任务记录中，但不会出现在 Outbox。")
                 }
 
                 Section("声音") {
@@ -450,7 +510,7 @@ private struct NotificationSettingsPage: View {
                         get: { model.uiSettings.soundEnabled },
                         set: { enabled in model.updateUISettings { $0.soundEnabled = enabled } }
                     )) {
-                        SettingsLabel("提示音", detail: "新事件进入列表时播放本机轻提示音")
+                        SettingsLabel("提示音", detail: "新事件进入 Outbox 时播放本机轻提示音")
                     }
                 }
 
@@ -617,14 +677,7 @@ private struct NotificationSettingsPage: View {
         symbol: String,
         kind: String
     ) -> some View {
-        LabeledContent {
-            Picker("", selection: notificationBinding(kind)) {
-                Text("仅列表").tag(NotificationMode.list)
-                Text("关闭").tag(NotificationMode.ignore)
-            }
-            .labelsHidden()
-            .frame(width: 120)
-        } label: {
+        Toggle(isOn: notificationBinding(kind)) {
             Label {
                 SettingsLabel(title, detail: detail)
             } icon: {
@@ -632,13 +685,15 @@ private struct NotificationSettingsPage: View {
                     .foregroundStyle(.secondary)
             }
         }
+        .toggleStyle(.switch)
     }
 
-    private func notificationBinding(_ kind: String) -> Binding<NotificationMode> {
+    private func notificationBinding(_ kind: String) -> Binding<Bool> {
         Binding(
-            get: { model.uiSettings.notificationRules.mode(for: kind) == .ignore ? .ignore : .list },
-            set: { mode in
+            get: { model.uiSettings.notificationRules.mode(for: kind) != .ignore },
+            set: { isEnabled in
                 model.updateUISettings { settings in
+                    let mode: NotificationMode = isEnabled ? .list : .ignore
                     switch kind {
                     case "approval": settings.notificationRules.approval = mode
                     case "question": settings.notificationRules.question = mode
@@ -1027,9 +1082,33 @@ private struct DisplaySettingsPage: View {
         VStack(spacing: 0) {
             SettingsPageHeader(
                 title: "显示",
-                subtitle: "控制任务卡的信息密度；只显示 Runtime 允许的安全字段。"
+                subtitle: "控制任务卡和额度卡的信息密度；只显示 Runtime 允许的安全字段。"
             )
             Form {
+                Section {
+                    Picker(
+                        selection: Binding(
+                            get: { model.uiSettings.quotaDisplayMode },
+                            set: { mode in
+                                model.updateUISettings { $0.quotaDisplayMode = mode }
+                            }
+                        ),
+                        label: SettingsLabel(
+                            "额度卡片",
+                            detail: "完整保留全部信息；紧凑使用双行；单行把核心额度排在一行"
+                        )
+                    ) {
+                        Text("完整").tag(QuotaDisplayMode.full)
+                        Text("紧凑").tag(QuotaDisplayMode.compact)
+                        Text("单行").tag(QuotaDisplayMode.singleLine)
+                    }
+                    .pickerStyle(.segmented)
+                } header: {
+                    Text("额度显示")
+                } footer: {
+                    Text("默认使用完整模式。三种模式都会随额度栏宽度自适应，且不改变额度数据与刷新规则。")
+                }
+
                 Section("显示档位") {
                     Picker("任务卡", selection: Binding(
                         get: { activePreset },

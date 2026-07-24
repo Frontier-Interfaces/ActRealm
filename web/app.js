@@ -32,6 +32,9 @@ const ui = {
   settingsTrigger: document.querySelector("#settings-trigger"),
   settingsOverlay: document.querySelector("#settings-overlay"),
   settingsClose: document.querySelector("#settings-close"),
+  settingsSaveFeedback: document.querySelector("#settings-save-feedback"),
+  settingsSaveMessage: document.querySelector("#settings-save-message"),
+  settingsSaveRetry: document.querySelector("#settings-save-retry"),
   notifyApproval: document.querySelector("#notify-approval"),
   notifyQuestion: document.querySelector("#notify-question"),
   notifyError: document.querySelector("#notify-error"),
@@ -55,8 +58,9 @@ const ui = {
   runtimeMonitorDetails: document.querySelector("#runtime-monitor-details"),
   runtimeMonitorGrid: document.querySelector("#runtime-monitor-grid"),
   runtimeMonitorRefresh: document.querySelector("#runtime-monitor-refresh"),
-  reminderRows: [...document.querySelectorAll(".reminder-row[data-rule]")],
+  runtimeActionFeedback: document.querySelector("#runtime-action-feedback"),
   retentionOptions: [...document.querySelectorAll(".retention-options button")],
+  quotaDisplayOptions: [...document.querySelectorAll(".quota-display-options button")],
   wipeConfirmation: document.querySelector("#wipe-confirmation"),
   wipeConfirmationInput: document.querySelector("#wipe-confirmation-input"),
   wipeConfirm: document.querySelector("#wipe-confirm"),
@@ -81,6 +85,7 @@ let runtimeConnected = false;
 let reconnectDelay = 500;
 let undoCommandId;
 let toastTimer;
+let toastPriority = 0;
 let setupState = { providers: [], firstRun: false };
 let setupLoaded = false;
 let setupBusy = false;
@@ -94,10 +99,12 @@ let settingsState = {
   displayProfile: "detailed",
   displayFieldsVersion: 3,
   taskCardFields: ["project", "task", "model", "activity", "plan", "sessionTokens", "turnTokens", "inputOutputTokens", "cacheTokens", "reasoningTokens", "cost", "context", "tool", "subagents", "environment", "recovery", "control", "jump"],
+  quotaDisplayMode: "standard",
 };
 let displayCatalog = [];
 let claudeBridge = { status: "not_installed" };
 let settingsBusy = false;
+let failedSettingsDraft;
 let notificationsPrimed = false;
 let knownAttentionIds = new Set();
 let notificationItemId;
@@ -176,9 +183,10 @@ function emptyState(icon, title, detail) {
 function onboardingTaskEmpty() {
   const root = element("div", "empty-state onboarding-task-empty");
   const icon = element("div", "onboarding-empty-icon");
-  const signal = element("span", "signal-bars onboarding-signal");
-  signal.append(element("i"), element("i"), element("i"));
-  icon.append(signal);
+  const brand = element("img", "onboarding-brand-icon");
+  brand.src = "/assets/actrealm-icon.png";
+  brand.alt = "";
+  icon.append(brand);
   root.append(icon);
   root.append(element("h3", "", "尚未连接任何 Agent"));
   root.append(element("p", "", "连接 Claude 或 Codex 后，运行中的任务与待处理事项会显示在这里。数据仅留在本机。"));
@@ -495,10 +503,10 @@ function bridgeStatusCopy(status) {
 function renderSettings() {
   const rules = settingsState.notificationRules || {};
   const visibleRule = (value) => value === "ignore" ? "ignore" : "list";
-  ui.notifyApproval.value = visibleRule(rules.approval);
-  ui.notifyQuestion.value = visibleRule(rules.question);
-  ui.notifyError.value = visibleRule(rules.error);
-  ui.notifyCompletion.value = visibleRule(rules.completion);
+  ui.notifyApproval.checked = visibleRule(rules.approval) === "list";
+  ui.notifyQuestion.checked = visibleRule(rules.question) === "list";
+  ui.notifyError.checked = visibleRule(rules.error) === "list";
+  ui.notifyCompletion.checked = visibleRule(rules.completion) === "list";
   ui.soundEnabled.checked = Boolean(settingsState.soundEnabled);
   ui.muteClaude.checked = Boolean(settingsState.providerMuted?.claude);
   ui.muteCodex.checked = Boolean(settingsState.providerMuted?.codex);
@@ -531,16 +539,13 @@ function renderSettings() {
       ? "wrap"
       : "install";
   ui.claudeBridgeAction.disabled = settingsBusy || blocked;
-  for (const row of ui.reminderRows) {
-    const key = row.dataset.rule;
-    const value = visibleRule(rules[key]);
-    for (const button of row.querySelectorAll("button[data-value]")) {
-      button.classList.toggle("active", button.dataset.value === value);
-      button.setAttribute("aria-pressed", String(button.dataset.value === value));
-    }
-  }
   for (const button of ui.retentionOptions) {
     const active = Number(button.dataset.value) === retention;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  }
+  for (const button of ui.quotaDisplayOptions) {
+    const active = button.dataset.value === normalizedQuotaDisplayMode(settingsState.quotaDisplayMode);
     button.classList.toggle("active", active);
     button.setAttribute("aria-pressed", String(active));
   }
@@ -576,27 +581,41 @@ function renderFieldSelector() {
   }
 }
 
+function setSettingsFeedback(message, { error = false, retry = false } = {}) {
+  ui.settingsSaveMessage.textContent = message || "";
+  ui.settingsSaveFeedback.hidden = !message;
+  ui.settingsSaveFeedback.classList.toggle("error", error);
+  ui.settingsSaveRetry.hidden = !retry;
+}
+
 async function loadSettings() {
   try {
     const response = await api("/api/v1/settings");
     settingsState = response.settings;
+    failedSettingsDraft = undefined;
+    setSettingsFeedback("");
     displayCatalog = response.displayCatalog || [];
     claudeBridge = response.claudeQuotaBridge;
     renderSettings();
     renderAttention();
     renderSessions();
+    renderQuota();
   } catch (error) {
-    showToast(`设置读取失败：${error.message}`);
+    setSettingsFeedback(`设置读取失败：${error.detail || error.message}`, { error: true, retry: true });
   }
+}
+
+function normalizedQuotaDisplayMode(value) {
+  return ["standard", "twoLine", "compact"].includes(value) ? value : "standard";
 }
 
 function settingsFromForm() {
   return {
     notificationRules: {
-      approval: ui.notifyApproval.value,
-      question: ui.notifyQuestion.value,
-      error: ui.notifyError.value,
-      completion: ui.notifyCompletion.value,
+      approval: ui.notifyApproval.checked ? "list" : "ignore",
+      question: ui.notifyQuestion.checked ? "list" : "ignore",
+      error: ui.notifyError.checked ? "list" : "ignore",
+      completion: ui.notifyCompletion.checked ? "list" : "ignore",
     },
     soundEnabled: ui.soundEnabled.checked,
     providerMuted: { claude: ui.muteClaude.checked, codex: ui.muteCodex.checked },
@@ -605,33 +624,39 @@ function settingsFromForm() {
     displayProfile: ui.displayProfile.value,
     displayFieldsVersion: settingsState.displayFieldsVersion || 3,
     taskCardFields: [...ui.taskCardFields.querySelectorAll("input:checked")].map((input) => input.value),
+    quotaDisplayMode: normalizedQuotaDisplayMode(settingsState.quotaDisplayMode),
   };
 }
 
-async function saveSettings() {
+async function saveSettings(settingsOverride) {
   if (settingsBusy) return;
   settingsBusy = true;
   const previousCodexMode = settingsState.codexEnhancedActivity;
+  const draft = settingsOverride || settingsFromForm();
+  setSettingsFeedback("");
   try {
     const response = await api("/api/v1/settings", {
       method: "PUT",
-      body: JSON.stringify(settingsFromForm()),
+      body: JSON.stringify(draft),
     });
     settingsState = response.settings;
+    failedSettingsDraft = undefined;
     displayCatalog = response.displayCatalog || displayCatalog;
     claudeBridge = response.claudeQuotaBridge;
     renderSettings();
     renderAttention();
     renderSessions();
+    renderQuota();
     if (previousCodexMode !== settingsState.codexEnhancedActivity) {
-      showToast("Codex Hook 已更新，请在 Codex 中运行 /hooks 重新检查信任");
+      setSettingsFeedback("Codex Hook 已更新，请在 Codex 中运行 /hooks 重新检查信任。");
       loadSetup();
     } else {
-      showToast("设置已保存到本机");
+      setSettingsFeedback("");
     }
   } catch (error) {
+    failedSettingsDraft = draft;
     renderSettings();
-    showToast(`设置保存失败：${error.detail || error.message}`);
+    setSettingsFeedback(`设置保存失败：${error.detail || error.message}`, { error: true, retry: true });
   } finally {
     settingsBusy = false;
     renderSettings();
@@ -849,7 +874,7 @@ function renderInteractiveForm(item, card) {
     const legend = element("legend", "", question.label || "问题");
     fieldset.append(legend);
     if (question.prompt) fieldset.append(element("p", "question-prompt", question.prompt));
-    const binding = { question, values: [], other: undefined, input: undefined };
+    const binding = { question, values: [], other: undefined, input: undefined, error: undefined };
     if (question.inputType === "choice") {
       const choices = element("div", "question-choices");
       for (const [index, option] of (question.options || []).entries()) {
@@ -894,6 +919,18 @@ function renderInteractiveForm(item, card) {
       fieldset.append(input);
       if (question.isSecret) fieldset.append(element("p", "secret-note", "仅在内存中提交，不写入数据库、日志或导出。"));
     }
+    binding.error = element("p", "question-error");
+    binding.error.hidden = true;
+    fieldset.append(binding.error);
+    for (const control of [...binding.values, binding.other, binding.input].filter(Boolean)) {
+      const clearError = () => {
+        binding.error.hidden = true;
+        binding.error.textContent = "";
+        fieldset.classList.remove("invalid");
+      };
+      control.addEventListener("input", clearError);
+      control.addEventListener("change", clearError);
+    }
     bindings.push(binding);
     form.append(fieldset);
   }
@@ -922,30 +959,46 @@ function renderInteractiveForm(item, card) {
   form.addEventListener("submit", (event) => {
     event.preventDefault();
     const answers = {};
+    const showFieldError = (binding, message) => {
+      binding.error.textContent = message;
+      binding.error.hidden = false;
+      binding.error.parentElement.classList.add("invalid");
+      const target = binding.input || binding.values[0] || binding.other;
+      target?.focus();
+    };
+    for (const binding of bindings) {
+      binding.error.hidden = true;
+      binding.error.textContent = "";
+      binding.error.parentElement.classList.remove("invalid");
+    }
     for (const binding of bindings) {
       const { question } = binding;
       if (question.inputType === "choice") {
         const values = binding.values.filter((input) => input.checked).map((input) => input.value);
         if (binding.other?.value.trim()) values.push(binding.other.value.trim());
         if (!values.length && question.required) {
-          showToast(`请回答“${question.label}”`);
+          showFieldError(binding, "请选择一个答案。");
           return;
         }
         answers[question.id] = ["claude_question", "codex_user_input"].includes(interaction.kind) ? values : values[0];
       } else if (question.inputType === "boolean") {
         if (!binding.input.value && question.required) {
-          showToast(`请回答“${question.label}”`);
+          showFieldError(binding, "请选择“是”或“否”。");
           return;
         }
         if (binding.input.value) answers[question.id] = interaction.kind === "codex_user_input" ? [binding.input.value] : binding.input.value === "true";
       } else {
         const value = binding.input.value.trim();
         if (!value && question.required) {
-          showToast(`请填写“${question.label}”`);
+          showFieldError(binding, "请输入回答。");
           return;
         }
         if (value) {
           const normalized = question.inputType === "number" ? Number(value) : value;
+          if (question.inputType === "number" && !Number.isFinite(normalized)) {
+            showFieldError(binding, "请输入有效数字。");
+            return;
+          }
           answers[question.id] = interaction.kind === "codex_user_input" ? [String(normalized)] : normalized;
         }
       }
@@ -1398,7 +1451,7 @@ function selectSession(sessionId) {
 
 async function jumpSession(session) {
   if (!session || session.jumpCapability === "unsupported") {
-    showToast("当前环境不支持跳转；ActRealm 不会假装已经定位到原对话");
+    showToast("当前环境不支持跳转；ActRealm 不会假装已定位到原对话");
     return;
   }
   try {
@@ -1422,7 +1475,7 @@ async function manageSession(session) {
       method: "POST",
       body: JSON.stringify({ action: "attach" }),
     });
-    showToast("Codex 对话已由 ActRealm app-server Connector 接管");
+    showToast("已连接 ActRealm app-server；Codex 原生窗口仍保留当前 Turn 的控制权");
     await loadSnapshot();
   } catch (error) {
     showToast(`托管连接失败：${error.detail || error.message}`);
@@ -1462,11 +1515,11 @@ async function clearSessionFromList(session) {
   if (selectedSessionId === session.id) selectedSessionId = undefined;
   await loadSnapshot().catch(() => renderSessions());
   if (failed) {
-    showToast(`任务已清除；${failed} 项仍需在待处理区或 Agent 原界面处理`);
+    showToast(`任务已清除；${failed} 项仍需在 Outbox 或 Agent 原界面处理`);
   } else if (related.length) {
     showToast(`任务已清除，并交还 ${related.length} 项待处理事项`);
   } else {
-    showToast("任务已从当前列表清除；收到新事件后会重新出现");
+    showToast("已从列表移除；有新活动时会自动恢复");
   }
 }
 
@@ -1695,7 +1748,10 @@ function quotaSlots() {
 }
 
 function quotaRenderSignature() {
-  return JSON.stringify(quotaSlots());
+  return JSON.stringify({
+    displayMode: normalizedQuotaDisplayMode(settingsState.quotaDisplayMode),
+    slots: quotaSlots(),
+  });
 }
 
 function updateQuotaTimes() {
@@ -1714,6 +1770,11 @@ function updateQuotaTimes() {
 function renderQuota() {
   lastQuotaRenderSignature = quotaRenderSignature();
   ui.quotaList.replaceChildren();
+  const displayMode = normalizedQuotaDisplayMode(settingsState.quotaDisplayMode);
+  const compact = displayMode === "twoLine";
+  const singleLine = displayMode === "compact";
+  ui.quotaList.classList.toggle("compact", compact);
+  ui.quotaList.classList.toggle("single-line", singleLine);
   if (isFirstRun()) {
     ui.quotaSyncTime.textContent = "最近同步 · 等待 Agent 接入";
     ui.quotaList.append(onboardingQuotaState());
@@ -1734,9 +1795,46 @@ function renderQuota() {
       && typeof quota.usedPct === "number"
       && typeof quota.remainingPct === "number";
     if (!hasLastValue) {
-      const unavailable = element("article", "quota-unavailable");
+      const modeClass = compact ? " compact" : singleLine ? " single-line" : "";
+      const unavailable = element("article", `quota-unavailable${modeClass}`);
       const unavailableTitle = element("div", "row-title");
       unavailableTitle.append(providerIcon(quota.provider), element("strong", "", label));
+      if (compact) {
+        unavailableTitle.append(element("span", "quota-status-chip neutral", "暂不可用"));
+        unavailable.append(unavailableTitle);
+        const detail = element("div", "quota-compact-detail unavailable");
+        detail.append(element("p", "", quota.reason || "额度来源没有返回可验证数据"));
+        if (quota.provider === "claude") {
+          const help = element("button", "quota-help", "检查设置");
+          help.type = "button";
+          help.addEventListener("click", openSettings);
+          detail.append(help);
+        }
+        unavailable.append(detail);
+        ui.quotaList.append(unavailable);
+        continue;
+      }
+      if (singleLine) {
+        unavailableTitle.append(
+          element("span", "quota-compact-status", "暂不可用"),
+          element("span", "quota-state-dot neutral"),
+        );
+        unavailable.title = quota.reason || "额度来源没有返回可验证数据";
+        if (quota.provider === "claude") {
+          unavailable.tabIndex = 0;
+          unavailable.setAttribute("role", "button");
+          unavailable.addEventListener("click", openSettings);
+          unavailable.addEventListener("keydown", (event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              openSettings();
+            }
+          });
+        }
+        unavailable.append(unavailableTitle);
+        ui.quotaList.append(unavailable);
+        continue;
+      }
       unavailable.append(unavailableTitle);
       unavailable.append(element("p", "", quota.reason || "额度来源没有返回可验证数据"));
       unavailable.append(element("div", "quota-track"));
@@ -1749,9 +1847,61 @@ function renderQuota() {
       ui.quotaList.append(unavailable);
       continue;
     }
-    const row = element("article", `quota-row${quota.status === "stale" ? " stale" : ""}`);
+    const modeClass = compact ? " compact" : singleLine ? " single-line" : "";
+    const row = element("article", `quota-row${quota.status === "stale" ? " stale" : ""}${modeClass}`);
     const title = element("div", "row-title");
     title.append(providerIcon(quota.provider), element("strong", "", label));
+    const tone = quota.status === "stale"
+      ? "warning"
+      : quota.remainingPct >= 50 ? "healthy" : quota.remainingPct >= 20 ? "warning" : "critical";
+    if (singleLine) {
+      const track = element("div", "quota-track");
+      const fill = element("div", "quota-fill");
+      fill.style.width = `${Math.max(0, Math.min(100, quota.remainingPct))}%`;
+      fill.classList.add(tone);
+      track.append(fill);
+      title.append(
+        track,
+        element("span", "section-meta", `${Math.round(quota.remainingPct)}%`),
+        element("span", `quota-state-dot ${tone}`),
+      );
+      row.append(title);
+      row.title = quota.status === "stale"
+        ? `${label} · 保留上次有效值`
+        : `${label} · 剩余 ${Math.round(quota.remainingPct)}%`;
+      ui.quotaList.append(row);
+      continue;
+    }
+    if (compact) {
+      title.append(element(
+        "span",
+        `quota-status-chip ${quota.status === "stale" ? "warning" : "healthy"}`,
+        quota.status === "stale" ? "已过期" : "可用",
+      ));
+      row.append(title);
+
+      const detail = element("div", "quota-compact-detail");
+      detail.append(element("strong", "quota-compact-remaining", `剩余 ${Math.round(quota.remainingPct)}%`));
+      const track = element("div", "quota-track");
+      const fill = element("div", "quota-fill");
+      fill.style.width = `${Math.max(0, Math.min(100, quota.remainingPct))}%`;
+      fill.classList.add(tone);
+      track.append(fill);
+      detail.append(track);
+
+      const reset = element(
+        "span",
+        "quota-compact-reset",
+        quota.status === "stale" ? "数据已过期" : "重置时间未提供",
+      );
+      if (quota.resetsAt) {
+        reset.dataset.quotaResetsAt = String(Number(quota.resetsAt) * 1000);
+      }
+      detail.append(reset);
+      row.append(detail);
+      ui.quotaList.append(row);
+      continue;
+    }
     title.append(element("span", "section-meta", `剩余 ${Math.round(quota.remainingPct)}%`));
     row.append(title);
     const track = element("div", "quota-track");
@@ -2059,25 +2209,22 @@ async function undoCommand(commandId) {
   }
 }
 
-function showToast(message) {
-  window.clearTimeout(toastTimer);
-  ui.toast.textContent = message;
-  ui.toast.hidden = false;
-  toastTimer = window.setTimeout(() => { ui.toast.hidden = true; }, 3500);
+function inferredToastPriority(message) {
+  const errorMarkers = ["失败", "无法", "不能", "未连接", "没有可用", "没有找到", "未找到", "已过期", "请输入", "仍需在"];
+  return errorMarkers.some((marker) => String(message).includes(marker)) ? 1 : 0;
 }
 
-function chooseReminder(rule, value) {
-  const control = {
-    approval: ui.notifyApproval,
-    question: ui.notifyQuestion,
-    error: ui.notifyError,
-    completion: ui.notifyCompletion,
-  }[rule];
-  if (!control) return;
-  control.value = value;
-  settingsState.notificationRules = { ...(settingsState.notificationRules || {}), [rule]: value };
-  renderSettings();
-  saveSettings();
+function showToast(message, priority = inferredToastPriority(message)) {
+  if (!ui.toast.hidden && priority < toastPriority) return;
+  window.clearTimeout(toastTimer);
+  toastPriority = priority;
+  ui.toast.textContent = message;
+  ui.toast.classList.toggle("error", priority > 0);
+  ui.toast.hidden = false;
+  toastTimer = window.setTimeout(() => {
+    ui.toast.hidden = true;
+    toastPriority = 0;
+  }, 3200);
 }
 
 function chooseRetention(value) {
@@ -2163,6 +2310,12 @@ async function waitForRuntimeRestart(previousInstanceId, restartToken) {
   throw new Error("RESTART_TIMEOUT");
 }
 
+function setRuntimeActionFeedback(message, error = false) {
+  ui.runtimeActionFeedback.textContent = message || "";
+  ui.runtimeActionFeedback.hidden = !message;
+  ui.runtimeActionFeedback.classList.toggle("error", error);
+}
+
 async function restartRuntime() {
   if (restartInProgress) return;
   const waiting = openItems().filter((item) => item.kind === "approval" || item.kind === "native_approval").length;
@@ -2170,6 +2323,7 @@ async function restartRuntime() {
   restartInProgress = true;
   ui.runtimeRestart.disabled = true;
   ui.runtimeRestart.textContent = "正在保存状态…";
+  setRuntimeActionFeedback("正在安全保存状态并重新连接 Runtime…");
   const restartToken = crypto.randomUUID();
   try {
     const previous = await readPublicHealth();
@@ -2207,13 +2361,13 @@ async function restartRuntime() {
     connectSocket();
     setConnected(true);
     await loadRuntimeMonitor();
-    showToast("Runtime 已重启 · Hook 通道与任务状态已恢复");
+    setRuntimeActionFeedback("Runtime 已重启，Hook 通道与任务状态已恢复。");
   } catch (error) {
     restartInProgress = false;
     setConnected(false);
-    showToast(error.message === "RESTART_TIMEOUT"
+    setRuntimeActionFeedback(error.message === "RESTART_TIMEOUT"
       ? "Runtime 未能自动恢复，请在终端重新运行 serve --open"
-      : `Runtime 重启失败：${error.message}`);
+      : `Runtime 重启失败：${error.message}`, true);
   } finally {
     ui.runtimeRestart.disabled = false;
     ui.runtimeRestart.textContent = "重启 Runtime";
@@ -2229,6 +2383,10 @@ ui.setupClose.addEventListener("click", closeSetup);
 ui.setupRefresh.addEventListener("click", loadSetup);
 ui.settingsTrigger.addEventListener("click", openSettings);
 ui.settingsClose.addEventListener("click", closeSettings);
+ui.settingsSaveRetry.addEventListener("click", () => {
+  if (failedSettingsDraft) saveSettings(failedSettingsDraft);
+  else loadSettings();
+});
 ui.settingsOverlay.addEventListener("click", (event) => {
   if (event.target === ui.settingsOverlay) closeSettings();
 });
@@ -2244,6 +2402,14 @@ ui.taskCardFields.addEventListener("change", () => {
   settingsState.taskCardFields = [...ui.taskCardFields.querySelectorAll("input:checked")].map((input) => input.value);
   saveSettings();
 });
+for (const button of ui.quotaDisplayOptions) {
+  button.addEventListener("click", () => {
+    settingsState.quotaDisplayMode = normalizedQuotaDisplayMode(button.dataset.value);
+    renderSettings();
+    renderQuota();
+    saveSettings();
+  });
+}
 ui.sessionDetailClose.addEventListener("click", closeSessionDetail);
 ui.sessionDetailOverlay.addEventListener("click", (event) => {
   if (event.target === ui.sessionDetailOverlay) closeSessionDetail();
@@ -2270,11 +2436,6 @@ ui.wipeCancel.addEventListener("click", cancelClearConfirmation);
 ui.wipeConfirmationInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter") clearLocalData();
 });
-for (const row of ui.reminderRows) {
-  for (const button of row.querySelectorAll("button[data-value]")) {
-    button.addEventListener("click", () => chooseReminder(row.dataset.rule, button.dataset.value));
-  }
-}
 for (const button of ui.retentionOptions) {
   button.addEventListener("click", () => chooseRetention(Number(button.dataset.value)));
 }

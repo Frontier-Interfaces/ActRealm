@@ -1979,6 +1979,7 @@ struct UiSettings {
     display_profile: String,
     task_card_fields: Vec<String>,
     display_fields_version: u32,
+    quota_display_mode: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2035,6 +2036,7 @@ impl Default for UiSettings {
                 "jump".to_owned(),
             ],
             display_fields_version: 3,
+            quota_display_mode: "standard".to_owned(),
         }
     }
 }
@@ -2059,6 +2061,12 @@ impl UiSettings {
             "concise" | "detailed" | "developer" | "custom"
         ) {
             return Err("displayProfile must be concise, detailed, developer, or custom");
+        }
+        if !matches!(
+            self.quota_display_mode.as_str(),
+            "standard" | "twoLine" | "compact"
+        ) {
+            return Err("quotaDisplayMode must be standard, twoLine, or compact");
         }
         if self.task_card_fields.len() > TASK_CARD_DISPLAY_FIELDS.len() {
             return Err("taskCardFields contains too many fields");
@@ -4193,6 +4201,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(legacy.display_profile, "detailed");
+        assert_eq!(legacy.quota_display_mode, "standard");
         assert!(legacy.task_card_fields.contains(&"activity".to_owned()));
         legacy.validate().unwrap();
 
@@ -4258,6 +4267,25 @@ mod tests {
         };
         custom.validate().unwrap();
 
+        let compact_quota = UiSettings {
+            quota_display_mode: "compact".to_owned(),
+            ..UiSettings::default()
+        };
+        compact_quota.validate().unwrap();
+        let two_line_quota = UiSettings {
+            quota_display_mode: "twoLine".to_owned(),
+            ..UiSettings::default()
+        };
+        two_line_quota.validate().unwrap();
+        let invalid_quota = UiSettings {
+            quota_display_mode: "dense".to_owned(),
+            ..UiSettings::default()
+        };
+        assert_eq!(
+            invalid_quota.validate(),
+            Err("quotaDisplayMode must be standard, twoLine, or compact")
+        );
+
         for independent_usage_field in [
             "sessionTokens",
             "turnTokens",
@@ -4277,6 +4305,7 @@ mod tests {
             .task_card_fields
             .contains(&"cost".to_owned()));
         assert_eq!(UiSettings::default().display_fields_version, 3);
+        assert_eq!(UiSettings::default().quota_display_mode, "standard");
         assert!(!UiSettings::default()
             .task_card_fields
             .contains(&"tokens".to_owned()));
@@ -4293,6 +4322,7 @@ mod tests {
         }
 
         let encoded = serde_json::to_string(&UiSettings::default()).unwrap();
+        assert!(encoded.contains(r#""quotaDisplayMode":"standard""#));
         assert!(!encoded.contains("raw"));
         assert!(!encoded.contains("payload"));
         assert!(!encoded.contains("command"));

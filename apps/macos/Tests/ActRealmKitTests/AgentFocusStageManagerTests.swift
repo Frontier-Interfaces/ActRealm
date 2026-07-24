@@ -3,6 +3,46 @@ import Testing
 @testable import ActRealmUI
 
 @Suite struct AgentFocusStageManagerTests {
+    @Test func boundWorkspacePresenceUsesTheWholeDesktopNotOnlyTheDispatchProvider() {
+        let boundApplications = [
+            ForegroundWorkspaceApp(
+                bundleIdentifier: "com.openai.chat",
+                name: "ChatGPT"
+            ),
+            ForegroundWorkspaceApp(
+                bundleIdentifier: "com.google.Chrome",
+                name: "Google Chrome"
+            ),
+        ]
+
+        #expect(ForegroundWorkspacePresence.isActive(
+            boundApplications: boundApplications,
+            visibleApplications: [
+                ForegroundWorkspaceApp(
+                    bundleIdentifier: "COM.GOOGLE.CHROME",
+                    name: "Google Chrome"
+                ),
+            ]
+        ))
+    }
+
+    @Test func boundWorkspacePresenceRejectsAnotherDesktop() {
+        #expect(!ForegroundWorkspacePresence.isActive(
+            boundApplications: [
+                ForegroundWorkspaceApp(
+                    bundleIdentifier: "com.openai.chat",
+                    name: "ChatGPT"
+                ),
+            ],
+            visibleApplications: [
+                ForegroundWorkspaceApp(
+                    bundleIdentifier: "com.apple.TextEdit",
+                    name: "TextEdit"
+                ),
+            ]
+        ))
+    }
+
     @Test func systemControllerAppliesPreferenceWithoutRestartingWindowManager() {
         final class State {
             var enabled = false

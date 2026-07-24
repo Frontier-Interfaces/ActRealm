@@ -649,6 +649,13 @@ public enum TaskCardDisplayPresets {
     ]
 }
 
+public enum QuotaDisplayMode: String, Codable, CaseIterable, Sendable {
+    case full = "standard"
+    case compact = "twoLine"
+    // Preserve the previous one-line mode's persisted raw value.
+    case singleLine = "compact"
+}
+
 public struct UISettings: Codable, Equatable, Sendable {
     public var notificationRules: NotificationRules
     public var soundEnabled: Bool
@@ -658,6 +665,7 @@ public struct UISettings: Codable, Equatable, Sendable {
     public var displayProfile: String
     public var taskCardFields: [String]
     public var displayFieldsVersion: UInt32?
+    public var quotaDisplayMode: QuotaDisplayMode
 
     public init(
         notificationRules: NotificationRules = NotificationRules(),
@@ -667,7 +675,8 @@ public struct UISettings: Codable, Equatable, Sendable {
         retentionDays: UInt32 = 90,
         displayProfile: String = "detailed",
         taskCardFields: [String] = TaskCardDisplayPresets.detailed,
-        displayFieldsVersion: UInt32? = 3
+        displayFieldsVersion: UInt32? = 3,
+        quotaDisplayMode: QuotaDisplayMode = .full
     ) {
         self.notificationRules = notificationRules
         self.soundEnabled = soundEnabled
@@ -677,9 +686,38 @@ public struct UISettings: Codable, Equatable, Sendable {
         self.displayProfile = displayProfile
         self.taskCardFields = taskCardFields
         self.displayFieldsVersion = displayFieldsVersion
+        self.quotaDisplayMode = quotaDisplayMode
     }
 
     public static let defaults = UISettings()
+
+    private enum CodingKeys: String, CodingKey {
+        case notificationRules
+        case soundEnabled
+        case providerMuted
+        case codexEnhancedActivity
+        case retentionDays
+        case displayProfile
+        case taskCardFields
+        case displayFieldsVersion
+        case quotaDisplayMode
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        notificationRules = try container.decode(NotificationRules.self, forKey: .notificationRules)
+        soundEnabled = try container.decode(Bool.self, forKey: .soundEnabled)
+        providerMuted = try container.decode(ProviderMuted.self, forKey: .providerMuted)
+        codexEnhancedActivity = try container.decode(Bool.self, forKey: .codexEnhancedActivity)
+        retentionDays = try container.decode(UInt32.self, forKey: .retentionDays)
+        displayProfile = try container.decode(String.self, forKey: .displayProfile)
+        taskCardFields = try container.decode([String].self, forKey: .taskCardFields)
+        displayFieldsVersion = try container.decodeIfPresent(UInt32.self, forKey: .displayFieldsVersion)
+        quotaDisplayMode = try container.decodeIfPresent(
+            QuotaDisplayMode.self,
+            forKey: .quotaDisplayMode
+        ) ?? .full
+    }
 }
 
 public struct DisplayField: Codable, Equatable, Sendable, Identifiable {

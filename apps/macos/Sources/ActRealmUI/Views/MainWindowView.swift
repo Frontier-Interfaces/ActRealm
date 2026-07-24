@@ -8,6 +8,29 @@ public enum MainWindowPage: Sendable, Hashable {
     case foregroundScheduling
 }
 
+struct WorkspaceColumnWidths: Equatable {
+    let outbox: CGFloat
+    let tasks: CGFloat
+    let quota: CGFloat
+}
+
+enum WorkspaceColumnLayout {
+    static let gap: CGFloat = 16
+    static let minimumQuotaWidth: CGFloat = 300
+    static let minimumOutboxWidth: CGFloat = 292
+
+    static func resolve(containerWidth: CGFloat) -> WorkspaceColumnWidths {
+        let available = max(0, containerWidth - gap * 2)
+        let quota = max(minimumQuotaWidth, available * 0.25)
+        let outbox = max(minimumOutboxWidth, available * 0.28)
+        return WorkspaceColumnWidths(
+            outbox: outbox,
+            tasks: max(0, available - outbox - quota),
+            quota: quota
+        )
+    }
+}
+
 /// Native SwiftUI reproduction of `ActRealm Interactive Demo.dc.html`.
 /// The native title bar is transparent: macOS keeps ownership of the window
 /// controls while the app header shares the same uninterrupted background.
@@ -33,18 +56,19 @@ public struct MainWindowView: View {
             Group {
                 if page == .actRealmWorkspace {
                     GeometryReader { proxy in
-                        let gap: CGFloat = 16
-                        let available = max(0, proxy.size.width - gap * 2)
+                        let columns = WorkspaceColumnLayout.resolve(
+                            containerWidth: proxy.size.width
+                        )
 
-                        HStack(spacing: gap) {
+                        HStack(spacing: WorkspaceColumnLayout.gap) {
                             OutboxSection()
-                                .frame(width: available * 0.30)
+                                .frame(width: columns.outbox)
                             AgentTasksSection(
                                 onOpenSetup: { switchPage(to: .agentSetup) }
                             )
-                                .frame(width: available * 0.48)
+                                .frame(width: columns.tasks)
                             QuotaSection()
-                                .frame(width: available * 0.22)
+                                .frame(width: columns.quota)
                         }
                     }
                     .padding(.horizontal, 16)
@@ -65,7 +89,7 @@ public struct MainWindowView: View {
             }
         }
         .frame(
-            minWidth: 1120,
+            minWidth: 1160,
             idealWidth: 1440,
             maxWidth: .infinity,
             // Fits a 600-point-tall display after macOS reserves space for
@@ -94,7 +118,7 @@ public struct MainWindowView: View {
         .modifier(WindowGlassBackground())
         .ignoresSafeArea(.container, edges: .top)
         .overlay(alignment: .bottom) {
-            if let toast = model.toastMessage {
+            if !model.isSettingsVisible, let toast = model.toastMessage {
                 StatusToast(text: toast)
                     .padding(.bottom, 20)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -204,8 +228,7 @@ private struct IntegratedWindowHeader: View {
 private struct WindowBrand: View {
     var body: some View {
         HStack(spacing: 7) {
-            LogoMark(barWidth: 3, heights: [6, 11, 8])
-                .frame(width: 14, height: 12, alignment: .bottom)
+            LogoMark(size: 19)
             Text("ActRealm")
                 .font(.system(size: 14, weight: .bold))
                 .foregroundStyle(DT.textStrong)
@@ -294,7 +317,7 @@ private struct SchedulingNavigationButton: View {
     }
 }
 
-private struct StatusToast: View {
+struct StatusToast: View {
     let text: String
 
     var body: some View {

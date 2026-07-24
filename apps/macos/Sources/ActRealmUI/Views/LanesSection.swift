@@ -6,14 +6,7 @@ struct AgentTasksSection: View {
     @Environment(\.snapshotRendering) private var snapshotRendering
     let onOpenSetup: () -> Void
 
-    private var tasks: [LaneTask] {
-        let cutoff = model.now.addingTimeInterval(-30 * 60)
-        return model.derived.agentTasks.filter { task in
-            guard !model.isTaskDismissed(task) else { return false }
-            return task.status == .running || task.status == .waiting
-                || task.hasVisibleAttention || task.lastEventAt >= cutoff
-        }
-    }
+    private var tasks: [LaneTask] { model.visibleAgentTasks }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -629,11 +622,13 @@ private struct DetailLine: View {
 
 private struct ProgressTrack: View {
     let fraction: Double
+    var color: Color = DT.blue
+
     var body: some View {
         GeometryReader { proxy in
             ZStack(alignment: .leading) {
                 Capsule().fill(DT.progressTrack)
-                Capsule().fill(DT.blue)
+                Capsule().fill(color)
                     .frame(width: proxy.size.width * max(0, min(1, fraction)))
             }
         }
@@ -798,7 +793,19 @@ private struct QuotaCard: View {
     @Environment(\.openSettings) private var openSettings
     let slot: QuotaSlot
 
+    @ViewBuilder
     var body: some View {
+        switch model.uiSettings.quotaDisplayMode {
+        case .full:
+            standardCard
+        case .compact:
+            compactCard
+        case .singleLine:
+            singleLineCard
+        }
+    }
+
+    private var standardCard: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 7) {
                 ProviderAvatar(kind: slot.slot.provider, size: 16)
@@ -826,6 +833,132 @@ private struct QuotaCard: View {
         .shadow(color: DT.softShadow, radius: 2, y: 1)
     }
 
+    private var compactCard: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 7) {
+                ProviderAvatar(kind: slot.slot.provider, size: 20)
+                Text(title)
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(DT.textPrimary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.9)
+                Spacer(minLength: 8)
+                statusChip
+            }
+
+            compactContent
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 11)
+        .frame(maxWidth: .infinity, minHeight: 84, alignment: .leading)
+        .background(cardFill, in: RoundedRectangle(cornerRadius: 13))
+        .overlay(RoundedRectangle(cornerRadius: 13).strokeBorder(DT.hairlineSoft, lineWidth: 1))
+        .shadow(color: DT.softShadow, radius: 2, y: 1)
+        .help(compactHelp)
+    }
+
+    private var singleLineCard: some View {
+        HStack(spacing: 5) {
+            ProviderAvatar(kind: slot.slot.provider, size: 18)
+
+            Text(title)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(DT.textPrimary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
+                .layoutPriority(2)
+
+            if let remaining = compactRemaining {
+                ProgressTrack(fraction: remaining / 100, color: compactTone)
+                    .frame(minWidth: 34, idealWidth: 64, maxWidth: .infinity)
+                    .frame(height: 5)
+                    .layoutPriority(1)
+
+                Text("\(Int(remaining.rounded()))%")
+                    .font(.system(size: 13.5, weight: .heavy))
+                    .foregroundStyle(remaining < 50 ? DT.amberText : DT.textPrimary)
+                    .monospacedDigit()
+                    .fixedSize(horizontal: true, vertical: false)
+                    .frame(minWidth: 34, alignment: .trailing)
+            } else {
+                Spacer(minLength: 4)
+                Text(compactStatus)
+                    .font(.system(size: 9.5, weight: .semibold))
+                    .foregroundStyle(compactTone)
+                    .lineLimit(1)
+            }
+
+            ZStack {
+                Circle()
+                    .fill(compactTone.opacity(0.14))
+                    .frame(width: 15, height: 15)
+                StatusDot(color: compactTone, size: 7, glow: compactIsAvailable)
+            }
+        }
+        .padding(.horizontal, 8)
+        .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+        .background(cardFill, in: RoundedRectangle(cornerRadius: 13))
+        .overlay(RoundedRectangle(cornerRadius: 13).strokeBorder(DT.hairlineSoft, lineWidth: 1))
+        .shadow(color: DT.softShadow, radius: 2, y: 1)
+        .help(compactHelp)
+        .accessibilityElement(children: .combine)
+    }
+
+    @ViewBuilder
+    private var compactContent: some View {
+        switch slot.availability {
+        case .available(let remaining, let resetsAt, _):
+            compactUsageRow(
+                remaining: remaining,
+                trailing: resetsAt.map(resetText) ?? "重置时间未提供"
+            )
+        case .stale(let remaining, let resetsAt, _):
+            if let remaining {
+                compactUsageRow(
+                    remaining: remaining,
+                    trailing: resetsAt.map(resetText) ?? "数据已过期"
+                )
+            } else {
+                Text("额度数据已过期")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(DT.amberText)
+                    .padding(.top, 12)
+            }
+        case .unavailable(let reason):
+            HStack(spacing: 8) {
+                Text(reason ?? "当前 Provider 版本暂不支持额度解析")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(DT.textSecondary)
+                    .lineLimit(2)
+                Spacer(minLength: 4)
+                Button("检查设置") { openSettings() }
+                    .buttonStyle(ActionButtonStyle(kind: .secondary, compact: true))
+            }
+            .padding(.top, 12)
+        }
+    }
+
+    private func compactUsageRow(remaining: Double, trailing: String) -> some View {
+        HStack(alignment: .center, spacing: 9) {
+            Text("剩余 \(Int(remaining.rounded()))%")
+                .font(.system(size: 15, weight: .heavy))
+                .foregroundStyle(remaining < 50 ? DT.amberText : DT.textPrimary)
+                .monospacedDigit()
+                .fixedSize(horizontal: true, vertical: false)
+
+            ProgressTrack(fraction: remaining / 100, color: compactTone)
+                .frame(minWidth: 48, idealWidth: 110, maxWidth: .infinity)
+                .frame(height: 5)
+
+            Text(trailing)
+                .font(.system(size: 9.5))
+                .foregroundStyle(DT.textWeak)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .padding(.top, 12)
+    }
+
     @ViewBuilder
     private var content: some View {
         switch slot.availability {
@@ -841,20 +974,12 @@ private struct QuotaCard: View {
                     .lineLimit(1)
             }
             .padding(.top, 8)
-            ProgressTrack(fraction: remaining / 100)
+            ProgressTrack(
+                fraction: remaining / 100,
+                color: remaining < 50 ? Color.orange : DT.greenDot
+            )
                 .frame(height: 5)
-                .tint(remaining < 50 ? Color.orange : DT.greenDot)
                 .padding(.top, 6)
-                .overlay {
-                    GeometryReader { proxy in
-                        HStack(spacing: 0) {
-                            Capsule().fill(remaining < 50 ? Color.orange : DT.greenDot)
-                                .frame(width: proxy.size.width * max(0, min(1, remaining / 100)))
-                            Spacer(minLength: 0)
-                        }
-                    }
-                    .padding(.top, 6)
-                }
             Text(capturedAt.map { "\(max(0, Int(model.now.timeIntervalSince($0) / 60))) 分钟前更新" } ?? "更新时间未提供")
                 .font(.system(size: 9.5))
                 .foregroundStyle(DT.textFaint)
@@ -909,6 +1034,47 @@ private struct QuotaCard: View {
     private var cardFill: Color {
         if case .unavailable = slot.availability { return DT.cardFaint }
         return DT.cardMedium
+    }
+    private var compactRemaining: Double? {
+        switch slot.availability {
+        case .available(let remaining, _, _): remaining
+        case .stale(let remaining, _, _): remaining
+        case .unavailable: nil
+        }
+    }
+    private var compactTone: Color {
+        switch slot.availability {
+        case .available(let remaining, _, _):
+            remaining < 50 ? DT.amberDot : DT.greenDot
+        case .stale:
+            DT.amberDot
+        case .unavailable:
+            DT.textFaint
+        }
+    }
+    private var compactIsAvailable: Bool {
+        if case .available = slot.availability { return true }
+        return false
+    }
+    private var compactStatus: String {
+        switch slot.availability {
+        case .available:
+            "可用"
+        case .stale:
+            "已过期"
+        case .unavailable:
+            "暂不可用"
+        }
+    }
+    private var compactHelp: String {
+        switch slot.availability {
+        case .available(let remaining, let resetsAt, _):
+            return "\(title)，剩余 \(Int(remaining.rounded()))%，\(resetsAt.map(resetText) ?? "重置时间未提供")"
+        case .stale(let remaining, _, _):
+            return "\(title)，\(remaining.map { "上次记录剩余 \(Int($0.rounded()))%" } ?? "额度数据已过期")"
+        case .unavailable(let reason):
+            return "\(title)，\(reason ?? "当前 Provider 版本暂不支持额度解析")"
+        }
     }
     private func resetText(_ date: Date) -> String {
         let base = ZhFormat.resetTime(date, now: model.now)

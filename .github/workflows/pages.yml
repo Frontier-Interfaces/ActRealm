@@ -6,6 +6,7 @@ on:
       - agent/v1-full
     paths:
       - index.html
+      - assets/**
       - CNAME
       - .github/workflows/pages.yml
   workflow_dispatch:

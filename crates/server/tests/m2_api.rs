@@ -206,6 +206,24 @@ fn embedded_ui_contract_is_bounded_honest_and_complete() {
     assert!(INDEX_HTML.contains("OUTBOX"));
     assert!(INDEX_HTML.contains("AGENT TASKS"));
     assert!(INDEX_HTML.contains("通知与数据"));
+    assert!(INDEX_HTML.contains("id=\"settings-save-feedback\""));
+    assert!(INDEX_HTML.contains("id=\"settings-save-retry\""));
+    assert!(INDEX_HTML.contains("id=\"runtime-action-feedback\""));
+    assert!(APP_JS.contains("setSettingsFeedback"));
+    assert!(APP_JS.contains("setRuntimeActionFeedback"));
+    assert!(APP_JS.contains("question-error"));
+    assert!(!APP_JS.contains("设置已保存到本机"));
+    assert!(INDEX_HTML.contains("进入 Outbox 的事件"));
+    assert!(INDEX_HTML.contains("关闭某项后，此类事件仍会保留在任务记录中"));
+    for control in [
+        "id=\"notify-approval\" type=\"checkbox\" aria-label=\"等待批准进入 Outbox\"",
+        "id=\"notify-question\" type=\"checkbox\" aria-label=\"等待回答进入 Outbox\"",
+        "id=\"notify-error\" type=\"checkbox\" aria-label=\"需要处理进入 Outbox\"",
+        "id=\"notify-completion\" type=\"checkbox\" aria-label=\"等待确认进入 Outbox\"",
+    ] {
+        assert!(INDEX_HTML.contains(control));
+    }
+    assert!(!INDEX_HTML.contains(">仅列表</button>"));
     assert!(!INDEX_HTML.contains("mac-menubar"));
     assert!(!INDEX_HTML.contains("traffic-lights"));
     let toolbar = INDEX_HTML
@@ -240,6 +258,12 @@ fn embedded_ui_contract_is_bounded_honest_and_complete() {
     assert!(!INDEX_HTML.contains('$'));
     assert!(APP_JS.contains("quotaDurationLabel"));
     assert!(APP_JS.contains("保留上次有效值"));
+    assert!(INDEX_HTML.contains("quota-display-options"));
+    assert!(APP_JS.contains("quotaDisplayMode"));
+    assert!(APP_CSS.contains(".quota-list.compact"));
+    assert!(APP_CSS.contains(".quota-list.single-line"));
+    assert!(APP_CSS.contains("minmax(300px, 25fr)"));
+    assert!(APP_JS.contains("displayMode === \"twoLine\""));
     assert!(!APP_JS.contains("Codex · 本周"));
     assert!(APP_JS.contains("额度来源没有返回可验证数据"));
     assert!(APP_JS.contains("const hasLastValue"));
