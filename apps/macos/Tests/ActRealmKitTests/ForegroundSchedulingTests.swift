@@ -61,6 +61,7 @@ import Testing
     @MainActor
     @Test func liveArrivalMovesThroughReminderOpenWaitAndReturn() {
         let model = AppModel(defaults: isolatedDefaults(), demo: true)
+        model.setAppLanguage(.simplifiedChinese)
         let start = Date(timeIntervalSince1970: 1_000)
         bindWorkspace(model)
 
@@ -116,6 +117,7 @@ import Testing
     @MainActor
     @Test func closingAgentFocusHUDCancelsTheHiddenSwitchButKeepsTheEvent() {
         let model = AppModel(defaults: isolatedDefaults(), demo: true)
+        model.setAppLanguage(.simplifiedChinese)
         bindWorkspace(model)
 
         model.receiveForegroundArrival(
@@ -158,6 +160,7 @@ import Testing
     @MainActor
     @Test func unboundWorkspaceKeepsArrivalInListAndDoesNotSuppressHUD() {
         let model = AppModel(defaults: isolatedDefaults(), demo: true)
+        model.setAppLanguage(.simplifiedChinese)
 
         model.receiveForegroundArrival(
             id: "approval-unbound",

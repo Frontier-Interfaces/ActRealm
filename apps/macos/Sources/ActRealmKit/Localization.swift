@@ -86,13 +86,14 @@ public enum AppLocalization {
     }
 
     private static func localizationBundle(identifier: String) -> Bundle? {
-        if let path = Bundle.module.path(forResource: identifier, ofType: "lproj"),
-           let bundle = Bundle(path: path) {
-            return bundle
-        }
-        if let path = Bundle.main.path(forResource: identifier, ofType: "lproj"),
-           let bundle = Bundle(path: path) {
-            return bundle
+        for container in [Bundle.module, Bundle.main] {
+            guard let resourcesURL = container.resourceURL else { continue }
+            let localizationURL = resourcesURL
+                .appendingPathComponent(identifier, isDirectory: true)
+                .appendingPathExtension("lproj")
+            if let bundle = Bundle(url: localizationURL) {
+                return bundle
+            }
         }
         return nil
     }
