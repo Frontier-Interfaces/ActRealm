@@ -29,6 +29,7 @@ public enum SettingsSection: String, CaseIterable, Hashable, Identifiable, Senda
 
 public struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.snapshotRendering) private var snapshotRendering
     @State private var selection: SettingsSection
 
     public init(initialSection: SettingsSection = .general) {
@@ -37,12 +38,16 @@ public struct SettingsView: View {
 
     public var body: some View {
         HStack(spacing: 0) {
-            List(SettingsSection.allCases, selection: $selection) { section in
-                Text(section.title)
-                    .tag(section)
+            if snapshotRendering {
+                snapshotSidebar
+            } else {
+                List(SettingsSection.allCases, selection: $selection) { section in
+                    Text(LocalizedStringKey(section.title))
+                        .tag(section)
+                }
+                .listStyle(.sidebar)
+                .frame(width: 168)
             }
-            .listStyle(.sidebar)
-            .frame(width: 168)
 
             Divider()
 
@@ -83,6 +88,26 @@ public struct SettingsView: View {
         }
     }
 
+    private var snapshotSidebar: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(SettingsSection.allCases) { section in
+                Text(LocalizedStringKey(section.title))
+                    .font(.system(size: 12.5, weight: section == selection ? .semibold : .regular))
+                    .foregroundStyle(section == selection ? Color.accentColor : Color.primary)
+                    .padding(.horizontal, 10)
+                    .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+                    .background(
+                        section == selection ? Color.accentColor.opacity(0.13) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    )
+            }
+            Spacer()
+        }
+        .padding(10)
+        .frame(width: 168)
+        .background(Color(nsColor: .underPageBackgroundColor))
+    }
+
     @ViewBuilder
     private var detail: some View {
         switch selection {
@@ -103,6 +128,7 @@ public struct SettingsView: View {
 }
 
 private struct SettingsSaveFeedback: View {
+    @Environment(\.locale) private var locale
     let message: String
     let isError: Bool
     var retry: (() -> Void)?
@@ -116,7 +142,7 @@ private struct SettingsSaveFeedback: View {
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: isError ? "exclamationmark.triangle.fill" : "info.circle.fill")
-            Text(message)
+            Text(localized(message, locale: locale))
                 .font(.system(size: 11.5, weight: .semibold))
             Spacer(minLength: 8)
             if let retry {
@@ -144,9 +170,9 @@ private struct SettingsPageHeader: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(title)
+            Text(LocalizedStringKey(title))
                 .font(.title2.weight(.bold))
-            Text(subtitle)
+            Text(LocalizedStringKey(subtitle))
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -168,9 +194,9 @@ private struct SettingsLabel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(title)
+            Text(LocalizedStringKey(title))
             if let detail {
-                Text(detail)
+                Text(LocalizedStringKey(detail))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -180,6 +206,7 @@ private struct SettingsLabel: View {
 
 private struct GeneralSettingsPage: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.locale) private var locale
     @State private var showingRuntimeMonitor = false
 
     var body: some View {
@@ -190,6 +217,26 @@ private struct GeneralSettingsPage: View {
             )
             Form {
                 Section {
+                    Picker(
+                        selection: Binding(
+                            get: { model.appLanguage },
+                            set: { model.setAppLanguage($0) }
+                        )
+                    ) {
+                        Text("跟随系统").tag(AppLanguage.system)
+                        Text("简体中文").tag(AppLanguage.simplifiedChinese)
+                        Text("English").tag(AppLanguage.english)
+                    } label: {
+                        SettingsLabel("界面语言")
+                    }
+                    .pickerStyle(.menu)
+                } header: {
+                    Text("语言")
+                } footer: {
+                    Text("系统默认会根据 macOS 首选语言选择中文或英文。")
+                }
+
+                Section {
                     LabeledContent {
                         Label(runtimeStatusTitle, systemImage: runtimeStatusSymbol)
                             .foregroundStyle(runtimeStatusColor)
@@ -198,13 +245,14 @@ private struct GeneralSettingsPage: View {
                     }
 
                     LabeledContent("最近同步") {
-                        Text(model.lastSyncAt.map(ZhFormat.syncClock) ?? "尚未同步")
+                        Text(model.lastSyncAt.map(ZhFormat.syncClock)
+                            ?? localized("尚未同步", locale: locale))
                             .foregroundStyle(.secondary)
                     }
 
                     if let message = model.runtimeActionMessage {
                         Label(
-                            message,
+                            localized(message, locale: locale),
                             systemImage: model.bridgeStatus.isListening
                                 ? "checkmark.circle.fill"
                                 : "exclamationmark.triangle.fill"
@@ -250,20 +298,24 @@ private struct GeneralSettingsPage: View {
     }
 
     private var runtimeStatusTitle: String {
-        if model.isRestartingRuntime { return "正在重启" }
-        return switch model.bridgeStatus {
+        if model.isRestartingRuntime {
+            return localized("正在重启", locale: locale)
+        }
+        let key = switch model.bridgeStatus {
         case .listening: "运行正常"
         case .starting: "正在启动"
         case .absent: "未连接"
         }
+        return localized(key, locale: locale)
     }
 
     private var runtimeStatusDetail: String {
-        switch model.bridgeStatus {
+        let key = switch model.bridgeStatus {
         case .listening: "Agent 事件与本机控制连接可用"
         case .starting: "正在等待本机服务完成启动"
         case .absent(let reason): reason ?? "本机服务暂时不可用"
         }
+        return localized(key, locale: locale)
     }
 
     private var runtimeStatusSymbol: String {
@@ -285,6 +337,7 @@ private struct GeneralSettingsPage: View {
 
 private struct AgentSettingsPage: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.locale) private var locale
 
     var body: some View {
         VStack(spacing: 0) {
@@ -337,7 +390,10 @@ private struct AgentSettingsPage: View {
                         )
                         Spacer(minLength: 12)
                         Button(
-                            model.isQuotaRefreshBusy ? "正在更新…" : "立即更新",
+                            localized(
+                                model.isQuotaRefreshBusy ? "正在更新…" : "立即更新",
+                                locale: locale
+                            ),
                             systemImage: "arrow.clockwise"
                         ) {
                             Task { await model.refreshQuotaNow() }
@@ -348,7 +404,7 @@ private struct AgentSettingsPage: View {
                         )
                     }
                     if let message = model.quotaRefreshMessage {
-                        Text(message)
+                        Text(localized(message, locale: locale))
                             .font(.caption)
                             .foregroundStyle(
                                 message.contains("失败") || message.contains("未连接")
@@ -356,7 +412,11 @@ private struct AgentSettingsPage: View {
                                     : Color.secondary
                             )
                             .textSelection(.enabled)
-                            .accessibilityLabel("额度更新结果：\(message)")
+                            .accessibilityLabel(localizedFormat(
+                                "额度更新结果：%@",
+                                locale: locale,
+                                message
+                            ))
                     }
 
                     Toggle(isOn: Binding(
@@ -420,14 +480,18 @@ private struct AgentSettingsPage: View {
         prominent: Bool = false
     ) -> some View {
         if prominent {
-            Button(label) {
+            Button {
                 Task { await model.changeSetup(provider: provider, action: action) }
+            } label: {
+                Text(LocalizedStringKey(label))
             }
             .buttonStyle(.borderedProminent)
             .disabled(!model.bridgeStatus.isListening || model.isSetupBusy)
         } else {
-            Button(label) {
+            Button {
                 Task { await model.changeSetup(provider: provider, action: action) }
+            } label: {
+                Text(LocalizedStringKey(label))
             }
             .buttonStyle(.bordered)
             .disabled(!model.bridgeStatus.isListening || model.isSetupBusy)
@@ -465,6 +529,7 @@ private struct AgentSettingsPage: View {
 
 private struct NotificationSettingsPage: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.locale) private var locale
     @State private var displayCatalogRevision = 0
 
     var body: some View {
@@ -534,13 +599,24 @@ private struct NotificationSettingsPage: View {
                     if model.hudSettings.displayMode == .selectedDisplay {
                         Picker(selection: selectedDisplayBinding) {
                             ForEach(displayOptions) { display in
-                                Text(display.isMain ? "\(display.name)（主显示器）" : display.name)
+                                Text(display.isMain
+                                    ? localizedFormat(
+                                        "%@（主显示器）",
+                                        locale: locale,
+                                        display.name
+                                    )
+                                    : display.name)
                                     .tag(display.id)
                             }
                             if let selectedID = model.hudSettings.selectedDisplayID,
                                resolvedSelectedDisplay == nil
                             {
-                                Text("\(model.hudSettings.selectedDisplayName ?? "显示器")（未连接）")
+                                Text(localizedFormat(
+                                    "%@（未连接）",
+                                    locale: locale,
+                                    model.hudSettings.selectedDisplayName
+                                        ?? localized("显示器", locale: locale)
+                                ))
                                     .tag(selectedID)
                             }
                         } label: {
@@ -644,7 +720,7 @@ private struct NotificationSettingsPage: View {
     }
 
     private var hudDisplayModeDetail: String {
-        switch model.hudSettings.displayMode {
+        let key = switch model.hudSettings.displayMode {
         case .systemMain:
             "始终显示在 macOS 当前的主显示器"
         case .selectedDisplay:
@@ -652,13 +728,14 @@ private struct NotificationSettingsPage: View {
         case .followActRealmWindow:
             "ActRealm 主窗口跨屏移动后，HUD 会同步跟随"
         }
+        return localized(key, locale: locale)
     }
 
     private var selectedDisplayDetail: String {
         guard resolvedSelectedDisplay != nil else {
-            return "所选显示器未连接时暂用系统主显示器"
+            return localized("所选显示器未连接时暂用系统主显示器", locale: locale)
         }
-        return "当前已连接"
+        return localized("当前已连接", locale: locale)
     }
 
     private var resolvedSelectedDisplay: HUDDisplayOption? {
@@ -707,7 +784,7 @@ private struct NotificationSettingsPage: View {
     }
 
     private func hudField(_ label: String, field: HUDDisplayField) -> some View {
-        Toggle(label, isOn: Binding(
+        Toggle(isOn: Binding(
             get: { model.hudSettings.fields.contains(field) },
             set: { enabled in
                 model.updateHUDSettings { settings in
@@ -718,7 +795,9 @@ private struct NotificationSettingsPage: View {
                     }
                 }
             }
-        ))
+        )) {
+            Text(LocalizedStringKey(label))
+        }
         .toggleStyle(.checkbox)
     }
 
@@ -726,6 +805,7 @@ private struct NotificationSettingsPage: View {
 
 private struct ThemeSettingsPage: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.locale) private var locale
     @State private var importError: String?
 
     var body: some View {
@@ -757,7 +837,11 @@ private struct ThemeSettingsPage: View {
                         SettingsLabel(
                             "工作区背景",
                             detail: hasCustomBackground
-                                ? "\(backgroundKindLabel)已复制到 ActRealm 的本地应用数据目录"
+                                ? localizedFormat(
+                                    "%@已复制到 ActRealm 的本地应用数据目录",
+                                    locale: locale,
+                                    backgroundKindLabel
+                                )
                                 : "正在使用默认玻璃背景"
                         )
                         Spacer()
@@ -841,24 +925,25 @@ private struct ThemeSettingsPage: View {
         ) {
             Button("好", role: .cancel) { importError = nil }
         } message: {
-            Text(importError ?? "请选择另一张图片。")
+            Text(localized(importError ?? "请选择另一张图片。", locale: locale))
         }
     }
 
     private var hasCustomBackground: Bool { model.themeBackgroundURL != nil }
 
     private var backgroundKindLabel: String {
-        switch model.themeSettings.backgroundKind {
+        let key = switch model.themeSettings.backgroundKind {
         case .image: "静态图片"
         case .animatedImage: "GIF"
         case .video: "循环视频"
         }
+        return localized(key, locale: locale)
     }
 
     private func chooseBackground() {
         let panel = NSOpenPanel()
-        panel.title = "选择 ActRealm 背景"
-        panel.prompt = "使用背景"
+        panel.title = localized("选择 ActRealm 背景", locale: locale)
+        panel.prompt = localized("使用背景", locale: locale)
         panel.allowedContentTypes = [.image, .movie]
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
@@ -908,6 +993,7 @@ private struct ThemeSettingsPage: View {
 }
 
 private struct ThemeLanePreview: View {
+    @Environment(\.locale) private var locale
     let backgroundURL: URL?
     let backgroundKind: ThemeBackgroundKind
     let laneOpacity: Double
@@ -994,12 +1080,13 @@ private struct ThemeLanePreview: View {
     }
 
     private var backgroundLabel: String {
-        guard backgroundURL != nil else { return "默认背景" }
-        switch backgroundKind {
-        case .image: return "静态图片"
-        case .animatedImage: return "GIF 循环"
-        case .video: return "视频循环 · 静音"
+        guard backgroundURL != nil else { return localized("默认背景", locale: locale) }
+        let key = switch backgroundKind {
+        case .image: "静态图片"
+        case .animatedImage: "GIF 循环"
+        case .video: "视频循环 · 静音"
         }
+        return localized(key, locale: locale)
     }
 }
 
@@ -1055,7 +1142,7 @@ private struct TaskCardFieldGuide: View {
     }
 
     private func guideChip(_ text: String) -> some View {
-        Text(text)
+        Text(LocalizedStringKey(text))
             .font(.system(size: 8.5, weight: .medium))
             .foregroundStyle(DT.textWeak)
             .padding(.horizontal, 7)
@@ -1141,10 +1228,10 @@ private struct DisplaySettingsPage: View {
                             if !fields.isEmpty {
                                 VStack(alignment: .leading, spacing: 8) {
                                     VStack(alignment: .leading, spacing: 2) {
-                                        Text(placement.title)
+                                        Text(LocalizedStringKey(placement.title))
                                             .font(.system(size: 11, weight: .semibold))
                                             .foregroundStyle(DT.textSecondary)
-                                        Text(placement.detail)
+                                        Text(LocalizedStringKey(placement.detail))
                                             .font(.system(size: 9.5))
                                             .foregroundStyle(DT.textFaint)
                                     }
@@ -1157,9 +1244,19 @@ private struct DisplaySettingsPage: View {
                                         ForEach(fields) { field in
                                             Toggle(isOn: fieldBinding(field)) {
                                                 VStack(alignment: .leading, spacing: 2) {
-                                                    Text(field.label)
+                                                    Text(AppLocalization.localizedDisplayFieldLabel(
+                                                        id: field.id,
+                                                        fallback: field.label,
+                                                        language: model.appLanguage
+                                                    ))
                                                         .font(.system(size: 11))
-                                                    if let description = field.description, !description.isEmpty {
+                                                    if let description = AppLocalization
+                                                        .localizedDisplayFieldDescription(
+                                                            id: field.id,
+                                                            fallback: field.description,
+                                                            language: model.appLanguage
+                                                        ),
+                                                       !description.isEmpty {
                                                         Text(description)
                                                             .font(.system(size: 9))
                                                             .foregroundStyle(DT.textFaint)
@@ -1354,7 +1451,7 @@ private struct DataSettingsPage: View {
         VStack(spacing: 3) {
             Text(value)
                 .font(.title3.weight(.semibold))
-            Text(label)
+            Text(LocalizedStringKey(label))
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

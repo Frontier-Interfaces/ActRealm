@@ -4,26 +4,35 @@ import SwiftUI
 struct AgentTasksSection: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.snapshotRendering) private var snapshotRendering
+    @Environment(\.locale) private var locale
     let onOpenSetup: () -> Void
 
     private var tasks: [LaneTask] { model.visibleAgentTasks }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("AGENT TASKS")
-                    .font(.system(size: 13, weight: .heavy))
-                    .kerning(0.65)
-                    .foregroundStyle(DT.textPrimary)
-                Text("正在进行的任务 · 点击展开详情")
-                    .font(.system(size: 11))
-                    .foregroundStyle(DT.textSecondary)
-                    .lineLimit(1)
-                Spacer(minLength: 8)
-                Text(summary)
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(DT.textWeak)
-                    .lineLimit(1)
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    headerTitle
+                    Text("正在进行的任务 · 点击展开详情")
+                        .font(.system(size: 11))
+                        .foregroundStyle(DT.textSecondary)
+                        .fixedSize(horizontal: true, vertical: false)
+                    Spacer(minLength: 8)
+                    Text(summary)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(DT.textWeak)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    headerTitle
+                    Spacer(minLength: 8)
+                    Text(compactSummary)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(DT.textWeak)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
             }
 
             if tasks.isEmpty {
@@ -71,12 +80,37 @@ struct AgentTasksSection: View {
         let waiting = tasks.filter { $0.status == .waiting }.count
         let running = tasks.filter { $0.status == .running }.count
         let completed = tasks.filter { $0.status == .done }.count
-        return "\(tasks.count) 个任务 · \(waiting) 等待 · \(running) 运行中 · \(completed) 已完成"
+        return localizedFormat(
+            "%lld 个任务 · %lld 等待 · %lld 运行中 · %lld 已完成",
+            locale: locale,
+            Int64(tasks.count),
+            Int64(waiting),
+            Int64(running),
+            Int64(completed)
+        )
+    }
+
+    private var compactSummary: String {
+        localizedFormat(
+            "%lld 个任务 · %lld 等待",
+            locale: locale,
+            Int64(tasks.count),
+            Int64(tasks.filter { $0.status == .waiting }.count)
+        )
+    }
+
+    private var headerTitle: some View {
+        Text("AGENT TASKS")
+            .font(.system(size: 13, weight: .heavy))
+            .kerning(0.65)
+            .foregroundStyle(DT.textPrimary)
+            .fixedSize(horizontal: true, vertical: false)
     }
 }
 
 private struct SetupDetectionState: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.locale) private var locale
 
     var body: some View {
         VStack(spacing: 9) {
@@ -87,7 +121,10 @@ private struct SetupDetectionState: View {
                     .font(.system(size: 25, weight: .light))
                     .foregroundStyle(DT.textWeak)
             }
-            Text(model.bridgeStatus.isListening ? "正在检测本机 Agent" : "正在等待 Runtime")
+            Text(localized(
+                model.bridgeStatus.isListening ? "正在检测本机 Agent" : "正在等待 Runtime",
+                locale: locale
+            ))
                 .font(.system(size: 11.5, weight: .semibold))
                 .foregroundStyle(DT.textSecondary)
             Text("接入状态确认前不会显示伪造的任务或额度")
@@ -121,6 +158,7 @@ private struct FirstRunTasksEmpty: View {
 
 private struct TaskRow: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.locale) private var locale
     let task: LaneTask
     let expanded: Bool
 
@@ -128,9 +166,11 @@ private struct TaskRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 7) {
+            HStack(alignment: .top, spacing: 7) {
                 ProviderAvatar(kind: provider, size: 20)
-                Text(fieldVisible("task") ? task.title : providerName)
+                Text(fieldVisible("task")
+                    ? task.localizedTitle(language: model.appLanguage)
+                    : providerName)
                     .font(.system(size: 12.5, weight: .bold))
                     .foregroundStyle(titleColor)
                     .lineLimit(1)
@@ -140,7 +180,11 @@ private struct TaskRow: View {
                     Text(rightStatus)
                         .font(.system(size: 10.5, weight: .semibold))
                         .foregroundStyle(rightColor)
-                        .lineLimit(1)
+                        .multilineTextAlignment(.trailing)
+                        .lineLimit(2)
+                        .frame(maxWidth: 190, alignment: .trailing)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .layoutPriority(1)
                 }
             }
 
@@ -173,12 +217,18 @@ private struct TaskRow: View {
                     .lineLimit(1)
                 }
                 if fieldVisible("plan"), let plan = task.planProgress {
-                    Text("计划 \(plan.done)/\(plan.total)")
+                    Text(localizedFormat(
+                        "计划 %lld/%lld",
+                        locale: locale,
+                        Int64(plan.done),
+                        Int64(plan.total)
+                    ))
                         .font(.system(size: 9.5))
                         .foregroundStyle(DT.textWeak)
                     ProgressTrack(fraction: Double(plan.done) / Double(plan.total))
                         .frame(width: 70, height: 4)
-                    if let activity = task.activity, activity.contains("子 Agent") {
+                    if let activity = task.localizedActivity(language: model.appLanguage),
+                       activity.contains("子 Agent") || activity.lowercased().contains("subagent") {
                         Text(activity)
                             .font(.system(size: 9.5))
                             .foregroundStyle(DT.textWeak)
@@ -189,8 +239,12 @@ private struct TaskRow: View {
                 Button("清除") { model.dismissTask(task) }
                     .buttonStyle(ClearTaskButtonStyle())
                     .help(task.openOutboxCount > 0
-                        ? "清除任务并安全交还 \(task.openOutboxCount) 项待处理事项"
-                        : "从列表中移除该任务")
+                        ? localizedFormat(
+                            "清除任务并安全交还 %lld 项待处理事项",
+                            locale: locale,
+                            Int64(task.openOutboxCount)
+                        )
+                        : localized("从列表中移除该任务", locale: locale))
             }
             .padding(.top, 3)
 
@@ -318,13 +372,13 @@ private struct TaskRow: View {
                         .foregroundStyle(DT.blueText)
                         .frame(width: 18, height: 18)
                         .background(DT.blueBg, in: Circle())
-                        .help(agent.agentType ?? "子 Agent")
+                        .help(agent.agentType ?? localized("子 Agent", locale: locale))
                 }
             }
             ForEach(task.session.subagents.prefix(6)) { agent in
                 HStack(spacing: 6) {
                     Circle().fill(DT.greenDot).frame(width: 5, height: 5)
-                    Text(agent.agentType ?? "子 Agent")
+                    Text(agent.agentType ?? localized("子 Agent", locale: locale))
                         .font(.system(size: 10.5, weight: .medium))
                         .foregroundStyle(DT.textSecondary)
                         .lineLimit(1)
@@ -344,11 +398,12 @@ private struct TaskRow: View {
     }
 
     private func subagentStatus(_ status: String) -> String {
-        switch status {
+        let key = switch status {
         case "pendingInit": "准备中"
         case "running", "started", "interacted": "运行中"
         default: status
         }
+        return localized(key, locale: locale)
     }
 
     private func planIcon(for status: String) -> String {
@@ -374,13 +429,25 @@ private struct TaskRow: View {
             || (fieldVisible("context") && task.contextUsageFraction != nil) {
             HStack(spacing: 6) {
                 if fieldVisible("sessionTokens"), let total = task.totalTokens {
-                    usageChip("累计 \(ZhFormat.tokenCount(total)) Token", tone: .neutral)
+                    usageChip(localizedFormat(
+                        "累计 %@ Token",
+                        locale: locale,
+                        ZhFormat.tokenCount(total)
+                    ), tone: .neutral)
                 }
                 if fieldVisible("context"), let fraction = task.contextUsageFraction {
-                    usageChip("上下文 \(Int((fraction * 100).rounded()))%", tone: fraction >= 0.7 ? .amber : .blue)
+                    usageChip(localizedFormat(
+                        "上下文 %lld%%",
+                        locale: locale,
+                        Int64((fraction * 100).rounded())
+                    ), tone: fraction >= 0.7 ? .amber : .blue)
                 }
                 if fieldVisible("cost"), task.estimatedCostUsdMicros != nil {
-                    usageChip("估算 API 价格 \(estimatedCostText)", tone: .blue)
+                    usageChip(localizedFormat(
+                        "估算 API 价格 %@",
+                        locale: locale,
+                        estimatedCostText
+                    ), tone: .blue)
                 }
                 Spacer(minLength: 0)
             }
@@ -419,8 +486,15 @@ private struct TaskRow: View {
     }
     private var contextIsTight: Bool { (task.contextUsageFraction ?? 0) >= 0.7 }
     private var planText: String {
-        if let plan = task.planProgress { return "\(plan.done)/\(plan.total)（进行中）" }
-        return "未提供计划事件"
+        if let plan = task.planProgress {
+            return localizedFormat(
+                "%lld/%lld（进行中）",
+                locale: locale,
+                Int64(plan.done),
+                Int64(plan.total)
+            )
+        }
+        return localized("未提供计划事件", locale: locale)
     }
     private var tokenText: String { task.totalTokens.map(ZhFormat.tokenCount) ?? "暂无数据" }
     private var tokenIsHigh: Bool { (task.totalTokens ?? 0) >= 140_000 }
@@ -433,7 +507,7 @@ private struct TaskRow: View {
             : String(format: "$%.2f", dollars)
     }
     private var recoveryText: String {
-        switch task.session.recoveryState {
+        let key = switch task.session.recoveryState {
         case "controllable": "已重新连接，可控制"
         case "observing": "仍在运行，仅可观察"
         case "waiting_for_event": "历史已恢复，等待新事件"
@@ -441,10 +515,11 @@ private struct TaskRow: View {
         case "ended": "已结束"
         default: "等待确认状态"
         }
+        return localized(key, locale: locale)
     }
     private var controlText: String {
         guard task.session.controlCapability == "managed" else {
-            return "外部 Hook，仅观察 / 授权"
+            return localized("外部 Hook，仅观察 / 授权", locale: locale)
         }
         let directRequestOpen = model.derived.openOutbox.contains {
             $0.attention.sessionId == task.id
@@ -452,16 +527,18 @@ private struct TaskRow: View {
                 && $0.attention.requestId != nil
         }
         if directRequestOpen {
-            return "托管请求已接入，可直接审批"
+            return localized("托管请求已接入，可直接审批", locale: locale)
         }
-        return model.client.snapshot.capabilities?.codexConnector?.managedApprovals == true
+        return localized(model.client.snapshot.capabilities?.codexConnector?.managedApprovals == true
             ? "app-server 已连接；原生审批仍需在 Codex 处理"
-            : "app-server 已连接；当前版本审批需原界面"
+            : "app-server 已连接；当前版本审批需原界面", locale: locale)
     }
     private var metaLine: String {
         var parts = [providerName]
         if fieldVisible("project"), let project = task.projectName, !project.isEmpty { parts.append(project) }
-        if fieldVisible("model") { parts.append(task.model ?? "模型未知") }
+        if fieldVisible("model") {
+            parts.append(task.model ?? localized("模型未知", locale: locale))
+        }
         return parts.joined(separator: " · ")
     }
     private func fieldVisible(_ field: String) -> Bool {
@@ -512,25 +589,27 @@ private struct TaskRow: View {
         return items
     }
     private var note: String {
-        switch task.status {
+        let key = switch task.status {
         case .done: "确认后归档本轮"
         case .idle: "最近没有新的活动"
         default: provider == .codex
             ? "状态粒度由当前 Hook / Connector 能力决定"
             : "只显示 Runtime 已验证的工具与计划事件"
         }
+        return localized(key, locale: locale)
     }
     private var providerName: String {
         provider.displayName
     }
     private var badge: String {
-        switch task.status {
+        let key = switch task.status {
         case .waiting: "等待"
         case .running: "运行中"
         case .failed: "出错"
         case .done: "完成"
         case .idle: "空闲"
         }
+        return localized(key, locale: locale)
     }
     private var rightStatus: String {
         switch task.status {
@@ -545,27 +624,69 @@ private struct TaskRow: View {
             case .error: verb = "需要处理"
             case nil: verb = task.session.execState == "awaiting_approval" ? "等待批准" : "等待处理"
             }
-            return "\(verb) · 已等 \(ZhFormat.waitDuration(model.now.timeIntervalSince(since)))"
+            return localizedFormat(
+                "%@ · 已等 %@",
+                locale: locale,
+                localized(verb, locale: locale),
+                ZhFormat.waitDuration(
+                    model.now.timeIntervalSince(since),
+                    language: model.appLanguage
+                )
+            )
         case .running:
-            return "\(task.activity ?? "正在运行") · \(turnTiming)"
+            let activity = task.localizedActivity(language: model.appLanguage)
+                ?? localized("运行中", locale: locale)
+            return "\(activity) · \(turnTiming)"
         case .failed:
-            return "运行失败 · \(ZhFormat.relativeAgo(model.now.timeIntervalSince(task.lastEventAt)))"
+            return localizedFormat(
+                "运行失败 · %@",
+                locale: locale,
+                ZhFormat.relativeAgo(
+                    model.now.timeIntervalSince(task.lastEventAt),
+                    language: model.appLanguage
+                )
+            )
         case .done:
-            return "本轮已完成 · \(ZhFormat.relativeAgo(model.now.timeIntervalSince(task.lastEventAt)))"
+            return localizedFormat(
+                "本轮已完成 · %@",
+                locale: locale,
+                ZhFormat.relativeAgo(
+                    model.now.timeIntervalSince(task.lastEventAt),
+                    language: model.appLanguage
+                )
+            )
         case .idle:
-            return "最近活动 · \(ZhFormat.relativeAgo(model.now.timeIntervalSince(task.lastEventAt)))"
+            return localizedFormat(
+                "最近活动 · %@",
+                locale: locale,
+                ZhFormat.relativeAgo(
+                    model.now.timeIntervalSince(task.lastEventAt),
+                    language: model.appLanguage
+                )
+            )
         }
     }
     private var turnTiming: String {
         let started = task.turnStartedAt ?? task.activitySince ?? task.lastEventAt
         let ended = task.turnEndedAt ?? model.now
-        let total = ZhFormat.waitDuration(max(0, ended.timeIntervalSince(started)))
+        let total = ZhFormat.waitDuration(
+            max(0, ended.timeIntervalSince(started)),
+            language: model.appLanguage
+        )
         if task.turnEndedAt == nil,
            let phase = task.activitySince,
            phase > started {
-            return "本轮 \(total) · 当前阶段 \(ZhFormat.waitDuration(max(0, model.now.timeIntervalSince(phase))))"
+            return localizedFormat(
+                "本轮 %@ · 当前阶段 %@",
+                locale: locale,
+                total,
+                ZhFormat.waitDuration(
+                    max(0, model.now.timeIntervalSince(phase)),
+                    language: model.appLanguage
+                )
+            )
         }
-        return "本轮 \(total)"
+        return localizedFormat("本轮 %@", locale: locale, total)
     }
     private var rightColor: Color {
         switch task.status {
@@ -603,15 +724,16 @@ private struct TaskRow: View {
 }
 
 private struct DetailLine: View {
+    @Environment(\.locale) private var locale
     let label: String
     let value: String
     var emphasized = false
 
     var body: some View {
         HStack(spacing: 10) {
-            Text(label).foregroundStyle(DT.textWeak)
+            Text(localized(label, locale: locale)).foregroundStyle(DT.textWeak)
             Spacer(minLength: 4)
-            Text(value)
+            Text(localized(value, locale: locale))
                 .fontWeight(emphasized ? .semibold : .regular)
                 .foregroundStyle(emphasized ? DT.amberText : DT.textPrimary)
                 .lineLimit(1)
@@ -712,14 +834,17 @@ struct QuotaSection: View {
         LazyVStack(spacing: 8) {
             ForEach(model.derived.quotaSlots) { slot in
                 QuotaCard(slot: slot)
+                    .frame(maxWidth: .infinity)
             }
         }
         .padding(.top, 11)
+        .frame(maxWidth: .infinity)
     }
 }
 
 private struct RuntimeLiveStatus: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.locale) private var locale
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -733,7 +858,11 @@ private struct RuntimeLiveStatus: View {
                     .font(.system(size: 10.5, weight: .semibold))
             }
 
-            Text("最近同步 · \(model.lastSyncAt.map(ZhFormat.syncClock) ?? "—")")
+            Text(localizedFormat(
+                "最近同步 · %@",
+                locale: locale,
+                model.lastSyncAt.map(ZhFormat.syncClock) ?? "—"
+            ))
                 .font(.system(size: 9.5))
                 .padding(.leading, 1)
         }
@@ -743,11 +872,12 @@ private struct RuntimeLiveStatus: View {
     }
 
     private var status: String {
-        switch model.bridgeStatus {
+        let key = switch model.bridgeStatus {
         case .listening: "Runtime · 本机在线"
         case .starting: "Runtime · 本机启动中"
         case .absent: "Runtime · 本机未连接"
         }
+        return localized(key, locale: locale)
     }
 
     private var color: Color {
@@ -791,6 +921,7 @@ private struct FirstRunQuotaState: View {
 private struct QuotaCard: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.openSettings) private var openSettings
+    @Environment(\.locale) private var locale
     let slot: QuotaSlot
 
     @ViewBuilder
@@ -841,9 +972,11 @@ private struct QuotaCard: View {
                     .font(.system(size: 12, weight: .bold))
                     .foregroundStyle(DT.textPrimary)
                     .lineLimit(1)
-                    .minimumScaleFactor(0.9)
-                Spacer(minLength: 8)
+                    .minimumScaleFactor(0.78)
+                    .layoutPriority(1)
+                Spacer(minLength: 4)
                 statusChip
+                    .fixedSize(horizontal: true, vertical: false)
             }
 
             compactContent
@@ -910,13 +1043,15 @@ private struct QuotaCard: View {
         case .available(let remaining, let resetsAt, _):
             compactUsageRow(
                 remaining: remaining,
-                trailing: resetsAt.map(resetText) ?? "重置时间未提供"
+                trailing: resetsAt.map(resetText)
+                    ?? localized("重置时间未提供", locale: locale)
             )
         case .stale(let remaining, let resetsAt, _):
             if let remaining {
                 compactUsageRow(
                     remaining: remaining,
-                    trailing: resetsAt.map(resetText) ?? "数据已过期"
+                    trailing: resetsAt.map(resetText)
+                        ?? localized("数据已过期", locale: locale)
                 )
             } else {
                 Text("额度数据已过期")
@@ -924,9 +1059,10 @@ private struct QuotaCard: View {
                     .foregroundStyle(DT.amberText)
                     .padding(.top, 12)
             }
-        case .unavailable(let reason):
+        case .unavailable:
             HStack(spacing: 8) {
-                Text(reason ?? "当前 Provider 版本暂不支持额度解析")
+                Text(slot.localizedUnavailableReason(language: model.appLanguage)
+                    ?? localized("当前 Provider 版本暂不支持额度解析", locale: locale))
                     .font(.system(size: 10.5))
                     .foregroundStyle(DT.textSecondary)
                     .lineLimit(2)
@@ -939,22 +1075,50 @@ private struct QuotaCard: View {
     }
 
     private func compactUsageRow(remaining: Double, trailing: String) -> some View {
-        HStack(alignment: .center, spacing: 9) {
-            Text("剩余 \(Int(remaining.rounded()))%")
-                .font(.system(size: 15, weight: .heavy))
-                .foregroundStyle(remaining < 50 ? DT.amberText : DT.textPrimary)
-                .monospacedDigit()
-                .fixedSize(horizontal: true, vertical: false)
+        let remainingText = localizedFormat(
+            "剩余 %lld%%",
+            locale: locale,
+            Int64(remaining.rounded())
+        )
+        return ViewThatFits(in: .horizontal) {
+            HStack(alignment: .center, spacing: 9) {
+                Text(remainingText)
+                    .font(.system(size: 15, weight: .heavy))
+                    .foregroundStyle(remaining < 50 ? DT.amberText : DT.textPrimary)
+                    .monospacedDigit()
+                    .fixedSize(horizontal: true, vertical: false)
 
-            ProgressTrack(fraction: remaining / 100, color: compactTone)
-                .frame(minWidth: 48, idealWidth: 110, maxWidth: .infinity)
-                .frame(height: 5)
+                ProgressTrack(fraction: remaining / 100, color: compactTone)
+                    .frame(minWidth: 48, idealWidth: 110, maxWidth: .infinity)
+                    .frame(height: 5)
 
-            Text(trailing)
-                .font(.system(size: 9.5))
-                .foregroundStyle(DT.textWeak)
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
+                Text(trailing)
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(DT.textWeak)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(alignment: .center, spacing: 9) {
+                    Text(remainingText)
+                        .font(.system(size: 15, weight: .heavy))
+                        .foregroundStyle(remaining < 50 ? DT.amberText : DT.textPrimary)
+                        .monospacedDigit()
+                        .fixedSize(horizontal: true, vertical: false)
+
+                    ProgressTrack(fraction: remaining / 100, color: compactTone)
+                        .frame(minWidth: 48, maxWidth: .infinity)
+                        .frame(height: 5)
+                }
+
+                Text(trailing)
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(DT.textWeak)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
         }
         .padding(.top, 12)
     }
@@ -964,11 +1128,16 @@ private struct QuotaCard: View {
         switch slot.availability {
         case .available(let remaining, let resetsAt, let capturedAt):
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("剩余 \(Int(remaining.rounded()))%")
+                Text(localizedFormat(
+                    "剩余 %lld%%",
+                    locale: locale,
+                    Int64(remaining.rounded())
+                ))
                     .font(.system(size: 16, weight: .heavy))
                     .foregroundStyle(remaining < 50 ? DT.amberText : DT.textPrimary)
                 Spacer(minLength: 2)
-                Text(resetsAt.map(resetText) ?? "重置时间未提供")
+                Text(resetsAt.map(resetText)
+                    ?? localized("重置时间未提供", locale: locale))
                     .font(.system(size: 9.5))
                     .foregroundStyle(DT.textWeak)
                     .lineLimit(1)
@@ -980,22 +1149,40 @@ private struct QuotaCard: View {
             )
                 .frame(height: 5)
                 .padding(.top, 6)
-            Text(capturedAt.map { "\(max(0, Int(model.now.timeIntervalSince($0) / 60))) 分钟前更新" } ?? "更新时间未提供")
+            Text(capturedAt.map {
+                localizedFormat(
+                    "%lld 分钟前更新",
+                    locale: locale,
+                    Int64(max(0, Int(model.now.timeIntervalSince($0) / 60)))
+                )
+            } ?? localized("更新时间未提供", locale: locale))
                 .font(.system(size: 9.5))
                 .foregroundStyle(DT.textFaint)
                 .padding(.top, 6)
         case .stale(let remaining, let resetsAt, let capturedAt):
-            Text(remaining.map { "上次记录剩余 \(Int($0.rounded()))%" } ?? "额度数据已过期")
+            Text(remaining.map {
+                localizedFormat(
+                    "上次记录剩余 %lld%%",
+                    locale: locale,
+                    Int64($0.rounded())
+                )
+            } ?? localized("额度数据已过期", locale: locale))
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(DT.amberText)
                 .padding(.top, 8)
-            Text([resetsAt.map(resetText), capturedAt.map { ZhFormat.relativeAgo(model.now.timeIntervalSince($0)) }]
+            Text([resetsAt.map(resetText), capturedAt.map {
+                ZhFormat.relativeAgo(
+                    model.now.timeIntervalSince($0),
+                    language: model.appLanguage
+                )
+            }]
                 .compactMap { $0 }.joined(separator: " · "))
                 .font(.system(size: 9.5))
                 .foregroundStyle(DT.textFaint)
                 .padding(.top, 6)
-        case .unavailable(let reason):
-            Text(reason ?? "当前 Provider 版本暂不支持额度解析")
+        case .unavailable:
+            Text(slot.localizedUnavailableReason(language: model.appLanguage)
+                ?? localized("当前 Provider 版本暂不支持额度解析", locale: locale))
                 .font(.system(size: 10.5))
                 .foregroundStyle(DT.textSecondary)
                 .lineSpacing(2)
@@ -1021,15 +1208,16 @@ private struct QuotaCard: View {
 
     private var title: String {
         let provider = slot.slot.provider == .claude ? "Claude" : "Codex"
-        return "\(provider) · \(slot.title)"
+        return "\(provider) · \(slot.localizedTitle(language: model.appLanguage))"
     }
     private var sourceLabel: String {
-        switch slot.source {
+        let key = switch slot.source {
         case "oauth_usage": "OAuth 自动同步"
         case "statusline": "Claude 对话同步"
         case "rollout_experimental": "本机 Session 同步"
         default: slot.source.replacingOccurrences(of: "_", with: " ")
         }
+        return localized(key, locale: locale)
     }
     private var cardFill: Color {
         if case .unavailable = slot.availability { return DT.cardFaint }
@@ -1057,7 +1245,7 @@ private struct QuotaCard: View {
         return false
     }
     private var compactStatus: String {
-        switch slot.availability {
+        let key = switch slot.availability {
         case .available:
             "可用"
         case .stale:
@@ -1065,19 +1253,46 @@ private struct QuotaCard: View {
         case .unavailable:
             "暂不可用"
         }
+        return localized(key, locale: locale)
     }
     private var compactHelp: String {
         switch slot.availability {
         case .available(let remaining, let resetsAt, _):
-            return "\(title)，剩余 \(Int(remaining.rounded()))%，\(resetsAt.map(resetText) ?? "重置时间未提供")"
+            return localizedFormat(
+                "%@，剩余 %lld%%，%@",
+                locale: locale,
+                title,
+                Int64(remaining.rounded()),
+                resetsAt.map(resetText)
+                    ?? localized("重置时间未提供", locale: locale)
+            )
         case .stale(let remaining, _, _):
-            return "\(title)，\(remaining.map { "上次记录剩余 \(Int($0.rounded()))%" } ?? "额度数据已过期")"
-        case .unavailable(let reason):
-            return "\(title)，\(reason ?? "当前 Provider 版本暂不支持额度解析")"
+            let status = remaining.map {
+                localizedFormat(
+                    "上次记录剩余 %lld%%",
+                    locale: locale,
+                    Int64($0.rounded())
+                )
+            } ?? localized("额度数据已过期", locale: locale)
+            return localizedFormat("%@，%@", locale: locale, title, status)
+        case .unavailable:
+            return localizedFormat(
+                "%@，%@",
+                locale: locale,
+                title,
+                slot.localizedUnavailableReason(language: model.appLanguage)
+                    ?? localized("当前 Provider 版本暂不支持额度解析", locale: locale)
+            )
         }
     }
     private func resetText(_ date: Date) -> String {
-        let base = ZhFormat.resetTime(date, now: model.now)
-        return Calendar.current.isDateInToday(date) ? "今天 \(base)" : base
+        let base = ZhFormat.resetTime(
+            date,
+            now: model.now,
+            language: model.appLanguage
+        )
+        return Calendar.current.isDateInToday(date)
+            ? localizedFormat("今天 %@", locale: locale, base)
+            : base
     }
 }

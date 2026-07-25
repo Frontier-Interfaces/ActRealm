@@ -456,6 +456,32 @@ without making the final v1 release complete.
       plan, sub-Agent, auto-review/escalation, direct question, and completion.
 - [ ] Commit and push are separately authorized by the user.
 
+### Post-M14 - macOS interface localization
+
+- [x] Settings exposes one native interface-language control with System
+      Default, Simplified Chinese, and English choices; System Default maps a
+      `zh*` macOS preferred language to Simplified Chinese and otherwise uses
+      English.
+- [x] An explicit choice is local to the macOS client, persists in
+      `UserDefaults`, and updates the main window, Settings, menu-bar popover,
+      HUD, transient notices, counts, durations, task state, and quota copy
+      without changing Runtime facts or schemas.
+- [x] Provider/user-authored prompts, command details, model names, and other
+      source content remain verbatim rather than being machine-translated.
+- [x] The package declares both localizations and includes the main
+      `en.lproj` / `zh-Hans.lproj` tables plus the Swift Package resource
+      bundle.
+- [x] The repository macOS script completes a full SwiftUI build and all 115
+      Swift tests pass, including language resolution, persistence, resource,
+      duration, and menu-bar presentation coverage.
+- [x] SnapshotTool renders 23 English and 23 Simplified Chinese artifacts;
+      deterministic review covers the main workspace, narrow quota modes,
+      Settings, Agent Focus, HUD, menu-bar popover, and Runtime monitor.
+- [ ] The packaged app's live language switch is manually accepted in both
+      languages; the local UI automation channel was unavailable for the final
+      click-through.
+- [ ] Commit and push are separately authorized by the user.
+
 ## Publishing rule
 
 Each milestone is implemented test-first. A test-candidate branch push requires

@@ -556,7 +556,7 @@ fn restart_restores_running_session_and_keeps_private_jump_locator_out_of_json()
         let before = store.snapshot().unwrap();
         assert_eq!(before.sessions[0].jump_capability, "exact_conversation");
         let serialized = serde_json::to_string(&before).unwrap();
-        assert!(serialized.contains("精确打开对话"));
+        assert!(serialized.contains("Open exact conversation"));
         assert!(!serialized.contains("private-window-id"));
         assert!(!serialized.contains("/dev/ttys999"));
         assert!(!serialized.contains("com.openai.codex"));
@@ -567,7 +567,7 @@ fn restart_restores_running_session_and_keeps_private_jump_locator_out_of_json()
     assert_eq!(session.exec_state, "thinking");
     assert_eq!(session.turn_started_at, Some(50_000));
     assert_eq!(session.jump_capability, "exact_conversation");
-    assert_eq!(session.jump_label, "精确打开对话");
+    assert_eq!(session.jump_label, "Open exact conversation");
     drop(reopened);
     fs::remove_dir_all(root).unwrap();
 }
@@ -869,7 +869,7 @@ fn codex_auto_review_is_observed_without_creating_a_competing_waiter() {
     );
     assert_eq!(
         snapshot.sessions[0].activity.as_deref(),
-        Some("Codex 正在自动审批")
+        Some("Codex is reviewing permissions automatically")
     );
     drop(store);
     fs::remove_dir_all(root).unwrap();
@@ -917,7 +917,7 @@ fn codex_noninteractive_modes_are_not_labeled_as_auto_approval() {
     {
         assert_eq!(
             session.activity.as_deref(),
-            Some("Codex 完全访问模式，无需用户审批")
+            Some("Codex full-access mode does not require user approval")
         );
     }
     assert_eq!(
@@ -926,7 +926,7 @@ fn codex_noninteractive_modes_are_not_labeled_as_auto_approval() {
             .iter()
             .find(|session| session.permission_mode.as_deref() == Some("dontAsk"))
             .and_then(|session| session.activity.as_deref()),
-        Some("Codex 非交互模式，不会请求用户审批")
+        Some("Codex non-interactive mode will not request user approval")
     );
     drop(store);
     fs::remove_dir_all(root).unwrap();
@@ -1073,7 +1073,7 @@ fn codex_request_permissions_hook_tracks_native_request_without_claiming_a_decis
     let waiting = store.snapshot().unwrap();
     assert_eq!(waiting.attention.len(), 1);
     assert_eq!(waiting.attention[0].kind, "native_approval");
-    assert_eq!(waiting.attention[0].title, "Codex 正在请求批准");
+    assert_eq!(waiting.attention[0].title, "Codex is requesting approval");
     assert_eq!(
         waiting.attention[0].detail.as_deref(),
         Some("允许本任务后续运行的终端命令访问互联网。")
@@ -1177,11 +1177,11 @@ fn codex_request_permissions_hook_tracks_native_request_without_claiming_a_decis
     assert!(handled.sessions[0]
         .activity
         .as_deref()
-        .is_some_and(|activity| activity.contains("Codex 原界面权限请求已处理")));
+        .is_some_and(|activity| activity.contains("permission request was handled in Codex")));
     assert!(!handled.sessions[0]
         .activity
         .as_deref()
-        .is_some_and(|activity| activity.contains("批准") || activity.contains("拒绝")));
+        .is_some_and(|activity| activity.contains("approved") || activity.contains("denied")));
     assert!(handled
         .attention
         .iter()
@@ -1221,10 +1221,15 @@ fn codex_plugin_install_hook_surfaces_provider_owned_attention_until_codex_advan
         .iter()
         .find(|item| item.kind == "native_approval")
         .unwrap();
-    assert_eq!(native.title, "Codex 请求安装或连接 GitHub");
+    assert_eq!(
+        native.title,
+        "Codex requests installation or connection of GitHub"
+    );
     assert_eq!(
         native.detail.as_deref(),
-        Some("GitHub 插件可连接仓库、PR 和工作流。 请回到 Codex 原界面确认或取消。")
+        Some(
+            "GitHub 插件可连接仓库、PR 和工作流。 Return to the Codex interface to confirm or cancel."
+        )
     );
     assert_eq!(native.request_id, None);
     assert_eq!(waiting.sessions[0].exec_state, "awaiting_approval");
@@ -1234,7 +1239,7 @@ fn codex_plugin_install_hook_surfaces_provider_owned_attention_until_codex_advan
     );
     assert_eq!(
         waiting.sessions[0].activity.as_deref(),
-        Some("等待你在 Codex 中确认安装或连接 GitHub")
+        Some("Waiting for you to confirm installation or connection of GitHub in Codex")
     );
     store
         .ingest(BridgeRequest::from_hook_at(
@@ -1281,12 +1286,12 @@ fn codex_plugin_install_hook_surfaces_provider_owned_attention_until_codex_advan
     assert_eq!(handled.sessions[0].approval_owner, None);
     assert_eq!(
         handled.sessions[0].activity.as_deref(),
-        Some("Codex 原界面请求已处理，继续运行")
+        Some("The request was handled in Codex; continuing")
     );
     assert!(!handled.sessions[0]
         .activity
         .as_deref()
-        .is_some_and(|activity| activity.contains("批准") || activity.contains("拒绝")));
+        .is_some_and(|activity| activity.contains("approved") || activity.contains("denied")));
     assert!(handled.attention.iter().any(|item| {
         item.kind == "native_approval"
             && item.state == "resolved"
@@ -1370,7 +1375,10 @@ fn restart_expires_every_approval_without_a_live_waiter() {
         session.exec_state == "waiting_for_event" && session.approval_owner.is_none()
     }));
     assert!(recovered.sessions.iter().all(|session| {
-        session.activity.as_deref() == Some("Runtime 已重启，旧回复通道失效；等待 Agent 新事件")
+        session.activity.as_deref()
+            == Some(
+                "Runtime restarted and the old reply channel expired; waiting for a new Agent event"
+            )
     }));
     drop(reopened);
     fs::remove_dir_all(root).unwrap();
@@ -1761,7 +1769,7 @@ fn claude_task_progress_uses_only_stable_task_ids_and_never_invents_a_percentage
         .unwrap();
     let created = store.snapshot().unwrap().sessions.remove(0);
     assert_eq!((created.plan_done, created.plan_total), (Some(0), Some(2)));
-    assert_eq!(created.activity.as_deref(), Some("计划进度 0/2"));
+    assert_eq!(created.activity.as_deref(), Some("Plan progress 0/2"));
 
     store
         .ingest(event("TaskCompleted", Some("task-1"), 1_003))
@@ -1788,7 +1796,7 @@ fn claude_task_progress_uses_only_stable_task_ids_and_never_invents_a_percentage
         (completed.plan_done, completed.plan_total),
         (Some(2), Some(2))
     );
-    assert_eq!(completed.activity.as_deref(), Some("计划进度 2/2"));
+    assert_eq!(completed.activity.as_deref(), Some("Plan progress 2/2"));
     drop(store);
     fs::remove_dir_all(root).unwrap();
 }
@@ -1820,14 +1828,14 @@ fn subagent_counts_and_background_stop_state_are_fact_based() {
         .unwrap();
     assert_eq!(
         store.snapshot().unwrap().sessions[0].activity.as_deref(),
-        Some("派了 2 个子 Agent")
+        Some("2 subagents running")
     );
     store
         .ingest(subagent("SubagentStop", Some("agent-1"), 2_003))
         .unwrap();
     assert_eq!(
         store.snapshot().unwrap().sessions[0].activity.as_deref(),
-        Some("派了 1 个子 Agent")
+        Some("1 subagents running")
     );
 
     let tool = BridgeRequest::from_hook_at(
@@ -1861,7 +1869,10 @@ fn subagent_counts_and_background_stop_state_are_fact_based() {
         .find(|session| session.provider_session_id == "background-session")
         .unwrap();
     assert_eq!(background.exec_state, "tool_running");
-    assert_eq!(background.activity.as_deref(), Some("后台任务仍在运行 · 1"));
+    assert_eq!(
+        background.activity.as_deref(),
+        Some("1 background tasks still running")
+    );
     assert!(snapshot
         .attention
         .iter()
@@ -2155,7 +2166,7 @@ fn provider_handled_approval_resolves_attention_and_session_waiting_state() {
     assert!(waiting.attention[0]
         .detail
         .as_deref()
-        .is_some_and(|detail| detail.contains("终端命令")));
+        .is_some_and(|detail| detail.contains("terminal command")));
 
     store
         .ingest(request_at(
@@ -2287,7 +2298,7 @@ fn successful_turn_without_write_tools_still_creates_completion_attention() {
         .find(|item| item.kind == "completion")
         .unwrap();
     assert_eq!(completion.state, "open");
-    assert_eq!(completion.title, "任务已完成，等你确认");
+    assert_eq!(completion.title, "Task completed; waiting for confirmation");
     drop(store);
     fs::remove_dir_all(root).unwrap();
 }
@@ -2311,7 +2322,10 @@ fn lifecycle_replay_does_not_create_a_task_completion_or_meaningful_activity() {
     let snapshot = store.snapshot().unwrap();
     assert!(snapshot.attention.is_empty());
     assert_eq!(snapshot.sessions[0].last_meaningful_activity_at, None);
-    assert_eq!(snapshot.sessions[0].activity.as_deref(), Some("会话已结束"));
+    assert_eq!(
+        snapshot.sessions[0].activity.as_deref(),
+        Some("Session ended")
+    );
     drop(store);
     fs::remove_dir_all(root).unwrap();
 }

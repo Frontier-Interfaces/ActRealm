@@ -136,6 +136,7 @@ public final class ForegroundSchedulingController: ObservableObject {
     @Published private(set) var selectedWorkspaceDisplayID: UInt32?
 
     private let model: AppModel
+    fileprivate var appLocale: Locale { model.interfaceLocale }
     private var cancellables: Set<AnyCancellable> = []
     private var lastHandledPhase: ForegroundDispatchPhase?
     private var lastHandledID: String?
@@ -281,7 +282,10 @@ public final class ForegroundSchedulingController: ObservableObject {
     private func activateAgent(for provider: ProviderKind?, reportFailure: Bool = true) -> Bool {
         guard let target = agentTarget(for: provider) else {
             if reportFailure {
-                model.showToast("未找到对应 Agent 窗口；事件仍保留在 ActRealm")
+                model.showToast(AppLocalization.localized(
+                    "未找到对应 Agent 窗口；事件仍保留在 ActRealm",
+                    language: model.appLanguage
+                ))
             }
             refreshWorkspaceStatus()
             return false
@@ -414,7 +418,10 @@ public final class ForegroundSchedulingController: ObservableObject {
             enableSucceeded: enabled
         )
         if originalState == nil || (originalState == false && !enabled) {
-            model.showToast("无法更改 macOS 台前调度；仍继续聚焦 Agent")
+            model.showToast(AppLocalization.localized(
+                "无法更改 macOS 台前调度；仍继续聚焦 Agent",
+                language: model.appLanguage
+            ))
         }
     }
 
@@ -423,7 +430,10 @@ public final class ForegroundSchedulingController: ObservableObject {
         let restored = stageManagerController.setEnabled(false)
         stageManagerLease.finishRestore(succeeded: restored)
         if !restored {
-            model.showToast("无法恢复台前调度进入前状态，请在控制中心检查")
+            model.showToast(AppLocalization.localized(
+                "无法恢复台前调度进入前状态，请在控制中心检查",
+                language: model.appLanguage
+            ))
         }
     }
 
@@ -456,7 +466,10 @@ public final class ForegroundSchedulingController: ObservableObject {
             backing: .buffered,
             defer: true
         )
-        panel.title = "选择 Agent 绑定工作区"
+        panel.title = AppLocalization.localized(
+            "选择 Agent 绑定工作区",
+            language: model.appLanguage
+        )
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.hidesOnDeactivate = false
@@ -465,7 +478,8 @@ public final class ForegroundSchedulingController: ObservableObject {
             controller: self,
             onConfirm: { [weak self] in self?.confirmWorkspaceSelection() },
             onCancel: { [weak self] in self?.model.cancelForegroundWorkspaceSelection() }
-        ))
+        )
+        .environment(\.locale, model.interfaceLocale))
         workspaceSelectionPanel = panel
         return panel
     }
@@ -635,7 +649,14 @@ private struct WorkspaceSelectionPanelView: View {
                     set: { controller.selectWorkspaceDisplay($0) }
                 )) {
                     ForEach(controller.availableWorkspaceDisplays) { display in
-                        Text(display.label).tag(display.id)
+                        Text(display.isPrimary
+                            ? localizedFormat(
+                                "%@（主显示器）",
+                                locale: controller.appLocale,
+                                display.name
+                            )
+                            : display.name)
+                            .tag(display.id)
                     }
                 }
                 .pickerStyle(.menu)
@@ -677,5 +698,6 @@ private struct WorkspaceSelectionPanelView: View {
         }
         .padding(22)
         .frame(width: 540, height: 330)
+        .environment(\.locale, controller.appLocale)
     }
 }

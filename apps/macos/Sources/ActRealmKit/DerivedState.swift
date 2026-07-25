@@ -162,6 +162,97 @@ public struct OutboxEntry: Identifiable, Equatable, Sendable {
         attention.riskNotes.first
     }
 
+    public func localizedRiskReason(language: AppLanguage) -> String? {
+        guard let fallback = attention.riskNotes.first else { return nil }
+        return AppLocalization.localizedRuntimeMessage(
+            attention.riskMessages?.first,
+            fallback: fallback,
+            language: language
+        )
+    }
+
+    public func localizedDetail(language: AppLanguage) -> String? {
+        guard let fallback = attention.detail else { return nil }
+        return AppLocalization.localizedRuntimeMessage(
+            attention.detailMessage,
+            fallback: fallback,
+            language: language
+        )
+    }
+
+    public var actionTitleMessage: RuntimeMessage {
+        if let titleMessage = attention.titleMessage {
+            return titleMessage
+        }
+        let providerName = provider?.displayName ?? attention.provider
+        return switch kind {
+        case .approval:
+            RuntimeMessage(code: "attention.approval.title")
+        case .nativeApproval:
+            RuntimeMessage(
+                code: "attention.native_approval.title",
+                args: ["provider": providerName]
+            )
+        case .question:
+            RuntimeMessage(
+                code: "attention.question.title",
+                args: ["provider": providerName]
+            )
+        case .error:
+            RuntimeMessage(code: "attention.error.title")
+        case .completion:
+            RuntimeMessage(code: "attention.completion.title")
+        }
+    }
+
+    public func localizedActionTitle(language: AppLanguage) -> String {
+        let providerName = provider?.displayName ?? attention.provider
+        switch kind {
+        case .approval:
+            if let toolName {
+                return AppLocalization.formatted(
+                    "%@ 请求运行 %@，等待批准",
+                    providerName,
+                    toolName,
+                    language: language
+                )
+            }
+            return AppLocalization.formatted(
+                "%@ 请求一次操作，等待批准",
+                providerName,
+                language: language
+            )
+        case .nativeApproval:
+            return AppLocalization.localizedRuntimeMessage(
+                actionTitleMessage,
+                fallback: attention.title.isEmpty
+                    ? "\(providerName) 等待在原界面批准"
+                    : attention.title,
+                language: language
+            )
+        case .question:
+            return AppLocalization.localizedRuntimeMessage(
+                actionTitleMessage,
+                fallback: "\(providerName) 发出一个待回答问题",
+                language: language
+            )
+        case .error:
+            return AppLocalization.localizedRuntimeMessage(
+                actionTitleMessage,
+                fallback: "任务运行失败，需要检查",
+                language: language
+            )
+        case .completion:
+            return AppLocalization.localizedRuntimeMessage(
+                actionTitleMessage,
+                fallback: attention.title.isEmpty
+                    ? "本轮修改已完成，等待确认。"
+                    : attention.title,
+                language: language
+            )
+        }
+    }
+
     init(attention: AttentionRecord, sessionTitle: String?) {
         self.attention = attention
         self.kind = OutboxKind(record: attention.kind)
@@ -172,8 +263,8 @@ public struct OutboxEntry: Identifiable, Equatable, Sendable {
 
         let providerName = ProviderKind(record: attention.provider)?.displayName ?? attention.provider
         var tool: String?
-        if attention.title.hasPrefix("允许 ") {
-            let stripped = attention.title.dropFirst("允许 ".count)
+        if let prefix = ["允许 ", "Allow "].first(where: { attention.title.hasPrefix($0) }) {
+            let stripped = attention.title.dropFirst(prefix.count)
             if let mark = stripped.firstIndex(where: { $0 == "？" || $0 == "?" }) {
                 let candidate = String(stripped[..<mark]).trimmingCharacters(in: .whitespaces)
                 if !candidate.isEmpty { tool = candidate }
@@ -287,6 +378,22 @@ public struct LaneTask: Identifiable, Equatable, Sendable {
     public var turnStartedAt: Date? { session.turnStartedAt.map(ZhFormat.date(fromMillis:)) }
     public var turnEndedAt: Date? { session.turnEndedAt.map(ZhFormat.date(fromMillis:)) }
 
+    public func localizedTitle(language: AppLanguage) -> String {
+        // Runtime status belongs in `activityMessage`. A task title may be
+        // authored by the user or Provider and must remain verbatim even when
+        // it happens to resemble a known status phrase.
+        title
+    }
+
+    public func localizedActivity(language: AppLanguage) -> String? {
+        guard let activity else { return nil }
+        return AppLocalization.localizedRuntimeMessage(
+            session.activityMessage,
+            fallback: activity,
+            language: language
+        )
+    }
+
     public var planProgress: (done: Int, total: Int)? {
         guard let done = session.planDone, let total = session.planTotal, total > 0 else { return nil }
         return (Int(done), Int(total))
@@ -387,6 +494,8 @@ public struct QuotaSlot: Identifiable, Equatable, Sendable {
 
     public let slot: QuotaSlotID
     public let title: String
+    public let titleMessage: RuntimeMessage?
+    public let reasonMessage: RuntimeMessage?
     public let source: String
     public let planType: String?
     public let windowMinutes: UInt64?
@@ -400,9 +509,28 @@ public struct QuotaSlot: Identifiable, Equatable, Sendable {
         return false
     }
 
+    public func localizedTitle(language: AppLanguage) -> String {
+        AppLocalization.localizedRuntimeMessage(
+            titleMessage,
+            fallback: title,
+            language: language
+        )
+    }
+
+    public func localizedUnavailableReason(language: AppLanguage) -> String? {
+        guard case .unavailable(let reason) = availability, let reason else { return nil }
+        return AppLocalization.localizedRuntimeMessage(
+            reasonMessage,
+            fallback: reason,
+            language: language
+        )
+    }
+
     init(entry: QuotaEntry, index: Int) {
         self.slot = QuotaSlotID.make(entry: entry, index: index)
         self.title = Self.windowTitle(entry)
+        self.titleMessage = entry.windowMessage
+        self.reasonMessage = entry.reasonMessage
         self.source = entry.source
         self.planType = entry.planType
         self.windowMinutes = entry.windowMinutes
@@ -432,16 +560,16 @@ public struct QuotaSlot: Identifiable, Equatable, Sendable {
     private static func windowTitle(_ entry: QuotaEntry) -> String {
         if let name = entry.limitName, !name.isEmpty { return name }
         if let minutes = entry.windowMinutes, minutes > 0 {
-            if minutes.isMultiple(of: 43_200) { return "\(minutes / 43_200) 个月" }
-            if minutes.isMultiple(of: 10_080) { return "\(minutes / 10_080) 周" }
-            if minutes.isMultiple(of: 1_440) { return "\(minutes / 1_440) 天" }
-            if minutes.isMultiple(of: 60) { return "\(minutes / 60) 小时" }
-            return "\(minutes) 分钟"
+            if minutes.isMultiple(of: 43_200) { return "\(minutes / 43_200) months" }
+            if minutes.isMultiple(of: 10_080) { return "\(minutes / 10_080) weeks" }
+            if minutes.isMultiple(of: 1_440) { return "\(minutes / 1_440) days" }
+            if minutes.isMultiple(of: 60) { return "\(minutes / 60) hours" }
+            return "\(minutes) minutes"
         }
         switch entry.window {
-        case "5h": return "5 小时"
-        case "7d": return "7 天"
-        case "week": return "本周"
+        case "5h": return "5 hours"
+        case "7d": return "7 days"
+        case "week": return "This week"
         default: return entry.window.replacingOccurrences(of: "_", with: " ")
         }
     }
@@ -467,6 +595,10 @@ public struct PendingDecision: Identifiable, Equatable, Sendable {
     public let createdAt: Date
 
     public var id: UUID { commandId }
+
+    public func localizedSummary(language: AppLanguage) -> String {
+        AppLocalization.localizedProviderText(summary, language: language)
+    }
 }
 
 // MARK: - Derived state

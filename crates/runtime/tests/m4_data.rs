@@ -171,5 +171,5 @@ fn interactive_question_schema_and_secret_answers_never_enter_persistent_export(
     assert!(!encoded.contains("private form prompt 347819"));
     assert!(!encoded.contains("secret field description 347819"));
     assert!(!encoded.contains("requested_schema"));
-    assert!(encoded.contains("Claude 需要补充信息"));
+    assert!(encoded.contains("Claude needs more information"));
 }

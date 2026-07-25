@@ -62,6 +62,9 @@ fn spawn_provider_hook_with_timeout(
     payload: &Value,
     timeout_ms: u64,
 ) -> Child {
+    let isolated_home = socket
+        .parent()
+        .expect("integration test socket must have a parent directory");
     let mut child = Command::new(env!("CARGO_BIN_EXE_actrealm"))
         .args([
             "hook",
@@ -70,6 +73,7 @@ fn spawn_provider_hook_with_timeout(
             "--socket",
             socket.to_str().unwrap(),
         ])
+        .env("ACTREALM_HOME", isolated_home)
         .env("ACTREALM_HOOK_REPLY_TIMEOUT_MS", timeout_ms.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

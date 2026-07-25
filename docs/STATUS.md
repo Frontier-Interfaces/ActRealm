@@ -1,16 +1,14 @@
 # ActRealm current status
 
-Last reviewed: 2026-07-23
+Last reviewed: 2026-07-25
 
-Source branch: `agent/v1-full`
+Source branch: `agent/runtime-client-localization-hardening`
 
-Current functional baseline: M15 plus the post-M14 live-state and controlled
-Runtime-recovery refinements on `agent/v1-full`. A subsequent usage/OAuth
-hardening candidate has passed its automated/resource gates and awaits exact
-local installation and user acceptance. The first-run/setup-center candidate
-has passed visual acceptance and its original exact-helper installation. The
-company-branch Codex internal-session filter is now merged locally, with the
-schema 9 synchronized tree passing its Rust and resource gates.
+Current functional baseline: the macOS/Web localization and Runtime
+status-code candidate based on tagged commit
+`0.1.0-early-preview.1` (`a93e01e`). It includes M15 plus the post-M14
+live-state, Runtime-recovery, usage/OAuth, setup-center, internal-session,
+native/Web parity, and Provider-lifecycle work recorded below.
 
 This file is the short, current source of truth. The
 [implementation plan](WIDGET_V1_PLAN.md),
@@ -105,14 +103,26 @@ provide the detailed requirements and evidence.
   dynamic lane instead of being dropped. Full Rust, release, language, and
   macOS gates pass; fresh real-Provider visual acceptance remains pending. See the
   [verification record](POST_M14_PROVIDER_LIFECYCLE_PROJECTION.md).
-- **Latest synchronized-tree gates:** 177 Rust tests passed, with three
+- **Post-M14 macOS localization candidate:** the native app now follows the
+  first macOS preferred language by default and offers local overrides for
+  Simplified Chinese and English. The main window, Settings, menu-bar popover,
+  HUD, generated status text, counts, durations, and quota presentation switch
+  without changing Runtime facts or Provider-authored content. Runtime-owned
+  generated presentation now uses stable codes with English compatibility
+  text, while API errors and display-field labels are rendered by each
+  client. The complete SwiftUI build and all 115 macOS tests pass; 23 English
+  and 23 Simplified Chinese deterministic snapshots pass visual review. Live
+  in-app language-switch acceptance remains pending because the local UI
+  automation channel was unavailable. See the
+  [verification record](POST_M14_MACOS_LOCALIZATION.md).
+- **Latest synchronized-tree gates:** 199 Rust tests passed, with three
   explicitly manual/resource tests ignored in the ordinary workspace run;
   zero-warning Clippy, format, JavaScript syntax, release build, language
-  contract, focused schema-9 regression, and the explicit two-minute resource
-  gate passed. The resource sample recorded 0.000% average idle CPU and 6,272
-  KiB maximum Runtime RSS. The current macOS Swift rerun was blocked before any
-  test assertion by SwiftPM `sandbox_apply: Operation not permitted`; the prior
-  30-test result is not represented as a test of this synchronized tree.
+  contract, M0 end-to-end path, and the explicit two-minute resource gate
+  passed. The resource sample recorded 0.003% average idle CPU and 7,024 KiB
+  maximum Runtime RSS across 118 samples. The exact ad-hoc package launched
+  its arm64 App and bundled Helper, owned the live Runtime lock, passed deep
+  code-sign verification, and returned `overall: pass` from `doctor --json`.
 - **M13 real-Provider acceptance:** still pending. The milestone was committed
   and pushed at the user's direction before this final manual confirmation.
 - **Final v1 release:** not yet declared. The required continuous 48-hour
@@ -149,6 +159,7 @@ provide the detailed requirements and evidence.
 | Post-M14 | Codex internal-session filtering | Synchronized Rust/resource gates pass; latest installation and macOS Swift rerun pending | [verification](POST_M14_CODEX_INTERNAL_SESSION_FILTERING.md) |
 | Post-M14 | macOS/Web feature parity | Native source and focused Kit tests complete; full SwiftUI build and visual/real-Provider acceptance pending | [verification](POST_M14_MACOS_WEB_PARITY.md) |
 | Post-M14 | Provider lifecycle projection | Full automated/release/macOS gates pass; real Claude/Codex visual acceptance pending | [verification](POST_M14_PROVIDER_LIFECYCLE_PROJECTION.md) |
+| Post-M14 | macOS interface localization | Full SwiftUI build, 115 tests, and 23×2 deterministic snapshots pass; live in-app switch acceptance pending | [verification](POST_M14_MACOS_LOCALIZATION.md) |
 
 M5 is a release-qualification track, not the chronological end of feature
 development. Later functional milestones may be implemented while M5's

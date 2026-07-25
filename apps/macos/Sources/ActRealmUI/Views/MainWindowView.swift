@@ -17,11 +17,19 @@ struct WorkspaceColumnWidths: Equatable {
 enum WorkspaceColumnLayout {
     static let gap: CGFloat = 16
     static let minimumQuotaWidth: CGFloat = 300
+    static let minimumEnglishQuotaWidth: CGFloat = 360
     static let minimumOutboxWidth: CGFloat = 292
 
-    static func resolve(containerWidth: CGFloat) -> WorkspaceColumnWidths {
+    static func resolve(
+        containerWidth: CGFloat,
+        language: AppLanguage = .simplifiedChinese
+    ) -> WorkspaceColumnWidths {
         let available = max(0, containerWidth - gap * 2)
-        let quota = max(minimumQuotaWidth, available * 0.25)
+        let resolvedLanguage = AppLanguage.resolvedIdentifier(selection: language)
+        let quotaMinimum = resolvedLanguage == AppLanguage.english.rawValue
+            ? minimumEnglishQuotaWidth
+            : minimumQuotaWidth
+        let quota = max(quotaMinimum, available * 0.25)
         let outbox = max(minimumOutboxWidth, available * 0.28)
         return WorkspaceColumnWidths(
             outbox: outbox,
@@ -57,7 +65,8 @@ public struct MainWindowView: View {
                 if page == .actRealmWorkspace {
                     GeometryReader { proxy in
                         let columns = WorkspaceColumnLayout.resolve(
-                            containerWidth: proxy.size.width
+                            containerWidth: proxy.size.width,
+                            language: model.appLanguage
                         )
 
                         HStack(spacing: WorkspaceColumnLayout.gap) {
@@ -146,6 +155,7 @@ public struct MainWindowView: View {
 
 private struct IntegratedWindowHeader: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.locale) private var locale
     let page: MainWindowPage
     let openWorkspace: () -> Void
     let openSetup: () -> Void
@@ -171,7 +181,7 @@ private struct IntegratedWindowHeader: View {
                         .overlay(Capsule().strokeBorder(DT.neutralBadgeStroke, lineWidth: 1))
                 }
                 .buttonStyle(.plain)
-                .help("返回 ActRealm 工作区")
+                .help(localized("返回 ActRealm 工作区", locale: locale))
             }
 
             SchedulingNavigationButton(
@@ -190,7 +200,7 @@ private struct IntegratedWindowHeader: View {
             }
             .buttonStyle(.plain)
             .focusable(false)
-            .help("打开 ActRealm 设置")
+            .help(localized("打开 ActRealm 设置", locale: locale))
 
             if !model.bridgeStatus.isListening {
                 Button(action: openSettings) {
@@ -203,7 +213,7 @@ private struct IntegratedWindowHeader: View {
                         .overlay(Capsule().strokeBorder(DT.redStroke, lineWidth: 1))
                 }
                 .buttonStyle(.plain)
-                .help("打开设置检查本机服务")
+                .help(localized("打开设置检查本机服务", locale: locale))
             }
         }
         .padding(.leading, 82)
@@ -217,11 +227,12 @@ private struct IntegratedWindowHeader: View {
     }
 
     private var runtimeIssueLabel: String {
-        switch model.bridgeStatus {
+        let key = switch model.bridgeStatus {
         case .starting: "服务启动中"
         case .absent: "服务未连接"
         case .listening: ""
         }
+        return localized(key, locale: locale)
     }
 }
 
@@ -240,6 +251,7 @@ private struct WindowBrand: View {
 
 private struct AgentConnectionButton: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.locale) private var locale
     let action: () -> Void
 
     var body: some View {
@@ -256,18 +268,27 @@ private struct AgentConnectionButton: View {
             .overlay(Capsule().strokeBorder(stroke, lineWidth: 1))
         }
         .buttonStyle(.plain)
-        .help("打开 Agent 接入中心")
+        .help(localized("打开 Agent 接入中心", locale: locale))
     }
 
     private var label: String {
-        guard model.setupInfo != nil else { return "正在检测 Agent" }
-        if model.isFirstRun { return "未连接 Agent" }
+        guard model.setupInfo != nil else { return localized("正在检测 Agent", locale: locale) }
+        if model.isFirstRun { return localized("未连接 Agent", locale: locale) }
         if model.pendingAgentSetupCount > 0 {
             return model.connectedAgentCount > 0
-                ? "\(model.connectedAgentCount) 个已接入 · \(model.pendingAgentSetupCount) 待处理"
-                : "\(model.pendingAgentSetupCount) 项接入待处理"
+                ? localizedFormat(
+                    "%lld 个已接入 · %lld 待处理",
+                    locale: locale,
+                    Int64(model.connectedAgentCount),
+                    Int64(model.pendingAgentSetupCount)
+                )
+                : localizedFormat(
+                    "%lld 项接入待处理",
+                    locale: locale,
+                    Int64(model.pendingAgentSetupCount)
+                )
         }
-        return "管理 Agent"
+        return localized("管理 Agent", locale: locale)
     }
 
     private var color: Color {
@@ -289,6 +310,7 @@ private struct AgentConnectionButton: View {
 }
 
 private struct SchedulingNavigationButton: View {
+    @Environment(\.locale) private var locale
     let selected: Bool
     let action: () -> Void
 
@@ -313,15 +335,19 @@ private struct SchedulingNavigationButton: View {
         }
         .buttonStyle(.plain)
         .focusable(false)
-        .help(selected ? "当前正在查看智能聚焦（Agent Focus）" : "打开智能聚焦（Agent Focus）")
+        .help(localized(
+            selected ? "当前正在查看智能聚焦（Agent Focus）" : "打开智能聚焦（Agent Focus）",
+            locale: locale
+        ))
     }
 }
 
 struct StatusToast: View {
+    @Environment(\.locale) private var locale
     let text: String
 
     var body: some View {
-        Text(text)
+        Text(localized(text, locale: locale))
             .font(.system(size: 11.5, weight: .semibold))
             .foregroundStyle(Color.white.opacity(0.92))
             .padding(.horizontal, 16)

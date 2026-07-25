@@ -76,6 +76,11 @@ if [[ ! -x "$SWIFT_BIN" ]]; then
   SWIFT_BIN="$(find "$PACKAGE_DIR/.build" -type f -name ActRealmApp -perm +111 2>/dev/null | grep -i "$SWIFT_CONFIGURATION" | head -1)"
 fi
 [[ -x "$SWIFT_BIN" ]] || { echo "error: built ActRealmApp binary not found" >&2; exit 1; }
+SWIFT_RESOURCE_BUNDLE="${SWIFT_BIN:h}/ActRealmMac_ActRealmKit.bundle"
+[[ -d "$SWIFT_RESOURCE_BUNDLE" ]] || {
+  echo "error: built localization resource bundle not found at $SWIFT_RESOURCE_BUNDLE" >&2
+  exit 1
+}
 
 echo "==> Assembling $APP"
 rm -rf "$APP"
@@ -87,6 +92,10 @@ cp "$RUST_REPO/target/release/actrealm" "$APP/Contents/Helpers/actrealm"
 cp "$INFO_PLIST" "$APP/Contents/Info.plist"
 cp "$APP_ICON" "$APP/Contents/Resources/ActRealm.icns"
 cp "$APP_ICON_PNG" "$APP/Contents/Resources/ActRealmIcon.png"
+cp -R "$SWIFT_RESOURCE_BUNDLE" "$APP/Contents/Resources/"
+for localization in "$PACKAGE_DIR/Sources/ActRealmKit/Resources/"*.lproj; do
+  cp -R "$localization" "$APP/Contents/Resources/"
+done
 cp "$REPO_ROOT/web/assets/claude.png" "$APP/Contents/Resources/ProviderIcons/claude.png"
 cp "$REPO_ROOT/web/assets/codex.png" "$APP/Contents/Resources/ProviderIcons/codex.png"
 GIT_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"

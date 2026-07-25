@@ -14,5 +14,5 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Reject legacy product language
+      - name: Validate product and Runtime language contracts
         run: ./scripts/check-actrealm-language.sh

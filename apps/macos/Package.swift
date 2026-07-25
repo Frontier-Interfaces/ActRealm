@@ -3,6 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "ActRealmMac",
+    defaultLocalization: "en",
     platforms: [
         .macOS(.v26)
     ],
@@ -12,7 +13,10 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "ActRealmKit"
+            name: "ActRealmKit",
+            resources: [
+                .process("Resources")
+            ]
         ),
         .target(
             name: "ActRealmUI",

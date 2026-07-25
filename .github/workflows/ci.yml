@@ -43,10 +43,11 @@ jobs:
       - name: Fetch locked Rust dependencies
         run: cargo fetch --locked
 
-      - name: Validate tracked text and product language
+      - name: Validate tracked text and language contracts
         run: |
           git diff --check
           ./scripts/check-actrealm-language.sh
+          node --check web/app.js
           plutil -lint apps/macos/Resources/Info.plist
 
       - name: Rust format

@@ -9,6 +9,7 @@ public struct RuntimeMonitorView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @Environment(\.snapshotRendering) private var snapshotRendering
+    @Environment(\.locale) private var locale
 
     public var body: some View {
         VStack(spacing: 0) {
@@ -72,7 +73,7 @@ public struct RuntimeMonitorView: View {
                     .frame(width: 24, height: 24)
             }
             .buttonStyle(PillButtonStyle(rank: .tertiary, horizontalPadding: 6))
-            .accessibilityLabel("关闭 Runtime 监控")
+            .accessibilityLabel(localized("关闭 Runtime 监控", locale: locale))
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 13)
@@ -129,7 +130,7 @@ public struct RuntimeMonitorView: View {
                 Text("发现旧的后台启动项")
                     .font(.system(size: 11.5, weight: .bold))
                     .foregroundStyle(DT.amberTextSoft)
-                Text(warning)
+                Text(localized(warning, locale: locale))
                     .font(DT.body(10.5))
                     .foregroundStyle(DT.textWeak)
             }
@@ -193,10 +194,10 @@ public struct RuntimeMonitorView: View {
                 .frame(width: 22, height: 22)
                 .background(tone.opacity(0.1), in: RoundedRectangle(cornerRadius: 7))
             VStack(alignment: .leading, spacing: 1) {
-                Text(title)
+                Text(localized(title, locale: locale))
                     .font(DT.micro(9.5))
                     .foregroundStyle(DT.textFaint)
-                Text(value)
+                Text(localized(value, locale: locale))
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(DT.textPrimary)
                     .lineLimit(1)
@@ -209,11 +210,11 @@ public struct RuntimeMonitorView: View {
 
     private func detailRow(title: String, value: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Text(title)
+            Text(localized(title, locale: locale))
                 .font(DT.micro(9.5))
                 .foregroundStyle(DT.textFaint)
                 .frame(width: 74, alignment: .leading)
-            Text(value)
+            Text(localized(value, locale: locale))
                 .font(DT.mono(10))
                 .foregroundStyle(DT.textWeak)
                 .lineLimit(1)
@@ -257,7 +258,7 @@ public struct RuntimeMonitorView: View {
     private var actionBar: some View {
         HStack(spacing: 10) {
             if let message = model.runtimeActionMessage {
-                Text(message)
+                Text(localized(message, locale: locale))
                     .font(DT.body(10.5))
                     .foregroundStyle(model.bridgeStatus.isListening ? DT.greenText : DT.redText)
                     .lineLimit(2)
@@ -285,7 +286,10 @@ public struct RuntimeMonitorView: View {
                     } else {
                         Image(systemName: "arrow.clockwise")
                     }
-                    Text(model.isRestartingRuntime ? "正在重启…" : "重启 Runtime")
+                    Text(localized(
+                        model.isRestartingRuntime ? "正在重启…" : "重启 Runtime",
+                        locale: locale
+                    ))
                 }
             }
             .buttonStyle(PillButtonStyle(rank: .primary, fontSize: 10.5, horizontalPadding: 14))
@@ -306,25 +310,36 @@ public struct RuntimeMonitorView: View {
     }
 
     private var statusTitle: String {
-        if model.isDemo { return "Runtime 监控预览" }
-        if model.isRestartingRuntime { return "正在重启 Runtime" }
-        switch model.bridgeStatus {
-        case .listening: return "Runtime 在线"
-        case .starting: return "Runtime 正在启动"
-        case .absent: return "Runtime 未连接"
+        if model.isDemo {
+            return localized("Runtime 监控预览", locale: locale)
         }
+        if model.isRestartingRuntime {
+            return localized("正在重启 Runtime", locale: locale)
+        }
+        let key = switch model.bridgeStatus {
+        case .listening: "Runtime 在线"
+        case .starting: "Runtime 正在启动"
+        case .absent: "Runtime 未连接"
+        }
+        return localized(key, locale: locale)
     }
 
     private var statusDetail: String {
-        if model.isDemo { return "正式运行时会显示真实进程、锁、Bridge 与连接状态。" }
-        switch model.bridgeStatus {
-        case .listening:
-            return "控制连接可用，Hook 事件可以进入主界面。"
-        case .starting:
-            return "Helper 已进入启动流程，正在等待 Bootstrap 与快照。"
-        case .absent(let reason):
-            return reason ?? "没有可用的 Runtime 控制连接。"
+        if model.isDemo {
+            return localized(
+                "正式运行时会显示真实进程、锁、Bridge 与连接状态。",
+                locale: locale
+            )
         }
+        let key = switch model.bridgeStatus {
+        case .listening:
+            "控制连接可用，Hook 事件可以进入主界面。"
+        case .starting:
+            "Helper 已进入启动流程，正在等待 Bootstrap 与快照。"
+        case .absent(let reason):
+            reason ?? "没有可用的 Runtime 控制连接。"
+        }
+        return localized(key, locale: locale)
     }
 
     private var statusColor: Color {
@@ -349,18 +364,24 @@ public struct RuntimeMonitorView: View {
     }
 
     private var lockOwnerText: String {
-        guard let pid = model.runtimeDiagnostics.lockOwnerPID else { return "无人持有" }
-        return model.runtimeDiagnostics.lockOwnerIsAlive ? "PID \(pid)" : "陈旧 PID \(pid)"
+        guard let pid = model.runtimeDiagnostics.lockOwnerPID else {
+            return localized("无人持有", locale: locale)
+        }
+        return model.runtimeDiagnostics.lockOwnerIsAlive
+            ? "PID \(pid)"
+            : localizedFormat("陈旧 PID %lld", locale: locale, Int64(pid))
     }
 
     private func pidText(_ pid: Int32?) -> String {
-        pid.map { "PID \($0)" } ?? "未运行"
+        pid.map { "PID \($0)" } ?? localized("未运行", locale: locale)
     }
 
     private var logText: String {
         let stdout = model.runtimeDiagnostics.stdoutTail.trimmingCharacters(in: .whitespacesAndNewlines)
         let stderr = model.runtimeDiagnostics.stderrTail.trimmingCharacters(in: .whitespacesAndNewlines)
         let combined = [stdout, stderr].filter { !$0.isEmpty }.joined(separator: "\n")
-        return combined.isEmpty ? "等待 Runtime 输出…" : combined
+        return combined.isEmpty
+            ? localized("等待 Runtime 输出…", locale: locale)
+            : combined
     }
 }

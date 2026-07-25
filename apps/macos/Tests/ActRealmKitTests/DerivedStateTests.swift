@@ -9,11 +9,13 @@ private func makeAttention(
     state: String = "open",
     risk: String = "low",
     title: String = "允许 Bash？",
+    titleMessage: RuntimeMessage? = nil,
     sessionId: String = "s"
 ) -> AttentionRecord {
     AttentionRecord(
         id: id, sessionId: sessionId, provider: "codex", project: "proj",
         requestId: kind == "approval" ? UUID() : nil, kind: kind, title: title,
+        titleMessage: titleMessage,
         detail: nil, state: state, risk: risk, riskNotes: [], commandPreview: nil,
         expiresAt: nil, createdAt: createdAt, resolution: nil
     )
@@ -23,11 +25,12 @@ private func makeSession(
     id: String,
     provider: String = "claude",
     execState: String = "idle",
+    title: String? = nil,
     lastEventAt: UInt64 = 1000
 ) -> SessionRecord {
     SessionRecord(
         id: id, provider: provider, providerSessionId: id, project: "proj",
-        title: "任务 \(id)", model: nil, execState: execState, approvalOwner: nil,
+        title: title ?? "任务 \(id)", model: nil, execState: execState, approvalOwner: nil,
         activity: nil, activitySince: nil, planDone: nil, planTotal: nil,
         lastEventAt: lastEventAt
     )
@@ -163,6 +166,35 @@ private func makeSnapshot(
         let entry = DerivedState.derive(from: snapshot).openOutbox[0]
         #expect(entry.kind == .nativeApproval)
         #expect(entry.actionTitle == "允许 Bash？")
+    }
+
+    @Test func completionHeadlineUsesRuntimeCodeInBothLanguages() {
+        let snapshot = makeSnapshot(attention: [
+            makeAttention(
+                id: "done",
+                kind: "completion",
+                createdAt: 100,
+                title: "Task completed; waiting for confirmation"
+            )
+        ])
+        let entry = DerivedState.derive(from: snapshot).openOutbox[0]
+
+        #expect(entry.actionTitleMessage.code == "attention.completion.title")
+        #expect(entry.localizedActionTitle(language: .english)
+            == "Task completed; waiting for confirmation")
+        #expect(entry.localizedActionTitle(language: .simplifiedChinese)
+            == "任务已完成，等待确认")
+    }
+
+    @Test func taskTitlesRemainVerbatimWhenTheyResembleLegacyStatusText() throws {
+        let task = try #require(DerivedState.derive(from: makeSnapshot(
+            sessions: [makeSession(
+                id: "user-title",
+                title: "正在运行 我的发布计划"
+            )]
+        )).agentTasks.first)
+
+        #expect(task.localizedTitle(language: .english) == "正在运行 我的发布计划")
     }
 }
 

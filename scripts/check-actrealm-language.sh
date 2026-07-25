@@ -30,3 +30,4 @@ if (( failed )); then
 fi
 
 printf '%s\n' "ActRealm language check passed"
+"$(dirname "$0")/check-runtime-language.sh"

@@ -2036,13 +2036,15 @@ fn ingest_transaction(
                 NonApprovalSpec {
                     kind: "question",
                     title: if request.provider == Provider::Codex {
-                        "Codex 正在询问"
+                        "Codex is asking"
                     } else if parsed.kind == EventKind::ElicitationRequested {
-                        "Claude 需要补充信息"
+                        "Claude needs more information"
                     } else {
-                        "Claude 正在询问"
+                        "Claude is asking"
                     },
-                    detail: Some("可直接在 ActRealm 回答；答案不会写入本地历史。"),
+                    detail: Some(
+                        "Answer directly in ActRealm. Answers are not written to local history.",
+                    ),
                     dedupe_key: request
                         .request_id
                         .map(|id| format!("interactive:{id}"))
@@ -2057,7 +2059,7 @@ fn ingest_transaction(
             &request,
             NonApprovalSpec {
                 kind: "error",
-                title: "Agent 运行失败",
+                title: "Agent run failed",
                 detail: request.raw.get("error").and_then(Value::as_str),
                 dedupe_key: format!(
                     "{}:{}:error:{}",
@@ -2074,7 +2076,7 @@ fn ingest_transaction(
             &request,
             NonApprovalSpec {
                 kind: "error",
-                title: "Agent 本轮已中断",
+                title: "Agent turn interrupted",
                 detail: request
                     .raw
                     .get("error")
@@ -2095,7 +2097,7 @@ fn ingest_transaction(
                 &request,
                 NonApprovalSpec {
                     kind: "question",
-                    title: "Agent 有问题",
+                    title: "Agent needs attention",
                     detail: request
                         .raw
                         .get("message")
@@ -2126,7 +2128,7 @@ fn ingest_transaction(
                 &request,
                 NonApprovalSpec {
                     kind: "completion",
-                    title: "任务已完成，等你确认",
+                    title: "Task completed; waiting for confirmation",
                     detail: None,
                     dedupe_key: format!(
                         "{}:{}:completion",
@@ -2205,7 +2207,11 @@ fn ingest_transaction(
             if native_permission_resolved
                 && matches!(parsed.kind, EventKind::ToolFinished | EventKind::ToolFailed)
             {
-                (state, owner, "Codex 原界面请求已处理，继续运行".to_owned())
+                (
+                    state,
+                    owner,
+                    "The request was handled in Codex; continuing".to_owned(),
+                )
             } else {
                 (state, owner, activity)
             }
@@ -2214,13 +2220,13 @@ fn ingest_transaction(
             default_activity
         } else {
             plan_progress
-                .map(|(done, total)| format!("计划进度 {done}/{total}"))
+                .map(|(done, total)| format!("Plan progress {done}/{total}"))
                 .or_else(|| {
                     active_subagents.and_then(|active| {
                         if active == 0 && parsed.kind == EventKind::SubagentStopped {
-                            Some("子 Agent 已结束".to_owned())
+                            Some("Subagent finished".to_owned())
                         } else if active > 0 {
-                            Some(format!("派了 {active} 个子 Agent"))
+                            Some(format!("{active} subagents running"))
                         } else {
                             None
                         }
@@ -2709,7 +2715,7 @@ fn commit_transaction(
         release_session_if_unblocked(
             &transaction,
             &command.6,
-            "回复通道已失效，等待 Agent 新事件",
+            "Reply channel expired; waiting for a new Agent event",
             now,
         )?;
         transaction.commit().map_err(storage_error)?;
@@ -2826,7 +2832,7 @@ fn act_attention_transaction(
         release_session_if_unblocked(
             &transaction,
             &session_id,
-            "待处理事项已结束，等待 Agent 后续事件",
+            "Attention item resolved; waiting for the Agent's next event",
             now,
         )?;
     }
@@ -2905,7 +2911,7 @@ fn reconcile_transaction(
         release_session_if_unblocked(
             &transaction,
             &session_id,
-            "Runtime 已重启，旧回复通道失效；等待 Agent 新事件",
+            "Runtime restarted and the old reply channel expired; waiting for a new Agent event",
             now,
         )?;
     }
@@ -2967,7 +2973,7 @@ fn expire_approval_transaction(
     release_session_if_unblocked(
         &transaction,
         &session_id,
-        "回复通道已失效，等待 Agent 新事件",
+        "Reply channel expired; waiting for a new Agent event",
         now,
     )?;
     transaction.commit().map_err(storage_error)?;
@@ -3022,7 +3028,7 @@ fn resolve_managed_request_transaction(
     release_session_if_unblocked(
         &transaction,
         &session_id,
-        "Codex 已接收审批结果，继续运行",
+        "Codex received the approval decision; continuing",
         now,
     )?;
     transaction.commit().map_err(storage_error)?;
@@ -3114,7 +3120,7 @@ fn reconcile_sessions_transaction(
         transaction
             .execute(
                 "UPDATE sessions SET exec_state = 'idle', approval_owner = NULL,
-                   activity = 'Agent 进程未活动', ended_at = ?2 WHERE id = ?1",
+               activity = 'Agent process is no longer active', ended_at = ?2 WHERE id = ?1",
                 params![session_id, to_i64(now)],
             )
             .map_err(storage_error)?;
@@ -3191,18 +3197,20 @@ fn sync_native_approval_transaction(
         if native_open.is_none() {
             let attention_id = Uuid::now_v7().to_string();
             let title = match provider {
-                Provider::Codex => "Codex 需要你在原界面批准",
-                Provider::Claude => "Claude 需要你在原界面批准",
-                Provider::Gemini => "Agent 需要你在原界面批准",
+                Provider::Codex => "Approve in Codex",
+                Provider::Claude => "Approve in Claude",
+                Provider::Gemini => "Approve in the Agent",
             };
             let detail = match provider {
                 Provider::Codex => {
-                    "Codex 客户端或终端正在等待原生权限决定；请在对应对话中批准或拒绝。"
+                    "Codex is waiting for a native permission decision. Approve or deny it in the corresponding conversation."
                 }
                 Provider::Claude => {
-                    "Claude 客户端或终端正在等待原生权限决定；请在对应对话中批准或拒绝。"
+                    "Claude is waiting for a native permission decision. Approve or deny it in the corresponding conversation."
                 }
-                Provider::Gemini => "Agent 正在等待原生权限决定；请在对应对话中处理。",
+                Provider::Gemini => {
+                    "The Agent is waiting for a native permission decision. Handle it in the corresponding conversation."
+                }
             };
             transaction
                 .execute(
@@ -3233,7 +3241,10 @@ fn sync_native_approval_transaction(
                  WHERE id = ?1",
                 params![
                     session_id,
-                    format!("等待你在 {} 中处理权限", provider_display_name(provider)),
+                    format!(
+                        "Waiting for you to handle permission in {}",
+                        provider_display_name(provider)
+                    ),
                     to_i64(now),
                 ],
             )
@@ -3342,10 +3353,13 @@ fn sync_native_approval_transaction(
                             "response_finished"
                         },
                         if active {
-                            format!("{} 原界面权限请求已处理", provider_display_name(provider))
+                            format!(
+                                "The permission request was handled in {}",
+                                provider_display_name(provider)
+                            )
                         } else {
                             format!(
-                                "{} 原界面权限请求已处理，本轮结束",
+                                "The permission request was handled in {}; the turn ended",
                                 provider_display_name(provider)
                             )
                         },
@@ -3377,7 +3391,7 @@ fn sync_native_approval_transaction(
                                dedupe_key, state, created_at
                              ) VALUES (
                                ?1, ?2, ?3, ?4, ?5, NULL, 'completion',
-                               '任务已完成，等你确认', NULL, NULL, 'unknown', '[]',
+                               'Task completed; waiting for confirmation', NULL, NULL, 'unknown', '[]',
                                ?6, 'open', ?7
                              )
                              ON CONFLICT(dedupe_key) DO NOTHING",
@@ -3768,7 +3782,7 @@ fn read_plan_steps(
 
     let mut statement = connection
         .prepare(
-            "SELECT task_id, COALESCE(subject, '未命名任务'), description,
+            "SELECT task_id, COALESCE(subject, 'Untitled task'), description,
                     CASE completed WHEN 1 THEN 'completed' ELSE 'pending' END
              FROM session_tasks
              WHERE session_id = ?1
@@ -3826,11 +3840,11 @@ fn read_active_subagents(
 
 fn environment_label(surface: Option<&str>, app: Option<&str>) -> Option<String> {
     match surface {
-        Some("codex_app") => Some("Codex 客户端".to_owned()),
-        Some("claude_app") => Some("Claude 客户端".to_owned()),
+        Some("codex_app") => Some("Codex app".to_owned()),
+        Some("claude_app") => Some("Claude app".to_owned()),
         Some("terminal") => Some(
             app.filter(|value| !value.trim().is_empty())
-                .unwrap_or("终端")
+                .unwrap_or("Terminal")
                 .chars()
                 .take(64)
                 .collect(),
@@ -4002,11 +4016,11 @@ fn insert_approval_attention(
                 turn_id,
                 request_id.to_string(),
                 format!(
-                    "允许 {}？",
+                    "Allow {}?",
                     tool_name
                         .map(sanitized_tool_name)
                         .as_deref()
-                        .unwrap_or("此操作")
+                        .unwrap_or("this operation")
                 ),
                 approval_detail(&request.raw, tool_name),
                 command.map(redacted_preview),
@@ -4092,8 +4106,8 @@ fn native_attention_copy(request: &BridgeRequest) -> (String, String) {
             .or_else(|| request.raw.pointer("/tool_input/plugin_id"))
             .and_then(Value::as_str)
             .and_then(sanitized_plugin_label);
-        let subject = plugin.as_deref().unwrap_or("插件");
-        let title = format!("Codex 请求安装或连接 {subject}");
+        let subject = plugin.as_deref().unwrap_or("plugin");
+        let title = format!("Codex requests installation or connection of {subject}");
         let reason = request
             .raw
             .pointer("/tool_input/suggest_reason")
@@ -4101,8 +4115,16 @@ fn native_attention_copy(request: &BridgeRequest) -> (String, String) {
             .and_then(Value::as_str)
             .and_then(sanitized_attention_text);
         let detail = reason.map_or_else(
-            || format!("Codex 正在显示 {subject} 的原生确认窗口；请回到对应对话确认或取消。"),
-            |reason| format!("{reason} 请回到 Codex 原界面确认或取消。"),
+            || {
+                format!(
+                    "Codex is showing a native confirmation window for {subject}. Return to the corresponding conversation to confirm or cancel."
+                )
+            },
+            |reason| {
+                format!(
+                    "{reason} Return to the Codex interface to confirm or cancel."
+                )
+            },
         );
         return (title, detail);
     }
@@ -4114,9 +4136,9 @@ fn native_attention_copy(request: &BridgeRequest) -> (String, String) {
         .and_then(Value::as_str)
         .and_then(sanitized_attention_text)
         .unwrap_or_else(|| {
-            "Codex 客户端或终端正在显示原生权限请求；请回到对应对话查看并处理。".to_owned()
+            "Codex is showing a native permission request. Return to the corresponding conversation to review and handle it.".to_owned()
         });
-    ("Codex 正在请求批准".to_owned(), detail)
+    ("Codex is requesting approval".to_owned(), detail)
 }
 
 fn native_attention_activity(request: &BridgeRequest) -> String {
@@ -4128,10 +4150,10 @@ fn native_attention_activity(request: &BridgeRequest) -> String {
             .or_else(|| request.raw.pointer("/tool_input/plugin_id"))
             .and_then(Value::as_str)
             .and_then(sanitized_plugin_label)
-            .unwrap_or_else(|| "插件".to_owned());
-        format!("等待你在 Codex 中确认安装或连接 {plugin}")
+            .unwrap_or_else(|| "plugin".to_owned());
+        format!("Waiting for you to confirm installation or connection of {plugin} in Codex")
     } else {
-        "Codex 正在请求批准，请在原界面处理".to_owned()
+        "Codex is requesting approval; handle it in the original interface".to_owned()
     }
 }
 
@@ -4550,11 +4572,17 @@ fn approval_detail(raw: &Value, tool_name: Option<&str>) -> Option<String> {
                     .find_map(|key| value.get(*key).and_then(Value::as_str))
             })
             .and_then(|path| Path::new(path).file_name().and_then(|name| name.to_str()))
-            .map(|name| format!("Agent 请求访问文件 {name}，完整路径请在原对话中核对。")),
+            .map(|name| {
+                format!(
+                    "The Agent requests access to {name}. Verify the full path in the original conversation."
+                )
+            }),
         Some("Bash" | "Shell") => Some(
-            "Agent 请求执行终端命令；这里只展示脱敏摘要，完整内容请在原对话中核对。".to_owned(),
+            "The Agent requests a terminal command. Only a redacted summary is shown here; verify the full command in the original conversation.".to_owned(),
         ),
-        Some(name) => Some(format!("Agent 请求运行 {name}，请核对操作目的和影响。")),
+        Some(name) => Some(format!(
+            "The Agent requests to run {name}. Verify the purpose and impact."
+        )),
         None => None,
     }
 }
@@ -4589,7 +4617,10 @@ fn sanitized_attention_text(value: &str) -> Option<String> {
     .iter()
     .any(|marker| lower.contains(marker))
     {
-        return Some("内容可能包含凭据，已隐藏；请回到原对话查看。".to_owned());
+        return Some(
+            "Content may contain credentials and was hidden. Review it in the original conversation."
+                .to_owned(),
+        );
     }
     let mut bounded = normalized.chars().take(180).collect::<String>();
     if normalized.chars().count() > 180 {
@@ -4946,19 +4977,19 @@ fn provider_handled_permission_state(
         (
             "thinking",
             None,
-            "Codex 完全访问模式，无需用户审批".to_owned(),
+            "Codex full-access mode does not require user approval".to_owned(),
         )
     } else if permission_mode == Some("dontAsk") {
         (
             "thinking",
             None,
-            "Codex 非交互模式，不会请求用户审批".to_owned(),
+            "Codex non-interactive mode will not request user approval".to_owned(),
         )
     } else {
         (
             "thinking",
             Some("provider"),
-            "Codex 正在自动审批".to_owned(),
+            "Codex is reviewing permissions automatically".to_owned(),
         )
     }
 }
@@ -5051,33 +5082,41 @@ fn project_event<'a>(
     current: &'a str,
 ) -> (&'a str, Option<&'static str>, String) {
     match kind {
-        EventKind::SessionStarted => ("idle", None, "等待新任务".to_owned()),
-        EventKind::SessionEnded => ("idle", None, "会话已结束".to_owned()),
-        EventKind::PromptSubmitted => ("thinking", None, "正在思考".to_owned()),
+        EventKind::SessionStarted => ("idle", None, "Waiting for a new task".to_owned()),
+        EventKind::SessionEnded => ("idle", None, "Session ended".to_owned()),
+        EventKind::PromptSubmitted => ("thinking", None, "Thinking".to_owned()),
         EventKind::ToolStarted => (
             "tool_running",
             None,
             format!(
-                "正在运行 {}",
+                "Running {}",
                 raw.get("tool_name")
                     .and_then(Value::as_str)
-                    .unwrap_or("工具")
+                    .unwrap_or("tool")
             ),
         ),
         EventKind::ToolFinished | EventKind::ToolFailed => {
-            ("thinking", None, "继续思考".to_owned())
+            ("thinking", None, "Continuing to think".to_owned())
         }
-        EventKind::PermissionRequested => {
-            ("awaiting_approval", Some("widget"), "等待你批准".to_owned())
-        }
-        EventKind::QuestionRequested | EventKind::ElicitationRequested => {
-            ("awaiting_approval", Some("widget"), "等待你回答".to_owned())
-        }
-        EventKind::PermissionDenied => ("thinking", None, "操作已在 Agent 中拒绝".to_owned()),
+        EventKind::PermissionRequested => (
+            "awaiting_approval",
+            Some("widget"),
+            "Waiting for your approval".to_owned(),
+        ),
+        EventKind::QuestionRequested | EventKind::ElicitationRequested => (
+            "awaiting_approval",
+            Some("widget"),
+            "Waiting for your answer".to_owned(),
+        ),
+        EventKind::PermissionDenied => (
+            "thinking",
+            None,
+            "The operation was denied in the Agent".to_owned(),
+        ),
         EventKind::AutoReviewStarted => (
             "thinking",
             Some("provider"),
-            "Codex 正在自动审查权限".to_owned(),
+            "Codex is reviewing permissions automatically".to_owned(),
         ),
         EventKind::AutoReviewCompleted => {
             let status = raw
@@ -5086,33 +5125,41 @@ fn project_event<'a>(
                 .and_then(Value::as_str)
                 .unwrap_or("completed");
             let label = match status {
-                "approved" => "Codex 自动审查已批准",
-                "denied" => "Codex 自动审查已拒绝",
-                "timedOut" => "Codex 自动审查超时，等待后续状态",
-                "aborted" => "Codex 自动审查已取消，等待后续状态",
-                _ => "Codex 自动审查已结束",
+                "approved" => "Codex automatic review approved the request",
+                "denied" => "Codex automatic review denied the request",
+                "timedOut" => "Codex automatic review timed out; waiting for a later status",
+                "aborted" => "Codex automatic review was cancelled; waiting for a later status",
+                _ => "Codex automatic review ended",
             };
             ("thinking", None, label.to_owned())
         }
-        EventKind::Compacting => ("compacting", None, "正在压缩记忆".to_owned()),
+        EventKind::Compacting => ("compacting", None, "Compacting context".to_owned()),
         EventKind::Stopped if has_background_work(raw) => {
             let count = ["background_tasks", "session_crons"]
                 .iter()
                 .filter_map(|field| raw.get(*field).and_then(Value::as_array))
                 .map(Vec::len)
                 .sum::<usize>();
-            ("tool_running", None, format!("后台任务仍在运行 · {count}"))
+            (
+                "tool_running",
+                None,
+                format!("{count} background tasks still running"),
+            )
         }
-        EventKind::Stopped => ("response_finished", None, "本轮已完成".to_owned()),
-        EventKind::Interrupted => ("failed", None, "本轮已中断".to_owned()),
-        EventKind::Failed => ("failed", None, "运行失败".to_owned()),
-        EventKind::Unknown => (current, None, "⚠ 事件不识别（可能版本不兼容）".to_owned()),
+        EventKind::Stopped => ("response_finished", None, "Turn completed".to_owned()),
+        EventKind::Interrupted => ("failed", None, "Turn interrupted".to_owned()),
+        EventKind::Failed => ("failed", None, "Run failed".to_owned()),
+        EventKind::Unknown => (
+            current,
+            None,
+            "Unrecognized event; the Provider version may be incompatible".to_owned(),
+        ),
         EventKind::Notification
         | EventKind::SubagentStarted
         | EventKind::SubagentStopped
         | EventKind::TaskCreated
         | EventKind::TaskCompleted
-        | EventKind::PlanUpdated => (current, None, "活动已更新".to_owned()),
+        | EventKind::PlanUpdated => (current, None, "Activity updated".to_owned()),
     }
 }
 
@@ -5133,14 +5180,23 @@ fn classify_risk(
     if high.iter().any(|needle| command.contains(needle)) {
         return (
             "high",
-            vec!["⚠ 已识别到高影响操作", "提交后动作本身不可撤销"],
+            vec![
+                "High-impact operation detected",
+                "The operation cannot be undone after it is submitted",
+            ],
         );
     }
     let has_shell_composition = ["|", ">", "<", "$(", "`", "&&", ";"]
         .iter()
         .any(|needle| command.contains(needle));
     if has_shell_composition {
-        return ("unknown", vec!["命令包含组合语法", "建议查看原窗口"]);
+        return (
+            "unknown",
+            vec![
+                "The command contains compound syntax",
+                "Review the original window",
+            ],
+        );
     }
     let low = ["git status", "git diff", "git log", "ls", "rg"];
     if low
@@ -5149,7 +5205,10 @@ fn classify_risk(
     {
         return (
             "low",
-            vec!["只读意图（规则提示，非安全保证）", "↩ 3 秒内可撤回批准决定"],
+            vec![
+                "Read-only intent; this rule is not a security guarantee",
+                "The approval decision can be undone for 3 seconds",
+            ],
         );
     }
     let medium = [
@@ -5169,10 +5228,19 @@ fn classify_risk(
     {
         return (
             "med",
-            vec!["可能执行项目代码或产生副作用", "建议核对原命令"],
+            vec![
+                "May run project code or produce side effects",
+                "Verify the original command",
+            ],
         );
     }
-    ("unknown", vec!["我不认识这个操作的影响", "建议查看原窗口"])
+    (
+        "unknown",
+        vec![
+            "The impact of this operation is unknown",
+            "Review the original window",
+        ],
+    )
 }
 
 fn redacted_preview(command: &str) -> String {
@@ -5265,11 +5333,12 @@ fn event_summary(raw: &Value, kind: EventKind) -> Option<String> {
         EventKind::PermissionRequested => {
             raw.get("tool_name").and_then(Value::as_str).map(|tool| {
                 if tool == "request_permissions" {
-                    "Codex 原界面请求批准".to_owned()
+                    "Codex requests approval in its original interface".to_owned()
                 } else if tool == "request_plugin_install" {
-                    "Codex 原界面请求安装或连接插件".to_owned()
+                    "Codex requests plugin installation or connection in its original interface"
+                        .to_owned()
                 } else {
-                    format!("请求运行 {}", sanitized_tool_name(tool))
+                    format!("Request to run {}", sanitized_tool_name(tool))
                 }
             })
         }
@@ -5279,7 +5348,7 @@ fn event_summary(raw: &Value, kind: EventKind) -> Option<String> {
         EventKind::AutoReviewStarted => Some("Codex auto approval review started".to_owned()),
         EventKind::AutoReviewCompleted => Some("Codex auto approval review completed".to_owned()),
         EventKind::Interrupted => Some("Provider turn interrupted".to_owned()),
-        EventKind::Unknown => Some("未知 Provider 事件".to_owned()),
+        EventKind::Unknown => Some("Unknown Provider event".to_owned()),
         _ => None,
     }
 }
@@ -5325,12 +5394,15 @@ fn jump_descriptor(
     let bundle = term_bundle_id.unwrap_or_default().to_ascii_lowercase();
     let codex_app = term_surface == Some("codex_app") || bundle == "com.openai.codex";
     if provider == "codex" && codex_app && Uuid::parse_str(provider_session_id).is_ok() {
-        return ("exact_conversation".to_owned(), "精确打开对话".to_owned());
+        return (
+            "exact_conversation".to_owned(),
+            "Open exact conversation".to_owned(),
+        );
     }
     let iterm = app.contains("iterm") || bundle == "com.googlecode.iterm2";
     let terminal = app == "apple_terminal" || bundle == "com.apple.terminal";
     if (iterm && term_session_id.is_some()) || (terminal && term_tty.is_some()) {
-        return ("terminal".to_owned(), "打开对应终端".to_owned());
+        return ("terminal".to_owned(), "Open terminal".to_owned());
     }
     let known_app = codex_app
         || term_surface == Some("claude_app")
@@ -5342,9 +5414,9 @@ fn jump_descriptor(
         || app.contains("warp")
         || bundle.starts_with("dev.warp.");
     if known_app {
-        return ("app_only".to_owned(), "只能打开应用".to_owned());
+        return ("app_only".to_owned(), "Open application".to_owned());
     }
-    ("unsupported".to_owned(), "当前环境不支持跳转".to_owned())
+    ("unsupported".to_owned(), "Jump is not supported".to_owned())
 }
 
 fn project_name(path: &str) -> Option<&str> {

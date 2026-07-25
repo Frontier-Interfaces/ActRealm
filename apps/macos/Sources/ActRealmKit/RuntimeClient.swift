@@ -7,18 +7,20 @@ public enum RuntimeClientError: Error, LocalizedError, Sendable {
     case requestFailed(Int, code: String?, detail: String?)
 
     public var errorDescription: String? {
-        switch self {
-        case .notConnected: "Runtime 尚未连接"
-        case .bootstrapFailed: "Runtime 身份验证失败"
-        case .missingSessionCookie: "Runtime 没有返回本机会话"
-        case .requestFailed(let status, let code, let detail):
-            detail ?? code ?? "请求失败（\(status)）"
-        }
+        code
     }
 
     public var code: String? {
-        if case .requestFailed(_, let code, _) = self { return code }
-        return nil
+        switch self {
+        case .notConnected:
+            "RUNTIME_NOT_CONNECTED"
+        case .bootstrapFailed:
+            "RUNTIME_AUTH_FAILED"
+        case .missingSessionCookie:
+            "RUNTIME_SESSION_MISSING"
+        case .requestFailed(let status, let code, _):
+            code ?? "HTTP_\(status)"
+        }
     }
 }
 
@@ -26,6 +28,7 @@ public struct JumpResponse: Codable, Equatable, Sendable {
     public let success: Bool
     public let capability: String
     public let label: String
+    public let labelMessage: RuntimeMessage?
 }
 
 /// Talks to a single running `actrealm` backend: performs the one-time

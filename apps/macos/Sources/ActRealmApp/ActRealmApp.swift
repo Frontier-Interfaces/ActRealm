@@ -19,6 +19,7 @@ struct ActRealmApp: App {
         Window("", id: "main") {
             MainWindowView()
                 .environmentObject(model)
+                .environment(\.locale, model.interfaceLocale)
                 .task {
                     model.start()
                     if hudController == nil {
@@ -60,15 +61,18 @@ struct ActRealmApp: App {
         MenuBarExtra {
             MenuBarPopoverView()
                 .environmentObject(model)
+                .environment(\.locale, model.interfaceLocale)
         } label: {
             MenuBarLabel()
                 .environmentObject(model)
+                .environment(\.locale, model.interfaceLocale)
         }
         .menuBarExtraStyle(.window)
 
         Window("设置", id: "settings") {
             SettingsView()
                 .environmentObject(model)
+                .environment(\.locale, model.interfaceLocale)
         }
         .defaultSize(width: 920, height: 660)
         .windowStyle(.hiddenTitleBar)

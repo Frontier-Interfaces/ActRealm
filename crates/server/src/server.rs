@@ -40,6 +40,8 @@ use thiserror::Error;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+use crate::status_messages;
+
 const SESSION_COOKIE: &str = "actrealm_session";
 const CSRF_HEADER: &str = "x-actrealm-csrf";
 const SETTINGS_KEY: &str = "ui_settings";
@@ -157,9 +159,9 @@ impl RuntimeRestartHandle {
                 api_bind,
                 response_sender,
             })
-            .map_err(|_| "Runtime 控制通道不可用".to_owned())?;
+            .map_err(|_| "Runtime control channel is unavailable".to_owned())?;
         UnixStream::connect(&self.socket_path)
-            .map_err(|error| format!("无法唤醒 bridge.sock：{error}"))?;
+            .map_err(|error| format!("Could not wake bridge.sock: {error}"))?;
         Ok(response_receiver)
     }
 }
@@ -439,7 +441,8 @@ impl CodexManager {
             .map(ToOwned::to_owned);
         let Some(executable) = executable else {
             if let Ok(mut current) = state.lock() {
-                current.error = Some("未找到支持 app-server 的 Codex 客户端".to_owned());
+                current.error =
+                    Some("No Codex client with app-server support was found".to_owned());
             }
             return Self {
                 connector: None,
@@ -517,7 +520,7 @@ impl CodexManager {
         let connector = self
             .connector
             .as_ref()
-            .ok_or_else(|| "Codex app-server Connector 当前不可用".to_owned())?;
+            .ok_or_else(|| "The Codex app-server Connector is unavailable".to_owned())?;
         let thread = connector
             .resume_thread(thread_id)
             .map_err(|error| error.to_string())?;
@@ -525,7 +528,7 @@ impl CodexManager {
             let mut state = self
                 .state
                 .lock()
-                .map_err(|_| "Connector 状态不可用".to_owned())?;
+                .map_err(|_| "Connector state is unavailable".to_owned())?;
             state.managed.insert(thread_id.to_owned());
             state.resume_failed.remove(thread_id);
             state.threads.insert(thread.id.clone(), thread.clone());
@@ -545,7 +548,7 @@ impl CodexManager {
 
     fn capability_value(&self) -> Value {
         let Ok(state) = self.state.lock() else {
-            return json!({"status":"unavailable","error":"Connector 状态不可用"});
+            return json!({"status":"unavailable","error":"Connector state is unavailable"});
         };
         json!({
             "status": state.status,
@@ -663,7 +666,7 @@ fn spawn_codex_handlers(
         }
         if let Ok(mut current) = request_state.lock() {
             current.status = "unavailable".to_owned();
-            current.error = Some("Codex app-server 请求通道已断开".to_owned());
+            current.error = Some("Codex app-server request channel disconnected".to_owned());
         }
     });
     let notification_store = store.clone();
@@ -673,7 +676,7 @@ fn spawn_codex_handlers(
         }
         if let Ok(mut current) = state.lock() {
             current.status = "unavailable".to_owned();
-            current.error = Some("Codex app-server 通知通道已断开".to_owned());
+            current.error = Some("Codex app-server notification channel disconnected".to_owned());
         }
     });
 }
@@ -1447,7 +1450,7 @@ async fn refresh_quota_now(State(state): State<AppState>, headers: HeaderMap) ->
         return api_error_detail(
             StatusCode::CONFLICT,
             "CLAUDE_OAUTH_DISABLED",
-            "Claude OAuth 额度同步未启用",
+            "Claude OAuth quota sync is disabled",
         );
     }
     let paths = match state.quota.lock() {
@@ -1455,7 +1458,7 @@ async fn refresh_quota_now(State(state): State<AppState>, headers: HeaderMap) ->
             return api_error_detail(
                 StatusCode::CONFLICT,
                 "QUOTA_REFRESH_IN_PROGRESS",
-                "已有额度刷新正在进行，请稍后重试",
+                "A quota refresh is already running; try again shortly",
             );
         }
         Ok(mut quota) => {
@@ -1495,7 +1498,7 @@ async fn refresh_quota_now(State(state): State<AppState>, headers: HeaderMap) ->
             return api_error_detail(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "CLAUDE_QUOTA_REFRESH_FAILED",
-                "额度刷新任务异常终止，请重启 ActRealm 后重试",
+                "The quota refresh task ended unexpectedly. Restart ActRealm and try again.",
             );
         }
     };
@@ -1529,18 +1532,18 @@ async fn refresh_quota_now(State(state): State<AppState>, headers: HeaderMap) ->
 fn quota_refresh_error_detail(error: &QuotaError) -> String {
     match error {
         QuotaError::OAuthUnavailable => {
-            "未找到可读取的 Claude Code 登录凭证；请启动 Claude Code CLI，完成登录或开始一次会话，再回到 ActRealm 点击“立即更新”".to_owned()
+            "No readable Claude Code credentials were found. Start the Claude Code CLI, sign in or begin a session, then return to ActRealm and refresh quota.".to_owned()
         }
         QuotaError::OAuthRequest(message) if message == "credential was rejected" => {
-            "Claude 登录凭证需要由官方 CLI 刷新；请启动 Claude Code CLI，完成登录或开始一次会话，再回到 ActRealm 点击“立即更新”".to_owned()
+            "Claude credentials must be refreshed by the official CLI. Start Claude Code, sign in or begin a session, then return to ActRealm and refresh quota.".to_owned()
         }
         QuotaError::OAuthRequest(message) if message == "temporarily rate limited" => {
-            "Claude 额度接口暂时限流，请稍后重试".to_owned()
+            "The Claude quota endpoint is temporarily rate limited. Try again later.".to_owned()
         }
         QuotaError::OAuthRequest(message) => {
-            format!("Claude 额度接口暂时不可用：{message}")
+            format!("The Claude quota endpoint is temporarily unavailable: {message}")
         }
-        _ => "本机额度缓存无法更新，请检查 Claude 登录状态后重试".to_owned(),
+        _ => "The local quota cache could not be refreshed. Check the Claude sign-in state and try again.".to_owned(),
     }
 }
 
@@ -2252,30 +2255,30 @@ fn settings_value(state: &AppState) -> Result<Value, String> {
     Ok(json!({
         "settings": settings,
         "displayCatalog": [
-            { "id": "task", "label": "任务标题与摘要", "level": "concise", "placement": "headline", "description": "主标题；若 Provider 标题与任务摘要不同，摘要显示在下一行" },
-            { "id": "activity", "label": "实时状态", "level": "concise", "placement": "headline", "description": "标题栏右侧的运行阶段、等待状态与耗时" },
-            { "id": "project", "label": "项目", "level": "concise", "placement": "subtitle", "description": "副标题中的项目名称" },
-            { "id": "model", "label": "模型", "level": "concise", "placement": "subtitle", "description": "副标题中的模型名称" },
-            { "id": "plan", "label": "计划进度", "level": "concise", "placement": "subtitle", "description": "折叠卡中的完成步数与进度条" },
-            { "id": "sessionTokens", "label": "会话累计 Token", "level": "concise", "placement": "overview", "description": "折叠卡用量胶囊；展开后显示累计值" },
-            { "id": "context", "label": "上下文占用", "level": "concise", "placement": "overview", "description": "折叠卡用量胶囊；展示当前上下文百分比" },
-            { "id": "cost", "label": "估算 API 价格", "level": "detailed", "placement": "overview", "description": "折叠卡用量胶囊；不是订阅账单" },
-            { "id": "turnTokens", "label": "本轮 Token", "level": "detailed", "placement": "details", "description": "展开详情中的最近一轮 Token" },
-            { "id": "inputOutputTokens", "label": "输入 / 输出 Token", "level": "detailed", "placement": "details", "description": "展开详情中的输入与输出拆分" },
-            { "id": "cacheTokens", "label": "缓存读取 / 写入 Token", "level": "detailed", "placement": "details", "description": "展开详情中的缓存读取与创建拆分" },
-            { "id": "reasoningTokens", "label": "推理 Token", "level": "detailed", "placement": "details", "description": "展开详情中的 Provider 推理用量" },
-            { "id": "tool", "label": "当前工具", "level": "detailed", "placement": "details", "description": "展开详情中的当前工具类别" },
-            { "id": "permissionMode", "label": "权限模式", "level": "detailed", "placement": "details", "description": "展开详情中的 Provider 权限策略" },
-            { "id": "subagents", "label": "运行中的子 Agent", "level": "detailed", "placement": "details", "description": "展开详情中的子 Agent 数量与列表" },
-            { "id": "environment", "label": "运行环境", "level": "detailed", "placement": "details", "description": "展开详情中的工作区或客户端环境" },
-            { "id": "recovery", "label": "恢复状态", "level": "detailed", "placement": "details", "description": "展开详情中的重连与控制恢复状态" },
-            { "id": "control", "label": "托管能力", "level": "detailed", "placement": "details", "description": "展开详情中的 Hook 或 Connector 能力" },
-            { "id": "jump", "label": "打开应用", "level": "detailed", "placement": "details", "description": "展开详情中的原应用跳转入口" },
-            { "id": "titleSource", "label": "标题来源", "level": "developer", "placement": "developer", "description": "展开详情中的标题解析来源" },
-            { "id": "sessionId", "label": "ActRealm Session ID", "level": "developer", "placement": "developer", "description": "ActRealm 内部会话标识" },
-            { "id": "providerSessionId", "label": "Provider Session ID", "level": "developer", "placement": "developer", "description": "Provider 原始会话标识" },
-            { "id": "providerTurnId", "label": "Provider Turn ID", "level": "developer", "placement": "developer", "description": "Provider 当前轮次标识" },
-            { "id": "lastEventAt", "label": "最后事件时间", "level": "developer", "placement": "developer", "description": "Runtime 最近接收事件的本地时间" }
+            { "id": "task", "label": "Task title and summary", "level": "concise", "placement": "headline", "description": "Primary title; the summary appears below when it differs from the Provider title" },
+            { "id": "activity", "label": "Live status", "level": "concise", "placement": "headline", "description": "Run phase, waiting state, and elapsed time shown beside the title" },
+            { "id": "project", "label": "Project", "level": "concise", "placement": "subtitle", "description": "Project name in the subtitle" },
+            { "id": "model", "label": "Model", "level": "concise", "placement": "subtitle", "description": "Model name in the subtitle" },
+            { "id": "plan", "label": "Plan progress", "level": "concise", "placement": "subtitle", "description": "Completed step count and progress bar in the collapsed card" },
+            { "id": "sessionTokens", "label": "Session Token total", "level": "concise", "placement": "overview", "description": "Usage chip in the collapsed card and total in expanded details" },
+            { "id": "context", "label": "Context usage", "level": "concise", "placement": "overview", "description": "Current context percentage in the collapsed card" },
+            { "id": "cost", "label": "Estimated API price", "level": "detailed", "placement": "overview", "description": "Estimated public API price; not a subscription bill" },
+            { "id": "turnTokens", "label": "Turn Tokens", "level": "detailed", "placement": "details", "description": "Most recent turn Token count in expanded details" },
+            { "id": "inputOutputTokens", "label": "Input / output Tokens", "level": "detailed", "placement": "details", "description": "Input and output Token breakdown in expanded details" },
+            { "id": "cacheTokens", "label": "Cache read / write Tokens", "level": "detailed", "placement": "details", "description": "Cache read and creation Token breakdown in expanded details" },
+            { "id": "reasoningTokens", "label": "Reasoning Tokens", "level": "detailed", "placement": "details", "description": "Provider reasoning usage in expanded details" },
+            { "id": "tool", "label": "Current tool", "level": "detailed", "placement": "details", "description": "Current tool category in expanded details" },
+            { "id": "permissionMode", "label": "Permission mode", "level": "detailed", "placement": "details", "description": "Provider permission policy in expanded details" },
+            { "id": "subagents", "label": "Running subagents", "level": "detailed", "placement": "details", "description": "Active subagent count and list in expanded details" },
+            { "id": "environment", "label": "Environment", "level": "detailed", "placement": "details", "description": "Workspace or client environment in expanded details" },
+            { "id": "recovery", "label": "Recovery state", "level": "detailed", "placement": "details", "description": "Reconnect and control recovery state in expanded details" },
+            { "id": "control", "label": "Control capability", "level": "detailed", "placement": "details", "description": "Hook or Connector capability in expanded details" },
+            { "id": "jump", "label": "Open application", "level": "detailed", "placement": "details", "description": "Entry point for returning to the original application" },
+            { "id": "titleSource", "label": "Title source", "level": "developer", "placement": "developer", "description": "Title parsing source in expanded details" },
+            { "id": "sessionId", "label": "ActRealm Session ID", "level": "developer", "placement": "developer", "description": "Internal ActRealm session identifier" },
+            { "id": "providerSessionId", "label": "Provider Session ID", "level": "developer", "placement": "developer", "description": "Original Provider session identifier" },
+            { "id": "providerTurnId", "label": "Provider Turn ID", "level": "developer", "placement": "developer", "description": "Current Provider turn identifier" },
+            { "id": "lastEventAt", "label": "Last event time", "level": "developer", "placement": "developer", "description": "Local time of the most recent Runtime event" }
         ],
         "claudeQuotaBridge": {
             "status": bridge.status,
@@ -2706,12 +2709,13 @@ async fn jump_session(
             "success": true,
             "capability": session.jump_capability,
             "label": session.jump_label,
+            "labelMessage": status_messages::jump(&session.jump_capability),
         }))
         .into_response(),
         Ok(false) | Err(_) => api_error_detail(
             StatusCode::CONFLICT,
             "JUMP_FAILED",
-            "系统没有找到目标窗口，或尚未授予应用控制权限",
+            "The target window was not found, or application control permission has not been granted",
         ),
     }
 }
@@ -3061,6 +3065,23 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
                 };
             }
             if let Some(object) = items.get_mut(index).and_then(Value::as_object_mut) {
+                let blocking_attention_kind = snapshot.attention.iter().find_map(|item| {
+                    (item.session_id == session.id
+                        && matches!(item.state.as_str(), "open" | "committing" | "decision_sent")
+                        && matches!(
+                            item.kind.as_str(),
+                            "approval" | "native_approval" | "question"
+                        ))
+                    .then_some(item.kind.as_str())
+                });
+                object.insert(
+                    "activityMessage".to_owned(),
+                    status_messages::session_activity(session, blocking_attention_kind),
+                );
+                object.insert(
+                    "jumpMessage".to_owned(),
+                    status_messages::jump(&session.jump_capability),
+                );
                 object.insert("controlCapability".to_owned(), Value::String(control));
                 object.insert("recoveryState".to_owned(), Value::String(recovery));
                 object.insert("canManage".to_owned(), Value::Bool(can_manage));
@@ -3074,22 +3095,47 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
         .map_err(|error| StoreError::Storage(error.to_string()))?;
     if let Some(items) = attention.as_array_mut() {
         for (index, item) in snapshot.attention.iter().enumerate() {
-            let Some(request_id) = item.request_id else {
+            let Some(object) = items.get_mut(index).and_then(Value::as_object_mut) else {
                 continue;
             };
-            let Ok(Some(interaction)) = state.waiters.interactive_prompt(request_id) else {
-                continue;
-            };
-            if let Some(object) = items.get_mut(index).and_then(Value::as_object_mut) {
-                object.insert(
-                    "interaction".to_owned(),
-                    serde_json::to_value(interaction)
-                        .map_err(|error| StoreError::Storage(error.to_string()))?,
-                );
+            object.insert(
+                "titleMessage".to_owned(),
+                status_messages::attention_title(item),
+            );
+            if let Some(message) = status_messages::attention_detail(item) {
+                object.insert("detailMessage".to_owned(), message);
+            }
+            object.insert(
+                "riskMessages".to_owned(),
+                Value::Array(status_messages::attention_risks(item)),
+            );
+            if let Some(request_id) = item.request_id {
+                if let Ok(Some(interaction)) = state.waiters.interactive_prompt(request_id) {
+                    object.insert(
+                        "interaction".to_owned(),
+                        serde_json::to_value(interaction)
+                            .map_err(|error| StoreError::Storage(error.to_string()))?,
+                    );
+                }
             }
         }
     }
-    let quota = quota_entries(state)?;
+    let quota_entries = quota_entries(state)?;
+    let mut quota = serde_json::to_value(&quota_entries)
+        .map_err(|error| StoreError::Storage(error.to_string()))?;
+    if let Some(items) = quota.as_array_mut() {
+        for (index, entry) in quota_entries.iter().enumerate() {
+            let Some(object) = items.get_mut(index).and_then(Value::as_object_mut) else {
+                continue;
+            };
+            if let Some(message) = status_messages::quota_window(entry) {
+                object.insert("windowMessage".to_owned(), message);
+            }
+            if let Some(message) = status_messages::quota_reason(entry) {
+                object.insert("reasonMessage".to_owned(), message);
+            }
+        }
+    }
     Ok(json!({
         "sessions": sessions,
         "attention": attention,
@@ -3513,21 +3559,21 @@ mod tests {
             .iter()
             .find(|session| session.provider_session_id == codex_id)
             .unwrap();
-        assert_eq!(exact.jump_label, "精确打开对话");
+        assert_eq!(exact.jump_label, "Open exact conversation");
         assert!(matches!(jump_target(exact), JumpTarget::CodexThread(_)));
         let terminal = snapshot
             .sessions
             .iter()
             .find(|session| session.provider_session_id == "iterm-session")
             .unwrap();
-        assert_eq!(terminal.jump_label, "打开对应终端");
+        assert_eq!(terminal.jump_label, "Open terminal");
         assert_eq!(jump_target(terminal), JumpTarget::ITermSession);
         let app = snapshot
             .sessions
             .iter()
             .find(|session| session.provider_session_id == "claude-app-session")
             .unwrap();
-        assert_eq!(app.jump_label, "只能打开应用");
+        assert_eq!(app.jump_label, "Open application");
         assert_eq!(
             jump_target(app),
             JumpTarget::AppBundle("com.anthropic.claudefordesktop")
@@ -3721,6 +3767,28 @@ mod tests {
         assert!(!provider_ids.contains("old-idle"));
         assert!(provider_ids.contains("recent-idle"));
         assert!(provider_ids.contains("old-attention"));
+        let attention_session = sessions
+            .iter()
+            .find(|session| session["providerSessionId"] == "old-attention")
+            .unwrap();
+        assert_eq!(
+            attention_session["activityMessage"]["code"],
+            "session.activity.awaiting_approval"
+        );
+        let attention = value["attention"].as_array().unwrap().first().unwrap();
+        assert_eq!(
+            attention["titleMessage"]["code"],
+            "attention.approval.title"
+        );
+        assert_eq!(
+            attention["detailMessage"]["code"],
+            "attention.approval.detail"
+        );
+        assert!(attention["riskMessages"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .all(|message| message["code"].as_str().is_some())
+        }));
         drop(state);
         drop(store);
         fs::remove_dir_all(root).unwrap();
@@ -3743,6 +3811,12 @@ mod tests {
             .iter()
             .filter(|entry| entry["provider"] == "claude")
             .all(|entry| entry["status"] == "unavailable"));
+        assert!(before["quota"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["provider"] == "claude")
+            .all(|entry| entry["reasonMessage"]["code"] == "quota.reason.cache_missing"));
 
         let cache = state.quota.lock().unwrap().collector.paths().claude_cache();
         actrealm_quota::capture_claude_statusline(
@@ -3763,6 +3837,8 @@ mod tests {
         assert!(claude.iter().all(|entry| entry["status"] == "available"));
         assert_eq!(claude[0]["usedPct"], 2.0);
         assert_eq!(claude[1]["usedPct"], 0.0);
+        assert_eq!(claude[0]["windowMessage"]["code"], "quota.window.hours");
+        assert_eq!(claude[0]["windowMessage"]["args"]["count"], "5");
 
         drop(state);
         drop(store);
@@ -4400,7 +4476,7 @@ mod tests {
         assert_eq!(recovered.sessions[0].approval_owner, None);
         assert_eq!(
             recovered.sessions[0].activity.as_deref(),
-            Some("待处理事项已结束，等待 Agent 后续事件")
+            Some("Attention item resolved; waiting for the Agent's next event")
         );
         let exported = serde_json::to_string(&store.export_json(now_millis()).unwrap()).unwrap();
         assert!(!exported.contains("secret-48291"));
@@ -5117,19 +5193,19 @@ done
     fn manual_quota_refresh_errors_are_actionable_without_exposing_credentials() {
         assert_eq!(
             quota_refresh_error_detail(&QuotaError::OAuthUnavailable),
-            "未找到可读取的 Claude Code 登录凭证；请启动 Claude Code CLI，完成登录或开始一次会话，再回到 ActRealm 点击“立即更新”"
+            "No readable Claude Code credentials were found. Start the Claude Code CLI, sign in or begin a session, then return to ActRealm and refresh quota."
         );
         assert_eq!(
             quota_refresh_error_detail(&QuotaError::OAuthRequest(
                 "credential was rejected".to_owned()
             )),
-            "Claude 登录凭证需要由官方 CLI 刷新；请启动 Claude Code CLI，完成登录或开始一次会话，再回到 ActRealm 点击“立即更新”"
+            "Claude credentials must be refreshed by the official CLI. Start Claude Code, sign in or begin a session, then return to ActRealm and refresh quota."
         );
         assert_eq!(
             quota_refresh_error_detail(&QuotaError::OAuthRequest(
                 "temporarily rate limited".to_owned()
             )),
-            "Claude 额度接口暂时限流，请稍后重试"
+            "The Claude quota endpoint is temporarily rate limited. Try again later."
         );
     }
 }

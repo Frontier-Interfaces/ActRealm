@@ -128,6 +128,169 @@ let runtimeMonitorInFlight = false;
 let lastRuntimeMonitorAt = 0;
 let hiddenSessions = JSON.parse(localStorage.getItem("actrealm.hiddenSessions") || "{}");
 const SESSION_VISIBLE_FOR_MS = 30 * 60 * 1000;
+const RUNTIME_MESSAGES_ZH = {
+  "session.activity.idle": "等待新任务",
+  "session.activity.ended": "会话已结束",
+  "session.activity.thinking": "正在思考",
+  "session.activity.tool_running": "正在运行 {tool}",
+  "session.activity.awaiting_approval": "等待你批准",
+  "session.activity.awaiting_answer": "等待你回答",
+  "session.activity.compacting": "正在压缩记忆",
+  "session.activity.completed": "本轮已完成",
+  "session.activity.interrupted": "本轮已中断",
+  "session.activity.failed": "运行失败",
+  "session.activity.plan_progress": "计划进度 {done}/{total}",
+  "session.activity.subagents_running": "{count} 个子 Agent 正在运行",
+  "session.activity.background_tasks_running": "{count} 个后台任务仍在运行",
+  "session.activity.permission_denied": "操作已在 Agent 中拒绝",
+  "session.activity.waiting_for_provider_event": "等待 Agent 后续事件",
+  "session.activity.unknown_event": "事件不识别，Provider 版本可能不兼容",
+  "attention.approval.title": "等待批准",
+  "attention.native_approval.title": "请在 {provider} 中批准",
+  "attention.question.title": "{provider} 正在询问",
+  "attention.error.title": "Agent 运行失败",
+  "attention.interrupted.title": "Agent 本轮已中断",
+  "attention.completion.title": "任务已完成，等待确认",
+  "attention.approval.detail": "请在原对话中核对操作内容和影响。",
+  "attention.native_approval.detail": "请在 {provider} 中查看并处理此请求。",
+  "attention.question.detail": "可直接在 ActRealm 回答；答案不会写入本地历史。",
+  "attention.risk.high_impact": "已识别到高影响操作",
+  "attention.risk.irreversible": "提交后动作本身不可撤销",
+  "attention.risk.compound_syntax": "命令包含组合语法",
+  "attention.risk.read_only_intent": "只读意图；规则提示不构成安全保证",
+  "attention.risk.undo_window": "批准决定可在 3 秒内撤回",
+  "attention.risk.side_effects": "可能执行项目代码或产生副作用",
+  "attention.risk.unknown_impact": "此操作的影响未知",
+  "attention.risk.review_original": "建议查看原窗口",
+  "interaction.claude_question.title": "Claude 正在询问",
+  "interaction.claude_elicitation.title": "Claude 需要补充信息",
+  "interaction.codex_user_input.title": "Codex 正在询问",
+  "jump.exact_conversation": "精确打开对话",
+  "jump.terminal": "打开对应终端",
+  "jump.app_only": "只能打开应用",
+  "jump.unsupported": "当前环境不支持跳转",
+  "quota.window.months": "{count} 个月",
+  "quota.window.weeks": "{count} 周",
+  "quota.window.days": "{count} 天",
+  "quota.window.hours": "{count} 小时",
+  "quota.window.minutes": "{count} 分钟",
+  "quota.window.current_week": "本周",
+  "quota.window.extra_usage": "额外用量",
+  "quota.reason.cache_missing": "额度缓存不存在，请开启 Claude 额度桥并完成一次对话。",
+  "quota.reason.cache_unreadable": "额度缓存不可读：{error}",
+  "quota.reason.cache_incompatible": "额度缓存版本不兼容。",
+  "quota.reason.cache_invalid": "额度缓存解析失败。",
+  "quota.reason.cache_from_future": "额度缓存时间晚于本机时间。",
+  "quota.reason.no_valid_window": "没有找到可验证的额度窗口。",
+  "quota.reason.codex_rollout_missing": "未找到 Codex rollout 文件。",
+  "quota.reason.codex_window_missing": "Codex rollout 中没有可验证的额度窗口。",
+};
+
+const API_ERRORS_ZH = {
+  ANSWER_FAILED: "回答未能发送给 Agent",
+  AUTH_UNAVAILABLE: "Runtime 身份验证暂不可用",
+  CLAUDE_BRIDGE_CHANGE_FAILED: "Claude 额度桥更新失败",
+  CLAUDE_OAUTH_DISABLED: "Claude 官方 OAuth 额度接口未启用",
+  CLAUDE_QUOTA_REFRESH_FAILED: "Claude 额度刷新失败",
+  CLEAR_FAILED: "本地数据清除失败",
+  CODEX_REINSTALL_FAILED: "Codex Hook 重新安装失败",
+  COMMAND_MISMATCH: "命令与当前请求不匹配",
+  COMMIT_TOO_EARLY: "决定仍在撤回窗口内",
+  CONNECTOR_ATTACH_FAILED: "Connector 连接失败",
+  DELETE_CONFIRMATION_REQUIRED: "需要输入 DELETE 才能清除数据",
+  EXPORT_FAILED: "本地数据导出失败",
+  INVALID_ACTION: "当前操作无效",
+  INVALID_ANSWER: "回答内容无效",
+  INVALID_BOOTSTRAP: "启动凭据无效或已过期",
+  INVALID_COMMAND_ID: "命令标识无效",
+  INVALID_HOST: "访问地址不是受信任的本机地址",
+  INVALID_ORIGIN: "请求来源不受信任",
+  INVALID_RESTART_TOKEN: "Runtime 重启凭据无效",
+  INVALID_SETTINGS: "设置内容无效",
+  JUMP_FAILED: "没有找到原窗口，或 macOS 尚未授予应用控制权限",
+  JUMP_UNSUPPORTED: "当前环境不支持跳转",
+  MANAGED_CONNECTOR_UNSUPPORTED: "当前会话不支持托管 Connector",
+  METRIC_RECORD_FAILED: "本地统计记录失败",
+  MISSING_REQUEST_ID: "当前请求没有可回复的请求标识",
+  PROVIDER_CLIENT_MISSING: "没有找到对应的 Agent 客户端",
+  PROVIDER_INSTALL_REQUIRED: "请先安装对应的 Agent 客户端",
+  QUESTION_EXPIRED: "这个问题已经过期，不能再提交",
+  QUOTA_PERSIST_FAILED: "额度结果无法保存到本机",
+  QUOTA_REFRESH_FAILED: "额度刷新失败",
+  QUOTA_REFRESH_IN_PROGRESS: "额度正在刷新，请稍后再试",
+  QUOTA_STATE_UNAVAILABLE: "额度状态暂不可用",
+  REQUEST_MISMATCH: "请求与当前待处理事项不匹配",
+  RETENTION_FAILED: "本地保留策略执行失败",
+  RUNTIME_RESTART_FAILED: "Runtime 重启失败",
+  RUNTIME_RESTART_TIMED_OUT: "Runtime 重启超时",
+  RUNTIME_RESTART_UNAVAILABLE: "当前 Runtime 无法自动重启",
+  RUNTIME_NOT_CONNECTED: "Runtime 尚未连接",
+  RUNTIME_AUTH_FAILED: "Runtime 身份验证失败",
+  RUNTIME_SESSION_MISSING: "Runtime 没有返回本机会话",
+  SESSION_NOT_FOUND: "没有找到对应任务",
+  SETTINGS_READ_FAILED: "本机设置读取失败",
+  SETUP_CHANGE_FAILED: "Agent 接入更新失败",
+  SETUP_INSPECTION_FAILED: "Agent 接入状态检查失败",
+  STALE_APPROVAL: "这项批准请求已经过期",
+  STALE_ATTENTION: "这项待处理事项已经更新或过期",
+  STORAGE_ERROR: "本地存储暂不可用",
+  UNAUTHORIZED: "本机会话已失效，请重新连接",
+  UNAUTHORIZED_MUTATION: "当前请求没有修改权限",
+  UNAUTHORIZED_WEBSOCKET: "实时连接身份验证失败",
+  UNKNOWN_ACTION: "未知操作",
+  UNKNOWN_BRIDGE_ACTION: "未知额度桥操作",
+  UNKNOWN_MANAGE_ACTION: "未知托管操作",
+  UNKNOWN_PROVIDER: "未知 Agent 类型",
+  UNKNOWN_SETUP_ACTION: "未知接入操作",
+  UNSAFE_DATA_PATH: "本地数据目录未通过安全检查",
+};
+
+function runtimeMessageText(message, fallback = "") {
+  if (!message?.code) return fallback;
+  let text = RUNTIME_MESSAGES_ZH[message.code] || fallback || message.code;
+  for (const [key, value] of Object.entries(message.args || {})) {
+    text = text.replaceAll(`{${key}}`, String(value));
+  }
+  return text;
+}
+
+function apiErrorText(error) {
+  const code = String(error?.message || "UNKNOWN_ERROR");
+  if (API_ERRORS_ZH[code]) return API_ERRORS_ZH[code];
+  const httpStatus = code.match(/^HTTP_(\d+)$/)?.[1];
+  if (httpStatus) return `本机请求失败（HTTP ${httpStatus}）`;
+  if (code === "RESTART_TIMEOUT") return "Runtime 未能自动恢复";
+  if (code.startsWith("HEALTH_")) return "Runtime 健康检查失败";
+  return "请求失败，请重试";
+}
+
+const DISPLAY_FIELDS_ZH = {
+  task: ["任务标题与摘要", "主标题；不同的任务摘要显示在下一行"],
+  activity: ["实时状态", "标题栏右侧的运行阶段与耗时"],
+  project: ["项目", "副标题中的项目名称"],
+  model: ["模型", "副标题中的模型名称"],
+  plan: ["计划进度", "完成步数与进度条"],
+  sessionTokens: ["会话累计 Token", "折叠卡用量胶囊"],
+  context: ["上下文占用", "当前上下文百分比"],
+  cost: ["估算 API 价格", "估算值，不是订阅账单"],
+  turnTokens: ["本轮 Token", "最近一轮 Token"],
+  inputOutputTokens: ["输入 / 输出 Token", "输入与输出拆分"],
+  cacheTokens: ["缓存读取 / 写入 Token", "缓存用量拆分"],
+  reasoningTokens: ["推理 Token", "Provider 推理用量"],
+  tool: ["当前工具", ""],
+  permissionMode: ["权限模式", ""],
+  subagents: ["运行中的子 Agent", ""],
+  environment: ["运行环境", ""],
+  recovery: ["恢复状态", ""],
+  control: ["托管能力", ""],
+  jump: ["打开应用", ""],
+  titleSource: ["标题来源", ""],
+  sessionId: ["ActRealm Session ID", ""],
+  providerSessionId: ["Provider Session ID", ""],
+  providerTurnId: ["Provider Turn ID", ""],
+  lastEventAt: ["最后事件时间", ""],
+};
+
 const SOCKET_STALE_AFTER_MS = 25 * 1000;
 const SNAPSHOT_FALLBACK_AFTER_MS = 15 * 1000;
 const SETUP_FOCUS_REFRESH_AFTER_MS = 5 * 1000;
@@ -433,7 +596,7 @@ async function loadSetup() {
     renderSetup();
     renderOnboardingState();
   } catch (error) {
-    showToast(`接入状态读取失败：${error.message}`);
+    showToast(`接入状态读取失败：${apiErrorText(error)}`);
   } finally {
     setupLoading = false;
   }
@@ -458,7 +621,7 @@ async function changeSetup(provider, action) {
     renderOnboardingState();
     showToast(action === "uninstall" ? `${providerName(provider)} 接入已移除` : `${providerName(provider)} 配置已安全写入`);
   } catch (error) {
-    showToast(`接入操作失败：${error.detail || error.message}`);
+    showToast(`接入操作失败：${apiErrorText(error)}`);
   } finally {
     setupBusy = false;
     renderSetup();
@@ -571,8 +734,11 @@ function renderFieldSelector() {
       input.checked = selected.has(field.id);
       input.disabled = profile !== "custom";
       const copy = element("span", "field-option-copy");
-      copy.append(element("strong", "", field.label));
-      if (field.description) copy.append(element("small", "", field.description));
+      const localizedField = DISPLAY_FIELDS_ZH[field.id];
+      const fieldLabel = localizedField?.[0] || field.id;
+      const fieldDescription = localizedField?.[1] || "";
+      copy.append(element("strong", "", fieldLabel));
+      if (fieldDescription) copy.append(element("small", "", fieldDescription));
       label.append(input, copy);
       options.append(label);
     }
@@ -601,7 +767,7 @@ async function loadSettings() {
     renderSessions();
     renderQuota();
   } catch (error) {
-    setSettingsFeedback(`设置读取失败：${error.detail || error.message}`, { error: true, retry: true });
+    setSettingsFeedback(`设置读取失败：${apiErrorText(error)}`, { error: true, retry: true });
   }
 }
 
@@ -656,7 +822,7 @@ async function saveSettings(settingsOverride) {
   } catch (error) {
     failedSettingsDraft = draft;
     renderSettings();
-    setSettingsFeedback(`设置保存失败：${error.detail || error.message}`, { error: true, retry: true });
+    setSettingsFeedback(`设置保存失败：${apiErrorText(error)}`, { error: true, retry: true });
   } finally {
     settingsBusy = false;
     renderSettings();
@@ -678,7 +844,7 @@ async function changeClaudeBridge() {
     await loadSnapshot();
     showToast(action === "uninstall" ? "Claude 额度桥已关闭，原状态栏已恢复" : "Claude 额度桥已开启，完成一次对话后会显示额度");
   } catch (error) {
-    showToast(`额度桥操作失败：${error.detail || error.message}`);
+    showToast(`额度桥操作失败：${apiErrorText(error)}`);
   } finally {
     settingsBusy = false;
     renderSettings();
@@ -700,7 +866,7 @@ async function exportLocalData() {
     URL.revokeObjectURL(url);
     showToast("本地数据已导出");
   } catch (error) {
-    showToast(`导出失败：${error.message}`);
+    showToast(`导出失败：${apiErrorText(error)}`);
   }
 }
 
@@ -719,7 +885,7 @@ async function exportLocalMetrics() {
     URL.revokeObjectURL(url);
     showToast("仅统计数据已导出，不含会话和事件明细");
   } catch (error) {
-    showToast(`统计导出失败：${error.message}`);
+    showToast(`统计导出失败：${apiErrorText(error)}`);
   }
 }
 
@@ -752,7 +918,7 @@ async function clearLocalData() {
     cancelClearConfirmation();
     showToast("本地运行数据已彻底清除，Hook 接入保持不变");
   } catch (error) {
-    showToast(`清除失败：${error.detail || error.message}`);
+    showToast(`清除失败：${apiErrorText(error)}`);
   }
 }
 
@@ -799,10 +965,14 @@ function renderMetrics() {
 
 function attentionTitle(item) {
   if (item.kind === "approval") return `请求运行 ${item.commandPreview || "一项工具操作"}，等待批准`;
-  if (item.kind === "native_approval") return item.title || `${providerName(item.provider)} 等待在原界面批准`;
-  if (item.kind === "error") return item.title || "任务出错停下来了";
-  if (item.kind === "completion") return item.title || "这一轮已经完成";
-  return item.title || "Agent 有一项待处理事项";
+  return runtimeMessageText(
+    item.titleMessage,
+    item.title || {
+      native_approval: `${providerName(item.provider)} 等待在原界面批准`,
+      error: "任务出错停下来了",
+      completion: "这一轮已经完成",
+    }[item.kind] || "Agent 有一项待处理事项",
+  );
 }
 
 function attentionContext(item) {
@@ -858,7 +1028,7 @@ async function submitQuestion(item, submission, controls) {
     await loadSnapshot();
   } catch (error) {
     for (const control of controls) control.disabled = false;
-    showToast(error.message === "QUESTION_EXPIRED" ? "这个问题已经过期，不能再提交" : `回答失败：${error.message}`);
+    showToast(`回答失败：${apiErrorText(error)}`);
   }
 }
 
@@ -1077,11 +1247,17 @@ function renderAttention() {
 
   const interactive = renderInteractiveForm(item, card);
   if (!interactive) {
-    const fact = item.detail || item.commandPreview;
+    const fact = runtimeMessageText(item.detailMessage, item.detail) || item.commandPreview;
     if (fact) card.append(element("div", "fact-block", fact));
     const risk = element("div", "risk-row");
     risk.append(element("span", "risk-chip", `风险标记：${item.risk || "未知"}`));
-    for (const note of item.riskNotes || []) risk.append(element("span", "risk-chip", note));
+    for (const [index, note] of (item.riskNotes || []).entries()) {
+      risk.append(element(
+        "span",
+        "risk-chip",
+        runtimeMessageText(item.riskMessages?.[index], note),
+      ));
+    }
     if (item.expiresAt) risk.append(element("span", "risk-chip", `截止 ${new Date(item.expiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`));
     card.append(risk);
   }
@@ -1346,7 +1522,10 @@ function openSessionDetail(session) {
     fields.has("permissionMode") ? detailPair("权限模式", session.permissionMode) : undefined,
     fields.has("subagents") ? detailPair("运行中的子 Agent", String(session.activeSubagents || 0)) : undefined,
     fields.has("environment") ? detailPair("运行环境", session.environment) : undefined,
-    fields.has("jump") ? detailPair("跳转能力", session.jumpLabel) : undefined,
+    fields.has("jump") ? detailPair(
+      "跳转能力",
+      runtimeMessageText(session.jumpMessage, session.jumpLabel),
+    ) : undefined,
     fields.has("titleSource") ? detailPair("标题来源", session.providerTitleSource) : undefined,
     fields.has("sessionId") ? detailPair("ActRealm Session ID", session.id, "developer-value") : undefined,
     fields.has("providerSessionId") ? detailPair("Provider Session ID", session.providerSessionId, "developer-value") : undefined,
@@ -1356,7 +1535,10 @@ function openSessionDetail(session) {
   const grid = element("div", "session-detail-grid");
   for (const row of rows) grid.append(row);
   ui.sessionDetailBody.append(grid);
-  ui.sessionDetailJump.textContent = session.jumpLabel || "当前环境不支持跳转";
+  ui.sessionDetailJump.textContent = runtimeMessageText(
+    session.jumpMessage,
+    session.jumpLabel || "当前环境不支持跳转",
+  );
   ui.sessionDetailJump.disabled = session.jumpCapability === "unsupported";
   ui.sessionDetailJump.onclick = () => jumpSession(session);
   ui.sessionDetailOverlay.hidden = false;
@@ -1409,22 +1591,23 @@ function activityDisplay(session) {
     };
   }
   const timing = turnTiming(session);
+  const runtimeActivity = runtimeMessageText(session.activityMessage, session.activity || "");
   if (session.execState === "thinking") {
-    return { className: "thinking", marker: "•••", text: `${session.activity || "正在思考"} · ${timing}` };
+    return { className: "thinking", marker: "•••", text: `${runtimeActivity || "正在思考"} · ${timing}` };
   }
   if (session.execState === "tool_running") {
-    return { className: "tool", marker: "▌", text: `${session.activity || "正在运行工具"} · ${timing}` };
+    return { className: "tool", marker: "▌", text: `${runtimeActivity || "正在运行工具"} · ${timing}` };
   }
   if (session.execState === "compacting") {
-    return { className: "compacting", marker: "◌", text: `${session.activity || "正在压缩记忆"} · ${timing}` };
+    return { className: "compacting", marker: "◌", text: `${runtimeActivity || "正在压缩记忆"} · ${timing}` };
   }
   if (session.execState === "failed") {
-    return { className: "failed", marker: "×", text: `${session.activity || "运行失败"} · ${timing}` };
+    return { className: "failed", marker: "×", text: `${runtimeActivity || "运行失败"} · ${timing}` };
   }
   if (session.execState === "response_finished") {
-    return { className: "idle", marker: "✓", text: `${session.activity || "本轮已完成"} · ${timing}` };
+    return { className: "idle", marker: "✓", text: `${runtimeActivity || "本轮已完成"} · ${timing}` };
   }
-  return { className: "idle", marker: "·", text: `${session.activity || "空闲"} · ${elapsedText(session.lastEventAt)}前` };
+  return { className: "idle", marker: "·", text: `${runtimeActivity || "空闲"} · ${elapsedText(session.lastEventAt)}前` };
 }
 
 function updateSessionActivity() {
@@ -1459,12 +1642,14 @@ async function jumpSession(session) {
       method: "POST",
       body: "{}",
     });
-    if (result.success) showToast(result.label || session.jumpLabel || "已打开 Agent");
+    if (result.success) {
+      showToast(runtimeMessageText(
+        result.labelMessage || session.jumpMessage,
+        result.label || session.jumpLabel || "已打开 Agent",
+      ));
+    }
   } catch (error) {
-    const message = error.message === "JUMP_FAILED"
-      ? "没有找到原窗口，或 macOS 尚未授予应用控制权限"
-      : `跳转失败：${error.message}`;
-    showToast(message);
+    showToast(`跳转失败：${apiErrorText(error)}`);
   }
 }
 
@@ -1478,7 +1663,7 @@ async function manageSession(session) {
     showToast("已连接 ActRealm app-server；Codex 原生窗口仍保留当前 Turn 的控制权");
     await loadSnapshot();
   } catch (error) {
-    showToast(`托管连接失败：${error.detail || error.message}`);
+    showToast(`托管连接失败：${apiErrorText(error)}`);
   }
 }
 
@@ -1623,7 +1808,10 @@ function buildSessionRow(session) {
         fields.has("subagents") ? ["运行中的子 Agent", String(session.activeSubagents || 0)] : undefined,
         fields.has("recovery") ? ["恢复状态", recoveryDisplay(session).label] : undefined,
         fields.has("control") ? ["托管能力", session.controlCapability === "managed" ? "Codex app-server 托管，可回答提问" : "外部 Hook，仅观察/授权"] : undefined,
-        fields.has("jump") ? ["打开应用", session.jumpLabel || "当前环境不支持"] : undefined,
+        fields.has("jump") ? ["打开应用", runtimeMessageText(
+          session.jumpMessage,
+          session.jumpLabel || "当前环境不支持",
+        )] : undefined,
         fields.has("titleSource") ? ["标题来源", session.providerTitleSource || "—"] : undefined,
         fields.has("sessionId") ? ["ActRealm Session ID", session.id] : undefined,
         fields.has("providerSessionId") ? ["Provider Session ID", session.providerSessionId] : undefined,
@@ -1734,7 +1922,10 @@ function quotaDurationLabel(minutes, fallback) {
 }
 
 function quotaWindowLabel(quota) {
-  const name = quota.limitName || quotaDurationLabel(quota.windowMinutes, quota.window);
+  const name = runtimeMessageText(
+    quota.windowMessage,
+    quota.limitName || quotaDurationLabel(quota.windowMinutes, quota.window),
+  );
   return `${providerName(quota.provider)} · ${name}`;
 }
 
@@ -1803,7 +1994,12 @@ function renderQuota() {
         unavailableTitle.append(element("span", "quota-status-chip neutral", "暂不可用"));
         unavailable.append(unavailableTitle);
         const detail = element("div", "quota-compact-detail unavailable");
-        detail.append(element("p", "", quota.reason || "额度来源没有返回可验证数据"));
+        detail.append(element(
+          "p",
+          "",
+          runtimeMessageText(quota.reasonMessage, quota.reason)
+            || "额度来源没有返回可验证数据",
+        ));
         if (quota.provider === "claude") {
           const help = element("button", "quota-help", "检查设置");
           help.type = "button";
@@ -1819,7 +2015,8 @@ function renderQuota() {
           element("span", "quota-compact-status", "暂不可用"),
           element("span", "quota-state-dot neutral"),
         );
-        unavailable.title = quota.reason || "额度来源没有返回可验证数据";
+        unavailable.title = runtimeMessageText(quota.reasonMessage, quota.reason)
+          || "额度来源没有返回可验证数据";
         if (quota.provider === "claude") {
           unavailable.tabIndex = 0;
           unavailable.setAttribute("role", "button");
@@ -1836,7 +2033,12 @@ function renderQuota() {
         continue;
       }
       unavailable.append(unavailableTitle);
-      unavailable.append(element("p", "", quota.reason || "额度来源没有返回可验证数据"));
+      unavailable.append(element(
+        "p",
+        "",
+        runtimeMessageText(quota.reasonMessage, quota.reason)
+          || "额度来源没有返回可验证数据",
+      ));
       unavailable.append(element("div", "quota-track"));
       if (quota.provider === "claude") {
         const help = element("button", "quota-help", "如何开启");
@@ -2181,7 +2383,10 @@ async function sendAction(item, action) {
     if (command.state === "pending_commit") showUndo(command.id, action);
     await loadSnapshot();
   } catch (error) {
-    showToast(error.message === "STALE_APPROVAL" ? "这项请求已过期，已交回原终端" : `操作失败：${error.message}`);
+    const message = error.message === "STALE_APPROVAL"
+      ? "这项请求已过期，已交回原终端"
+      : `操作失败：${apiErrorText(error)}`;
+    showToast(message);
     await loadSnapshot().catch(() => {});
   }
 }
@@ -2205,7 +2410,10 @@ async function undoCommand(commandId) {
     ui.undoToast.hidden = true;
     await loadSnapshot();
   } catch (error) {
-    showToast(error.message === "STALE_APPROVAL" ? "决定已经提交，不能再撤回" : `撤回失败：${error.message}`);
+    const message = error.message === "STALE_APPROVAL"
+      ? "决定已经提交，不能再撤回"
+      : `撤回失败：${apiErrorText(error)}`;
+    showToast(message);
   }
 }
 
@@ -2274,7 +2482,7 @@ async function loadRuntimeMonitor() {
     renderRuntimeMonitor(await api("/api/v1/runtime/status"));
     lastRuntimeMonitorAt = Date.now();
   } catch (error) {
-    ui.runtimeMonitorGrid.replaceChildren(element("span", "monitor-loading", `监控读取失败：${error.message}`));
+    ui.runtimeMonitorGrid.replaceChildren(element("span", "monitor-loading", `监控读取失败：${apiErrorText(error)}`));
   } finally {
     runtimeMonitorInFlight = false;
     ui.runtimeMonitorRefresh.disabled = false;
@@ -2367,7 +2575,7 @@ async function restartRuntime() {
     setConnected(false);
     setRuntimeActionFeedback(error.message === "RESTART_TIMEOUT"
       ? "Runtime 未能自动恢复，请在终端重新运行 serve --open"
-      : `Runtime 重启失败：${error.message}`, true);
+      : `Runtime 重启失败：${apiErrorText(error)}`, true);
   } finally {
     ui.runtimeRestart.disabled = false;
     ui.runtimeRestart.textContent = "重启 Runtime";
@@ -2506,7 +2714,7 @@ window.setInterval(maintainLiveConnection, 5000);
     connectSocket();
   } catch (error) {
     ui.attentionList.replaceChildren(emptyState("!", "无法连接本地 Runtime", "请从 actrealm serve 输出的一次性地址打开控制面板。"));
-    showToast(`连接失败：${error.message}`);
+    showToast(`连接失败：${apiErrorText(error)}`);
   } finally {
     document.body.classList.remove("app-booting");
   }
