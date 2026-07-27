@@ -197,7 +197,7 @@ fn bounded_five_thousand_session_snapshot_stays_within_server_budget() {
         .ingest(BridgeRequest::from_hook_at(
             Provider::Claude,
             json!({
-                "hook_event_name":"SessionStart",
+                "hook_event_name":"UserPromptSubmit",
                 "session_id":"bounded-performance-recent"
             }),
             now_millis(),

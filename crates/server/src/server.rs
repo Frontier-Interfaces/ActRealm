@@ -3402,23 +3402,6 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
     }))
 }
 
-#[cfg(test)]
-fn session_is_visible(
-    session: &SessionRecord,
-    visible_attention_sessions: &HashSet<&str>,
-    cutoff: u64,
-) -> bool {
-    let active = !matches!(
-        session.exec_state.as_str(),
-        "idle" | "response_finished" | "failed"
-    );
-    active
-        || session
-            .last_meaningful_activity_at
-            .is_some_and(|last| last >= cutoff)
-        || visible_attention_sessions.contains(session.id.as_str())
-}
-
 fn refresh_session_usage(state: &AppState, now: u64) -> Result<(), StoreError> {
     let records = {
         let mut usage = match state.usage.lock() {
@@ -5541,6 +5524,8 @@ mod tests {
             Uuid::now_v7()
         ));
         let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        let now = now_millis();
         store
             .ingest(BridgeRequest::from_hook_at(
                 Provider::Claude,
@@ -5548,15 +5533,11 @@ mod tests {
                     "hook_event_name":"SessionStart",
                     "session_id":"history-only"
                 }),
-                1_000,
+                now,
             ))
             .unwrap();
-        let lifecycle = store.snapshot().unwrap();
-        assert!(!session_is_visible(
-            &lifecycle.sessions[0],
-            &HashSet::new(),
-            0
-        ));
+        let lifecycle = snapshot_value(&state).unwrap();
+        assert!(lifecycle["sessions"].as_array().unwrap().is_empty());
 
         store
             .ingest(BridgeRequest::from_hook_at(
@@ -5566,15 +5547,13 @@ mod tests {
                     "session_id":"history-only",
                     "prompt":"现在开始真实任务"
                 }),
-                2_000,
+                now.saturating_add(1),
             ))
             .unwrap();
-        let active = store.snapshot().unwrap();
-        assert!(session_is_visible(
-            &active.sessions[0],
-            &HashSet::new(),
-            1_500
-        ));
+        let active = snapshot_value(&state).unwrap();
+        let sessions = active["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["providerSessionId"], "history-only");
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }

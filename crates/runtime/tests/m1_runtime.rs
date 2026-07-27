@@ -2902,6 +2902,55 @@ fn ui_snapshot_reads_only_recent_or_actionable_sessions() {
 }
 
 #[test]
+fn ui_snapshot_hides_recent_claude_lifecycle_replay_until_meaningful_activity() {
+    let root = temp_root("ui-snapshot-lifecycle-replay");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+
+    for index in 0..50 {
+        for (event, offset) in [("SessionStart", 0), ("SessionEnd", 1)] {
+            store
+                .ingest(request_at(
+                    Provider::Claude,
+                    event,
+                    &format!("history-only-{index}"),
+                    None,
+                    None,
+                    1_000 + index * 2 + offset,
+                ))
+                .unwrap();
+        }
+    }
+
+    let full_snapshot = store.snapshot().unwrap();
+    assert_eq!(full_snapshot.sessions.len(), 50);
+    assert!(full_snapshot
+        .sessions
+        .iter()
+        .all(|session| session.last_meaningful_activity_at.is_none()));
+    assert!(store.ui_snapshot(0).unwrap().sessions.is_empty());
+
+    store
+        .ingest(request_at(
+            Provider::Claude,
+            "UserPromptSubmit",
+            "history-only-17",
+            Some("real-turn"),
+            None,
+            2_000,
+        ))
+        .unwrap();
+    let visible = store.ui_snapshot(0).unwrap();
+    assert_eq!(visible.sessions.len(), 1);
+    assert_eq!(
+        visible.sessions[0].provider_session_id.as_str(),
+        "history-only-17"
+    );
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn snapshot_batches_plan_steps_and_subagents() {
     let root = temp_root("batched-ui-snapshot");
     let database = root.join("data.sqlite");
@@ -2961,16 +3010,18 @@ fn snapshot_batches_plan_steps_and_subagents() {
 fn ui_snapshot_cache_does_not_cross_cutoffs() {
     let root = temp_root("ui-snapshot-cache-cutoff");
     let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
-    store
-        .ingest(request_at(
-            Provider::Claude,
-            "SessionStart",
-            "cutoff-boundary",
-            None,
-            None,
-            1_000,
-        ))
-        .unwrap();
+    for event in ["UserPromptSubmit", "SessionEnd"] {
+        store
+            .ingest(request_at(
+                Provider::Claude,
+                event,
+                "cutoff-boundary",
+                Some("turn"),
+                None,
+                1_000,
+            ))
+            .unwrap();
+    }
 
     assert_eq!(store.ui_snapshot(1_000).unwrap().sessions.len(), 1);
     assert!(store.ui_snapshot(1_001).unwrap().sessions.is_empty());
@@ -2983,26 +3034,20 @@ fn ui_snapshot_cache_does_not_cross_cutoffs() {
 fn ui_snapshot_cache_reuses_moving_cutoffs_without_returning_expired_sessions() {
     let root = temp_root("ui-snapshot-moving-cutoff-cache");
     let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
-    store
-        .ingest(request_at(
-            Provider::Claude,
-            "SessionStart",
-            "crosses-cutoff",
-            None,
-            None,
-            1_000,
-        ))
-        .unwrap();
-    store
-        .ingest(request_at(
-            Provider::Claude,
-            "SessionStart",
-            "stays-visible",
-            None,
-            None,
-            1_002,
-        ))
-        .unwrap();
+    for (session, at) in [("crosses-cutoff", 1_000), ("stays-visible", 1_002)] {
+        for event in ["UserPromptSubmit", "SessionEnd"] {
+            store
+                .ingest(request_at(
+                    Provider::Claude,
+                    event,
+                    session,
+                    Some("turn"),
+                    None,
+                    at,
+                ))
+                .unwrap();
+        }
+    }
 
     let (first, first_query_count) = store.ui_snapshot_with_query_count(1_000).unwrap();
     assert_eq!(first.sessions.len(), 2);

@@ -2101,6 +2101,13 @@ fn ensure_session_activity_columns(connection: &Connection) -> Result<(), StoreE
             [],
         )
         .map_err(storage_error)?;
+    connection
+        .execute(
+            "CREATE INDEX IF NOT EXISTS sessions_last_meaningful_activity_at
+             ON sessions(last_meaningful_activity_at)",
+            [],
+        )
+        .map_err(storage_error)?;
     Ok(())
 }
 
@@ -4005,7 +4012,7 @@ fn read_snapshot(
                    ON usage.provider = sessions.provider
                   AND usage.provider_session_id = sessions.provider_session_id
                  WHERE ?1 IS NULL
-                    OR sessions.last_event_at >= ?1
+                    OR sessions.last_meaningful_activity_at >= ?1
                     OR sessions.exec_state NOT IN ('idle', 'response_finished', 'failed')
                     OR EXISTS (
                         SELECT 1 FROM attention_items
@@ -4123,7 +4130,7 @@ fn read_snapshot(
                     OR state IN ('open', 'committing', 'decision_sent', 'snoozed')
                     OR session_id IN (
                         SELECT id FROM sessions
-                        WHERE last_event_at >= ?1
+                        WHERE last_meaningful_activity_at >= ?1
                            OR exec_state NOT IN ('idle', 'response_finished', 'failed')
                            OR EXISTS (
                                SELECT 1 FROM attention_items AS blockers
@@ -4172,7 +4179,7 @@ fn read_snapshot(
                         WHERE state IN ('open', 'committing', 'decision_sent', 'snoozed')
                            OR session_id IN (
                                SELECT id FROM sessions
-                               WHERE last_event_at >= ?1
+                               WHERE last_meaningful_activity_at >= ?1
                                   OR exec_state NOT IN ('idle', 'response_finished', 'failed')
                                   OR EXISTS (
                                       SELECT 1 FROM attention_items AS blockers
@@ -4235,7 +4242,9 @@ fn filter_ui_snapshot_for_cutoff(snapshot: &mut StoreSnapshot, cutoff: u64) {
         .map(|attention| attention.session_id.as_str())
         .collect::<HashSet<_>>();
     snapshot.sessions.retain(|session| {
-        session.last_event_at >= cutoff
+        session
+            .last_meaningful_activity_at
+            .is_some_and(|last| last >= cutoff)
             || !matches!(
                 session.exec_state.as_str(),
                 "idle" | "response_finished" | "failed"
