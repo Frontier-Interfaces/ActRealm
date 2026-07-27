@@ -1,51 +1,47 @@
-- docs/reports/evidence/2026-07-22/00-evidence-index.txt
-- docs/reports/evidence/2026-07-22/01-automated-gates.log
-- docs/reports/evidence/2026-07-22/02-main-baseline.png
-- docs/reports/evidence/2026-07-22/03-outbox-four-concurrent.png
-- docs/reports/evidence/2026-07-22/04-outbox-selection-index-bug.png
-- docs/reports/evidence/2026-07-22/05-decision-sent-still-actionable.png
-- docs/reports/evidence/2026-07-22/06-outbox-primary-disappears-after-resolution.png
-- docs/reports/evidence/2026-07-22/07-claude-question-form-missing.png
-- docs/reports/evidence/2026-07-22/08-completion-notification.png
-- docs/reports/evidence/2026-07-22/09-completion-confirmation-wrong-toast.png
-- docs/reports/evidence/2026-07-22/10-provider-owned-modes.log
-- docs/reports/evidence/2026-07-22/11-native-approval-observation.png
-- docs/reports/evidence/2026-07-22/12-provider-owned-completion-notifications.png
-- docs/reports/evidence/2026-07-22/13-runtime-kill-recovery.log
-- docs/reports/evidence/2026-07-22/14-runtime-dead-stale-action-buttons.png
-- docs/reports/evidence/2026-07-22/15-restart-ghost-waiting-task.png
-- docs/reports/evidence/2026-07-22/16-SkyComputerUseService-theme-tab-crash.ips
-- docs/reports/evidence/2026-07-22/17-app-relaunch-cannot-attach-existing-runtime.png
-- docs/reports/evidence/2026-07-22/18-process-tree.log
-- docs/reports/evidence/2026-07-22/19-main-live-resource-samples.log
-- docs/reports/evidence/2026-07-22/20-runtime-high-cpu.sample.txt
-- docs/reports/evidence/2026-07-22/21-agent-focus-resource-samples.log
-- docs/reports/evidence/2026-07-22/22-agent-focus-page.png
-- docs/reports/evidence/2026-07-22/23-minimized-resource-samples.log
-- docs/reports/evidence/2026-07-22/24-package-distribution.log
-- docs/reports/evidence/2026-07-22/25-two-minute-resource-gate.log
-- docs/reports/evidence/2026-07-22/26-first-run-native.png
-- docs/reports/evidence/2026-07-22/27-first-run-codex-trust-step.png
-- docs/reports/evidence/2026-07-22/28-500-session-burst.log
-- docs/reports/evidence/2026-07-22/29-500-session-burst-valid.log
-- docs/reports/evidence/2026-07-22/30-live-network-and-permissions.log
-- docs/reports/evidence/2026-07-22/31-export-help.log
-- docs/reports/evidence/2026-07-22/32-live-export-privacy-summary.log
-- docs/reports/evidence/2026-07-22/33-bootstrap-diagnostics-source.log
-- docs/reports/evidence/2026-07-22/34-plan-subagent-ci-autostart.log
-- docs/reports/evidence/2026-07-22/35-settings-data-accessibility.jpeg
-- docs/reports/evidence/2026-07-22/36-settings-notification-scope-regression.jpeg
-- docs/reports/evidence/2026-07-22/37-settings-agent.jpeg
-- docs/reports/evidence/2026-07-22/38-keyboard-tab-focus.json
-- docs/reports/evidence/2026-07-22/39-source-anchors.log
-- docs/reports/evidence/2026-07-22/40-test-cleanup-and-final-doctor.log
-- docs/reports/evidence/2026-07-22/41-synthetic-session-final-states.log
-- docs/reports/evidence/2026-07-22/42-claude-open-creates-history-cards.png
-- docs/reports/evidence/2026-07-22/43-claude-open-without-new-code-task.png
-- docs/reports/evidence/2026-07-22/44-claude-open-event-analysis.log
-- docs/reports/evidence/2026-07-22/45-sleep-quota-and-lifecycle-source.log
-- docs/reports/evidence/2026-07-22/auto-review-request.json
-- docs/reports/evidence/2026-07-22/codex-native-approval.json
-- docs/reports/evidence/2026-07-22/full-access-request.json
-- docs/reports/evidence/2026-07-22/runtime-kill-waiter.json
-- docs/reports/evidence/2026-07-22/stress_500.sh
+ActRealm 2026-07-22 脱敏证据索引
+
+审查对象：
+- 分支：agent/v1-full
+- 冻结候选：50b891a4e7f7b8c07349d5a082cfc9dcfc9e7bd0
+- 环境范围：Apple Silicon、macOS 26
+- 方法：自动化门禁、真实 Hook、原生 UI、故障注入、隔离首装、压力、资源、安全和静态审计
+
+隐私处理：
+- 原始截图、崩溃报告、进程列表、机器路径、请求样本、运行日志和压力脚本已从当前树删除。
+- 本索引只保留测试名称、结论和不包含个人内容的聚合数字。
+- 原始材料不应提交；如需复测，应在本机临时目录生成并在核验后删除。
+
+自动化与安全：
+- Rust 格式、Clippy、工作区测试、Release 构建：通过。
+- Swift：12 个 Suite、71 项测试通过。
+- RustSec：未发现命中。
+- 仅回环网络、私有 Socket/数据权限：通过。
+- 导出脱敏与 Runtime 离线 fail-open：通过。
+- bootstrap 诊断脱敏：基线候选失败，列为 AR-015。
+
+Provider 与控制：
+- Claude/Codex 真实事件接入：通过。
+- request-keyed Codex 决策回传：通过。
+- Provider 原生审批仅观察、不伪造本地批准能力：通过。
+- 并发 Outbox 稳定选择：基线候选失败，列为 AR-001。
+- Claude 问题/Elicitation 原生回答：基线候选失败，列为 AR-002。
+- Runtime/App 重启、重附着与幽灵等待：基线候选失败，列为 AR-003 至 AR-006。
+- Provider listener 生命周期：基线候选失败，列为 AR-008。
+
+性能与恢复：
+- 500 个唯一会话、16 并发：2.32 秒完成，500 session、500 event、完整性检查通过。
+- 两分钟空闲资源门禁：通过。
+- Agent Focus 最小化与活跃大会话资源：基线候选失败，列为 AR-009、AR-010。
+- 睡眠唤醒后的额度/连接恢复：基线候选未具备专项路径，列为 AR-023。
+- 仅打开 Claude 时的历史空任务抑制：基线候选失败，列为 AR-024。
+
+首装与发布：
+- 隔离首装、Claude 配置恢复、Codex 官方信任步骤：通过。
+- 签名、公证、普通用户分发：基线候选失败，列为 AR-018。
+- 核心 CI 门禁：基线候选失败，列为 AR-019。
+- 自动更新、48 小时浸泡、Intel 与无障碍：未在本轮硬化范围内。
+
+权威问题描述、影响和复现条件仍保存在：
+docs/reports/ACTREALM_GLOBAL_RELEASE_AUDIT_2026-07-22.md
+
+注意：这是历史候选的脱敏审计索引，不代表当前工作树已经通过。当前修复结论必须以新的自动化门禁和发布硬化报告为准。

@@ -124,6 +124,7 @@ struct ProviderAvatar: View {
 // MARK: - Chips & badges
 
 struct Chip: View {
+    @Environment(\.locale) private var locale
     enum Tone { case amber, red, green, blue, neutral, provider(ProviderKind) }
 
     let text: String
@@ -131,7 +132,7 @@ struct Chip: View {
     var fontSize: CGFloat = 9.5
 
     var body: some View {
-        Text(text)
+        Text(localized(text, locale: locale))
             .font(.system(size: fontSize, weight: .bold))
             .foregroundStyle(foreground)
             .padding(.horizontal, 7)

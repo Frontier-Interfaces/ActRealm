@@ -6,6 +6,7 @@ import SwiftUI
 /// mutations come from `/api/v1/setup`; this view never edits Provider files.
 struct AgentSetupView: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.locale) private var locale
     let onBack: () -> Void
 
     var body: some View {
@@ -93,9 +94,21 @@ struct AgentSetupView: View {
                     .foregroundStyle(DT.textWeak)
             }
             Spacer()
-            Chip(text: "已接入 \(model.connectedAgentCount)", tone: .green, fontSize: 10)
             Chip(
-                text: "待处理 \(model.pendingAgentSetupCount)",
+                text: localizedFormat(
+                    "已接入 %lld",
+                    locale: locale,
+                    Int64(model.connectedAgentCount)
+                ),
+                tone: .green,
+                fontSize: 10
+            )
+            Chip(
+                text: localizedFormat(
+                    "待处理 %lld",
+                    locale: locale,
+                    Int64(model.pendingAgentSetupCount)
+                ),
                 tone: model.pendingAgentSetupCount > 0 ? .amber : .neutral,
                 fontSize: 10
             )
@@ -132,6 +145,7 @@ struct AgentSetupView: View {
 
 private struct ProviderSetupCard: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.locale) private var locale
     let provider: SetupInfo.ProviderSetup
 
     private var kind: ProviderKind {
@@ -146,7 +160,7 @@ private struct ProviderSetupCard: View {
                     Text(kind == .claude ? "Claude Code" : "Codex")
                         .font(.system(size: 14, weight: .bold))
                         .foregroundStyle(DT.textStrong)
-                    Text(provider.detectedText)
+                    Text(localized(provider.detectedText, locale: locale))
                         .font(.system(size: 10.5))
                         .foregroundStyle(DT.textWeak)
                 }
@@ -158,7 +172,8 @@ private struct ProviderSetupCard: View {
                 Text("配置")
                     .font(.system(size: 9.5, weight: .bold))
                     .foregroundStyle(DT.textWeak)
-                Text(provider.configPath ?? "尚未生成配置路径")
+                Text(provider.configPath
+                    ?? localized("尚未生成配置路径", locale: locale))
                     .font(.system(size: 10.5, design: .monospaced))
                     .foregroundStyle(DT.textSecondary)
                     .lineLimit(1)
@@ -227,8 +242,10 @@ private struct ProviderSetupCard: View {
         rank: PillButtonStyle.Rank,
         action: String
     ) -> some View {
-        Button(label) {
+        Button {
             Task { await model.changeSetup(provider: provider.provider, action: action) }
+        } label: {
+            Text(LocalizedStringKey(label))
         }
         .buttonStyle(PillButtonStyle(rank: rank, fontSize: 10.5, horizontalPadding: 12))
         .disabled(!model.bridgeStatus.isListening || model.isSetupBusy)
@@ -245,7 +262,11 @@ private struct ProviderSetupCard: View {
             Text("Codex 信任必须在官方界面确认")
                 .font(.system(size: 10.5, weight: .bold))
                 .foregroundStyle(DT.amberText)
-            Text("1. \(codexStartStep)   2. 输入 /hooks   3. 核对命令路径并信任   4. 新建会话后刷新")
+            Text(localizedFormat(
+                "1. %@   2. 输入 /hooks   3. 核对命令路径并信任   4. 新建会话后刷新",
+                locale: locale,
+                codexStartStep
+            ))
                 .font(.system(size: 10))
                 .foregroundStyle(DT.textSecondary)
             if let command = provider.reviewCommand {
@@ -263,8 +284,10 @@ private struct ProviderSetupCard: View {
     }
 
     private var codexStartStep: String {
-        if provider.cliInstalled == true { return "打开任意 Codex 终端会话" }
-        return "在终端运行卡片中的内置 Codex 命令"
+        if provider.cliInstalled == true {
+            return localized("打开任意 Codex 终端会话", locale: locale)
+        }
+        return localized("在终端运行卡片中的内置 Codex 命令", locale: locale)
     }
 
     private var statusChip: some View {
@@ -272,7 +295,7 @@ private struct ProviderSetupCard: View {
     }
 
     private var statusLabel: String {
-        switch provider.status {
+        let key = switch provider.status {
         case "connected": "已接入"
         case "installed_unverified": "等待验证"
         case "needs_trust": "等待信任"
@@ -283,10 +306,11 @@ private struct ProviderSetupCard: View {
         case "error": "配置无法解析"
         default: provider.status
         }
+        return localized(key, locale: locale)
     }
 
     private var statusDetail: String {
-        switch provider.status {
+        let key = switch provider.status {
         case "connected": "已收到安装后的真实 Agent 事件，实时活动可以正常显示。"
         case "installed_unverified": "配置已经就绪；启动一次真实会话后才能确认接入。"
         case "needs_trust": "打开 Codex，输入 /hooks，逐项检查并信任 ActRealm。"
@@ -297,6 +321,7 @@ private struct ProviderSetupCard: View {
         case "error": "为保护设置，ActRealm 已拒绝改写；请先恢复或修正配置。"
         default: provider.statusText
         }
+        return localized(key, locale: locale)
     }
 
     private var statusTone: (chip: Chip.Tone, text: Color, stroke: Color) {
@@ -313,7 +338,7 @@ private struct ProviderSetupCard: View {
         guard let command = provider.reviewCommand else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(command, forType: .string)
-        model.showToast("Codex 启动命令已复制；运行后输入 /hooks")
+        model.showToast(localized("Codex 启动命令已复制；运行后输入 /hooks", locale: locale))
     }
 
     private func openGuide() {

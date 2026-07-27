@@ -3,6 +3,7 @@
 use actrealm_installer::{provider_cli_candidates, HookProvider};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -78,6 +79,10 @@ pub struct QuotaEntry {
     pub captured_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reason_args: BTreeMap<String, String>,
 }
 
 impl QuotaEntry {
@@ -122,10 +127,18 @@ impl QuotaEntry {
             plan_type: None,
             captured_at: Some(captured_at),
             reason: None,
+            reason_code: None,
+            reason_args: BTreeMap::new(),
         }
     }
 
-    fn unavailable(provider: &str, window: &str, source: &str, reason: impl Into<String>) -> Self {
+    fn unavailable(
+        provider: &str,
+        window: &str,
+        source: &str,
+        reason_code: &str,
+        reason: impl Into<String>,
+    ) -> Self {
         Self {
             provider: provider.to_owned(),
             window: window.to_owned(),
@@ -140,7 +153,14 @@ impl QuotaEntry {
             plan_type: None,
             captured_at: None,
             reason: Some(reason.into()),
+            reason_code: Some(reason_code.to_owned()),
+            reason_args: BTreeMap::new(),
         }
+    }
+
+    fn with_reason_arg(mut self, key: &str, value: impl Into<String>) -> Self {
+        self.reason_args.insert(key.to_owned(), value.into());
+        self
     }
 
     fn with_metadata(
@@ -312,16 +332,22 @@ impl QuotaCollector {
                     "claude",
                     CLAUDE_SOURCE,
                     &["5h", "7d"],
-                    "额度缓存不存在；请开启 Claude 额度桥并完成一次对话",
+                    "quota.reason.cache_missing",
+                    "Quota cache is missing. Enable the Claude quota bridge and complete one conversation.",
                 )
             }
             Err(error) => {
+                let detail = error.to_string();
                 return unavailable_windows(
                     "claude",
                     CLAUDE_SOURCE,
                     &["5h", "7d"],
-                    format!("额度缓存不可读：{error}"),
+                    "quota.reason.cache_unreadable",
+                    format!("Quota cache could not be read: {detail}"),
                 )
+                .into_iter()
+                .map(|entry| entry.with_reason_arg("error", detail.clone()))
+                .collect();
             }
         };
         let cache = match serde_json::from_slice::<CacheDocument>(&bytes) {
@@ -337,7 +363,8 @@ impl QuotaCollector {
                     "claude",
                     CLAUDE_SOURCE,
                     &["5h", "7d"],
-                    "额度缓存版本不兼容",
+                    "quota.reason.cache_incompatible",
+                    "Quota cache schema is incompatible.",
                 )
             }
             Err(_) => {
@@ -345,7 +372,8 @@ impl QuotaCollector {
                     "claude",
                     CLAUDE_SOURCE,
                     &["5h", "7d"],
-                    "额度缓存解析失败",
+                    "quota.reason.cache_invalid",
+                    "Quota cache could not be parsed.",
                 )
             }
         };
@@ -354,7 +382,8 @@ impl QuotaCollector {
                 "claude",
                 CLAUDE_SOURCE,
                 &["5h", "7d"],
-                "额度缓存时间晚于本机时间",
+                "quota.reason.cache_from_future",
+                "Quota cache timestamp is later than the local clock.",
             );
         }
         let entries = cache
@@ -382,7 +411,8 @@ impl QuotaCollector {
                 "claude",
                 CLAUDE_SOURCE,
                 &["5h", "7d"],
-                "额度缓存没有可验证窗口",
+                "quota.reason.no_valid_window",
+                "No verifiable quota window was found.",
             )
         } else {
             entries
@@ -398,7 +428,8 @@ impl QuotaCollector {
                 "codex",
                 "unknown",
                 CODEX_SOURCE,
-                "未找到 Codex rollout 文件",
+                "quota.reason.codex_rollout_missing",
+                "No Codex rollout file was found.",
             )];
         }
         for (path, modified_at) in files {
@@ -419,7 +450,8 @@ impl QuotaCollector {
             "codex",
             "unknown",
             CODEX_SOURCE,
-            "rollout 中没有可验证的额度窗口",
+            "quota.reason.codex_window_missing",
+            "No verifiable quota window was found in the Codex rollout.",
         )]
     }
 }
@@ -428,12 +460,15 @@ fn unavailable_windows(
     provider: &str,
     source: &str,
     windows: &[&str],
+    reason_code: &str,
     reason: impl Into<String>,
 ) -> Vec<QuotaEntry> {
     let reason = reason.into();
     windows
         .iter()
-        .map(|window| QuotaEntry::unavailable(provider, window, source, reason.clone()))
+        .map(|window| {
+            QuotaEntry::unavailable(provider, window, source, reason_code, reason.clone())
+        })
         .collect()
 }
 
@@ -853,7 +888,7 @@ fn oauth_entries(response: OAuthUsageResponse, now_ms: u64) -> Vec<QuotaEntry> {
     push_oauth_window(
         &mut entries,
         "5h",
-        "5 小时",
+        "5 hours",
         300,
         response.five_hour,
         now_ms,
@@ -861,7 +896,7 @@ fn oauth_entries(response: OAuthUsageResponse, now_ms: u64) -> Vec<QuotaEntry> {
     push_oauth_window(
         &mut entries,
         "7d",
-        "7 天",
+        "7 days",
         10_080,
         response.seven_day,
         now_ms,
@@ -869,7 +904,7 @@ fn oauth_entries(response: OAuthUsageResponse, now_ms: u64) -> Vec<QuotaEntry> {
     push_oauth_window(
         &mut entries,
         "7d_sonnet",
-        "Sonnet · 7 天",
+        "Sonnet · 7 days",
         10_080,
         response.seven_day_sonnet,
         now_ms,
@@ -877,7 +912,7 @@ fn oauth_entries(response: OAuthUsageResponse, now_ms: u64) -> Vec<QuotaEntry> {
     push_oauth_window(
         &mut entries,
         "7d_opus",
-        "Opus · 7 天",
+        "Opus · 7 days",
         10_080,
         response.seven_day_opus,
         now_ms,
@@ -946,7 +981,7 @@ fn oauth_entries(response: OAuthUsageResponse, now_ms: u64) -> Vec<QuotaEntry> {
                     .with_metadata(
                         None,
                         None,
-                        Some("额外用量".to_owned()),
+                        Some("Extra usage".to_owned()),
                         None,
                     ),
                 );
@@ -1160,11 +1195,11 @@ pub fn statusline_text(entries: &[QuotaEntry]) -> String {
         .filter_map(|entry| {
             entry
                 .remaining_pct
-                .map(|remaining| format!("{} 剩余 {:.0}%", entry.window, remaining))
+                .map(|remaining| format!("{} {:.0}% remaining", entry.window, remaining))
         })
         .collect::<Vec<_>>();
     if parts.is_empty() {
-        "ActRealm · 额度等待首次响应".to_owned()
+        "ActRealm · quota waiting for first response".to_owned()
     } else {
         format!("ActRealm · {}", parts.join(" · "))
     }
@@ -1645,11 +1680,10 @@ mod tests {
         write_rollout(&root, "0.145.0", "null");
         let incompatible = collector.collect_codex(now + 1);
         assert_eq!(incompatible[0].status, "unavailable");
-        assert!(incompatible[0]
-            .reason
-            .as_deref()
-            .unwrap()
-            .contains("没有可验证"));
+        assert_eq!(
+            incompatible[0].reason_code.as_deref(),
+            Some("quota.reason.codex_window_missing")
+        );
         assert_eq!(incompatible[0].used_pct, None);
     }
 

@@ -1,5 +1,6 @@
 use actrealm_core::{BridgeRequest, Provider};
 use actrealm_runtime::{QuotaRecord, RuntimeStore};
+use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
@@ -147,6 +148,199 @@ fn design_retention_options_support_180_days_and_forever() {
 }
 
 #[test]
+fn retention_prunes_closed_expired_session_graph_but_preserves_actionable_rows() {
+    let database = Database::new("retention-graph");
+    RuntimeStore::open(&database.path).unwrap();
+    let now = 1_784_130_000_000_i64;
+    let expired_at = now - 31 * 86_400_000;
+
+    let mut connection = Connection::open(&database.path).unwrap();
+    let transaction = connection.transaction().unwrap();
+    for (session_id, attention_id, attention_state) in [
+        ("closed-expired", "closed-attention", "resolved"),
+        ("actionable-expired", "actionable-attention", "open"),
+    ] {
+        transaction
+            .execute(
+                "INSERT INTO sessions(
+                    id, provider, provider_session_id, exec_state, started_at, last_event_at
+                 ) VALUES (?1, 'claude', ?1, 'response_finished', ?2, ?2)",
+                (session_id, expired_at),
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO turns(id, session_id, ordinal, started_at, ended_at)
+                 VALUES (?1 || '-turn', ?1, 1, ?2, ?2)",
+                (session_id, expired_at),
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO events(id, session_id, turn_id, provider, type, occurred_at, ingest_seq)
+                 VALUES (?1 || '-event', ?1, ?1 || '-turn', 'claude', 'turn.stopped', ?2, ?2)",
+                (session_id, expired_at),
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO session_tasks(session_id, task_id, subject, completed, created_at)
+                 VALUES (?1, 'task', 'Retained task metadata', 1, ?2)",
+                (session_id, expired_at),
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO session_plan_steps(
+                    session_id, provider_turn_id, step_index, step, status, source, updated_at
+                 ) VALUES (?1, 'turn', 0, 'Run retention', 'completed', 'connector', ?2)",
+                (session_id, expired_at),
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO session_subagents(
+                    session_id, agent_id, status, active, started_at, stopped_at
+                 ) VALUES (?1, 'child', 'completed', 0, ?2, ?2)",
+                (session_id, expired_at),
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO attention_items(
+                    id, session_id, provider, turn_id, kind, title, risk, risk_notes,
+                    dedupe_key, state, created_at
+                 ) VALUES (?2, ?1, 'claude', ?1 || '-turn', 'approval',
+                    'Review requested action', 'unknown', '[]', ?2, ?3, ?4)",
+                (session_id, attention_id, attention_state, expired_at),
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO commands(id, attention_id, action, state, created_at)
+                 VALUES (?1 || '-command', ?1, 'allow', 'confirmed', ?2)",
+                (attention_id, expired_at),
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO session_usage(
+                    provider, provider_session_id, usage_source, usage_quality, captured_at
+                 ) VALUES ('claude', ?1, 'test', 'known', ?2)",
+                (session_id, expired_at),
+            )
+            .unwrap();
+    }
+    transaction
+        .execute(
+            "INSERT INTO quota_snapshots(provider, window, captured_at)
+             VALUES ('claude', '5h', ?1)",
+            [now],
+        )
+        .unwrap();
+    transaction
+        .execute(
+            "INSERT INTO settings(key, value) VALUES ('ui_settings', '{\"retentionDays\":30}')",
+            [],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    drop(connection);
+
+    let store = RuntimeStore::open(&database.path).unwrap();
+    assert_eq!(store.prune_events(30, now as u64).unwrap(), 1);
+    let export = store.export_json(now as u64).unwrap();
+    for table in [
+        "sessions",
+        "turns",
+        "events",
+        "session_tasks",
+        "session_plan_steps",
+        "session_subagents",
+        "attention_items",
+        "commands",
+        "session_usage",
+    ] {
+        assert_eq!(
+            export["tables"][table].as_array().unwrap().len(),
+            1,
+            "{table}"
+        );
+    }
+    assert_eq!(
+        export["tables"]["sessions"][0]["provider_session_id"],
+        "actionable-expired"
+    );
+    assert_eq!(export["tables"]["attention_items"][0]["state"], "open");
+    assert_eq!(
+        export["tables"]["quota_snapshots"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        export["tables"]["settings"][0]["value"],
+        "{\"retentionDays\":30}"
+    );
+}
+
+#[test]
+fn retention_reclaims_free_pages_at_a_controlled_boundary() {
+    let database = Database::new("retention-compaction");
+    RuntimeStore::open(&database.path).unwrap();
+    let now = 1_784_130_000_000_i64;
+    let expired_at = now - 31 * 86_400_000;
+
+    let mut connection = Connection::open(&database.path).unwrap();
+    let transaction = connection.transaction().unwrap();
+    for index in 0..2_000 {
+        let session_id = format!("expired-{index}");
+        transaction
+            .execute(
+                "INSERT INTO sessions(
+                    id, provider, provider_session_id, exec_state, started_at, last_event_at
+                 ) VALUES (?1, 'claude', ?1, 'idle', ?2, ?2)",
+                (&session_id, expired_at),
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO events(id, session_id, provider, type, occurred_at, ingest_seq)
+                 VALUES (?1 || '-event', ?1, 'claude', 'session.started', ?2, ?3)",
+                (&session_id, expired_at, index),
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+    let pages_before = connection
+        .query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    drop(connection);
+
+    let store = RuntimeStore::open(&database.path).unwrap();
+    assert_eq!(store.prune_events(30, now as u64).unwrap(), 2_000);
+    drop(store);
+
+    let connection = Connection::open(&database.path).unwrap();
+    let pages_after = connection
+        .query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    let freelist_after = connection
+        .query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    assert!(
+        pages_after < pages_before,
+        "pages: {pages_before} -> {pages_after}"
+    );
+    assert_eq!(freelist_after, 0);
+    drop(connection);
+
+    let reopened = RuntimeStore::open(&database.path).unwrap();
+    assert!(reopened.snapshot().unwrap().sessions.is_empty());
+}
+
+#[test]
 fn interactive_question_schema_and_secret_answers_never_enter_persistent_export() {
     let database = Database::new("interactive-privacy");
     let store = RuntimeStore::open(&database.path).unwrap();
@@ -171,5 +365,5 @@ fn interactive_question_schema_and_secret_answers_never_enter_persistent_export(
     assert!(!encoded.contains("private form prompt 347819"));
     assert!(!encoded.contains("secret field description 347819"));
     assert!(!encoded.contains("requested_schema"));
-    assert!(encoded.contains("Claude 需要补充信息"));
+    assert!(encoded.contains("Claude needs more information"));
 }

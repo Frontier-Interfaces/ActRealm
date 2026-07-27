@@ -66,8 +66,8 @@ fn statusline_command_caches_only_quota_and_prints_remaining_windows() {
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("5h 剩余 80%"));
-    assert!(stdout.contains("7d 剩余 40%"));
+    assert!(stdout.contains("5h 80% remaining"));
+    assert!(stdout.contains("7d 40% remaining"));
     assert!(output.stderr.is_empty());
 
     let cache = fs::read_to_string(root.0.join("actrealm-home/cache/claude-rl.json")).unwrap();
@@ -88,7 +88,7 @@ fn malformed_statusline_input_is_nonfatal_and_never_creates_a_cache() {
     child.stdin.take().unwrap().write_all(b"not-json").unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("额度暂不可用"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("quota unavailable"));
     assert!(!root.0.join("actrealm-home/cache/claude-rl.json").exists());
 }
 

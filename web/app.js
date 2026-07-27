@@ -1,5 +1,9 @@
 "use strict";
 
+const I18N = window.ActRealmI18n;
+const tr = (text) => I18N.tr(text);
+const currentLocale = () => I18N.resolvedLocale();
+
 const ui = {
   actRealmWorkspace: document.querySelector("#actrealm-workspace"),
   menuClock: document.querySelector("#menu-clock"),
@@ -61,10 +65,17 @@ const ui = {
   runtimeActionFeedback: document.querySelector("#runtime-action-feedback"),
   retentionOptions: [...document.querySelectorAll(".retention-options button")],
   quotaDisplayOptions: [...document.querySelectorAll(".quota-display-options button")],
+  languageSelect: document.querySelector("#language-select"),
   wipeConfirmation: document.querySelector("#wipe-confirmation"),
   wipeConfirmationInput: document.querySelector("#wipe-confirmation-input"),
   wipeConfirm: document.querySelector("#wipe-confirm"),
   wipeCancel: document.querySelector("#wipe-cancel"),
+  backupSummary: document.querySelector("#backup-summary"),
+  clearBackups: document.querySelector("#clear-backups"),
+  backupWipeConfirmation: document.querySelector("#backup-wipe-confirmation"),
+  backupWipeConfirmationInput: document.querySelector("#backup-wipe-confirmation-input"),
+  backupWipeConfirm: document.querySelector("#backup-wipe-confirm"),
+  backupWipeCancel: document.querySelector("#backup-wipe-cancel"),
   notificationBanner: document.querySelector("#notification-banner"),
   notificationKind: document.querySelector("#notification-kind"),
   notificationTitle: document.querySelector("#notification-title"),
@@ -103,6 +114,7 @@ let settingsState = {
 };
 let displayCatalog = [];
 let claudeBridge = { status: "not_installed" };
+let backupSummary = { count: 0, totalBytes: 0 };
 let settingsBusy = false;
 let failedSettingsDraft;
 let notificationsPrimed = false;
@@ -123,11 +135,175 @@ let lastSetupAt = 0;
 let lastSocketFrameAt = 0;
 let lastSnapshotAt = 0;
 let fallbackSnapshotInFlight = false;
+let socketTicketInFlight = false;
 let restartInProgress = false;
 let runtimeMonitorInFlight = false;
 let lastRuntimeMonitorAt = 0;
 let hiddenSessions = JSON.parse(localStorage.getItem("actrealm.hiddenSessions") || "{}");
 const SESSION_VISIBLE_FOR_MS = 30 * 60 * 1000;
+const RUNTIME_MESSAGES_ZH = {
+  "session.activity.idle": "等待新任务",
+  "session.activity.ended": "会话已结束",
+  "session.activity.thinking": "正在思考",
+  "session.activity.tool_running": "正在运行 {tool}",
+  "session.activity.awaiting_approval": "等待你批准",
+  "session.activity.awaiting_answer": "等待你回答",
+  "session.activity.compacting": "正在压缩记忆",
+  "session.activity.completed": "本轮已完成",
+  "session.activity.interrupted": "本轮已中断",
+  "session.activity.failed": "运行失败",
+  "session.activity.plan_progress": "计划进度 {done}/{total}",
+  "session.activity.subagents_running": "{count} 个子 Agent 正在运行",
+  "session.activity.background_tasks_running": "{count} 个后台任务仍在运行",
+  "session.activity.permission_denied": "操作已在 Agent 中拒绝",
+  "session.activity.waiting_for_provider_event": "等待 Agent 后续事件",
+  "session.activity.unknown_event": "事件不识别，Provider 版本可能不兼容",
+  "attention.approval.title": "等待批准",
+  "attention.native_approval.title": "请在 {provider} 中批准",
+  "attention.question.title": "{provider} 正在询问",
+  "attention.error.title": "Agent 运行失败",
+  "attention.interrupted.title": "Agent 本轮已中断",
+  "attention.completion.title": "任务已完成，等待确认",
+  "attention.approval.detail": "请在原对话中核对操作内容和影响。",
+  "attention.native_approval.detail": "请在 {provider} 中查看并处理此请求。",
+  "attention.question.detail": "可直接在 ActRealm 回答；答案不会写入本地历史。",
+  "attention.risk.high_impact": "已识别到高影响操作",
+  "attention.risk.irreversible": "提交后动作本身不可撤销",
+  "attention.risk.compound_syntax": "命令包含组合语法",
+  "attention.risk.read_only_intent": "只读意图；规则提示不构成安全保证",
+  "attention.risk.undo_window": "批准决定可在 3 秒内撤回",
+  "attention.risk.side_effects": "可能执行项目代码或产生副作用",
+  "attention.risk.unknown_impact": "此操作的影响未知",
+  "attention.risk.review_original": "建议查看原窗口",
+  "interaction.claude_question.title": "Claude 正在询问",
+  "interaction.claude_elicitation.title": "Claude 需要补充信息",
+  "interaction.codex_user_input.title": "Codex 正在询问",
+  "jump.exact_conversation": "精确打开对话",
+  "jump.terminal": "打开对应终端",
+  "jump.app_only": "只能打开应用",
+  "jump.unsupported": "当前环境不支持跳转",
+  "quota.window.months": "{count} 个月",
+  "quota.window.weeks": "{count} 周",
+  "quota.window.days": "{count} 天",
+  "quota.window.hours": "{count} 小时",
+  "quota.window.minutes": "{count} 分钟",
+  "quota.window.current_week": "本周",
+  "quota.window.extra_usage": "额外用量",
+  "quota.reason.cache_missing": "额度缓存不存在，请开启 Claude 额度桥并完成一次对话。",
+  "quota.reason.cache_unreadable": "额度缓存不可读：{error}",
+  "quota.reason.cache_incompatible": "额度缓存版本不兼容。",
+  "quota.reason.cache_invalid": "额度缓存解析失败。",
+  "quota.reason.cache_from_future": "额度缓存时间晚于本机时间。",
+  "quota.reason.no_valid_window": "没有找到可验证的额度窗口。",
+  "quota.reason.codex_rollout_missing": "未找到 Codex rollout 文件。",
+  "quota.reason.codex_window_missing": "Codex rollout 中没有可验证的额度窗口。",
+};
+
+const API_ERRORS_ZH = {
+  ANSWER_FAILED: "回答未能发送给 Agent",
+  AUTH_UNAVAILABLE: "Runtime 身份验证暂不可用",
+  BACKUP_CLEAR_FAILED: "配置备份未能安全清除",
+  BACKUP_DELETE_CONFIRMATION_REQUIRED: "需要输入 DELETE BACKUPS 才能清除配置备份",
+  CLAUDE_BRIDGE_CHANGE_FAILED: "Claude 额度桥更新失败",
+  CLAUDE_OAUTH_DISABLED: "Claude 官方 OAuth 额度接口未启用",
+  CLAUDE_QUOTA_REFRESH_FAILED: "Claude 额度刷新失败",
+  CLEAR_FAILED: "本地数据清除失败",
+  CODEX_REINSTALL_FAILED: "Codex Hook 重新安装失败",
+  COMMAND_MISMATCH: "命令与当前请求不匹配",
+  COMMIT_TOO_EARLY: "决定仍在撤回窗口内",
+  CONNECTOR_ATTACH_FAILED: "Connector 连接失败",
+  DELETE_CONFIRMATION_REQUIRED: "需要输入 DELETE 才能清除数据",
+  EXPORT_FAILED: "本地数据导出失败",
+  INVALID_ACTION: "当前操作无效",
+  INVALID_ANSWER: "回答内容无效",
+  INVALID_BOOTSTRAP: "启动凭据无效或已过期",
+  INVALID_COMMAND_ID: "命令标识无效",
+  INVALID_HOST: "访问地址不是受信任的本机地址",
+  INVALID_ORIGIN: "请求来源不受信任",
+  INVALID_RESTART_TOKEN: "Runtime 重启凭据无效",
+  INVALID_SETTINGS: "设置内容无效",
+  JUMP_FAILED: "没有找到原窗口，或 macOS 尚未授予应用控制权限",
+  JUMP_UNSUPPORTED: "当前环境不支持跳转",
+  MANAGED_CONNECTOR_UNSUPPORTED: "当前会话不支持托管 Connector",
+  METRIC_RECORD_FAILED: "本地统计记录失败",
+  MISSING_REQUEST_ID: "当前请求没有可回复的请求标识",
+  PROVIDER_CLIENT_MISSING: "没有找到对应的 Agent 客户端",
+  PROVIDER_INSTALL_REQUIRED: "请先安装对应的 Agent 客户端",
+  QUESTION_EXPIRED: "这个问题已经过期，不能再提交",
+  QUOTA_PERSIST_FAILED: "额度结果无法保存到本机",
+  QUOTA_REFRESH_FAILED: "额度刷新失败",
+  QUOTA_REFRESH_IN_PROGRESS: "额度正在刷新，请稍后再试",
+  QUOTA_STATE_UNAVAILABLE: "额度状态暂不可用",
+  REQUEST_MISMATCH: "请求与当前待处理事项不匹配",
+  RETENTION_FAILED: "本地保留策略执行失败",
+  RUNTIME_RESTART_FAILED: "Runtime 重启失败",
+  RUNTIME_RESTART_TIMED_OUT: "Runtime 重启超时",
+  RUNTIME_RESTART_UNAVAILABLE: "当前 Runtime 无法自动重启",
+  RUNTIME_NOT_CONNECTED: "Runtime 尚未连接",
+  RUNTIME_AUTH_FAILED: "Runtime 身份验证失败",
+  RUNTIME_SESSION_MISSING: "Runtime 没有返回本机会话",
+  SESSION_NOT_FOUND: "没有找到对应任务",
+  SETTINGS_READ_FAILED: "本机设置读取失败",
+  SETUP_CHANGE_FAILED: "Agent 接入更新失败",
+  SETUP_INSPECTION_FAILED: "Agent 接入状态检查失败",
+  STALE_APPROVAL: "这项批准请求已经过期",
+  STALE_ATTENTION: "这项待处理事项已经更新或过期",
+  STORAGE_ERROR: "本地存储暂不可用",
+  UNAUTHORIZED: "本机会话已失效，请重新连接",
+  UNAUTHORIZED_MUTATION: "当前请求没有修改权限",
+  UNAUTHORIZED_WEBSOCKET: "实时连接身份验证失败",
+  UNKNOWN_ACTION: "未知操作",
+  UNKNOWN_BRIDGE_ACTION: "未知额度桥操作",
+  UNKNOWN_MANAGE_ACTION: "未知托管操作",
+  UNKNOWN_PROVIDER: "未知 Agent 类型",
+  UNKNOWN_SETUP_ACTION: "未知接入操作",
+  UNSAFE_DATA_PATH: "本地数据目录未通过安全检查",
+};
+
+function runtimeMessageText(message, fallback = "") {
+  return I18N.runtimeMessage(message, fallback);
+}
+
+function apiErrorText(error) {
+  const code = String(error?.message || "UNKNOWN_ERROR");
+  const localized = I18N.apiError(code);
+  if (localized) return localized;
+  const httpStatus = code.match(/^HTTP_(\d+)$/)?.[1];
+  if (httpStatus) return currentLocale() === "en"
+    ? `Local request failed (HTTP ${httpStatus})`
+    : `本机请求失败（HTTP ${httpStatus}）`;
+  if (code === "RESTART_TIMEOUT") return tr("Runtime 未能自动恢复");
+  if (code.startsWith("HEALTH_")) return tr("Runtime 健康检查失败");
+  return tr("请求失败，请重试");
+}
+
+const DISPLAY_FIELDS_ZH = {
+  task: ["任务标题与摘要", "主标题；不同的任务摘要显示在下一行"],
+  activity: ["实时状态", "标题栏右侧的运行阶段与耗时"],
+  project: ["项目", "副标题中的项目名称"],
+  model: ["模型", "副标题中的模型名称"],
+  plan: ["计划进度", "完成步数与进度条"],
+  sessionTokens: ["会话累计 Token", "折叠卡用量胶囊"],
+  context: ["上下文占用", "当前上下文百分比"],
+  cost: ["估算 API 价格", "估算值，不是订阅账单"],
+  turnTokens: ["本轮 Token", "最近一轮 Token"],
+  inputOutputTokens: ["输入 / 输出 Token", "输入与输出拆分"],
+  cacheTokens: ["缓存读取 / 写入 Token", "缓存用量拆分"],
+  reasoningTokens: ["推理 Token", "Provider 推理用量"],
+  tool: ["当前工具", ""],
+  permissionMode: ["权限模式", ""],
+  subagents: ["运行中的子 Agent", ""],
+  environment: ["运行环境", ""],
+  recovery: ["恢复状态", ""],
+  control: ["托管能力", ""],
+  jump: ["打开应用", ""],
+  titleSource: ["标题来源", ""],
+  sessionId: ["ActRealm Session ID", ""],
+  providerSessionId: ["Provider Session ID", ""],
+  providerTurnId: ["Provider Turn ID", ""],
+  lastEventAt: ["最后事件时间", ""],
+};
+
 const SOCKET_STALE_AFTER_MS = 25 * 1000;
 const SNAPSHOT_FALLBACK_AFTER_MS = 15 * 1000;
 const SETUP_FOCUS_REFRESH_AFTER_MS = 5 * 1000;
@@ -153,8 +329,34 @@ function updateClock() {
 function element(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
+  if (text !== undefined) node.textContent = tr(String(text));
+  return node;
+}
+
+function rawElement(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
   if (text !== undefined) node.textContent = String(text);
   return node;
+}
+
+function setClientText(node, text) {
+  node.textContent = tr(String(text));
+}
+
+function initializeLanguage() {
+  I18N.translateStatic(document);
+  ui.languageSelect.value = I18N.preference();
+  ui.languageSelect.addEventListener("change", () => I18N.setPreference(ui.languageSelect.value));
+  window.addEventListener("actrealm:language-changed", () => {
+    ui.languageSelect.value = I18N.preference();
+    I18N.translateStatic(document);
+    render(snapshot);
+    renderSetup();
+    renderSettings();
+    setConnected(runtimeConnected);
+    updateLiveTimes();
+  });
 }
 
 function providerIcon(provider) {
@@ -326,17 +528,17 @@ function renderSetupHeader() {
   ui.agentStatusTrigger.classList.toggle("connected", connected > 0 && pending === 0);
   ui.agentStatusTrigger.classList.toggle("needs-attention", pending > 0);
   if (!setupLoaded) {
-    ui.agentStatusLabel.textContent = "正在检测 Agent";
-    ui.setupTriggerLabel.textContent = "连接 Agent";
+    setClientText(ui.agentStatusLabel, "正在检测 Agent");
+    setClientText(ui.setupTriggerLabel, "连接 Agent");
   } else if (isFirstRun()) {
-    ui.agentStatusLabel.textContent = "未连接 Agent";
-    ui.setupTriggerLabel.textContent = "连接 Agent";
+    setClientText(ui.agentStatusLabel, "未连接 Agent");
+    setClientText(ui.setupTriggerLabel, "连接 Agent");
   } else if (pending > 0) {
-    ui.agentStatusLabel.textContent = connected ? `${connected} 个已接入 · ${pending} 待处理` : `${pending} 项接入待处理`;
-    ui.setupTriggerLabel.textContent = "完成接入";
+    setClientText(ui.agentStatusLabel, connected ? `${connected} 个已接入 · ${pending} 待处理` : `${pending} 项接入待处理`);
+    setClientText(ui.setupTriggerLabel, "完成接入");
   } else {
-    ui.agentStatusLabel.textContent = `${connected} 个 Agent 已接入`;
-    ui.setupTriggerLabel.textContent = "Agent 接入";
+    setClientText(ui.agentStatusLabel, `${connected} 个 Agent 已接入`);
+    setClientText(ui.setupTriggerLabel, "Agent 接入");
   }
   ui.setupTrigger.classList.toggle("needs-attention", setupLoaded && (isFirstRun() || pending > 0));
 }
@@ -358,7 +560,9 @@ function renderSetup() {
 
     const config = element("div", "setup-config");
     config.append(element("span", "", "配置"));
-    const configPath = element("code", "", provider.configPath || "尚未生成配置路径");
+    const configPath = provider.configPath
+      ? rawElement("code", "", provider.configPath)
+      : element("code", "", "尚未生成配置路径");
     configPath.title = provider.configPath || "";
     config.append(configPath);
 
@@ -401,7 +605,7 @@ function renderSetup() {
         steps.append(element("li", "", step));
       }
       trust.append(steps);
-      if (provider.reviewCommand) trust.append(element("code", "setup-review-command", provider.reviewCommand));
+      if (provider.reviewCommand) trust.append(rawElement("code", "setup-review-command", provider.reviewCommand));
       card.append(trust);
     }
     ui.setupProviders.append(card);
@@ -433,7 +637,7 @@ async function loadSetup() {
     renderSetup();
     renderOnboardingState();
   } catch (error) {
-    showToast(`接入状态读取失败：${error.message}`);
+    showToast(`接入状态读取失败：${apiErrorText(error)}`);
   } finally {
     setupLoading = false;
   }
@@ -458,7 +662,7 @@ async function changeSetup(provider, action) {
     renderOnboardingState();
     showToast(action === "uninstall" ? `${providerName(provider)} 接入已移除` : `${providerName(provider)} 配置已安全写入`);
   } catch (error) {
-    showToast(`接入操作失败：${error.detail || error.message}`);
+    showToast(`接入操作失败：${apiErrorText(error)}`);
   } finally {
     setupBusy = false;
     renderSetup();
@@ -500,6 +704,18 @@ function bridgeStatusCopy(status) {
   }[status] || "状态暂时不可用";
 }
 
+function formatBackupBytes(value) {
+  let amount = Math.max(0, Number(value) || 0);
+  const units = ["B", "KB", "MB", "GB"];
+  let unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) {
+    amount /= 1024;
+    unit += 1;
+  }
+  const digits = unit === 0 || amount >= 10 ? 0 : 1;
+  return `${amount.toFixed(digits)} ${units[unit]}`;
+}
+
 function renderSettings() {
   const rules = settingsState.notificationRules || {};
   const visibleRule = (value) => value === "ignore" ? "ignore" : "list";
@@ -512,33 +728,42 @@ function renderSettings() {
   ui.muteCodex.checked = Boolean(settingsState.providerMuted?.codex);
   ui.codexEnhanced.checked = Boolean(settingsState.codexEnhancedActivity);
   const connector = snapshot.capabilities?.codexConnector;
-  ui.codexConnectorStatus.textContent = connector?.status === "connected"
+  setClientText(ui.codexConnectorStatus, connector?.status === "connected"
     ? `已连接 · ${connector.managedThreads || 0} 个托管对话`
     : connector?.status === "disabled"
       ? "当前 Runtime 未启用"
-      : connector?.error || "当前版本不可用";
+      : connector?.error || "当前版本不可用");
   const retention = [30, 90, 180, 0].includes(Number(settingsState.retentionDays))
     ? Number(settingsState.retentionDays)
     : 180;
   ui.retentionDays.value = String(retention);
   ui.displayProfile.value = settingsState.displayProfile || "detailed";
   renderFieldSelector();
-  ui.claudeBridgeStatus.textContent = bridgeStatusCopy(claudeBridge.status);
+  setClientText(ui.claudeBridgeStatus, bridgeStatusCopy(claudeBridge.status));
   const removable = claudeBridge.status === "installed";
   const blocked = claudeBridge.status === "config_malformed";
-  ui.claudeBridgeAction.textContent = removable
+  setClientText(ui.claudeBridgeAction, removable
     ? "关闭"
     : claudeBridge.status === "custom_conflict"
       ? "保留现有并开启"
       : claudeBridge.status === "helper_missing"
         ? "修复"
-        : "开启";
+        : "开启");
   ui.claudeBridgeAction.dataset.action = removable
     ? "uninstall"
     : claudeBridge.status === "custom_conflict"
       ? "wrap"
       : "install";
   ui.claudeBridgeAction.disabled = settingsBusy || blocked;
+  const backupCount = Number(backupSummary.count || 0);
+  const backupCountLabel = currentLocale() === "en"
+    ? `${backupCount.toLocaleString("en")} ${backupCount === 1 ? "backup" : "backups"}`
+    : `${backupCount.toLocaleString("zh-Hans")} 个`;
+  setClientText(
+    ui.backupSummary,
+    `${backupCountLabel} · ${formatBackupBytes(backupSummary.totalBytes)}`,
+  );
+  ui.clearBackups.disabled = settingsBusy || Number(backupSummary.count || 0) === 0;
   for (const button of ui.retentionOptions) {
     const active = Number(button.dataset.value) === retention;
     button.classList.toggle("active", active);
@@ -571,8 +796,11 @@ function renderFieldSelector() {
       input.checked = selected.has(field.id);
       input.disabled = profile !== "custom";
       const copy = element("span", "field-option-copy");
-      copy.append(element("strong", "", field.label));
-      if (field.description) copy.append(element("small", "", field.description));
+      const localizedField = DISPLAY_FIELDS_ZH[field.id];
+      const fieldLabel = localizedField?.[0] || field.id;
+      const fieldDescription = localizedField?.[1] || "";
+      copy.append(element("strong", "", fieldLabel));
+      if (fieldDescription) copy.append(element("small", "", fieldDescription));
       label.append(input, copy);
       options.append(label);
     }
@@ -582,7 +810,7 @@ function renderFieldSelector() {
 }
 
 function setSettingsFeedback(message, { error = false, retry = false } = {}) {
-  ui.settingsSaveMessage.textContent = message || "";
+  setClientText(ui.settingsSaveMessage, message || "");
   ui.settingsSaveFeedback.hidden = !message;
   ui.settingsSaveFeedback.classList.toggle("error", error);
   ui.settingsSaveRetry.hidden = !retry;
@@ -596,12 +824,13 @@ async function loadSettings() {
     setSettingsFeedback("");
     displayCatalog = response.displayCatalog || [];
     claudeBridge = response.claudeQuotaBridge;
+    backupSummary = response.backups || { count: 0, totalBytes: 0 };
     renderSettings();
     renderAttention();
     renderSessions();
     renderQuota();
   } catch (error) {
-    setSettingsFeedback(`设置读取失败：${error.detail || error.message}`, { error: true, retry: true });
+    setSettingsFeedback(`设置读取失败：${apiErrorText(error)}`, { error: true, retry: true });
   }
 }
 
@@ -643,6 +872,7 @@ async function saveSettings(settingsOverride) {
     failedSettingsDraft = undefined;
     displayCatalog = response.displayCatalog || displayCatalog;
     claudeBridge = response.claudeQuotaBridge;
+    backupSummary = response.backups || backupSummary;
     renderSettings();
     renderAttention();
     renderSessions();
@@ -656,7 +886,7 @@ async function saveSettings(settingsOverride) {
   } catch (error) {
     failedSettingsDraft = draft;
     renderSettings();
-    setSettingsFeedback(`设置保存失败：${error.detail || error.message}`, { error: true, retry: true });
+    setSettingsFeedback(`设置保存失败：${apiErrorText(error)}`, { error: true, retry: true });
   } finally {
     settingsBusy = false;
     renderSettings();
@@ -675,10 +905,11 @@ async function changeClaudeBridge() {
     });
     settingsState = response.settings;
     claudeBridge = response.claudeQuotaBridge;
+    backupSummary = response.backups || backupSummary;
     await loadSnapshot();
     showToast(action === "uninstall" ? "Claude 额度桥已关闭，原状态栏已恢复" : "Claude 额度桥已开启，完成一次对话后会显示额度");
   } catch (error) {
-    showToast(`额度桥操作失败：${error.detail || error.message}`);
+    showToast(`额度桥操作失败：${apiErrorText(error)}`);
   } finally {
     settingsBusy = false;
     renderSettings();
@@ -700,7 +931,7 @@ async function exportLocalData() {
     URL.revokeObjectURL(url);
     showToast("本地数据已导出");
   } catch (error) {
-    showToast(`导出失败：${error.message}`);
+    showToast(`导出失败：${apiErrorText(error)}`);
   }
 }
 
@@ -719,7 +950,7 @@ async function exportLocalMetrics() {
     URL.revokeObjectURL(url);
     showToast("仅统计数据已导出，不含会话和事件明细");
   } catch (error) {
-    showToast(`统计导出失败：${error.message}`);
+    showToast(`统计导出失败：${apiErrorText(error)}`);
   }
 }
 
@@ -752,12 +983,43 @@ async function clearLocalData() {
     cancelClearConfirmation();
     showToast("本地运行数据已彻底清除，Hook 接入保持不变");
   } catch (error) {
-    showToast(`清除失败：${error.detail || error.message}`);
+    showToast(`清除失败：${apiErrorText(error)}`);
+  }
+}
+
+function openBackupClearConfirmation() {
+  ui.backupWipeConfirmation.hidden = false;
+  ui.backupWipeConfirmationInput.value = "";
+  ui.backupWipeConfirmationInput.focus();
+}
+
+function cancelBackupClearConfirmation() {
+  ui.backupWipeConfirmation.hidden = true;
+  ui.backupWipeConfirmationInput.value = "";
+}
+
+async function clearConfigurationBackups() {
+  const confirmation = ui.backupWipeConfirmationInput.value.trim();
+  if (confirmation !== "DELETE BACKUPS") {
+    showToast("请输入 DELETE BACKUPS；没有删除任何备份");
+    return;
+  }
+  try {
+    const response = await api("/api/v1/backups/clear", {
+      method: "POST",
+      body: JSON.stringify({ confirmation }),
+    });
+    backupSummary = response.backups || { count: 0, totalBytes: 0 };
+    cancelBackupClearConfirmation();
+    renderSettings();
+    showToast("ActRealm 配置备份已清除");
+  } catch (error) {
+    showToast(`${tr("备份清除失败：")}${apiErrorText(error)}`);
   }
 }
 
 function stateLabel(state) {
-  return {
+  return tr({
     open: "等待处理",
     committing: "3 秒内可撤回",
     decision_sent: "决定已发送",
@@ -767,7 +1029,7 @@ function stateLabel(state) {
     expired: "已过期，交回终端",
     snoozed: "稍后提醒",
     dismissed: "已忽略",
-  }[state] || state;
+  }[state] || state);
 }
 
 function renderMetrics() {
@@ -798,37 +1060,50 @@ function renderMetrics() {
 }
 
 function attentionTitle(item) {
-  if (item.kind === "approval") return `请求运行 ${item.commandPreview || "一项工具操作"}，等待批准`;
-  if (item.kind === "native_approval") return item.title || `${providerName(item.provider)} 等待在原界面批准`;
-  if (item.kind === "error") return item.title || "任务出错停下来了";
-  if (item.kind === "completion") return item.title || "这一轮已经完成";
-  return item.title || "Agent 有一项待处理事项";
+  if (item.kind === "approval") {
+    const command = item.commandPreview || tr("一项工具操作");
+    return currentLocale() === "en"
+      ? `Request to run ${command}; waiting for approval`
+      : `请求运行 ${command}，等待批准`;
+  }
+  return runtimeMessageText(
+    item.titleMessage,
+    item.title || {
+      native_approval: currentLocale() === "en"
+        ? `${providerName(item.provider)} is waiting for approval in the original interface`
+        : `${providerName(item.provider)} 等待在原界面批准`,
+      error: tr("任务出错停下来了"),
+      completion: tr("这一轮已经完成"),
+    }[item.kind] || tr("Agent 有一项待处理事项"),
+  );
 }
 
 function attentionContext(item) {
   if (item.kind === "native_approval") {
     return {
-      kicker: `${providerName(item.provider)} 原界面请求 · ActRealm 仅同步状态`,
-      state: "等待原界面处理",
-      notification: "原界面请求批准",
+      kicker: currentLocale() === "en"
+        ? `${providerName(item.provider)} request in original interface · ActRealm only syncs status`
+        : `${providerName(item.provider)} 原界面请求 · ActRealm 仅同步状态`,
+      state: tr("等待原界面处理"),
+      notification: tr("原界面请求批准"),
     };
   }
   if (item.kind === "approval") {
     return {
-      kicker: "可在 ActRealm 审批 · 任务等待决定",
+      kicker: tr("可在 ActRealm 审批 · 任务等待决定"),
       state: stateLabel(item.state),
-      notification: "可在 ActRealm 审批",
+      notification: tr("可在 ActRealm 审批"),
     };
   }
   if (item.kind === "question") {
     return {
-      kicker: "可在 ActRealm 回答 · 任务等待输入",
+      kicker: tr("可在 ActRealm 回答 · 任务等待输入"),
       state: stateLabel(item.state),
-      notification: "等待回答",
+      notification: tr("等待回答"),
     };
   }
   return {
-    kicker: item.kind === "completion" ? "任务已完成" : "需要处理 · 任务已暂停",
+    kicker: tr(item.kind === "completion" ? "任务已完成" : "需要处理 · 任务已暂停"),
     state: stateLabel(item.state),
     notification: stateLabel(item.kind),
   };
@@ -858,22 +1133,24 @@ async function submitQuestion(item, submission, controls) {
     await loadSnapshot();
   } catch (error) {
     for (const control of controls) control.disabled = false;
-    showToast(error.message === "QUESTION_EXPIRED" ? "这个问题已经过期，不能再提交" : `回答失败：${error.message}`);
+    showToast(`回答失败：${apiErrorText(error)}`);
   }
 }
 
 function renderInteractiveForm(item, card) {
   const interaction = item.interaction;
   if (!interaction || item.state !== "open" || !item.requestId) return false;
-  if (interaction.message) card.append(element("div", "fact-block question-message", interaction.message));
+  if (interaction.message) card.append(rawElement("div", "fact-block question-message", interaction.message));
   const form = element("form", "question-form");
   const bindings = [];
   const allControls = [];
   for (const question of interaction.questions || []) {
     const fieldset = element("fieldset", "question-field");
-    const legend = element("legend", "", question.label || "问题");
+    const legend = question.label
+      ? rawElement("legend", "", question.label)
+      : element("legend", "", "问题");
     fieldset.append(legend);
-    if (question.prompt) fieldset.append(element("p", "question-prompt", question.prompt));
+    if (question.prompt) fieldset.append(rawElement("p", "question-prompt", question.prompt));
     const binding = { question, values: [], other: undefined, input: undefined, error: undefined };
     if (question.inputType === "choice") {
       const choices = element("div", "question-choices");
@@ -887,8 +1164,8 @@ function renderInteractiveForm(item, card) {
         allControls.push(input);
         binding.values.push(input);
         const copy = element("span", "");
-        copy.append(element("strong", "", option.label));
-        if (option.description) copy.append(element("small", "", option.description));
+        copy.append(rawElement("strong", "", option.label));
+        if (option.description) copy.append(rawElement("small", "", option.description));
         label.append(input, copy);
         choices.append(label);
       }
@@ -896,7 +1173,7 @@ function renderInteractiveForm(item, card) {
         const other = document.createElement("input");
         other.type = "text";
         other.className = "question-other";
-        other.placeholder = "其他答案（可直接输入）";
+        other.placeholder = tr("其他答案（可直接输入）");
         other.maxLength = 2000;
         allControls.push(other);
         binding.other = other;
@@ -905,7 +1182,7 @@ function renderInteractiveForm(item, card) {
       fieldset.append(choices);
     } else if (question.inputType === "boolean") {
       const input = document.createElement("select");
-      input.append(new Option("请选择", ""), new Option("是", "true"), new Option("否", "false"));
+      input.append(new Option(tr("请选择"), ""), new Option(tr("是"), "true"), new Option(tr("否"), "false"));
       allControls.push(input);
       binding.input = input;
       fieldset.append(input);
@@ -960,7 +1237,7 @@ function renderInteractiveForm(item, card) {
     event.preventDefault();
     const answers = {};
     const showFieldError = (binding, message) => {
-      binding.error.textContent = message;
+      setClientText(binding.error, message);
       binding.error.hidden = false;
       binding.error.parentElement.classList.add("invalid");
       const target = binding.input || binding.values[0] || binding.other;
@@ -1027,9 +1304,9 @@ function updateAttentionTimes() {
   if (items.length) {
     const oldest = Math.min(...items.map((item) => Number(item.createdAt || Date.now())));
     const minutes = Math.max(0, Math.floor((Date.now() - oldest) / 60000));
-    ui.attentionSummary.textContent = `最久等待 ${minutes} 分钟`;
+    setClientText(ui.attentionSummary, `最久等待 ${minutes} 分钟`);
   } else {
-    ui.attentionSummary.textContent = "暂无需要处理的事项";
+    setClientText(ui.attentionSummary, "暂无需要处理的事项");
   }
   updateMarkedElapsed(ui.attentionList);
 }
@@ -1060,14 +1337,14 @@ function renderAttention() {
   }[item.kind] || "待处理";
   kicker.append(element("span", "attention-kind", kindLabel));
   kicker.append(markLiveElapsed(element("span", "attention-state"), item.createdAt, "已等 "));
-  card.append(kicker, element("h3", "", attentionTitle(item)));
+  card.append(kicker, rawElement("h3", "", attentionTitle(item)));
 
   const agentLine = element("div", "agent-line");
   agentLine.append(providerIcon(item.provider));
   agentLine.append(element("strong", "", providerName(item.provider)));
-  if (item.project) agentLine.append(element("span", "", `· ${item.project}`));
+  if (item.project) agentLine.append(rawElement("span", "", `· ${item.project}`));
   const session = snapshot.sessions.find((candidate) => candidate.id === item.sessionId);
-  if (session?.title) agentLine.append(element("span", "", session.title));
+  if (session?.title) agentLine.append(rawElement("span", "", session.title));
   card.append(agentLine);
 
   const taskJump = element("button", "task-jump", "在 Agent 任务中查看 →");
@@ -1077,11 +1354,17 @@ function renderAttention() {
 
   const interactive = renderInteractiveForm(item, card);
   if (!interactive) {
-    const fact = item.detail || item.commandPreview;
+    const fact = runtimeMessageText(item.detailMessage, item.detail) || item.commandPreview;
     if (fact) card.append(element("div", "fact-block", fact));
     const risk = element("div", "risk-row");
     risk.append(element("span", "risk-chip", `风险标记：${item.risk || "未知"}`));
-    for (const note of item.riskNotes || []) risk.append(element("span", "risk-chip", note));
+    for (const [index, note] of (item.riskNotes || []).entries()) {
+      risk.append(element(
+        "span",
+        "risk-chip",
+        runtimeMessageText(item.riskMessages?.[index], note),
+      ));
+    }
     if (item.expiresAt) risk.append(element("span", "risk-chip", `截止 ${new Date(item.expiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`));
     card.append(risk);
   }
@@ -1143,7 +1426,7 @@ function renderAttention() {
         element("span", `queue-kind ${candidate.kind || "approval"}`, {
           approval: "等待批准", native_approval: "原界面批准", question: "提问", completion: "完成", error: "错误",
         }[candidate.kind] || "待处理"),
-        element("strong", "", attentionTitle(candidate)),
+        rawElement("strong", "", attentionTitle(candidate)),
         markLiveElapsed(element("span", ""), candidate.createdAt),
       );
       row.addEventListener("click", () => { currentAttention = index; renderAttention(); });
@@ -1158,48 +1441,54 @@ function sessionStatus(session) {
   if (waiting.length) {
     const first = waiting[0];
     const suffix = waiting.length > 1 ? ` ×${waiting.length}` : "";
-    if (first.kind === "native_approval") return { label: `原界面请求${suffix}`, className: "waiting" };
-    if (first.kind === "approval") return { label: `面板可审批${suffix}`, className: "waiting" };
-    if (first.kind === "question") return { label: `等待回答${suffix}`, className: "waiting" };
-    if (first.kind === "completion") return { label: `待确认${suffix}`, className: "waiting" };
-    return { label: `待处理${suffix}`, className: "waiting" };
+    if (first.kind === "native_approval") return { label: `${tr("原界面请求")}${suffix}`, className: "waiting" };
+    if (first.kind === "approval") return { label: `${tr("面板可审批")}${suffix}`, className: "waiting" };
+    if (first.kind === "question") return { label: `${tr("等待回答")}${suffix}`, className: "waiting" };
+    if (first.kind === "completion") return { label: `${tr("待确认")}${suffix}`, className: "waiting" };
+    return { label: `${tr("待处理")}${suffix}`, className: "waiting" };
   }
-  if (session.execState === "failed") return { label: "出错", className: "failed" };
+  if (session.execState === "failed") return { label: tr("出错"), className: "failed" };
   const completion = pendingAttentionForSession(session).find((item) => item.kind === "completion");
-  if (!isSessionActive(session) && completion) return { label: "待确认", className: "waiting" };
-  if (["idle", "response_finished"].includes(session.execState)) return { label: "空闲", className: "idle" };
-  return { label: "在跑", className: "" };
+  if (!isSessionActive(session) && completion) return { label: tr("待确认"), className: "waiting" };
+  if (["idle", "response_finished"].includes(session.execState)) return { label: tr("空闲"), className: "idle" };
+  return { label: tr("在跑"), className: "" };
 }
 
 function recoveryDisplay(session) {
-  return {
+  const result = {
     controllable: { label: "已重新连接，可控制", className: "controllable" },
     observing: { label: "仍在运行，仅可观察", className: "observing" },
     waiting_for_event: { label: "历史已恢复，等待新事件", className: "waiting" },
     lost_control: { label: "已失去控制", className: "lost" },
     ended: { label: "已结束", className: "ended" },
   }[session.recoveryState] || { label: "等待确认状态", className: "waiting" };
+  return { ...result, label: tr(result.label) };
 }
 
 function elapsedText(since, until = Date.now()) {
   const seconds = Math.max(0, Math.floor((Number(until) - Number(since || until)) / 1000));
-  if (seconds < 60) return `${seconds} 秒`;
+  if (seconds < 60) return currentLocale() === "en" ? I18N.plural(seconds, "second") : `${seconds} 秒`;
   const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes} 分 ${seconds % 60} 秒`;
-  return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
+  if (minutes < 60) return currentLocale() === "en"
+    ? `${I18N.plural(minutes, "minute")} ${I18N.plural(seconds % 60, "second")}`
+    : `${minutes} 分 ${seconds % 60} 秒`;
+  return currentLocale() === "en"
+    ? `${I18N.plural(Math.floor(minutes / 60), "hour")} ${I18N.plural(minutes % 60, "minute")}`
+    : `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
 }
 
 function markLiveElapsed(node, since, prefix = "", suffix = "") {
   node.dataset.liveElapsedSince = String(Number(since || Date.now()));
   node.dataset.liveElapsedPrefix = prefix;
   node.dataset.liveElapsedSuffix = suffix;
-  node.textContent = `${prefix}${elapsedText(node.dataset.liveElapsedSince)}${suffix}`;
+  node.textContent = `${prefix === "已等 " && currentLocale() === "en" ? "Waiting " : tr(prefix)}${elapsedText(node.dataset.liveElapsedSince)}${tr(suffix)}`;
   return node;
 }
 
 function updateMarkedElapsed(root) {
   for (const node of root.querySelectorAll("[data-live-elapsed-since]")) {
-    node.textContent = `${node.dataset.liveElapsedPrefix || ""}${elapsedText(node.dataset.liveElapsedSince)}${node.dataset.liveElapsedSuffix || ""}`;
+    const prefix = node.dataset.liveElapsedPrefix || "";
+    node.textContent = `${prefix === "已等 " && currentLocale() === "en" ? "Waiting " : tr(prefix)}${elapsedText(node.dataset.liveElapsedSince)}${tr(node.dataset.liveElapsedSuffix || "")}`;
   }
 }
 
@@ -1224,9 +1513,11 @@ function turnTiming(session) {
   const total = elapsedText(started, ended);
   const active = !session.turnEndedAt && !["idle", "response_finished", "failed"].includes(session.execState);
   const stage = active && Number(session.activitySince || 0) > started
-    ? ` · 当前阶段 ${elapsedText(session.activitySince)}`
+    ? currentLocale() === "en"
+      ? ` · Current phase ${elapsedText(session.activitySince)}`
+      : ` · 当前阶段 ${elapsedText(session.activitySince)}`
     : "";
-  return `本轮 ${total}${stage}`;
+  return currentLocale() === "en" ? `Turn ${total}${stage}` : `本轮 ${total}${stage}`;
 }
 
 function compactCount(value) {
@@ -1282,7 +1573,7 @@ function appendUsageStrip(container, session) {
   }
   if (cost != null) {
     const chip = element("span", "usage-chip", `估算 API 价格 ${cost}`);
-    chip.title = "按公开 API 单价或 Provider 官方会话费用估算；不是订阅账单";
+    chip.title = tr("按公开 API 单价或 Provider 官方会话费用估算；不是订阅账单");
     strip.append(chip);
   }
   container.append(strip);
@@ -1295,7 +1586,7 @@ function cardFieldVisible(field) {
 function detailPair(label, value, className = "") {
   if (value === undefined || value === null || value === "") return undefined;
   const row = element("div", `detail-pair ${className}`.trim());
-  row.append(element("span", "", label), element("strong", "", value));
+  row.append(element("span", "", label), rawElement("strong", "", value));
   return row;
 }
 
@@ -1310,7 +1601,7 @@ function closeSessionDetail() {
 
 function openSessionDetail(session) {
   detailSessionId = session.id;
-  ui.sessionDetailTitle.textContent = session.providerTitle || session.title || "任务详情";
+  ui.sessionDetailTitle.textContent = session.providerTitle || session.title || tr("任务详情");
   ui.sessionDetailBody.replaceChildren();
   const fields = new Set(settingsState.taskCardFields || []);
   const status = sessionStatus(session);
@@ -1319,7 +1610,7 @@ function openSessionDetail(session) {
     detailPair("Provider", providerName(session.provider)),
     detailPair("状态", status.label),
     fields.has("recovery") ? detailPair("恢复状态", recovery.label) : undefined,
-    fields.has("control") ? detailPair("控制能力", session.controlCapability === "managed" ? "Codex app-server 托管，可回答提问" : "外部 Hook，仅观察/授权") : undefined,
+    fields.has("control") ? detailPair("控制能力", tr(session.controlCapability === "managed" ? "Codex app-server 托管，可回答提问" : "外部 Hook，仅观察/授权")) : undefined,
     fields.has("project") ? detailPair("项目", session.project) : undefined,
     fields.has("task") ? detailPair("任务", session.title) : undefined,
     fields.has("model") ? detailPair("模型", session.model) : undefined,
@@ -1346,7 +1637,10 @@ function openSessionDetail(session) {
     fields.has("permissionMode") ? detailPair("权限模式", session.permissionMode) : undefined,
     fields.has("subagents") ? detailPair("运行中的子 Agent", String(session.activeSubagents || 0)) : undefined,
     fields.has("environment") ? detailPair("运行环境", session.environment) : undefined,
-    fields.has("jump") ? detailPair("跳转能力", session.jumpLabel) : undefined,
+    fields.has("jump") ? detailPair(
+      "跳转能力",
+      runtimeMessageText(session.jumpMessage, session.jumpLabel),
+    ) : undefined,
     fields.has("titleSource") ? detailPair("标题来源", session.providerTitleSource) : undefined,
     fields.has("sessionId") ? detailPair("ActRealm Session ID", session.id, "developer-value") : undefined,
     fields.has("providerSessionId") ? detailPair("Provider Session ID", session.providerSessionId, "developer-value") : undefined,
@@ -1356,7 +1650,10 @@ function openSessionDetail(session) {
   const grid = element("div", "session-detail-grid");
   for (const row of rows) grid.append(row);
   ui.sessionDetailBody.append(grid);
-  ui.sessionDetailJump.textContent = session.jumpLabel || "当前环境不支持跳转";
+  ui.sessionDetailJump.textContent = runtimeMessageText(
+    session.jumpMessage,
+    session.jumpLabel ? tr(session.jumpLabel) : tr("当前环境不支持跳转"),
+  );
   ui.sessionDetailJump.disabled = session.jumpCapability === "unsupported";
   ui.sessionDetailJump.onclick = () => jumpSession(session);
   ui.sessionDetailOverlay.hidden = false;
@@ -1388,16 +1685,20 @@ function activityDisplay(session) {
   const waiting = blockingAttentionForSession(session)[0];
   if (waiting) {
     const text = waiting.kind === "native_approval"
-      ? `${providerName(waiting.provider)} 正在请求批准，请回原界面处理`
+      ? currentLocale() === "en"
+        ? `${providerName(waiting.provider)} is requesting approval; handle it in the original interface`
+        : `${providerName(waiting.provider)} 正在请求批准，请回原界面处理`
       : waiting.kind === "approval"
-        ? "等待在 ActRealm 审批"
+        ? tr("等待在 ActRealm 审批")
         : waiting.kind === "question"
-          ? "等待在 ActRealm 回答"
-          : "等待处理";
+          ? tr("等待在 ActRealm 回答")
+          : tr("等待处理");
     return {
       className: "waiting",
       marker: "!",
-      text: `${text} · ${turnTiming(session)} · 已等 ${elapsedText(waiting.createdAt)}`,
+      text: currentLocale() === "en"
+        ? `${text} · ${turnTiming(session)} · Waiting ${elapsedText(waiting.createdAt)}`
+        : `${text} · ${turnTiming(session)} · 已等 ${elapsedText(waiting.createdAt)}`,
     };
   }
   const completion = pendingAttentionForSession(session).find((item) => item.kind === "completion");
@@ -1405,26 +1706,31 @@ function activityDisplay(session) {
     return {
       className: "waiting",
       marker: "✓",
-      text: `本轮已完成，等待确认 · ${turnTiming(session)} · 已等 ${elapsedText(completion.createdAt)}`,
+      text: currentLocale() === "en"
+        ? `Turn complete, waiting for confirmation · ${turnTiming(session)} · Waiting ${elapsedText(completion.createdAt)}`
+        : `本轮已完成，等待确认 · ${turnTiming(session)} · 已等 ${elapsedText(completion.createdAt)}`,
     };
   }
   const timing = turnTiming(session);
+  const runtimeActivity = runtimeMessageText(session.activityMessage, session.activity || "");
   if (session.execState === "thinking") {
-    return { className: "thinking", marker: "•••", text: `${session.activity || "正在思考"} · ${timing}` };
+    return { className: "thinking", marker: "•••", text: `${runtimeActivity || tr("正在思考")} · ${timing}` };
   }
   if (session.execState === "tool_running") {
-    return { className: "tool", marker: "▌", text: `${session.activity || "正在运行工具"} · ${timing}` };
+    return { className: "tool", marker: "▌", text: `${runtimeActivity || tr("正在运行工具")} · ${timing}` };
   }
   if (session.execState === "compacting") {
-    return { className: "compacting", marker: "◌", text: `${session.activity || "正在压缩记忆"} · ${timing}` };
+    return { className: "compacting", marker: "◌", text: `${runtimeActivity || tr("正在压缩记忆")} · ${timing}` };
   }
   if (session.execState === "failed") {
-    return { className: "failed", marker: "×", text: `${session.activity || "运行失败"} · ${timing}` };
+    return { className: "failed", marker: "×", text: `${runtimeActivity || tr("运行失败")} · ${timing}` };
   }
   if (session.execState === "response_finished") {
-    return { className: "idle", marker: "✓", text: `${session.activity || "本轮已完成"} · ${timing}` };
+    return { className: "idle", marker: "✓", text: `${runtimeActivity || tr("本轮已完成")} · ${timing}` };
   }
-  return { className: "idle", marker: "·", text: `${session.activity || "空闲"} · ${elapsedText(session.lastEventAt)}前` };
+  return { className: "idle", marker: "·", text: currentLocale() === "en"
+    ? `${runtimeActivity || tr("空闲")} · ${elapsedText(session.lastEventAt)} ago`
+    : `${runtimeActivity || "空闲"} · ${elapsedText(session.lastEventAt)}前` };
 }
 
 function updateSessionActivity() {
@@ -1459,12 +1765,14 @@ async function jumpSession(session) {
       method: "POST",
       body: "{}",
     });
-    if (result.success) showToast(result.label || session.jumpLabel || "已打开 Agent");
+    if (result.success) {
+      showToast(runtimeMessageText(
+        result.labelMessage || session.jumpMessage,
+        result.label || session.jumpLabel || "已打开 Agent",
+      ));
+    }
   } catch (error) {
-    const message = error.message === "JUMP_FAILED"
-      ? "没有找到原窗口，或 macOS 尚未授予应用控制权限"
-      : `跳转失败：${error.message}`;
-    showToast(message);
+    showToast(`跳转失败：${apiErrorText(error)}`);
   }
 }
 
@@ -1478,7 +1786,7 @@ async function manageSession(session) {
     showToast("已连接 ActRealm app-server；Codex 原生窗口仍保留当前 Turn 的控制权");
     await loadSnapshot();
   } catch (error) {
-    showToast(`托管连接失败：${error.detail || error.message}`);
+    showToast(`托管连接失败：${apiErrorText(error)}`);
   }
 }
 
@@ -1554,7 +1862,9 @@ function buildSessionRow(session) {
     const copy = element("div", "row-copy");
     const title = element("div", "row-title");
     const clientTitle = session.providerTitle || session.title || "等待下一条任务";
-    title.append(element("strong", "", fields.has("task") ? clientTitle : providerName(session.provider)));
+    title.append(fields.has("task")
+      ? rawElement("strong", "", clientTitle)
+      : element("strong", "", providerName(session.provider)));
     title.append(element("span", `state-pill ${status.className}`.trim(), status.label));
     if (fields.has("activity")) {
       const activity = activityDisplay(session);
@@ -1563,15 +1873,15 @@ function buildSessionRow(session) {
       title.append(activityNode);
     }
     const taskContent = fields.has("task") && session.providerTitle && session.title && session.providerTitle !== session.title
-      ? element("div", "session-question", session.title)
+      ? rawElement("div", "session-question", session.title)
       : undefined;
     copy.append(title);
     if (taskContent) copy.append(taskContent);
     const meta = [providerName(session.provider)];
     if (fields.has("project") && session.project) meta.push(session.project);
-    if (fields.has("model")) meta.push(session.model || "模型未知");
+    if (fields.has("model")) meta.push(session.model || tr("模型未知"));
     if (fields.has("project") || fields.has("model")) {
-      copy.append(element("div", "session-meta", meta.join(" · ")));
+      copy.append(rawElement("div", "session-meta", meta.join(" · ")));
     }
     appendUsageStrip(copy, session);
     if (fields.has("plan") && Number.isInteger(session.planDone) && Number.isInteger(session.planTotal) && session.planTotal > 0) {
@@ -1593,7 +1903,7 @@ function buildSessionRow(session) {
     }
     const clear = element("button", "session-clear", "清除");
     clear.type = "button";
-    clear.title = "从当前任务列表隐藏；收到新事件后会重新出现";
+    clear.title = tr("从当前任务列表隐藏；收到新事件后会重新出现");
     clear.addEventListener("click", (event) => {
       event.stopPropagation();
       clear.disabled = true;
@@ -1603,7 +1913,7 @@ function buildSessionRow(session) {
 
     if (session.id === selectedSessionId) {
       const details = element("div", "task-expanded");
-      const plan = Number(session.planTotal || 0) > 0 ? `${session.planDone || 0}/${session.planTotal}（进行中）` : "未提供";
+      const plan = Number(session.planTotal || 0) > 0 ? tr(`${session.planDone || 0}/${session.planTotal}（进行中）`) : tr("未提供");
       const pairs = [
         fields.has("environment") ? ["工作区", session.environment || session.project || `${providerName(session.provider)} 客户端`] : undefined,
         fields.has("context") ? ["本轮上下文", contextUsageText(session)] : undefined,
@@ -1622,8 +1932,11 @@ function buildSessionRow(session) {
         fields.has("permissionMode") ? ["权限模式", session.permissionMode || "—"] : undefined,
         fields.has("subagents") ? ["运行中的子 Agent", String(session.activeSubagents || 0)] : undefined,
         fields.has("recovery") ? ["恢复状态", recoveryDisplay(session).label] : undefined,
-        fields.has("control") ? ["托管能力", session.controlCapability === "managed" ? "Codex app-server 托管，可回答提问" : "外部 Hook，仅观察/授权"] : undefined,
-        fields.has("jump") ? ["打开应用", session.jumpLabel || "当前环境不支持"] : undefined,
+        fields.has("control") ? ["托管能力", tr(session.controlCapability === "managed" ? "Codex app-server 托管，可回答提问" : "外部 Hook，仅观察/授权")] : undefined,
+        fields.has("jump") ? ["打开应用", runtimeMessageText(
+          session.jumpMessage,
+          session.jumpLabel ? tr(session.jumpLabel) : tr("当前环境不支持"),
+        )] : undefined,
         fields.has("titleSource") ? ["标题来源", session.providerTitleSource || "—"] : undefined,
         fields.has("sessionId") ? ["ActRealm Session ID", session.id] : undefined,
         fields.has("providerSessionId") ? ["Provider Session ID", session.providerSessionId] : undefined,
@@ -1632,7 +1945,7 @@ function buildSessionRow(session) {
       ].filter(Boolean);
       for (const [label, value] of pairs) {
         const pair = element("div", "task-detail-pair");
-        pair.append(element("span", "", label), element("strong", "", value));
+        pair.append(element("span", "", label), rawElement("strong", "", value));
         details.append(pair);
       }
       const waiting = openItems().find((item) => item.sessionId === session.id);
@@ -1662,7 +1975,7 @@ function renderSessions() {
   const waitingCount = sessions.filter((session) => sessionStatus(session).className === "waiting").length;
   const runningCount = sessions.filter((session) => isSessionActive(session) && sessionStatus(session).className !== "waiting").length;
   const finishedCount = sessions.filter((session) => ["idle", "response_finished"].includes(session.execState)).length;
-  ui.sessionCount.textContent = `${sessions.length} 个任务 · ${waitingCount} 等待 · ${runningCount} 运行中 · ${finishedCount} 已完成`;
+  setClientText(ui.sessionCount, `${sessions.length} 个任务 · ${waitingCount} 等待 · ${runningCount} 运行中 · ${finishedCount} 已完成`);
   if (!sessions.length) {
     selectedSessionId = undefined;
     sessionActivityRefs.clear();
@@ -1723,6 +2036,16 @@ function renderSessions() {
 
 function quotaDurationLabel(minutes, fallback) {
   const value = Number(minutes || 0);
+  if (currentLocale() === "en") {
+    if (value > 0 && value % 43200 === 0) return I18N.plural(value / 43200, "month");
+    if (value > 0 && value % 10080 === 0) return I18N.plural(value / 10080, "week");
+    if (value > 0 && value % 1440 === 0) return I18N.plural(value / 1440, "day");
+    if (value > 0 && value % 60 === 0) return I18N.plural(value / 60, "hour");
+    if (value > 0) return I18N.plural(value, "minute");
+    if (fallback === "5h") return "5 hours";
+    if (fallback === "7d") return "7 days";
+    return fallback && fallback !== "unknown" ? fallback.replaceAll("_", " ") : "Quota";
+  }
   if (value > 0 && value % 43200 === 0) return `${value / 43200} 个月`;
   if (value > 0 && value % 10080 === 0) return `${value / 10080} 周`;
   if (value > 0 && value % 1440 === 0) return `${value / 1440} 天`;
@@ -1734,7 +2057,10 @@ function quotaDurationLabel(minutes, fallback) {
 }
 
 function quotaWindowLabel(quota) {
-  const name = quota.limitName || quotaDurationLabel(quota.windowMinutes, quota.window);
+  const name = runtimeMessageText(
+    quota.windowMessage,
+    quota.limitName || quotaDurationLabel(quota.windowMinutes, quota.window),
+  );
   return `${providerName(quota.provider)} · ${name}`;
 }
 
@@ -1757,13 +2083,15 @@ function quotaRenderSignature() {
 function updateQuotaTimes() {
   for (const node of ui.quotaList.querySelectorAll("[data-quota-captured-at]")) {
     const minutes = Math.max(0, Math.floor((Date.now() - Number(node.dataset.quotaCapturedAt)) / 60000));
-    node.textContent = minutes > 0 ? `${minutes} 分钟前更新` : "刚刚更新";
+    setClientText(node, minutes > 0 ? `${minutes} 分钟前更新` : "刚刚更新");
   }
   for (const node of ui.quotaList.querySelectorAll("[data-quota-resets-at]")) {
     const reset = new Date(Number(node.dataset.quotaResetsAt));
     node.textContent = reset.getTime() <= Date.now()
-      ? "已到重置时间，等待同步"
-      : `${reset.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })} 重置`;
+      ? tr("已到重置时间，等待同步")
+      : currentLocale() === "en"
+        ? `Resets ${reset.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })}`
+        : `${reset.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })} 重置`;
   }
 }
 
@@ -1776,15 +2104,17 @@ function renderQuota() {
   ui.quotaList.classList.toggle("compact", compact);
   ui.quotaList.classList.toggle("single-line", singleLine);
   if (isFirstRun()) {
-    ui.quotaSyncTime.textContent = "最近同步 · 等待 Agent 接入";
+    setClientText(ui.quotaSyncTime, "最近同步 · 等待 Agent 接入");
     ui.quotaList.append(onboardingQuotaState());
     return;
   }
   const slots = quotaSlots();
   const latestCapture = Math.max(0, ...slots.map((quota) => Number(quota.capturedAt || 0)));
   ui.quotaSyncTime.textContent = latestCapture
-    ? `最近同步 · ${new Date(latestCapture).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`
-    : "最近同步 · 等待额度来源";
+    ? currentLocale() === "en"
+      ? `Last sync · ${new Date(latestCapture).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`
+      : `最近同步 · ${new Date(latestCapture).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`
+    : tr("最近同步 · 等待额度来源");
   if (!slots.length) {
     ui.quotaList.append(emptyState("—", "暂时没有额度数据", "完成一次 Agent 对话后会在这里同步可验证额度。"));
     return;
@@ -1803,7 +2133,12 @@ function renderQuota() {
         unavailableTitle.append(element("span", "quota-status-chip neutral", "暂不可用"));
         unavailable.append(unavailableTitle);
         const detail = element("div", "quota-compact-detail unavailable");
-        detail.append(element("p", "", quota.reason || "额度来源没有返回可验证数据"));
+        detail.append(element(
+          "p",
+          "",
+          runtimeMessageText(quota.reasonMessage, quota.reason)
+            || "额度来源没有返回可验证数据",
+        ));
         if (quota.provider === "claude") {
           const help = element("button", "quota-help", "检查设置");
           help.type = "button";
@@ -1819,7 +2154,8 @@ function renderQuota() {
           element("span", "quota-compact-status", "暂不可用"),
           element("span", "quota-state-dot neutral"),
         );
-        unavailable.title = quota.reason || "额度来源没有返回可验证数据";
+        unavailable.title = runtimeMessageText(quota.reasonMessage, quota.reason)
+          || "额度来源没有返回可验证数据";
         if (quota.provider === "claude") {
           unavailable.tabIndex = 0;
           unavailable.setAttribute("role", "button");
@@ -1836,7 +2172,12 @@ function renderQuota() {
         continue;
       }
       unavailable.append(unavailableTitle);
-      unavailable.append(element("p", "", quota.reason || "额度来源没有返回可验证数据"));
+      unavailable.append(element(
+        "p",
+        "",
+        runtimeMessageText(quota.reasonMessage, quota.reason)
+          || "额度来源没有返回可验证数据",
+      ));
       unavailable.append(element("div", "quota-track"));
       if (quota.provider === "claude") {
         const help = element("button", "quota-help", "如何开启");
@@ -1918,7 +2259,7 @@ function renderQuota() {
       rollout_experimental: "本机 Session 同步",
     }[quota.source];
     if (sourceLabel) meta.append(element("span", "quota-source", sourceLabel));
-    if (quota.planType) meta.append(element("span", "", quota.planType));
+    if (quota.planType) meta.append(rawElement("span", "", quota.planType));
     if (quota.resetsAt) {
       const reset = new Date(Number(quota.resetsAt) * 1000);
       const resetNode = element("span", "");
@@ -2065,6 +2406,12 @@ async function bootstrap() {
   return true;
 }
 
+async function initializeAuthenticatedSession() {
+  const hashToken = new URLSearchParams(location.hash.slice(1)).get("bootstrap");
+  const plan = I18N.bootstrapPlan({ hashToken, csrfToken });
+  if (plan === "bootstrap-first") await bootstrap();
+}
+
 async function loadSnapshot() {
   const previousEventCount = Number(snapshot.stats?.eventCount || 0);
   try {
@@ -2091,9 +2438,9 @@ function setConnected(connected) {
   runtimeConnected = connected;
   document.body.classList.toggle("disconnected", !connected);
   ui.runtimeState.classList.toggle("online", connected);
-  ui.runtimeLabel.textContent = connected ? "Live · 本地" : "正在重连";
-  ui.runtimeFooterLabel.textContent = connected ? "Runtime · 本机在线" : "Runtime · 正在重连";
-  ui.runtimeSettingsLabel.textContent = connected ? "本机 Runtime 在线" : "本机 Runtime 正在重连";
+  setClientText(ui.runtimeLabel, connected ? "Live · 本地" : "正在重连");
+  setClientText(ui.runtimeFooterLabel, connected ? "Runtime · 本机在线" : "Runtime · 正在重连");
+  setClientText(ui.runtimeSettingsLabel, connected ? "本机 Runtime 在线" : "本机 Runtime 正在重连");
   ui.setupRefresh.disabled = !connected;
   ui.offlineBanner.hidden = connected;
   if (changed && setupLoaded && !ui.setupOverlay.hidden) renderSetup();
@@ -2107,13 +2454,34 @@ function scheduleSetupRefresh() {
   }, 500);
 }
 
-function connectSocket() {
+async function connectSocket() {
   if (!csrfToken || restartInProgress) return;
   if (socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(socket.readyState)) return;
+  if (socketTicketInFlight) return;
   window.clearTimeout(reconnectTimer);
   reconnectTimer = undefined;
+  socketTicketInFlight = true;
+  let ticket;
+  try {
+    const response = await api("/api/v1/ws-ticket", { method: "POST" });
+    ticket = response.ticket;
+  } catch (_) {
+    setConnected(false);
+    if (!restartInProgress) {
+      reconnectTimer = window.setTimeout(connectSocket, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+    }
+    return;
+  } finally {
+    socketTicketInFlight = false;
+  }
+  if (!ticket || restartInProgress) return;
+  if (socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(socket.readyState)) return;
   const scheme = location.protocol === "https:" ? "wss" : "ws";
-  const currentSocket = new WebSocket(`${scheme}://${location.host}/api/v1/ws?csrf=${encodeURIComponent(csrfToken)}`);
+  const currentSocket = new WebSocket(
+    `${scheme}://${location.host}/api/v1/ws`,
+    `actrealm.${ticket}`,
+  );
   socket = currentSocket;
   currentSocket.addEventListener("open", () => {
     if (socket !== currentSocket) return;
@@ -2181,14 +2549,17 @@ async function sendAction(item, action) {
     if (command.state === "pending_commit") showUndo(command.id, action);
     await loadSnapshot();
   } catch (error) {
-    showToast(error.message === "STALE_APPROVAL" ? "这项请求已过期，已交回原终端" : `操作失败：${error.message}`);
+    const message = error.message === "STALE_APPROVAL"
+      ? "这项请求已过期，已交回原终端"
+      : `操作失败：${apiErrorText(error)}`;
+    showToast(message);
     await loadSnapshot().catch(() => {});
   }
 }
 
 function showUndo(commandId, action) {
   undoCommandId = commandId;
-  ui.undoMessage.textContent = `${action === "approve" ? "批准" : "拒绝"} · 3 秒后提交`;
+  setClientText(ui.undoMessage, `${action === "approve" ? "批准" : "拒绝"} · 3 秒后提交`);
   ui.undoToast.hidden = false;
   window.setTimeout(() => {
     if (undoCommandId === commandId) {
@@ -2205,20 +2576,24 @@ async function undoCommand(commandId) {
     ui.undoToast.hidden = true;
     await loadSnapshot();
   } catch (error) {
-    showToast(error.message === "STALE_APPROVAL" ? "决定已经提交，不能再撤回" : `撤回失败：${error.message}`);
+    const message = error.message === "STALE_APPROVAL"
+      ? "决定已经提交，不能再撤回"
+      : `撤回失败：${apiErrorText(error)}`;
+    showToast(message);
   }
 }
 
 function inferredToastPriority(message) {
-  const errorMarkers = ["失败", "无法", "不能", "未连接", "没有可用", "没有找到", "未找到", "已过期", "请输入", "仍需在"];
-  return errorMarkers.some((marker) => String(message).includes(marker)) ? 1 : 0;
+  const normalized = String(message).toLowerCase();
+  const errorMarkers = ["失败", "无法", "不能", "未连接", "没有可用", "没有找到", "未找到", "已过期", "请输入", "仍需在", "failed", "unable", "cannot", "not connected", "not found", "expired", "enter "];
+  return errorMarkers.some((marker) => normalized.includes(marker)) ? 1 : 0;
 }
 
 function showToast(message, priority = inferredToastPriority(message)) {
   if (!ui.toast.hidden && priority < toastPriority) return;
   window.clearTimeout(toastTimer);
   toastPriority = priority;
-  ui.toast.textContent = message;
+  setClientText(ui.toast, message);
   ui.toast.classList.toggle("error", priority > 0);
   ui.toast.hidden = false;
   toastTimer = window.setTimeout(() => {
@@ -2249,8 +2624,10 @@ function renderRuntimeMonitor(status) {
     unavailable: ["Hook 通道不可用", "warning"],
   }[status.hook?.status] || ["Hook 状态未知", "warning"];
   const lastHook = status.hook?.lastEventAt
-    ? `${elapsedText(status.hook.lastEventAt)}前`
-    : "尚无真实事件";
+    ? currentLocale() === "en"
+      ? `${elapsedText(status.hook.lastEventAt)} ago`
+      : `${elapsedText(status.hook.lastEventAt)}前`
+    : tr("尚无真实事件");
   const restartResult = status.restart?.lastResult === "recovered"
     ? `已恢复 · ${status.restart.count} 次`
     : "本次启动未重启";
@@ -2274,7 +2651,7 @@ async function loadRuntimeMonitor() {
     renderRuntimeMonitor(await api("/api/v1/runtime/status"));
     lastRuntimeMonitorAt = Date.now();
   } catch (error) {
-    ui.runtimeMonitorGrid.replaceChildren(element("span", "monitor-loading", `监控读取失败：${error.message}`));
+    ui.runtimeMonitorGrid.replaceChildren(element("span", "monitor-loading", `监控读取失败：${apiErrorText(error)}`));
   } finally {
     runtimeMonitorInFlight = false;
     ui.runtimeMonitorRefresh.disabled = false;
@@ -2311,7 +2688,7 @@ async function waitForRuntimeRestart(previousInstanceId, restartToken) {
 }
 
 function setRuntimeActionFeedback(message, error = false) {
-  ui.runtimeActionFeedback.textContent = message || "";
+  setClientText(ui.runtimeActionFeedback, message || "");
   ui.runtimeActionFeedback.hidden = !message;
   ui.runtimeActionFeedback.classList.toggle("error", error);
 }
@@ -2319,10 +2696,10 @@ function setRuntimeActionFeedback(message, error = false) {
 async function restartRuntime() {
   if (restartInProgress) return;
   const waiting = openItems().filter((item) => item.kind === "approval" || item.kind === "native_approval").length;
-  if (waiting > 0 && !window.confirm(`当前有 ${waiting} 个请求正在等待。重启会安全放行这些请求并重新连接 Agent。`)) return;
+  if (waiting > 0 && !window.confirm(tr(`当前有 ${waiting} 个请求正在等待。重启会安全放行这些请求并重新连接 Agent。`))) return;
   restartInProgress = true;
   ui.runtimeRestart.disabled = true;
-  ui.runtimeRestart.textContent = "正在保存状态…";
+  setClientText(ui.runtimeRestart, "正在保存状态…");
   setRuntimeActionFeedback("正在安全保存状态并重新连接 Runtime…");
   const restartToken = crypto.randomUUID();
   try {
@@ -2351,10 +2728,10 @@ async function restartRuntime() {
     csrfToken = undefined;
     sessionStorage.removeItem("actrealm.csrf");
     setConnected(false);
-    ui.runtimeLabel.textContent = "正在重启";
-    ui.runtimeFooterLabel.textContent = "Runtime · 正在恢复";
-    ui.runtimeSettingsLabel.textContent = "本机 Runtime 正在重启";
-    ui.runtimeRestart.textContent = "正在恢复连接…";
+    setClientText(ui.runtimeLabel, "正在重启");
+    setClientText(ui.runtimeFooterLabel, "Runtime · 正在恢复");
+    setClientText(ui.runtimeSettingsLabel, "本机 Runtime 正在重启");
+    setClientText(ui.runtimeRestart, "正在恢复连接…");
     await waitForRuntimeRestart(previousInstanceId, restartToken);
     restartInProgress = false;
     reconnectDelay = 500;
@@ -2367,10 +2744,10 @@ async function restartRuntime() {
     setConnected(false);
     setRuntimeActionFeedback(error.message === "RESTART_TIMEOUT"
       ? "Runtime 未能自动恢复，请在终端重新运行 serve --open"
-      : `Runtime 重启失败：${error.message}`, true);
+      : `Runtime 重启失败：${apiErrorText(error)}`, true);
   } finally {
     ui.runtimeRestart.disabled = false;
-    ui.runtimeRestart.textContent = "重启 Runtime";
+    setClientText(ui.runtimeRestart, "重启 Runtime");
   }
 }
 
@@ -2436,12 +2813,18 @@ ui.wipeCancel.addEventListener("click", cancelClearConfirmation);
 ui.wipeConfirmationInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter") clearLocalData();
 });
+ui.clearBackups.addEventListener("click", openBackupClearConfirmation);
+ui.backupWipeConfirm.addEventListener("click", clearConfigurationBackups);
+ui.backupWipeCancel.addEventListener("click", cancelBackupClearConfirmation);
+ui.backupWipeConfirmationInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") clearConfigurationBackups();
+});
 for (const button of ui.retentionOptions) {
   button.addEventListener("click", () => chooseRetention(Number(button.dataset.value)));
 }
 ui.runtimeMonitor.addEventListener("click", () => {
   ui.runtimeMonitorDetails.hidden = !ui.runtimeMonitorDetails.hidden;
-  ui.runtimeMonitor.textContent = ui.runtimeMonitorDetails.hidden ? "查看监控" : "收起监控";
+  setClientText(ui.runtimeMonitor, ui.runtimeMonitorDetails.hidden ? "查看监控" : "收起监控");
   if (!ui.runtimeMonitorDetails.hidden) void loadRuntimeMonitor();
 });
 ui.runtimeMonitorRefresh.addEventListener("click", loadRuntimeMonitor);
@@ -2494,8 +2877,9 @@ window.setInterval(updateLiveTimes, 1000);
 window.setInterval(maintainLiveConnection, 5000);
 
 (async () => {
-  setConnected(false);
+  initializeLanguage();
   try {
+    await initializeAuthenticatedSession();
     await loadSnapshot();
     await loadSetup();
     await loadSettings();
@@ -2505,8 +2889,9 @@ window.setInterval(maintainLiveConnection, 5000);
     notificationsPrimed = true;
     connectSocket();
   } catch (error) {
+    setConnected(false);
     ui.attentionList.replaceChildren(emptyState("!", "无法连接本地 Runtime", "请从 actrealm serve 输出的一次性地址打开控制面板。"));
-    showToast(`连接失败：${error.message}`);
+    showToast(`连接失败：${apiErrorText(error)}`);
   } finally {
     document.body.classList.remove("app-booting");
   }

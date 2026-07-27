@@ -182,6 +182,114 @@ fn claude_install_backs_up_and_preserves_user_semantics() {
 }
 
 #[test]
+fn backup_identity_distinguishes_same_basename_provider_files() {
+    let mut fixture = Fixture::new("backup-identity");
+    fixture.paths.codex_hooks = fixture
+        .paths
+        .codex_hooks
+        .parent()
+        .unwrap()
+        .join("settings.json");
+    write_json(&fixture.paths.claude_settings, &json!({"claude": true}));
+    write_json(&fixture.paths.codex_hooks, &json!({"codex": true}));
+    let installer = fixture.installer();
+
+    let claude = installer
+        .install(HookProvider::Claude, InstallOptions::default())
+        .unwrap()
+        .backup_path
+        .unwrap();
+    let codex = installer
+        .install(HookProvider::Codex, InstallOptions::default())
+        .unwrap()
+        .backup_path
+        .unwrap();
+
+    assert_ne!(claude, codex);
+    assert!(claude
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("actrealm-backup-v1--claude-settings--"));
+    assert!(codex
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("actrealm-backup-v1--codex-hooks--"));
+    for backup in [claude, codex] {
+        assert_eq!(
+            fs::metadata(backup).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    assert_eq!(
+        fs::metadata(fixture.paths.actrealm_home.join("backups"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+}
+
+#[test]
+fn explicit_backup_clear_removes_only_actrealm_owned_private_regular_files() {
+    let fixture = Fixture::new("backup-clear");
+    write_json(&fixture.paths.claude_settings, &json!({"claude": true}));
+    write_json(&fixture.paths.codex_hooks, &json!({"codex": true}));
+    let installer = fixture.installer();
+    installer
+        .install(HookProvider::Claude, InstallOptions::default())
+        .unwrap();
+    installer
+        .install(HookProvider::Codex, InstallOptions::default())
+        .unwrap();
+
+    let before = installer.backup_summary().unwrap();
+    assert_eq!(before.count, 2);
+    assert!(before.total_bytes > 0);
+    let cleared = installer.clear_backups().unwrap();
+    assert_eq!(cleared.removed_count, before.count);
+    assert_eq!(cleared.removed_bytes, before.total_bytes);
+    assert_eq!(installer.backup_summary().unwrap().count, 0);
+    assert!(fixture.paths.claude_settings.is_file());
+    assert!(fixture.paths.codex_hooks.is_file());
+    assert!(fixture.paths.state_file().is_file());
+}
+
+#[test]
+fn backup_clear_refuses_symlinks_and_unmanaged_files_without_partial_deletion() {
+    let fixture = Fixture::new("backup-clear-refusal");
+    write_json(&fixture.paths.claude_settings, &json!({"claude": true}));
+    let installer = fixture.installer();
+    let managed = installer
+        .install(HookProvider::Claude, InstallOptions::default())
+        .unwrap()
+        .backup_path
+        .unwrap();
+    let backups = fixture.paths.actrealm_home.join("backups");
+    let unmanaged = backups.join("user-note.txt");
+    write_file(&unmanaged, b"keep", 0o600);
+
+    let error = installer.clear_backups().unwrap_err();
+    assert!(matches!(error, InstallerError::UnsafeBackupEntry(_)));
+    assert!(managed.exists());
+    assert!(unmanaged.exists());
+
+    fs::remove_file(&unmanaged).unwrap();
+    let symlink_path = backups.join("actrealm-backup-v1--claude-settings--999");
+    symlink(&fixture.paths.claude_settings, &symlink_path).unwrap();
+    let error = installer.clear_backups().unwrap_err();
+    assert!(matches!(error, InstallerError::UnsafeBackupEntry(_)));
+    assert!(managed.exists());
+    assert!(symlink_path
+        .symlink_metadata()
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[test]
 fn install_then_uninstall_restores_original_semantics_and_removes_only_ours() {
     let fixture = Fixture::new("round-trip");
     let original = user_claude_config();

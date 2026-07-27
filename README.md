@@ -15,17 +15,17 @@ and a safe path back to the work.
 
 [Website](https://www.getactrealm.com) ·
 [中文使用教程](docs/USER_GUIDE_zh-CN.md) ·
+[English user guide](docs/USER_GUIDE_en.md) ·
 [Current status](docs/STATUS.md) ·
 [Native client architecture](docs/NATIVE_CLIENT_ARCHITECTURE.md)
 
-> **Project status:** functional implementation is complete through M14 plus
-> post-M14 live-state and controlled Runtime-recovery refinements, but the
-> current source remains a local test candidate rather than a final v1 release.
-> A further usage/OAuth hardening change has passed its automated/resource
-> gates and still requires exact-candidate local installation and user
-> acceptance.
-> Real-Provider M13 acceptance and the continuous 48-hour Runtime stability
-> gate are still pending.
+> **Project status:** the current release-hardening candidate is based on
+> `1dff02d879443876a1ab59aca1654ca9d084e7ed` plus uncommitted local changes.
+> Tasks 1–9 of the 2026-07-27 hardening plan have passed their scoped Rust,
+> Swift, security, performance, language, backup, and CI-pin gates. It is still
+> a local test candidate: the final whole-tree gate, packaged-candidate
+> installation, real workflow acceptance, commit, push, tag, and release have
+> not been authorized. This candidate makes no 48-hour-soak claim.
 
 ## A different operating model for agent work
 
@@ -81,9 +81,15 @@ The current build includes:
   official-CLI OAuth expiry recovery when a Claude CLI is available;
 - **an authenticated local control surface** backed by a single Rust Runtime,
   SQLite persistence, WebSocket updates, diagnostics, and local export;
+- **bilingual local clients** with System/Simplified Chinese/English
+  presentation on macOS and System/Simplified Chinese/English on the embedded
+  Web UI without translating Provider-authored content;
 - **stable live updates and controlled recovery** with heartbeats, stale-channel
   fallback, in-place elapsed-time updates, a diagnostic manual Claude quota
   refresh, a local health monitor, and a one-button same-port Runtime restart;
+- **explicit backup governance** with source-aware private backups, visible
+  count/size, and a separate `DELETE BACKUPS` confirmation; backups are never
+  deleted automatically;
 - **a native macOS client codebase** with menu-bar UI, HUD, Runtime supervision,
   and experimental foreground scheduling.
 
@@ -114,11 +120,11 @@ fake allow/deny controls or infer the eventual outcome.
 
 ## Run the current build from source
 
-Requirements:
+Requirements for the current supported candidate:
 
-- macOS;
+- Apple Silicon Mac running macOS 26;
 - Git;
-- Rust stable 1.85 or newer;
+- Rust 1.97;
 - at least one local Provider: Claude Code CLI/Desktop or Codex CLI/Desktop.
 
 The active product implementation currently lives on `agent/v1-full`, so clone
@@ -173,8 +179,9 @@ apps/macos/Scripts/package-app.sh
 open apps/macos/dist/ActRealm.app
 ```
 
-The current native UI uses Swift tools 6.2 and macOS 26 APIs and currently
-targets Apple Silicon. Local packages remain ad-hoc signed QA artifacts. The
+The current native UI uses macOS 26 APIs, targets Apple Silicon only, and is
+verified in CI with Xcode 26.6. Local packages remain ad-hoc signed QA
+artifacts. The
 repository now contains a Developer ID signing, notarization, stapling, DMG,
 checksum, and GitHub release workflow, but a public installer is not considered
 available until that workflow runs with release credentials and the resulting
@@ -184,14 +191,15 @@ DMG passes a clean-Mac install gate.
 
 | Area | Status | Boundary |
 | --- | --- | --- |
-| Local Runtime and web control surface | Current test candidate | Functional through M14 plus live-state/recovery refinements; M13 real-Provider acceptance and the 48-hour soak remain open |
+| Local Runtime and web control surface | Current test candidate | Authenticated loopback-only control, bounded snapshots, bilingual Web UI, explicit backups, and controlled recovery; final packaged-candidate acceptance remains open |
 | Claude Code and Codex | Current build | Local sessions only; direct actions depend on the actual reply channel |
-| Native macOS client | Testable source | macOS 26+ on Apple Silicon; local packaging works, while clean-Mac release acceptance remains open |
+| Native macOS client | Testable source | macOS 26 on Apple Silicon only; local packaging works, while exact-candidate and clean-Mac release acceptance remain open |
 | Automatic ActRealm Workspace arrangement | Experimental | Requires macOS Accessibility permission and must fail without changing Runtime state |
 | ActRealm Review | In development | Planned test, diff, evidence, and checkpoint review; not part of the current build |
 | Gemini CLI adapter | In development | Not shipped as a current supported Provider |
 | Windows client | Roadmap | Runtime platform abstractions must land before the WinUI shell |
 | Public signed installer | Release-gated | Pipeline exists; Developer ID/notarization credentials and clean-Mac acceptance are still required |
+| Intel Mac, automatic updates, 48-hour soak, accessibility qualification | Deferred | Not implemented or claimed by this candidate |
 
 Roadmap-tagged capabilities on the website are target experiences, not evidence
 of shipped behavior. The detailed implementation and release truth lives in
@@ -223,7 +231,12 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --offline -- -D warnings
 cargo test --workspace --offline
 cargo build --workspace --release --offline
+./scripts/check-ci-pins.sh
 ./scripts/check-actrealm-language.sh
+./scripts/check-runtime-language.sh
+node --test web/i18n.test.js
+node --check web/i18n.js
+node --check web/app.js
 ./scripts/m0-e2e.sh
 ./scripts/m5-resource-check.sh target/release/actrealm
 apps/macos/Scripts/test.sh
@@ -252,8 +265,10 @@ change how those tools handle data.
 
 - [Current development and release status](docs/STATUS.md)
 - [Chinese installation and usage guide](docs/USER_GUIDE_zh-CN.md)
+- [English installation and usage guide](docs/USER_GUIDE_en.md)
 - [Native macOS/Windows architecture](docs/NATIVE_CLIENT_ARCHITECTURE.md)
 - [Executable v1 acceptance contract](docs/V1_ACCEPTANCE.md)
+- [2026-07-27 release-hardening report](docs/reports/ACTREALM_RELEASE_HARDENING_2026-07-27.md)
 - [M14 live usage, context, price, and quota evidence](docs/M14_USAGE_CONTEXT_QUOTA.md)
 - [M15 managed Codex approval boundary](docs/M15_CODEX_MANAGED_APPROVALS.md)
 - [OUTBOX and quota regression remediation](docs/reports/ACTREALM_OUTBOX_QUOTA_REGRESSION_2026-07-23.md)

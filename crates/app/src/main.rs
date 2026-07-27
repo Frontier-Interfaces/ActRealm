@@ -272,7 +272,7 @@ fn run_statusline() -> Result<()> {
         .take((MAX_HOOK_PAYLOAD_BYTES + 1) as u64)
         .read_to_end(&mut input);
     if input.len() > MAX_HOOK_PAYLOAD_BYTES {
-        println!("ActRealm · 额度输入过大");
+        println!("ActRealm · quota input too large");
         return Ok(());
     }
     let paths = QuotaPaths::discover();
@@ -283,7 +283,7 @@ fn run_statusline() -> Result<()> {
     let _ = capture_claude_statusline_usage(&input, &usage_paths.claude_status_cache_dir(), now);
     match capture_claude_statusline(&input, &paths.claude_cache(), now) {
         Ok(entries) => println!("{}", statusline_text(&entries)),
-        Err(_) => println!("ActRealm · 额度暂不可用"),
+        Err(_) => println!("ActRealm · quota unavailable"),
     }
     Ok(())
 }

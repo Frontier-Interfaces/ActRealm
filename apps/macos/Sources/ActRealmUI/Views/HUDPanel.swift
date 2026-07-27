@@ -146,6 +146,10 @@ public final class HUDPanelController {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.updateVisibility() }
             .store(in: &cancellables)
+        model.$appLanguage
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateVisibility() }
+            .store(in: &cancellables)
         model.$now
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.updateVisibility() }
@@ -314,6 +318,7 @@ public struct HUDCapsuleView: View {
 
     @EnvironmentObject var model: AppModel
     @Environment(\.snapshotRendering) private var snapshotRendering
+    @Environment(\.locale) private var locale
     @State private var decisionSubmission: HUDDecisionSubmission? = nil
     @State private var isHovering = false
 
@@ -364,13 +369,19 @@ public struct HUDCapsuleView: View {
                     content
                 }
 
-                Text(entry.kind == .approval ? "可直接允许或拒绝 · 事项保留在待处理列表" : "事项已进入待处理列表")
+                Text(localized(
+                    entry.kind == .approval
+                        ? "可直接允许或拒绝 · 事项保留在待处理列表"
+                        : "事项已进入待处理列表",
+                    locale: model.interfaceLocale
+                ))
                     .font(.system(size: 10))
                     .foregroundStyle(DT.textFaint)
             }
         }
         .padding(14)
         .fixedSize()
+        .environment(\.locale, model.interfaceLocale)
         .overlay(alignment: .topLeading) {
             if isHovering && !snapshotRendering {
                 Button {
@@ -394,8 +405,8 @@ public struct HUDCapsuleView: View {
                 .shadow(color: Color.black.opacity(0.28), radius: 6, y: 2)
                 .padding(.leading, 3)
                 .padding(.top, 3)
-                .help("关闭通知")
-                .accessibilityLabel("关闭通知")
+                .help(localized("关闭通知", locale: model.interfaceLocale))
+                .accessibilityLabel(localized("关闭通知", locale: model.interfaceLocale))
                 .transition(.opacity.combined(with: .scale(scale: 0.84)))
             }
         }
@@ -423,11 +434,17 @@ public struct HUDCapsuleView: View {
             HStack(spacing: 13) {
                 dispatchRing(dispatch, color: DT.amberDot)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(dispatch.title)
+                    Text(AppLocalization.localizedRuntimeMessage(
+                        dispatch.titleMessage,
+                        fallback: dispatch.title,
+                        language: model.appLanguage
+                    ))
                         .font(.system(size: 12.5, weight: .bold))
                         .foregroundStyle(DT.textStrong)
                         .lineLimit(1)
-                    Text(dispatch.taskTitle.map { "任务：\($0)" } ?? "任务需要处理")
+                    Text(dispatch.taskTitle.map {
+                        localizedFormat("任务：%@", locale: locale, $0)
+                    } ?? localized("任务需要处理", locale: locale))
                         .font(DT.body(10.5))
                         .foregroundStyle(DT.textWeak)
                         .lineLimit(1)
@@ -442,10 +459,18 @@ public struct HUDCapsuleView: View {
             HStack(spacing: 12) {
                 ProviderAvatar(kind: dispatch.provider ?? .codex, size: 34)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("正在聚焦 \(providerName(dispatch.provider))")
+                    Text(localizedFormat(
+                        "正在聚焦 %@",
+                        locale: locale,
+                        providerName(dispatch.provider)
+                    ))
                         .font(.system(size: 12.5, weight: .bold))
                         .foregroundStyle(DT.textStrong)
-                    Text(dispatch.title)
+                    Text(AppLocalization.localizedRuntimeMessage(
+                        dispatch.titleMessage,
+                        fallback: dispatch.title,
+                        language: model.appLanguage
+                    ))
                         .font(DT.body(10.5))
                         .foregroundStyle(DT.textWeak)
                         .lineLimit(1)
@@ -456,7 +481,11 @@ public struct HUDCapsuleView: View {
             HStack(spacing: 12) {
                 dispatchRing(dispatch, color: DT.greenDot)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("等待鼠标进入绑定工作区 · \(remainingSeconds(dispatch)) 秒")
+                    Text(localizedFormat(
+                        "等待鼠标进入绑定工作区 · %lld 秒",
+                        locale: locale,
+                        Int64(remainingSeconds(dispatch))
+                    ))
                         .font(.system(size: 12.5, weight: .bold))
                         .foregroundStyle(DT.textStrong)
                     Text("进入即视为已接收；事件仍等待批准、回答或确认")
@@ -504,12 +533,13 @@ public struct HUDCapsuleView: View {
     }
 
     private func dispatchHint(_ dispatch: ForegroundDispatchState) -> String {
-        switch dispatch.phase {
+        let key = switch dispatch.phase {
         case .reminding: "倒计时结束后自动聚焦 · 也可以稍后处理"
         case .opening: "优先打开具体任务；失败时打开 Agent 页面"
         case .awaitingWorkspace: "鼠标进入绑定工作区即视为已接收"
         case .returnedToActRealmWorkspace: "任务仍保留在待处理列表"
         }
+        return localized(key, locale: locale)
     }
 
     private func providerName(_ provider: ProviderKind?) -> String {
@@ -557,7 +587,7 @@ public struct HUDCapsuleView: View {
                     }
                     .buttonStyle(.plain)
                     .contentShape(Circle())
-                    .help("拒绝")
+                    .help(localized("拒绝", locale: locale))
 
                     Button {
                         submit(.approve, entry: entry)
@@ -572,7 +602,7 @@ public struct HUDCapsuleView: View {
                     .buttonStyle(.plain)
                     .contentShape(Circle())
                     .shadow(color: DT.blue.opacity(0.4), radius: 8, y: 4)
-                    .help("允许（3 秒内可撤回）")
+                    .help(localized("允许（3 秒内可撤回）", locale: locale))
                 } else {
                     decisionSubmissionStatus(entry)
                 }
@@ -627,22 +657,25 @@ public struct HUDCapsuleView: View {
     }
 
     private func decisionStatusText(_ entry: OutboxEntry) -> String {
-        switch entry.state {
+        let key = switch entry.state {
         case .open:
-            return decisionSubmission?.action == .deny ? "正在提交拒绝…" : "正在提交允许…"
+            decisionSubmission?.action == .deny ? "正在提交拒绝…" : "正在提交允许…"
         case .committing:
-            return "正在建立撤回窗口…"
+            "正在建立撤回窗口…"
         case .decisionSent:
-            return "已写给 Provider，等待确认"
+            "已写给 Provider，等待确认"
         case .snoozed, .resolved:
-            return "请求状态已更新"
+            "请求状态已更新"
         }
+        return localized(key, locale: locale)
     }
 
     private func headline(_ entry: OutboxEntry) -> String {
-        if model.hudSettings.fields.contains(.event) { return entry.actionTitle }
+        if model.hudSettings.fields.contains(.event) {
+            return entry.localizedActionTitle(language: model.appLanguage)
+        }
         if model.hudSettings.fields.contains(.task), let task = entry.taskTitle { return task }
-        return "ActRealm 通知"
+        return localized("ActRealm 通知", locale: locale)
     }
 
     private func detailParts(_ entry: OutboxEntry) -> [String] {
@@ -661,7 +694,10 @@ public struct HUDCapsuleView: View {
             parts.append(project)
         }
         if model.hudSettings.fields.contains(.elapsed) {
-            parts.append(ZhFormat.relativeAgo(model.now.timeIntervalSince(entry.createdAt)))
+            parts.append(ZhFormat.relativeAgo(
+                model.now.timeIntervalSince(entry.createdAt),
+                language: model.appLanguage
+            ))
         }
         return parts
     }
@@ -718,7 +754,7 @@ public struct HUDCapsuleView: View {
                     .foregroundStyle(DT.greenText)
             )
             VStack(alignment: .leading, spacing: 2) {
-                Text(pending.summary)
+                Text(pending.localizedSummary(language: model.appLanguage))
                     .font(.system(size: 12.5, weight: .bold))
                     .foregroundStyle(DT.textStrong)
                     .lineLimit(1)

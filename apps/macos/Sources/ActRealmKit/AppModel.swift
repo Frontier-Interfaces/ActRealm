@@ -366,6 +366,7 @@ public struct ForegroundDispatchState: Identifiable, Equatable, Sendable {
     public let provider: ProviderKind?
     public let eventKind: AgentFocusEventKind
     public let title: String
+    public let titleMessage: RuntimeMessage?
     public let taskTitle: String?
     public let phase: ForegroundDispatchPhase
     public let startedAt: Date
@@ -376,6 +377,7 @@ public struct ForegroundDispatchState: Identifiable, Equatable, Sendable {
         provider: ProviderKind?,
         eventKind: AgentFocusEventKind = .approval,
         title: String,
+        titleMessage: RuntimeMessage? = nil,
         taskTitle: String?,
         phase: ForegroundDispatchPhase,
         startedAt: Date,
@@ -385,6 +387,7 @@ public struct ForegroundDispatchState: Identifiable, Equatable, Sendable {
         self.provider = provider
         self.eventKind = eventKind
         self.title = title
+        self.titleMessage = titleMessage
         self.taskTitle = taskTitle
         self.phase = phase
         self.startedAt = startedAt
@@ -416,6 +419,7 @@ private struct ForegroundQueuedArrival: Equatable, Sendable {
     let provider: ProviderKind?
     let eventKind: AgentFocusEventKind
     let title: String
+    let titleMessage: RuntimeMessage?
     let taskTitle: String?
     let receivedAt: Date
 }
@@ -453,15 +457,22 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var uiSettings: UISettings = .defaults
     @Published public private(set) var displayCatalog: [DisplayField] = []
     @Published public private(set) var claudeQuotaBridge: ClaudeQuotaBridge?
+    @Published public private(set) var backupSummary: BackupSummary = .empty
     @Published public private(set) var isSetupBusy = false
     @Published public private(set) var isSettingsBusy = false
     @Published public private(set) var settingsSaveError: String?
     @Published public private(set) var settingsSaveNotice: String?
+    @Published public private(set) var appLanguage: AppLanguage
     @Published public private(set) var isQuotaRefreshBusy = false
     /// Persistent result shown in Settings. A main-window toast alone is not
     /// visible while the separate Settings scene is frontmost.
     @Published public private(set) var quotaRefreshMessage: String?
-    @Published public private(set) var eventUIP95Ms: UInt64?
+    /// Local event-to-native-presentation timing. Runtime transport p95
+    /// remains a Runtime concern and is never combined with this window.
+    @Published public private(set) var nativePresentationP95Ms: UInt64?
+    /// Factual task-card values are retained independently from quota, setup,
+    /// metrics and the one-second display clock.
+    @Published public private(set) var taskRenderSignatures: [TaskRenderSignature] = []
     /// Monotonic event observed by the AppKit shell to play the optional local
     /// arrival sound without moving platform UI code into ActRealmKit.
     @Published public private(set) var notificationPulse: UInt64 = 0
@@ -506,12 +517,13 @@ public final class AppModel: ObservableObject {
             !["connected", "not_installed", "provider_missing", "cli_missing"].contains($0.status)
         }.count ?? 0
     }
+    public var interfaceLocale: Locale { appLanguage.locale }
     /// The single user-visible task feed shared by the main window and menu bar.
     /// Runtime sessions remain intact, while locally cleared task versions stay
     /// out of every compact UI until a newer event makes them visible again.
     public var visibleAgentTasks: [LaneTask] {
         let cutoff = now.addingTimeInterval(-30 * 60)
-        return derived.agentTasks.filter { task in
+        return taskRenderSignatures.map(\.task).filter { task in
             guard !isTaskDismissed(task) else { return false }
             return task.status == .running || task.status == .waiting
                 || task.hasVisibleAttention || task.lastEventAt >= cutoff
@@ -548,7 +560,8 @@ public final class AppModel: ObservableObject {
     private var hasDeferredSnapshotProjection = false
     private var persistedUISettings: UISettings = .defaults
     private var renderedEventCount: UInt64 = 0
-    private var eventUILatenciesMs: [UInt64] = []
+    private var nativePresentationLatency = NativePresentationLatency()
+    private var taskRenderProjector = TaskRenderProjector()
     private var started = false
     private var wakeRecoveryTask: Task<Void, Never>?
 
@@ -559,6 +572,7 @@ public final class AppModel: ObservableObject {
         demo: Bool = ProcessInfo.processInfo.environment["ACTREALM_DEMO"] == "1"
     ) {
         self.defaults = defaults
+        self.appLanguage = AppLocalization.selectedLanguage(defaults: defaults)
         self.themeDirectory = themeDirectory
             ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
                 .appendingPathComponent("ActRealm/Theme", isDirectory: true)
@@ -650,11 +664,13 @@ public final class AppModel: ObservableObject {
         startTicker()
         if isDemo {
             derived = DemoData.derivedState(now: now)
+            publishTaskCards(derived.agentTasks)
             setupInfo = DemoData.setup
             uiSettings = DemoData.settings.settings
             persistedUISettings = DemoData.settings.settings
             displayCatalog = DemoData.settings.displayCatalog
             claudeQuotaBridge = DemoData.settings.claudeQuotaBridge
+            backupSummary = DemoData.settings.backups
             bridgeStatus = .listening
             lastSyncAt = now
             return
@@ -694,10 +710,13 @@ public final class AppModel: ObservableObject {
             try? await Task.sleep(for: .milliseconds(350))
             guard !Task.isCancelled else { return }
             if let error = await client.recoverAfterSystemWake() {
-                runtimeActionMessage = "唤醒后恢复失败：\(error)"
+                runtimeActionMessage = l10nFormat(
+                    "唤醒后恢复失败：%@",
+                    clientErrorMessage(error)
+                )
                 restartRuntime()
             } else {
-                runtimeActionMessage = "已恢复实时连接并请求额度更新"
+                runtimeActionMessage = l10n("已恢复实时连接并请求额度更新")
                 supervisor.refreshDiagnostics()
             }
         }
@@ -719,7 +738,10 @@ public final class AppModel: ObservableObject {
                 }
             }
             if let error {
-                runtimeActionMessage = error
+                runtimeActionMessage = AppLocalization.localizedRuntimeSupervisorText(
+                    error,
+                    language: appLanguage
+                )
                 isRestartingRuntime = false
                 return
             }
@@ -727,7 +749,10 @@ public final class AppModel: ObservableObject {
             for _ in 0..<60 {
                 if bridgeStatus.isListening { break }
                 if case .failed(let message) = supervisor.state {
-                    runtimeActionMessage = message
+                    runtimeActionMessage = AppLocalization.localizedRuntimeSupervisorText(
+                        message,
+                        language: appLanguage
+                    )
                     break
                 }
                 try? await Task.sleep(for: .milliseconds(200))
@@ -765,12 +790,16 @@ public final class AppModel: ObservableObject {
         if let updated {
             setupInfo = updated
             apply(snapshot: latestSnapshot, emitArrivals: false)
-            showToast(action == "uninstall"
-                ? "\(providerDisplayName(provider)) 接入已移除"
-                : "\(providerDisplayName(provider)) 配置已安全写入")
+            showToast(l10nFormat(
+                action == "uninstall" ? "%@ 接入已移除" : "%@ 配置已安全写入",
+                providerDisplayName(provider)
+            ))
             return true
         }
-        showToast("接入操作失败：\(error ?? "未知错误")")
+        showToast(l10nFormat(
+            "接入操作失败：%@",
+            clientErrorMessage(error)
+        ))
         return false
     }
 
@@ -778,7 +807,7 @@ public final class AppModel: ObservableObject {
         guard !isDemo else { return }
         guard let response = await client.fetchSettings() else {
             settingsSaveNotice = nil
-            settingsSaveError = "无法读取本机设置，请检查 Runtime 连接后重试。"
+            settingsSaveError = l10n("无法读取本机设置，请检查 Runtime 连接后重试。")
             return
         }
         settingsSaveError = nil
@@ -796,7 +825,12 @@ public final class AppModel: ObservableObject {
         failedUISettings = nil
         settingsSaveError = nil
         settingsSaveNotice = nil
-        apply(snapshot: latestSnapshot, emitArrivals: false)
+        if isDemo {
+            derived = DemoData.derivedState(now: now)
+            publishTaskCards(derived.agentTasks)
+        } else {
+            apply(snapshot: latestSnapshot, emitArrivals: false)
+        }
         settingsSaveTask?.cancel()
         settingsSaveTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(180))
@@ -816,7 +850,9 @@ public final class AppModel: ObservableObject {
             failedUISettings = nil
             settingsSaveError = nil
             if previousCodexMode != response.settings.codexEnhancedActivity {
-                settingsSaveNotice = "Codex Hook 已更新，请在 Codex 中运行 /hooks 重新检查信任。"
+                settingsSaveNotice = l10n(
+                    "Codex Hook 已更新，请在 Codex 中运行 /hooks 重新检查信任。"
+                )
                 await refreshSetup()
             } else {
                 settingsSaveNotice = nil
@@ -824,7 +860,10 @@ public final class AppModel: ObservableObject {
         } else {
             failedUISettings = settings
             settingsSaveNotice = nil
-            let message = "设置保存失败：\(error ?? "未知错误")"
+            let message = l10nFormat(
+                "设置保存失败：%@",
+                clientErrorMessage(error)
+            )
             await refreshSettings()
             settingsSaveError = message
         }
@@ -843,6 +882,7 @@ public final class AppModel: ObservableObject {
         persistedUISettings = response.settings
         displayCatalog = response.displayCatalog
         claudeQuotaBridge = response.claudeQuotaBridge
+        backupSummary = response.backups
         apply(snapshot: latestSnapshot, emitArrivals: false)
     }
 
@@ -854,27 +894,30 @@ public final class AppModel: ObservableObject {
         if let response {
             acceptSettings(response)
             await client.refreshSnapshot()
-            showToast(action == "uninstall"
+            showToast(l10n(action == "uninstall"
                 ? "Claude 额度桥已关闭，原状态栏已恢复"
-                : "Claude 额度桥已开启，完成一次对话后会显示额度")
+                : "Claude 额度桥已开启，完成一次对话后会显示额度"))
         } else {
-            showToast("额度桥操作失败：\(error ?? "未知错误")")
+            showToast(l10nFormat(
+                "额度桥操作失败：%@",
+                clientErrorMessage(error)
+            ))
         }
     }
 
     public func refreshQuotaNow() async {
         guard !isDemo, !isQuotaRefreshBusy else { return }
         guard canControlRuntime else {
-            let message = "Runtime 未连接，暂时无法刷新额度"
+            let message = l10n("Runtime 未连接，暂时无法刷新额度")
             quotaRefreshMessage = message
             return
         }
         isQuotaRefreshBusy = true
         defer { isQuotaRefreshBusy = false }
-        quotaRefreshMessage = "正在通过 Anthropic 官方接口更新…"
+        quotaRefreshMessage = l10n("正在通过 Anthropic 官方接口更新…")
         let previousCapture = Self.latestClaudeQuotaCapture(in: client.snapshot)
         if let error = await client.requestQuotaRefresh() {
-            let message = "额度刷新失败：\(error)"
+            let message = l10nFormat("额度刷新失败：%@", clientErrorMessage(error))
             quotaRefreshMessage = message
             return
         }
@@ -882,14 +925,16 @@ public final class AppModel: ObservableObject {
             if let currentCapture = Self.latestClaudeQuotaCapture(in: client.snapshot),
                previousCapture.map({ currentCapture > $0 }) ?? true
             {
-                let message = "Claude 额度已主动更新"
+                let message = l10n("Claude 额度已主动更新")
                 quotaRefreshMessage = message
                 return
             }
             try? await Task.sleep(for: .seconds(1))
             await client.refreshSnapshot()
         }
-        let message = "已请求刷新，但 Claude 暂未返回新额度；请启动 Claude Code CLI 并开始一次会话后重试"
+        let message = l10n(
+            "已请求刷新，但 Claude 暂未返回新额度；请启动 Claude Code CLI 并开始一次会话后重试"
+        )
         quotaRefreshMessage = message
     }
 
@@ -902,22 +947,39 @@ public final class AppModel: ObservableObject {
 
     public func exportLocalData(metricsOnly: Bool) async -> Data? {
         let (data, error) = await client.exportData(metricsOnly: metricsOnly)
-        if data == nil { showToast("导出失败：\(error ?? "未知错误")") }
+        if data == nil {
+            showToast(l10nFormat("导出失败：%@", clientErrorMessage(error)))
+        }
         return data
     }
 
     @discardableResult
     public func clearLocalData(confirmation: String) async -> Bool {
         guard confirmation == "DELETE" else {
-            showToast("请输入 DELETE；没有删除任何数据")
+            showToast(l10n("请输入 DELETE；没有删除任何数据"))
             return false
         }
         if let error = await client.clearData(confirmation: confirmation) {
-            showToast("清除失败：\(error)")
+            showToast(l10nFormat("清除失败：%@", clientErrorMessage(error)))
             return false
         }
         await refreshSettings()
-        showToast("本地运行数据已彻底清除，Hook 接入保持不变")
+        showToast(l10n("本地运行数据已彻底清除，Hook 接入保持不变"))
+        return true
+    }
+
+    @discardableResult
+    public func clearConfigurationBackups(confirmation: String) async -> Bool {
+        guard confirmation == "DELETE BACKUPS" else {
+            showToast(l10n("请输入 DELETE BACKUPS；没有删除任何备份"))
+            return false
+        }
+        if let error = await client.clearBackups(confirmation: confirmation) {
+            showToast(l10nFormat("备份清除失败：%@", clientErrorMessage(error)))
+            return false
+        }
+        await refreshSettings()
+        showToast(l10n("ActRealm 配置备份已清除"))
         return true
     }
 
@@ -927,11 +989,11 @@ public final class AppModel: ObservableObject {
         answers: [String: JSONValue]? = nil
     ) async -> Bool {
         guard canControlRuntime else {
-            showToast("Runtime 控制通道已断开；请恢复连接后再回答")
+            showToast(l10n("Runtime 控制通道已断开；请恢复连接后再回答"))
             return false
         }
         guard let requestId = entry.attention.requestId else {
-            showToast("这个问题没有可用的回复通道")
+            showToast(l10n("这个问题没有可用的回复通道"))
             return false
         }
         if let error = await client.answerQuestion(
@@ -939,30 +1001,39 @@ public final class AppModel: ObservableObject {
             action: action,
             answers: answers
         ) {
-            showToast("回答失败：\(error)")
+            showToast(l10nFormat("回答失败：%@", clientErrorMessage(error)))
             return false
         }
-        showToast(action == "native" ? "已交回 Agent 原界面回答" : "回答已安全发送给 Agent")
+        showToast(l10n(
+            action == "native" ? "已交回 Agent 原界面回答" : "回答已安全发送给 Agent"
+        ))
         return true
     }
 
     public func jump(to task: LaneTask) async {
         guard task.session.jumpCapability != "unsupported" else {
-            showToast("当前环境不支持跳转；ActRealm 不会假装已定位到原对话")
+            showToast(l10n("当前环境不支持跳转；ActRealm 不会假装已定位到原对话"))
             return
         }
         let (response, error) = await client.jumpSession(task.id)
         if let response, response.success {
-            showToast(response.label)
+            showToast(AppLocalization.localizedRuntimeMessage(
+                response.labelMessage,
+                fallback: response.label,
+                language: appLanguage
+            ))
         } else {
-            showToast("跳转失败：\(error ?? "没有找到原窗口")")
+            showToast(l10nFormat(
+                "跳转失败：%@",
+                error.map(clientErrorMessage) ?? l10n("没有找到原窗口")
+            ))
         }
     }
 
     public func jump(to entry: OutboxEntry) async {
         guard let task = derived.agentTasks.first(where: { $0.id == entry.attention.sessionId }) else {
             revealSession(for: entry)
-            showToast("已定位对应任务；当前没有可验证的原窗口跳转信息")
+            showToast(l10n("已定位对应任务；当前没有可验证的原窗口跳转信息"))
             return
         }
         await jump(to: task)
@@ -971,9 +1042,9 @@ public final class AppModel: ObservableObject {
     public func manage(_ task: LaneTask) async {
         guard task.session.canManage == true else { return }
         if let error = await client.manageSession(task.id) {
-            showToast("托管连接失败：\(error)")
+            showToast(l10nFormat("托管连接失败：%@", clientErrorMessage(error)))
         } else {
-            showToast("已连接 ActRealm app-server；Codex 原生窗口仍保留当前 Turn 的控制权")
+            showToast(l10n("已连接 ActRealm app-server；Codex 原生窗口仍保留当前 Turn 的控制权"))
         }
     }
 
@@ -983,6 +1054,22 @@ public final class AppModel: ObservableObject {
         case "codex": "Codex"
         default: provider
         }
+    }
+
+    private func l10n(_ key: String) -> String {
+        AppLocalization.localized(key, language: appLanguage, defaults: defaults)
+    }
+
+    private func l10nFormat(_ key: String, _ arguments: CVarArg...) -> String {
+        String(
+            format: l10n(key),
+            locale: interfaceLocale,
+            arguments: arguments
+        )
+    }
+
+    private func clientErrorMessage(_ code: String?) -> String {
+        AppLocalization.localizedAPIError(code, language: appLanguage)
     }
 
     private func startTicker() {
@@ -1002,12 +1089,21 @@ public final class AppModel: ObservableObject {
                 }
                 if self.isDemo, self.isWorkspaceAnimationActive {
                     self.derived = DemoData.derivedState(now: tick)
+                    self.publishTaskCards(self.derived.agentTasks)
                 }
             }
         }
     }
 
     // MARK: - Snapshot handling
+
+    private func publishTaskCards(_ tasks: [LaneTask]) {
+        let projection = taskRenderProjector.apply(tasks)
+        // Do not assign an equal array: @Published would otherwise notify the
+        // whole task feed for a quota/metrics/setup/clock-only refresh.
+        guard !projection.changedTaskIDs.isEmpty else { return }
+        taskRenderSignatures = projection.signatures
+    }
 
     func receive(snapshot: Snapshot) {
         let previous = latestSnapshot
@@ -1035,6 +1131,7 @@ public final class AppModel: ObservableObject {
         let complete = setupInfo == nil || setupInfo?.firstRun == true
             ? DerivedState.empty
             : DerivedState.derive(from: snapshot)
+        publishTaskCards(complete.agentTasks)
         // Reminder rules control presentation, not Runtime truth. An ignored
         // approval still keeps its task in the waiting state, matching Web.
         let next = DerivedState(
@@ -1068,6 +1165,7 @@ public final class AppModel: ObservableObject {
                     provider: arrival.provider,
                     eventKind: AgentFocusEventKind(outboxKind: arrival.kind),
                     title: arrival.actionTitle,
+                    titleMessage: arrival.actionTitleMessage,
                     taskTitle: arrival.taskTitle
                 )
             }
@@ -1102,15 +1200,9 @@ public final class AppModel: ObservableObject {
             let latestEventAt = snapshot.sessions.map(\.lastEventAt).max() ?? 0
             let currentMillis = UInt64(max(0, Date().timeIntervalSince1970 * 1000))
             if latestEventAt > 0, currentMillis >= latestEventAt {
-                let latency = currentMillis - latestEventAt
-                if latency <= 10_000 {
-                    eventUILatenciesMs.append(latency)
-                    if eventUILatenciesMs.count > 100 {
-                        eventUILatenciesMs.removeFirst(eventUILatenciesMs.count - 100)
-                    }
-                    let sorted = eventUILatenciesMs.sorted()
-                    let index = max(0, Int(ceil(Double(sorted.count) * 0.95)) - 1)
-                    eventUIP95Ms = sorted[index]
+                let eventAt = Date(timeIntervalSince1970: TimeInterval(latestEventAt) / 1_000)
+                if nativePresentationLatency.record(eventAt: eventAt, renderedAt: Date()) {
+                    nativePresentationP95Ms = nativePresentationLatency.p95Milliseconds
                 }
             }
             renderedEventCount = snapshot.stats.eventCount
@@ -1145,7 +1237,7 @@ public final class AppModel: ObservableObject {
         case (.buildingBackend, _), (.launching, _), (.restarting, _), (.idle, _), (_, .connecting), (_, .idle):
             .starting
         case (_, .error(let message)):
-            .absent(message)
+            .absent(clientErrorMessage(message))
         }
         bridgeStatus = nextStatus
         runtimeActionMessage = RuntimeStatusMessagePolicy.reconciled(
@@ -1190,9 +1282,9 @@ public final class AppModel: ObservableObject {
                 attentionId: entry.id,
                 requestId: requestId
             ) {
-                showToast("处理失败：\(error)")
+                showToast(l10nFormat("处理失败：%@", clientErrorMessage(error)))
             } else {
-                showToast(Self.acknowledgementToast(for: entry))
+                showToast(localizedAcknowledgementToast(for: entry))
             }
         }
     }
@@ -1224,7 +1316,7 @@ public final class AppModel: ObservableObject {
         else { return }
         selectedOutboxID = target
         outboxHighlighted = true
-        showToast("已定位到 Outbox 待处理事项")
+        showToast(l10n("已定位到 Outbox 待处理事项"))
         outboxHighlightTask?.cancel()
         outboxHighlightTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(1_600))
@@ -1258,11 +1350,17 @@ public final class AppModel: ObservableObject {
         if expandedTaskId == task.id { expandedTaskId = nil }
         if pinnedSessionId == task.id { pinnedSessionId = nil }
         if failed > 0 {
-            showToast("任务已清除；\(failed) 项仍需在 Outbox 或 Agent 原界面处理")
+            showToast(l10nFormat(
+                "任务已清除；%lld 项仍需在 Outbox 或 Agent 原界面处理",
+                Int64(failed)
+            ))
         } else if !related.isEmpty {
-            showToast("任务已清除，并交还 \(related.count) 项待处理事项")
+            showToast(l10nFormat(
+                "任务已清除，并交还 %lld 项待处理事项",
+                Int64(related.count)
+            ))
         } else {
-            showToast("已从列表移除；有新活动时会自动恢复")
+            showToast(l10n("已从列表移除；有新活动时会自动恢复"))
         }
     }
 
@@ -1273,6 +1371,21 @@ public final class AppModel: ObservableObject {
 
     public func setSettingsVisible(_ visible: Bool) {
         isSettingsVisible = visible
+    }
+
+    public func setAppLanguage(_ language: AppLanguage) {
+        guard appLanguage != language else { return }
+        appLanguage = language
+        defaults.set(language.rawValue, forKey: AppLanguage.preferenceKey)
+        // These values are short-lived rendered notices rather than Runtime
+        // facts. Clear them so a language change cannot leave the previous
+        // locale visible while state-backed content re-renders immediately.
+        runtimeActionMessage = nil
+        quotaRefreshMessage = nil
+        settingsSaveError = nil
+        settingsSaveNotice = nil
+        toastMessage = nil
+        foregroundReturnNotes = [:]
     }
 
     public func showToast(_ message: String, priority: ToastPriority? = nil) {
@@ -1289,12 +1402,19 @@ public final class AppModel: ObservableObject {
         }
     }
 
-    private static func inferredToastPriority(for message: String) -> ToastPriority {
+    nonisolated static func inferredToastPriorityForTest(_ message: String) -> ToastPriority {
+        inferredToastPriority(for: message)
+    }
+
+    private nonisolated static func inferredToastPriority(for message: String) -> ToastPriority {
+        let normalized = message.lowercased()
         let errorMarkers = [
             "失败", "无法", "不能", "未连接", "没有可用", "没有找到", "未找到",
             "已过期", "请输入", "请回答", "请填写", "仍需在",
+            "failed", "could not", "cannot", "disconnected", "unavailable",
+            "not found", "expired", "enter ", "still need",
         ]
-        return errorMarkers.contains(where: message.contains) ? .error : .informational
+        return errorMarkers.contains(where: normalized.contains) ? .error : .informational
     }
 
     /// Applies one atomic edit and persists it immediately. The page calls this
@@ -1348,7 +1468,7 @@ public final class AppModel: ObservableObject {
         displayName: String?
     ) {
         guard !apps.isEmpty else {
-            showToast("当前工作区没有可绑定的 Agent 应用")
+            showToast(l10n("当前工作区没有可绑定的 Agent 应用"))
             return
         }
         updateForegroundScheduling {
@@ -1358,7 +1478,7 @@ public final class AppModel: ObservableObject {
             $0.workspaceDisplayName = displayName
         }
         isSelectingForegroundWorkspace = false
-        showToast("Agent 的绑定工作区已保存")
+        showToast(l10n("Agent 的绑定工作区已保存"))
     }
 
     public func clearForegroundWorkspaceBinding() {
@@ -1368,7 +1488,7 @@ public final class AppModel: ObservableObject {
             $0.workspaceDisplayID = nil
             $0.workspaceDisplayName = nil
         }
-        showToast("Agent 的绑定工作区已清除")
+        showToast(l10n("Agent 的绑定工作区已清除"))
     }
 
     public var themeBackgroundURL: URL? {
@@ -1494,7 +1614,7 @@ public final class AppModel: ObservableObject {
     public func keepForegroundTaskInActRealmWorkspace() {
         guard foregroundDispatch != nil else { return }
         completeForegroundDispatch(startNext: true, at: Date())
-        showToast("已稍后处理；事件仍保留在 ActRealm")
+        showToast(l10n("已稍后处理；事件仍保留在 ActRealm"))
     }
 
     /// Deterministic visual preview used by SnapshotTool. It never creates a
@@ -1512,8 +1632,9 @@ public final class AppModel: ObservableObject {
             id: Self.foregroundTestDispatchID,
             provider: nil,
             eventKind: .approval,
-            title: "智能聚焦测试",
-            taskTitle: "验证 Agent Focus 切换与接收",
+            title: "Agent Focus test",
+            titleMessage: RuntimeMessage(code: "client.agent_focus.test.title"),
+            taskTitle: nil,
             at: Date()
         )
     }
@@ -1523,7 +1644,7 @@ public final class AppModel: ObservableObject {
               dispatch.phase == .awaitingWorkspace
         else { return }
         completeForegroundDispatch(startNext: true, at: Date())
-        showToast("已接收 · 事件仍等待实际处理")
+        showToast(l10n("已接收 · 事件仍等待实际处理"))
     }
 
     public func acceptForegroundInPlace() {
@@ -1533,19 +1654,20 @@ public final class AppModel: ObservableObject {
             hudArrivalDeadline = Date().addingTimeInterval(TimeInterval(hudSettings.displaySeconds))
         }
         completeForegroundDispatch(startNext: true, at: Date())
-        showToast("已在对应 Agent 的绑定工作区 · 不重复切换")
+        showToast(l10n("已在对应 Agent 的绑定工作区 · 不重复切换"))
     }
 
     public func failForegroundTargetActivation() {
         guard let dispatch = foregroundDispatch else { return }
         let now = Date()
-        let note = "未找到具体任务或 Agent 页面，已返回 ActRealm"
+        let note = l10n("未找到具体任务或 Agent 页面，已返回 ActRealm")
         foregroundReturnNotes[dispatch.id] = note
         foregroundDispatch = ForegroundDispatchState(
             id: dispatch.id,
             provider: dispatch.provider,
             eventKind: dispatch.eventKind,
             title: dispatch.title,
+            titleMessage: dispatch.titleMessage,
             taskTitle: dispatch.taskTitle,
             phase: .returnedToActRealmWorkspace,
             startedAt: now,
@@ -1569,6 +1691,7 @@ public final class AppModel: ObservableObject {
         provider: ProviderKind?,
         eventKind: AgentFocusEventKind = .approval,
         title: String,
+        titleMessage: RuntimeMessage? = nil,
         taskTitle: String?,
         at date: Date = Date()
     ) {
@@ -1577,17 +1700,18 @@ public final class AppModel: ObservableObject {
             provider: provider,
             eventKind: eventKind,
             title: title,
+            titleMessage: titleMessage,
             taskTitle: taskTitle,
             receivedAt: date
         )
         guard foregroundScheduling.isEnabled else { return }
         guard foregroundScheduling.eventRules.allows(eventKind) else { return }
         guard workspaceSupportsForegroundFocus(for: provider) else {
-            showToast("事件已进入 ActRealm；对应 Agent 尚未绑定到工作区")
+            showToast(l10n("事件已进入 ActRealm；对应 Agent 尚未绑定到工作区"))
             return
         }
         guard effectiveForegroundStrategy(for: provider) != .actRealmWorkspace else {
-            showToast("事件已进入 ActRealm，不自动切换页面")
+            showToast(l10n("事件已进入 ActRealm，不自动切换页面"))
             return
         }
         guard foregroundDispatch?.id != id,
@@ -1613,6 +1737,7 @@ public final class AppModel: ObservableObject {
                 provider: arrival.provider,
                 eventKind: arrival.eventKind,
                 title: arrival.title,
+                titleMessage: arrival.titleMessage,
                 taskTitle: arrival.taskTitle,
                 phase: .opening,
                 startedAt: date,
@@ -1625,6 +1750,7 @@ public final class AppModel: ObservableObject {
                 provider: arrival.provider,
                 eventKind: arrival.eventKind,
                 title: arrival.title,
+                titleMessage: arrival.titleMessage,
                 taskTitle: arrival.taskTitle,
                 phase: .reminding,
                 startedAt: date,
@@ -1644,6 +1770,7 @@ public final class AppModel: ObservableObject {
                 provider: dispatch.provider,
                 eventKind: dispatch.eventKind,
                 title: dispatch.title,
+                titleMessage: dispatch.titleMessage,
                 taskTitle: dispatch.taskTitle,
                 phase: .awaitingWorkspace,
                 startedAt: date,
@@ -1651,13 +1778,14 @@ public final class AppModel: ObservableObject {
             )
         case .awaitingWorkspace:
             if foregroundScheduling.returnsToActRealmWorkspace {
-                let note = "未检测到鼠标进入对应 Agent 的绑定工作区，已返回 ActRealm"
+                let note = l10n("未检测到鼠标进入对应 Agent 的绑定工作区，已返回 ActRealm")
                 foregroundReturnNotes[dispatch.id] = note
                 foregroundDispatch = ForegroundDispatchState(
                     id: dispatch.id,
                     provider: dispatch.provider,
                     eventKind: dispatch.eventKind,
                     title: dispatch.title,
+                    titleMessage: dispatch.titleMessage,
                     taskTitle: dispatch.taskTitle,
                     phase: .returnedToActRealmWorkspace,
                     startedAt: date,
@@ -1666,7 +1794,7 @@ public final class AppModel: ObservableObject {
                 showToast(note)
             } else {
                 completeForegroundDispatch(startNext: true, at: date)
-                showToast("未检测到接收；保持当前 Agent 页面")
+                showToast(l10n("未检测到接收；保持当前 Agent 页面"))
             }
         case .returnedToActRealmWorkspace:
             completeForegroundDispatch(startNext: true, at: date)
@@ -1679,6 +1807,7 @@ public final class AppModel: ObservableObject {
             provider: dispatch.provider,
             eventKind: dispatch.eventKind,
             title: dispatch.title,
+            titleMessage: dispatch.titleMessage,
             taskTitle: dispatch.taskTitle,
             phase: .opening,
             startedAt: date,
@@ -1805,5 +1934,19 @@ public final class AppModel: ObservableObject {
         case .question: "已标记提问处理\(suffix)"
         case .approval, .nativeApproval: "已确认处理\(suffix)"
         }
+    }
+
+    private func localizedAcknowledgementToast(for entry: OutboxEntry) -> String {
+        let trimmed = entry.taskTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let subject = trimmed?.isEmpty == false ? trimmed : nil
+        let key: String
+        switch entry.kind {
+        case .completion: key = subject == nil ? "已确认任务完成" : "已确认任务完成：%@"
+        case .error: key = subject == nil ? "已标记问题解决" : "已标记问题解决：%@"
+        case .question: key = subject == nil ? "已标记提问处理" : "已标记提问处理：%@"
+        case .approval, .nativeApproval: key = subject == nil ? "已确认处理" : "已确认处理：%@"
+        }
+        guard let subject else { return l10n(key) }
+        return l10nFormat(key, subject)
     }
 }

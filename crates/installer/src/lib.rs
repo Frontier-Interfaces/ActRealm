@@ -5,6 +5,7 @@ use std::env;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -305,6 +306,20 @@ pub struct InstallReport {
     pub definition_hash: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupSummary {
+    pub count: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupClearReport {
+    pub removed_count: u64,
+    pub removed_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RepairReport {
@@ -399,6 +414,8 @@ pub enum InstallerError {
     MissingHome,
     #[error("unsafe symbolic link refused: {0}")]
     SymlinkRefused(PathBuf),
+    #[error("unmanaged or unsafe backup entry refused: {0}")]
+    UnsafeBackupEntry(PathBuf),
     #[error("source binary is missing, not a regular file, or not executable: {0}")]
     InvalidSourceBinary(PathBuf),
     #[error("provider configuration exceeds the {limit} byte safety limit: {path}")]
@@ -479,6 +496,43 @@ impl Installer {
 
     pub fn paths(&self) -> &InstallPaths {
         &self.paths
+    }
+
+    pub fn backup_summary(&self) -> Result<BackupSummary, InstallerError> {
+        let files = self.managed_backup_files()?;
+        Ok(BackupSummary {
+            count: files.len().try_into().unwrap_or(u64::MAX),
+            total_bytes: files
+                .iter()
+                .fold(0_u64, |total, (_, bytes)| total.saturating_add(*bytes)),
+        })
+    }
+
+    /// Deletes only private, regular files whose names prove that ActRealm
+    /// created them. The complete directory is preflighted before any removal,
+    /// so a symlink or unknown file refuses the whole operation.
+    pub fn clear_backups(&self) -> Result<BackupClearReport, InstallerError> {
+        let files = self.managed_backup_files()?;
+        let report = BackupClearReport {
+            removed_count: files.len().try_into().unwrap_or(u64::MAX),
+            removed_bytes: files
+                .iter()
+                .fold(0_u64, |total, (_, bytes)| total.saturating_add(*bytes)),
+        };
+        for (path, _) in files {
+            let metadata = fs::symlink_metadata(&path).map_err(|source| InstallerError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.permissions().mode() & 0o077 != 0
+            {
+                return Err(InstallerError::UnsafeBackupEntry(path));
+            }
+            fs::remove_file(&path).map_err(|source| InstallerError::Io { path, source })?;
+        }
+        Ok(report)
     }
 
     pub fn intent(&self, provider: HookProvider) -> Result<InstallIntent, InstallerError> {
@@ -1089,20 +1143,130 @@ impl Installer {
         }
         let backups = self.paths.actrealm_home.join("backups");
         ensure_private_directory(&backups)?;
-        let file_name = source_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("config");
-        let mut destination = backups.join(format!("{file_name}.{}", now_millis()));
+        fs::set_permissions(&backups, fs::Permissions::from_mode(0o700)).map_err(|source| {
+            InstallerError::Io {
+                path: backups.clone(),
+                source,
+            }
+        })?;
+        let identity = self.backup_source_identity(source_path);
+        let created_at = now_millis();
+        let mut destination = backups.join(format!("actrealm-backup-v1--{identity}--{created_at}"));
         let mut collision = 0_u64;
         while destination.exists() {
             collision += 1;
-            destination = backups.join(format!("{file_name}.{}.{}", now_millis(), collision));
+            destination = backups.join(format!(
+                "actrealm-backup-v1--{identity}--{created_at}--{collision}"
+            ));
         }
         let bytes = read_bounded(source_path, CONFIG_LIMIT_BYTES)?;
         atomic_write(&destination, &bytes, 0o600)?;
         Ok(destination)
     }
+
+    fn backup_source_identity(&self, source_path: &Path) -> String {
+        if source_path == self.paths.claude_settings {
+            return "claude-settings".to_owned();
+        }
+        if source_path == self.paths.codex_hooks {
+            return "codex-hooks".to_owned();
+        }
+        if source_path == self.paths.codex_config {
+            return "codex-config".to_owned();
+        }
+        if source_path == self.paths.state_file() {
+            return "install-state".to_owned();
+        }
+        let fingerprint = source_path
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .fold(0xcbf29ce484222325_u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+            });
+        format!("other-{fingerprint:016x}")
+    }
+
+    fn managed_backup_files(&self) -> Result<Vec<(PathBuf, u64)>, InstallerError> {
+        let backups = self.paths.actrealm_home.join("backups");
+        let metadata = match fs::symlink_metadata(&backups) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(InstallerError::Io {
+                    path: backups,
+                    source,
+                })
+            }
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(InstallerError::UnsafeBackupEntry(backups));
+        }
+        let entries = fs::read_dir(&backups).map_err(|source| InstallerError::Io {
+            path: backups.clone(),
+            source,
+        })?;
+        let mut files = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| InstallerError::Io {
+                path: backups.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                return Err(InstallerError::UnsafeBackupEntry(path));
+            };
+            let metadata = fs::symlink_metadata(&path).map_err(|source| InstallerError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.permissions().mode() & 0o077 != 0
+                || !is_owned_backup_name(name)
+            {
+                return Err(InstallerError::UnsafeBackupEntry(path));
+            }
+            files.push((path, metadata.len()));
+        }
+        files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        Ok(files)
+    }
+}
+
+fn is_owned_backup_name(name: &str) -> bool {
+    if let Some(rest) = name.strip_prefix("actrealm-backup-v1--") {
+        let components = rest.split("--").collect::<Vec<_>>();
+        return matches!(components.len(), 2 | 3)
+            && !components[0].is_empty()
+            && components[0]
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            && components[1].bytes().all(|byte| byte.is_ascii_digit())
+            && components
+                .get(2)
+                .is_none_or(|value| value.bytes().all(|byte| byte.is_ascii_digit()));
+    }
+    [
+        "settings.json",
+        "hooks.json",
+        "config.toml",
+        "install-state.json",
+    ]
+    .iter()
+    .any(|base| {
+        name.strip_prefix(&format!("{base}."))
+            .is_some_and(|suffix| {
+                let components = suffix.split('.').collect::<Vec<_>>();
+                matches!(components.len(), 1 | 2)
+                    && components.iter().all(|value| {
+                        !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            })
+    })
 }
 
 fn provider_intent(state: &InstallState, provider: HookProvider) -> InstallIntent {

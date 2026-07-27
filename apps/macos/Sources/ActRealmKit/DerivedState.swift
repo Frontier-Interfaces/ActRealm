@@ -162,6 +162,97 @@ public struct OutboxEntry: Identifiable, Equatable, Sendable {
         attention.riskNotes.first
     }
 
+    public func localizedRiskReason(language: AppLanguage) -> String? {
+        guard let fallback = attention.riskNotes.first else { return nil }
+        return AppLocalization.localizedRuntimeMessage(
+            attention.riskMessages?.first,
+            fallback: fallback,
+            language: language
+        )
+    }
+
+    public func localizedDetail(language: AppLanguage) -> String? {
+        guard let fallback = attention.detail else { return nil }
+        return AppLocalization.localizedRuntimeMessage(
+            attention.detailMessage,
+            fallback: fallback,
+            language: language
+        )
+    }
+
+    public var actionTitleMessage: RuntimeMessage {
+        if let titleMessage = attention.titleMessage {
+            return titleMessage
+        }
+        let providerName = provider?.displayName ?? attention.provider
+        return switch kind {
+        case .approval:
+            RuntimeMessage(code: "attention.approval.title")
+        case .nativeApproval:
+            RuntimeMessage(
+                code: "attention.native_approval.title",
+                args: ["provider": providerName]
+            )
+        case .question:
+            RuntimeMessage(
+                code: "attention.question.title",
+                args: ["provider": providerName]
+            )
+        case .error:
+            RuntimeMessage(code: "attention.error.title")
+        case .completion:
+            RuntimeMessage(code: "attention.completion.title")
+        }
+    }
+
+    public func localizedActionTitle(language: AppLanguage) -> String {
+        let providerName = provider?.displayName ?? attention.provider
+        switch kind {
+        case .approval:
+            if let toolName {
+                return AppLocalization.formatted(
+                    "%@ 请求运行 %@，等待批准",
+                    providerName,
+                    toolName,
+                    language: language
+                )
+            }
+            return AppLocalization.formatted(
+                "%@ 请求一次操作，等待批准",
+                providerName,
+                language: language
+            )
+        case .nativeApproval:
+            return AppLocalization.localizedRuntimeMessage(
+                actionTitleMessage,
+                fallback: attention.title.isEmpty
+                    ? "\(providerName) 等待在原界面批准"
+                    : attention.title,
+                language: language
+            )
+        case .question:
+            return AppLocalization.localizedRuntimeMessage(
+                actionTitleMessage,
+                fallback: "\(providerName) 发出一个待回答问题",
+                language: language
+            )
+        case .error:
+            return AppLocalization.localizedRuntimeMessage(
+                actionTitleMessage,
+                fallback: "任务运行失败，需要检查",
+                language: language
+            )
+        case .completion:
+            return AppLocalization.localizedRuntimeMessage(
+                actionTitleMessage,
+                fallback: attention.title.isEmpty
+                    ? "本轮修改已完成，等待确认。"
+                    : attention.title,
+                language: language
+            )
+        }
+    }
+
     init(attention: AttentionRecord, sessionTitle: String?) {
         self.attention = attention
         self.kind = OutboxKind(record: attention.kind)
@@ -172,8 +263,8 @@ public struct OutboxEntry: Identifiable, Equatable, Sendable {
 
         let providerName = ProviderKind(record: attention.provider)?.displayName ?? attention.provider
         var tool: String?
-        if attention.title.hasPrefix("允许 ") {
-            let stripped = attention.title.dropFirst("允许 ".count)
+        if let prefix = ["允许 ", "Allow "].first(where: { attention.title.hasPrefix($0) }) {
+            let stripped = attention.title.dropFirst(prefix.count)
             if let mark = stripped.firstIndex(where: { $0 == "？" || $0 == "?" }) {
                 let candidate = String(stripped[..<mark]).trimmingCharacters(in: .whitespaces)
                 if !candidate.isEmpty { tool = candidate }
@@ -234,6 +325,44 @@ public enum LaneTaskStatus: Sendable, Equatable {
     }
 }
 
+public enum RecoveryPresentation: Equatable, Sendable {
+    case controllable
+    case observing
+    case waitingForEvent
+    case lostControl
+    case ended
+    case unknown
+
+    init(execState: String, recoveryState: String?) {
+        if !Self.executionEnded(execState), recoveryState == "ended" {
+            self = .unknown
+            return
+        }
+        switch recoveryState {
+        case "controllable": self = .controllable
+        case "observing": self = .observing
+        case "waiting_for_event": self = .waitingForEvent
+        case "lost_control": self = .lostControl
+        case "ended": self = .ended
+        default: self = .unknown
+        }
+    }
+
+    private static func executionEnded(_ execState: String) -> Bool {
+        ["idle", "response_finished", "failed"].contains(execState)
+    }
+}
+
+public struct TaskDetailRow: Equatable, Sendable {
+    public let field: String
+    public let value: String
+
+    public init(field: String, value: String) {
+        self.field = field
+        self.value = value
+    }
+}
+
 public struct LaneTask: Identifiable, Equatable, Sendable {
     public let session: SessionRecord
     public let status: LaneTaskStatus
@@ -257,6 +386,22 @@ public struct LaneTask: Identifiable, Equatable, Sendable {
     public var projectName: String? { session.project }
     public var model: String? { session.model }
     public var activity: String? { session.activity }
+    public var recoveryPresentation: RecoveryPresentation {
+        RecoveryPresentation(execState: session.execState, recoveryState: session.recoveryState)
+    }
+    /// Fallback for a live execution with no finer-grained Runtime activity.
+    public var activityLabel: String {
+        status == .running ? "运行中" : status.badgeText
+    }
+    /// Facts that should disappear from the expanded card when Runtime did not
+    /// provide them. A placeholder would turn missing Provider state into a
+    /// claim about the Provider.
+    public var detailRows: [TaskDetailRow] {
+        guard let currentTool = session.currentTool?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !currentTool.isEmpty
+        else { return [] }
+        return [TaskDetailRow(field: "tool", value: currentTool)]
+    }
     public var activitySince: Date? { session.activitySince.map(ZhFormat.date(fromMillis:)) }
     public var lastEventAt: Date { ZhFormat.date(fromMillis: session.lastEventAt) }
     public var inputTokens: UInt64? { session.inputTokens }
@@ -286,6 +431,22 @@ public struct LaneTask: Identifiable, Equatable, Sendable {
     public var lastTurnTokens: UInt64? { session.lastTurnTokens }
     public var turnStartedAt: Date? { session.turnStartedAt.map(ZhFormat.date(fromMillis:)) }
     public var turnEndedAt: Date? { session.turnEndedAt.map(ZhFormat.date(fromMillis:)) }
+
+    public func localizedTitle(language: AppLanguage) -> String {
+        // Runtime status belongs in `activityMessage`. A task title may be
+        // authored by the user or Provider and must remain verbatim even when
+        // it happens to resemble a known status phrase.
+        title
+    }
+
+    public func localizedActivity(language: AppLanguage) -> String? {
+        guard let activity else { return nil }
+        return AppLocalization.localizedRuntimeMessage(
+            session.activityMessage,
+            fallback: activity,
+            language: language
+        )
+    }
 
     public var planProgress: (done: Int, total: Int)? {
         guard let done = session.planDone, let total = session.planTotal, total > 0 else { return nil }
@@ -322,6 +483,117 @@ public struct LaneTask: Identifiable, Equatable, Sendable {
         default:
             self.status = (hasBlockingAttention || hasCompletionAttention) ? .waiting : .idle
         }
+    }
+}
+
+/// The immutable facts rendered by one task card. The identity is always the
+/// Runtime Session ID, so presentation-only snapshot changes can be ignored
+/// without giving a SwiftUI row a new value to render.
+public struct TaskRenderSignature: Identifiable, Equatable, Sendable {
+    public let sessionID: String
+    public let task: LaneTask
+
+    public var id: String { sessionID }
+
+    public init(task: LaneTask) {
+        self.sessionID = task.id
+        self.task = task
+    }
+}
+
+public struct TaskRenderProjectionResult: Equatable, Sendable {
+    /// Ordered by the task feed, with each entry keyed by a stable Session ID.
+    public let signatures: [TaskRenderSignature]
+    /// Includes only cards with changed facts (or a removed Session ID).
+    public let changedTaskIDs: [String]
+
+    public init(signatures: [TaskRenderSignature], changedTaskIDs: [String]) {
+        self.signatures = signatures
+        self.changedTaskIDs = changedTaskIDs
+    }
+}
+
+/// Retains the latest factual signature for each task card. It deliberately
+/// projects only sessions plus their task-relevant attention: quota, metrics,
+/// setup and clocks remain outside this cache.
+public struct TaskRenderProjector: Sendable {
+    private var signaturesBySessionID: [String: TaskRenderSignature] = [:]
+
+    public init() {}
+
+    public mutating func apply(_ snapshot: Snapshot) -> TaskRenderProjectionResult {
+        apply(DerivedState.derive(from: snapshot).agentTasks)
+    }
+
+    public mutating func apply(_ tasks: [LaneTask]) -> TaskRenderProjectionResult {
+        var nextBySessionID: [String: TaskRenderSignature] = [:]
+        var orderedSessionIDs: [String] = []
+        var changedTaskIDs: [String] = []
+
+        for task in tasks {
+            let signature = TaskRenderSignature(task: task)
+            // Runtime Session IDs are unique. Keep the first occurrence
+            // defensively rather than crashing if a malformed snapshot repeats
+            // one, which preserves the same deterministic visible card.
+            guard nextBySessionID[signature.sessionID] == nil else { continue }
+            nextBySessionID[signature.sessionID] = signature
+            orderedSessionIDs.append(signature.sessionID)
+            if signaturesBySessionID[signature.sessionID] != signature {
+                changedTaskIDs.append(signature.sessionID)
+            }
+        }
+
+        let removedIDs = signaturesBySessionID.keys
+            .filter { nextBySessionID[$0] == nil }
+            .sorted()
+        changedTaskIDs.append(contentsOf: removedIDs)
+        signaturesBySessionID = nextBySessionID
+
+        return TaskRenderProjectionResult(
+            signatures: orderedSessionIDs.compactMap { nextBySessionID[$0] },
+            changedTaskIDs: changedTaskIDs
+        )
+    }
+
+    public static func diff(
+        old: [LaneTask],
+        new: [LaneTask]
+    ) -> TaskRenderProjectionResult {
+        var projector = TaskRenderProjector()
+        _ = projector.apply(old)
+        return projector.apply(new)
+    }
+}
+
+/// Native presentation timing is intentionally client-local. It is separate
+/// from Runtime transport measurements and accepts only a recent event that
+/// can be ordered at render time.
+public struct NativePresentationLatency: Sendable {
+    public static let maximumAge: TimeInterval = 10
+    public static let maximumSamples = 100
+
+    private var samples: [UInt64] = []
+
+    public init() {}
+
+    public var sampleCount: Int { samples.count }
+
+    public var p95Milliseconds: UInt64? {
+        guard !samples.isEmpty else { return nil }
+        let sorted = samples.sorted()
+        let index = Int(ceil(Double(sorted.count) * 0.95)) - 1
+        return sorted[index]
+    }
+
+    @discardableResult
+    public mutating func record(eventAt: Date, renderedAt: Date) -> Bool {
+        let interval = renderedAt.timeIntervalSince(eventAt)
+        guard interval >= 0, interval <= Self.maximumAge else { return false }
+        samples.append(UInt64((interval * 1_000).rounded(.down)))
+        if samples.count > Self.maximumSamples {
+            samples.removeFirst(samples.count - Self.maximumSamples)
+        }
+        return true
     }
 }
 
@@ -387,6 +659,8 @@ public struct QuotaSlot: Identifiable, Equatable, Sendable {
 
     public let slot: QuotaSlotID
     public let title: String
+    public let titleMessage: RuntimeMessage?
+    public let reasonMessage: RuntimeMessage?
     public let source: String
     public let planType: String?
     public let windowMinutes: UInt64?
@@ -400,9 +674,28 @@ public struct QuotaSlot: Identifiable, Equatable, Sendable {
         return false
     }
 
+    public func localizedTitle(language: AppLanguage) -> String {
+        AppLocalization.localizedRuntimeMessage(
+            titleMessage,
+            fallback: title,
+            language: language
+        )
+    }
+
+    public func localizedUnavailableReason(language: AppLanguage) -> String? {
+        guard case .unavailable(let reason) = availability, let reason else { return nil }
+        return AppLocalization.localizedRuntimeMessage(
+            reasonMessage,
+            fallback: reason,
+            language: language
+        )
+    }
+
     init(entry: QuotaEntry, index: Int) {
         self.slot = QuotaSlotID.make(entry: entry, index: index)
         self.title = Self.windowTitle(entry)
+        self.titleMessage = entry.windowMessage
+        self.reasonMessage = entry.reasonMessage
         self.source = entry.source
         self.planType = entry.planType
         self.windowMinutes = entry.windowMinutes
@@ -432,16 +725,16 @@ public struct QuotaSlot: Identifiable, Equatable, Sendable {
     private static func windowTitle(_ entry: QuotaEntry) -> String {
         if let name = entry.limitName, !name.isEmpty { return name }
         if let minutes = entry.windowMinutes, minutes > 0 {
-            if minutes.isMultiple(of: 43_200) { return "\(minutes / 43_200) 个月" }
-            if minutes.isMultiple(of: 10_080) { return "\(minutes / 10_080) 周" }
-            if minutes.isMultiple(of: 1_440) { return "\(minutes / 1_440) 天" }
-            if minutes.isMultiple(of: 60) { return "\(minutes / 60) 小时" }
-            return "\(minutes) 分钟"
+            if minutes.isMultiple(of: 43_200) { return "\(minutes / 43_200) months" }
+            if minutes.isMultiple(of: 10_080) { return "\(minutes / 10_080) weeks" }
+            if minutes.isMultiple(of: 1_440) { return "\(minutes / 1_440) days" }
+            if minutes.isMultiple(of: 60) { return "\(minutes / 60) hours" }
+            return "\(minutes) minutes"
         }
         switch entry.window {
-        case "5h": return "5 小时"
-        case "7d": return "7 天"
-        case "week": return "本周"
+        case "5h": return "5 hours"
+        case "7d": return "7 days"
+        case "week": return "This week"
         default: return entry.window.replacingOccurrences(of: "_", with: " ")
         }
     }
@@ -467,6 +760,10 @@ public struct PendingDecision: Identifiable, Equatable, Sendable {
     public let createdAt: Date
 
     public var id: UUID { commandId }
+
+    public func localizedSummary(language: AppLanguage) -> String {
+        AppLocalization.localizedProviderText(summary, language: language)
+    }
 }
 
 // MARK: - Derived state

@@ -2,6 +2,16 @@ import Foundation
 
 // MARK: - Runtime snapshot
 
+public struct RuntimeMessage: Codable, Equatable, Sendable {
+    public let code: String
+    public let args: [String: String]
+
+    public init(code: String, args: [String: String] = [:]) {
+        self.code = code
+        self.args = args
+    }
+}
+
 public struct PlanStepRecord: Codable, Identifiable, Equatable, Sendable {
     public let id: String
     public let text: String
@@ -44,6 +54,7 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
     public let execState: String
     public let approvalOwner: String?
     public let activity: String?
+    public let activityMessage: RuntimeMessage?
     public let activitySince: UInt64?
     public let planDone: UInt32?
     public let planTotal: UInt32?
@@ -76,6 +87,7 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
     public let environment: String?
     public let jumpCapability: String?
     public let jumpLabel: String?
+    public let jumpMessage: RuntimeMessage?
     public let controlCapability: String?
     public let recoveryState: String?
     public let canManage: Bool?
@@ -96,6 +108,7 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
         execState: String,
         approvalOwner: String?,
         activity: String?,
+        activityMessage: RuntimeMessage? = nil,
         activitySince: UInt64?,
         planDone: UInt32?,
         planTotal: UInt32?,
@@ -127,6 +140,7 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
         environment: String? = nil,
         jumpCapability: String? = nil,
         jumpLabel: String? = nil,
+        jumpMessage: RuntimeMessage? = nil,
         controlCapability: String? = nil,
         recoveryState: String? = nil,
         canManage: Bool? = nil,
@@ -144,6 +158,7 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
         self.execState = execState
         self.approvalOwner = approvalOwner
         self.activity = activity
+        self.activityMessage = activityMessage
         self.activitySince = activitySince
         self.planDone = planDone
         self.planTotal = planTotal
@@ -174,6 +189,7 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
         self.environment = environment
         self.jumpCapability = jumpCapability
         self.jumpLabel = jumpLabel
+        self.jumpMessage = jumpMessage
         self.controlCapability = controlCapability
         self.recoveryState = recoveryState
         self.canManage = canManage
@@ -183,13 +199,14 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case id, provider, providerSessionId, project, title, providerTitle, providerTitleSource
-        case model, execState, approvalOwner, activity, activitySince, planDone, planTotal, planSteps
+        case model, execState, approvalOwner, activity, activityMessage, activitySince
+        case planDone, planTotal, planSteps
         case turnStartedAt, turnEndedAt, tokenTotal, contextWindowTokens
         case inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens, reasoningTokens
         case lastTurnTokens, contextUsedTokens, contextUsedPercent, estimatedCostUsdMicros
         case costKind, pricingSource, usageSource, usageQuality, usageCapturedAt
         case permissionMode, currentTool, activeSubagents, subagents, providerTurnId, environment
-        case jumpCapability, jumpLabel, controlCapability, recoveryState, canManage
+        case jumpCapability, jumpLabel, jumpMessage, controlCapability, recoveryState, canManage
         case connectorThreadStatus, lastEventAt
     }
 
@@ -210,6 +227,7 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
         execState = try values.decode(String.self, forKey: .execState)
         approvalOwner = try values.decodeIfPresent(String.self, forKey: .approvalOwner)
         activity = try values.decodeIfPresent(String.self, forKey: .activity)
+        activityMessage = try values.decodeIfPresent(RuntimeMessage.self, forKey: .activityMessage)
         activitySince = try values.decodeIfPresent(UInt64.self, forKey: .activitySince)
         planDone = try values.decodeIfPresent(UInt32.self, forKey: .planDone)
         planTotal = try values.decodeIfPresent(UInt32.self, forKey: .planTotal)
@@ -242,6 +260,7 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
         environment = try values.decodeIfPresent(String.self, forKey: .environment)
         jumpCapability = try values.decodeIfPresent(String.self, forKey: .jumpCapability)
         jumpLabel = try values.decodeIfPresent(String.self, forKey: .jumpLabel)
+        jumpMessage = try values.decodeIfPresent(RuntimeMessage.self, forKey: .jumpMessage)
         controlCapability = try values.decodeIfPresent(String.self, forKey: .controlCapability)
         recoveryState = try values.decodeIfPresent(String.self, forKey: .recoveryState)
         canManage = try values.decodeIfPresent(Bool.self, forKey: .canManage)
@@ -273,10 +292,33 @@ public struct InteractivePrompt: Codable, Equatable, Sendable {
     public let kind: String
     public let provider: String
     public let title: String
+    public let titleCode: String?
     public let message: String?
     public let expiresAt: UInt64
     public let supportsNative: Bool
     public let questions: [InteractiveQuestion]
+
+    public init(
+        requestId: UUID,
+        kind: String,
+        provider: String,
+        title: String,
+        titleCode: String? = nil,
+        message: String?,
+        expiresAt: UInt64,
+        supportsNative: Bool,
+        questions: [InteractiveQuestion]
+    ) {
+        self.requestId = requestId
+        self.kind = kind
+        self.provider = provider
+        self.title = title
+        self.titleCode = titleCode
+        self.message = message
+        self.expiresAt = expiresAt
+        self.supportsNative = supportsNative
+        self.questions = questions
+    }
 }
 
 public struct AttentionRecord: Codable, Identifiable, Equatable, Sendable {
@@ -287,10 +329,13 @@ public struct AttentionRecord: Codable, Identifiable, Equatable, Sendable {
     public let requestId: UUID?
     public let kind: String
     public let title: String
+    public let titleMessage: RuntimeMessage?
     public let detail: String?
+    public let detailMessage: RuntimeMessage?
     public let state: String
     public let risk: String
     public let riskNotes: [String]
+    public let riskMessages: [RuntimeMessage]?
     public let commandPreview: String?
     public let expiresAt: UInt64?
     public let createdAt: UInt64
@@ -305,10 +350,13 @@ public struct AttentionRecord: Codable, Identifiable, Equatable, Sendable {
         requestId: UUID?,
         kind: String,
         title: String,
+        titleMessage: RuntimeMessage? = nil,
         detail: String?,
+        detailMessage: RuntimeMessage? = nil,
         state: String,
         risk: String,
         riskNotes: [String],
+        riskMessages: [RuntimeMessage]? = nil,
         commandPreview: String?,
         expiresAt: UInt64?,
         createdAt: UInt64,
@@ -322,10 +370,13 @@ public struct AttentionRecord: Codable, Identifiable, Equatable, Sendable {
         self.requestId = requestId
         self.kind = kind
         self.title = title
+        self.titleMessage = titleMessage
         self.detail = detail
+        self.detailMessage = detailMessage
         self.state = state
         self.risk = risk
         self.riskNotes = riskNotes
+        self.riskMessages = riskMessages
         self.commandPreview = commandPreview
         self.expiresAt = expiresAt
         self.createdAt = createdAt
@@ -357,6 +408,10 @@ public struct QuotaEntry: Codable, Equatable, Sendable {
     public let planType: String?
     public let capturedAt: UInt64?
     public let reason: String?
+    public let reasonCode: String?
+    public let reasonArgs: [String: String]?
+    public let windowMessage: RuntimeMessage?
+    public let reasonMessage: RuntimeMessage?
 
     public init(
         provider: String,
@@ -371,7 +426,11 @@ public struct QuotaEntry: Codable, Equatable, Sendable {
         limitName: String? = nil,
         planType: String? = nil,
         capturedAt: UInt64?,
-        reason: String?
+        reason: String?,
+        reasonCode: String? = nil,
+        reasonArgs: [String: String]? = nil,
+        windowMessage: RuntimeMessage? = nil,
+        reasonMessage: RuntimeMessage? = nil
     ) {
         self.provider = provider
         self.window = window
@@ -386,6 +445,10 @@ public struct QuotaEntry: Codable, Equatable, Sendable {
         self.planType = planType
         self.capturedAt = capturedAt
         self.reason = reason
+        self.reasonCode = reasonCode
+        self.reasonArgs = reasonArgs
+        self.windowMessage = windowMessage
+        self.reasonMessage = reasonMessage
     }
 }
 
@@ -749,10 +812,23 @@ public struct ClaudeQuotaBridge: Codable, Equatable, Sendable {
     public let customConflict: Bool?
 }
 
+public struct BackupSummary: Codable, Equatable, Sendable {
+    public let count: UInt64
+    public let totalBytes: UInt64
+
+    public init(count: UInt64, totalBytes: UInt64) {
+        self.count = count
+        self.totalBytes = totalBytes
+    }
+
+    public static let empty = BackupSummary(count: 0, totalBytes: 0)
+}
+
 public struct SettingsResponse: Codable, Equatable, Sendable {
     public let settings: UISettings
     public let displayCatalog: [DisplayField]
     public let claudeQuotaBridge: ClaudeQuotaBridge
+    public let backups: BackupSummary
 }
 
 public enum AttentionAction: String, Sendable {

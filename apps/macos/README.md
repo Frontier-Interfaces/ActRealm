@@ -9,6 +9,10 @@ Native SwiftUI/AppKit client for the local `actrealm` Runtime.
   loopback API and WebSocket;
 - execute macOS-only Agent Focus through `NSWorkspace` and AppKit, including
   pointer acceptance and bounded Stage Manager state restoration;
+- localize the native app, menu-bar popover, Settings, and HUD in English or
+  Simplified Chinese. The default follows the first macOS preferred language
+  (`zh*` selects Simplified Chinese; every other language falls back to
+  English), while an explicit choice is stored only in local `UserDefaults`;
 - package one tested `actrealm` binary inside `ActRealm.app`.
 
 The client does not read SQLite or Provider configuration directly. Hooks,
@@ -24,6 +28,15 @@ support matrix.
 ```bash
 swift build --package-path apps/macos
 apps/macos/Scripts/test.sh
+```
+
+The snapshot tool accepts `--language=en` or `--language=zh-Hans` so both
+localized surfaces can be rendered deterministically:
+
+```bash
+SDKROOT="$(apps/macos/Scripts/resolve-sdk.sh)" \
+  swift run --package-path apps/macos --disable-sandbox SnapshotTool \
+  /tmp/actrealm-snapshots-en --language=en
 ```
 
 The helper scripts prefer the installed macOS 26 SDK because the current UI

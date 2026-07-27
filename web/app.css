@@ -699,6 +699,14 @@ button { color: inherit; }
 .switch input:checked + span::after { transform: translateX(19px); }
 
 .retention-row { margin-top: 13px; }
+.language-row select {
+  min-width: 132px;
+  border: 1px solid rgba(0, 0, 0, .1);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, .7);
+  color: rgba(0, 0, 0, .76);
+  padding: 7px 28px 7px 10px;
+}
 .quota-display-row .segmented-options { margin-left: auto; }
 .data-actions { margin-top: 11px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .data-actions .dark { border-radius: 12px; background: rgba(20, 22, 30, .85); box-shadow: 0 6px 16px rgba(20, 22, 30, .25); color: #fff; }

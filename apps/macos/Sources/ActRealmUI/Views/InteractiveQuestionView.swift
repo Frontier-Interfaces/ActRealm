@@ -6,6 +6,7 @@ import SwiftUI
 /// logs, snapshots, or export data.
 struct InteractiveQuestionView: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.locale) private var locale
     let entry: OutboxEntry
     let prompt: InteractivePrompt
 
@@ -60,7 +61,7 @@ struct InteractiveQuestionView: View {
     private func questionField(_ question: InteractiveQuestion) -> some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 4) {
-                Text(question.label.isEmpty ? "问题" : question.label)
+                Text(question.label.isEmpty ? localized("问题", locale: locale) : question.label)
                     .font(.system(size: 11, weight: .bold))
                     .foregroundStyle(DT.textPrimary)
                 if question.required {
@@ -114,7 +115,7 @@ struct InteractiveQuestionView: View {
             }
 
             if let validationError = validationErrors[question.id] {
-                Label(validationError, systemImage: "exclamationmark.circle.fill")
+                Label(localized(validationError, locale: locale), systemImage: "exclamationmark.circle.fill")
                     .font(.system(size: 9.5, weight: .semibold))
                     .foregroundStyle(DT.redText)
             }

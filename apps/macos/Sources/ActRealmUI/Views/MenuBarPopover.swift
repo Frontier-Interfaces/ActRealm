@@ -2,12 +2,24 @@ import AppKit
 import ActRealmKit
 import SwiftUI
 
-/// 330pt glass card inside the MenuBarExtra window.
+enum MenuBarPopoverLayout {
+    static let standardWidth: CGFloat = 330
+    static let englishWidth: CGFloat = 360
+
+    static func width(language: AppLanguage) -> CGFloat {
+        AppLanguage.resolvedIdentifier(selection: language) == AppLanguage.english.rawValue
+            ? englishWidth
+            : standardWidth
+    }
+}
+
+/// Language-adaptive glass card inside the MenuBarExtra window.
 public struct MenuBarPopoverView: View {
     public init() {}
 
     @EnvironmentObject var model: AppModel
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.locale) private var locale
 
     private var entries: [OutboxEntry] { model.derived.openOutbox }
 
@@ -37,7 +49,7 @@ public struct MenuBarPopoverView: View {
             footer
         }
         .padding(14)
-        .frame(width: 330)
+        .frame(width: MenuBarPopoverLayout.width(language: model.appLanguage))
     }
 
     // MARK: Header
@@ -71,11 +83,12 @@ public struct MenuBarPopoverView: View {
     }
 
     private var pillText: String {
-        switch model.bridgeStatus {
+        let key = switch model.bridgeStatus {
         case .listening: "本机在线"
         case .starting: "启动中…"
         case .absent: "Runtime 未连接"
         }
+        return localized(key, locale: locale)
     }
 
     private var runtimeTone: MenuBarStatusTone {
@@ -100,12 +113,15 @@ public struct MenuBarPopoverView: View {
     private func queueRow(_ entry: OutboxEntry) -> some View {
         HStack(spacing: 8) {
             Chip(text: entry.kind.badgeText, tone: .forOutboxKind(entry.kind), fontSize: 9)
-            Text(entry.actionTitle)
+            Text(entry.localizedActionTitle(language: model.appLanguage))
                 .font(.system(size: 11.5, weight: .semibold))
                 .foregroundStyle(Color(lightWhite: 0.8, darkWhite: 0.88))
                 .lineLimit(1)
             Spacer(minLength: 4)
-            Text(ZhFormat.shortAge(model.now.timeIntervalSince(entry.createdAt)))
+            Text(ZhFormat.shortAge(
+                model.now.timeIntervalSince(entry.createdAt),
+                language: model.appLanguage
+            ))
                 .font(DT.micro(10))
                 .foregroundStyle(DT.textFaint)
         }
@@ -118,7 +134,8 @@ public struct MenuBarPopoverView: View {
         let presentation = MenuBarLanePresentation(
             provider: lane.provider,
             tasks: model.visibleAgentTasks(for: lane.provider),
-            now: model.now
+            now: model.now,
+            language: model.appLanguage
         )
         return HStack(spacing: 9) {
             ProviderAvatar(kind: lane.provider, size: 22)
@@ -246,11 +263,20 @@ struct MenuBarLanePresentation: Equatable {
     let trailing: String
     let tone: MenuBarStatusTone
 
-    init(lane: Lane, now: Date) {
-        self.init(provider: lane.provider, tasks: lane.tasks, now: now)
+    init(
+        lane: Lane,
+        now: Date,
+        language: AppLanguage = .simplifiedChinese
+    ) {
+        self.init(provider: lane.provider, tasks: lane.tasks, now: now, language: language)
     }
 
-    init(provider: ProviderKind, tasks: [LaneTask], now: Date) {
+    init(
+        provider: ProviderKind,
+        tasks: [LaneTask],
+        now: Date,
+        language: AppLanguage = .simplifiedChinese
+    ) {
         let waiting = tasks.filter { $0.status == .waiting }
         let failed = tasks.filter { $0.status == .failed }
         let running = tasks.filter { $0.status == .running }
@@ -259,33 +285,53 @@ struct MenuBarLanePresentation: Equatable {
         title = provider.displayName
 
         if provider == .gemini {
-            subtitle = "\(provider.displayName) · 仅通知"
+            subtitle = "\(provider.displayName) · \(AppLocalization.localized("仅通知", language: language))"
         } else if let featured {
             switch featured.status {
-            case .waiting: subtitle = "\(provider.displayName) · 等待处理"
-            case .running: subtitle = "\(provider.displayName) · \(featured.activity ?? "正在运行")"
-            case .failed: subtitle = "\(provider.displayName) · 运行失败"
-            case .done: subtitle = "\(provider.displayName) · 本轮已完成"
-            case .idle: subtitle = "\(provider.displayName) · 空闲"
+            case .waiting:
+                subtitle = "\(provider.displayName) · \(AppLocalization.localized("等待处理", language: language))"
+            case .running:
+                subtitle = "\(provider.displayName) · \(AppLocalization.localized(featured.activity ?? "运行中", language: language))"
+            case .failed:
+                subtitle = "\(provider.displayName) · \(AppLocalization.localized("运行失败", language: language))"
+            case .done:
+                subtitle = "\(provider.displayName) · \(AppLocalization.localized("本轮已完成", language: language))"
+            case .idle:
+                subtitle = "\(provider.displayName) · \(AppLocalization.localized("空闲", language: language))"
             }
         } else {
-            subtitle = "\(provider.displayName) · 无活动任务"
+            subtitle = "\(provider.displayName) · \(AppLocalization.localized("无活动任务", language: language))"
         }
 
         if !waiting.isEmpty {
-            trailing = "\(waiting.count) 项待处理"
+            trailing = AppLocalization.formatted(
+                "%lld 项待处理",
+                Int64(waiting.count),
+                language: language
+            )
             tone = .amber
         } else if !failed.isEmpty {
-            trailing = "\(failed.count) 项出错"
+            trailing = AppLocalization.formatted(
+                "%lld 项出错",
+                Int64(failed.count),
+                language: language
+            )
             tone = .red
         } else if !running.isEmpty {
-            trailing = "\(running.count) 项运行中"
+            trailing = AppLocalization.formatted(
+                "%lld 项运行中",
+                Int64(running.count),
+                language: language
+            )
             tone = .blue
         } else if let featured {
-            trailing = ZhFormat.shortAge(now.timeIntervalSince(featured.lastEventAt))
+            trailing = ZhFormat.shortAge(
+                now.timeIntervalSince(featured.lastEventAt),
+                language: language
+            )
             tone = .neutral
         } else {
-            trailing = "无活动"
+            trailing = AppLocalization.localized("无活动", language: language)
             tone = .neutral
         }
     }
@@ -296,6 +342,7 @@ struct MenuBarLanePresentation: Equatable {
 private struct CompactApprovalCard: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.locale) private var locale
     @State private var confirmingAllow = false
     let entry: OutboxEntry
 
@@ -305,17 +352,27 @@ private struct CompactApprovalCard: View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 7) {
                 StatusDot(color: tone.dotColor, size: 7)
-                Text("\(entry.provider?.displayName ?? entry.attention.provider) · \(entry.kind.badgeText)")
+                Text(
+                    "\(entry.provider?.displayName ?? entry.attention.provider) · "
+                        + localized(entry.kind.badgeText, locale: locale)
+                )
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(tone.textColor)
                 Spacer()
-                Text("已等 \(ZhFormat.waitDuration(model.now.timeIntervalSince(entry.createdAt)))")
+                Text(localizedFormat(
+                    "已等 %@",
+                    locale: locale,
+                    ZhFormat.waitDuration(
+                        model.now.timeIntervalSince(entry.createdAt),
+                        language: model.appLanguage
+                    )
+                ))
                     .font(DT.micro(9.5))
                     .foregroundStyle(DT.textWeak)
             }
             if entry.kind == .approval {
                 HStack(spacing: 6) {
-                    Text("\(entry.toolName ?? "操作") — \(entry.attention.commandPreview ?? "")")
+                    Text("\(entry.toolName ?? localized("操作", locale: locale)) — \(entry.attention.commandPreview ?? "")")
                         .font(DT.mono(12))
                         .foregroundStyle(DT.textPrimary)
                         .lineLimit(1)
@@ -331,7 +388,7 @@ private struct CompactApprovalCard: View {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
                         .strokeBorder(DT.commandBoxStroke, lineWidth: 1)
                 )
-            } else if let detail = entry.attention.detail {
+            } else if let detail = entry.localizedDetail(language: model.appLanguage) {
                 Text(detail)
                     .font(DT.body(11))
                     .foregroundStyle(DT.textSecondary)
@@ -355,10 +412,10 @@ private struct CompactApprovalCard: View {
         if let project = entry.attention.project { parts.append(project) }
         if let provider = entry.provider {
             switch provider {
-            case .claude: parts.append("24 小时未回复将交回 Provider")
-            case .codex: parts.append("1 小时未回复将交回 Provider")
-            case .gemini: parts.append("仅通知")
-            case .custom: parts.append("由连接器定义")
+            case .claude: parts.append(localized("24 小时未回复将交回 Provider", locale: locale))
+            case .codex: parts.append(localized("1 小时未回复将交回 Provider", locale: locale))
+            case .gemini: parts.append(localized("仅通知", locale: locale))
+            case .custom: parts.append(localized("由连接器定义", locale: locale))
             }
         }
         return parts.joined(separator: " · ")

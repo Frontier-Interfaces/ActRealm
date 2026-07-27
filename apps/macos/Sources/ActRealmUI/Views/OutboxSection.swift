@@ -4,6 +4,7 @@ import SwiftUI
 struct OutboxSection: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.snapshotRendering) private var snapshotRendering
+    @Environment(\.locale) private var locale
 
     private var entries: [OutboxEntry] { model.derived.openOutbox }
     private var selectedEntry: OutboxEntry? {
@@ -96,7 +97,11 @@ struct OutboxSection: View {
 
                 let rest = entries.filter { $0.id != selectedEntry.id }
                 if !rest.isEmpty {
-                    Text("队列 · 还有 \(rest.count) 项")
+                    Text(localizedFormat(
+                        "队列 · 还有 %lld 项",
+                        locale: locale,
+                        Int64(rest.count)
+                    ))
                         .font(.system(size: 11))
                         .foregroundStyle(DT.textWeak)
                         .padding(.top, 16)
@@ -117,8 +122,14 @@ struct OutboxSection: View {
     }
 
     private var subtitle: String {
-        guard let wait = model.derived.longestWait else { return "暂无需要处理的事项" }
-        return "最久等待 \(max(0, Int(wait / 60))) 分钟"
+        guard let wait = model.derived.longestWait else {
+            return localized("暂无需要处理的事项", locale: locale)
+        }
+        return localizedFormat(
+            "最久等待 %lld 分钟",
+            locale: locale,
+            Int64(max(0, Int(wait / 60)))
+        )
     }
 
     private func primaryAnchor(_ id: String) -> String {
@@ -129,6 +140,7 @@ struct OutboxSection: View {
 private struct OutboxPrimaryCard: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.snapshotRendering) private var snapshotRendering
+    @Environment(\.locale) private var locale
     let entry: OutboxEntry
     @State private var confirming = false
 
@@ -142,7 +154,7 @@ private struct OutboxPrimaryCard: View {
                     .foregroundStyle(DT.textWeak)
             }
 
-            Text(entry.actionTitle)
+            Text(entry.localizedActionTitle(language: model.appLanguage))
                 .font(.system(size: 16, weight: .heavy))
                 .foregroundStyle(DT.textStrong)
                 .fixedSize(horizontal: false, vertical: true)
@@ -156,7 +168,9 @@ private struct OutboxPrimaryCard: View {
                     .font(.system(size: 11))
                     .foregroundStyle(DT.textSecondary)
                     .fixedSize()
-                Text(entry.taskTitle.map { "任务：\($0)" } ?? "")
+                Text(entry.taskTitle.map {
+                    localizedFormat("任务：%@", locale: locale, $0)
+                } ?? "")
                     .font(.system(size: 11))
                     .foregroundStyle(DT.textWeak)
                     .lineLimit(1)
@@ -182,7 +196,7 @@ private struct OutboxPrimaryCard: View {
                 HStack(spacing: 7) {
                     Image(systemName: "arrow.uturn.backward")
                         .font(.system(size: 9, weight: .bold))
-                    Text(returnNote)
+                    Text(localized(returnNote, locale: locale))
                         .font(.system(size: 10.5, weight: .semibold))
                 }
                 .foregroundStyle(DT.amberText)
@@ -224,13 +238,14 @@ private struct OutboxPrimaryCard: View {
     private var approvalBody: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 10) {
-                Text(entry.toolName ?? "操作")
+                Text(entry.toolName ?? localized("操作", locale: locale))
                     .font(.system(size: 10.5, weight: .bold))
                     .foregroundStyle(DT.textSecondary)
                     .padding(.horizontal, 9)
                     .padding(.vertical, 2.5)
                     .background(DT.neutralChipBg, in: RoundedRectangle(cornerRadius: 7))
-                Text(entry.attention.commandPreview ?? "Provider 未提供命令预览")
+                Text(entry.attention.commandPreview
+                    ?? localized("Provider 未提供命令预览", locale: locale))
                     .font(.system(size: 13, design: .monospaced))
                     .foregroundStyle(DT.textPrimary)
                     .lineLimit(1)
@@ -249,7 +264,12 @@ private struct OutboxPrimaryCard: View {
                 .padding(.top, 9)
 
             if entry.state != .open {
-                Text(entry.state == .committing ? "决定将在 3 秒撤回窗口后提交" : "决定已写给 Provider，等待后续事件确认")
+                Text(localized(
+                    entry.state == .committing
+                        ? "决定将在 3 秒撤回窗口后提交"
+                        : "决定已写给 Provider，等待后续事件确认",
+                    locale: locale
+                ))
                     .font(.system(size: 10.5, weight: .semibold))
                     .foregroundStyle(DT.amberText)
                     .padding(.top, 12)
@@ -271,20 +291,77 @@ private struct OutboxPrimaryCard: View {
                 .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(DT.redStroke, lineWidth: 1))
                 .padding(.top, 12)
             } else {
-                HStack(spacing: 9) {
-                    Button("允许") { model.approve(entry) }
-                        .buttonStyle(ActionButtonStyle(kind: .primary))
-                        .disabled(!model.canControlRuntime)
-                    Button("拒绝") { model.deny(entry) }
-                        .buttonStyle(ActionButtonStyle(kind: .secondary))
-                        .disabled(!model.canControlRuntime)
-                    Button("二次确认后允许") { confirming = true }
-                        .buttonStyle(ActionButtonStyle(kind: .tertiary))
-                        .disabled(!model.canControlRuntime)
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 9) {
+                        compactApprovalButton(
+                            "允许",
+                            kind: .primary,
+                            action: { model.approve(entry) }
+                        )
+                        compactApprovalButton(
+                            "拒绝",
+                            kind: .secondary,
+                            action: { model.deny(entry) }
+                        )
+                        compactApprovalButton(
+                            "二次确认后允许",
+                            kind: .tertiary,
+                            action: { confirming = true }
+                        )
+                    }
+                    .fixedSize(horizontal: true, vertical: false)
+
+                    VStack(spacing: 9) {
+                        HStack(spacing: 9) {
+                            fullWidthApprovalButton(
+                                "允许",
+                                kind: .primary,
+                                action: { model.approve(entry) }
+                            )
+                            fullWidthApprovalButton(
+                                "拒绝",
+                                kind: .secondary,
+                                action: { model.deny(entry) }
+                            )
+                        }
+                        fullWidthApprovalButton(
+                            "二次确认后允许",
+                            kind: .tertiary,
+                            action: { confirming = true }
+                        )
+                    }
                 }
                 .padding(.top, 14)
             }
         }
+    }
+
+    private func compactApprovalButton(
+        _ title: String,
+        kind: ActionButtonStyle.Kind,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Text(LocalizedStringKey(title))
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .buttonStyle(ActionButtonStyle(kind: kind, compact: true))
+        .disabled(!model.canControlRuntime)
+    }
+
+    private func fullWidthApprovalButton(
+        _ title: String,
+        kind: ActionButtonStyle.Kind,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Text(LocalizedStringKey(title))
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
+        }
+        .buttonStyle(ActionButtonStyle(kind: kind))
+        .disabled(!model.canControlRuntime)
     }
 
     private var questionBody: some View {
@@ -295,7 +372,8 @@ private struct OutboxPrimaryCard: View {
                 InteractiveQuestionView(entry: entry, prompt: prompt)
             } else {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text(entry.attention.detail ?? "Agent 正在等待回答。")
+                    Text(entry.localizedDetail(language: model.appLanguage)
+                        ?? localized("Agent 正在等待回答。", locale: locale))
                         .font(.system(size: 11.5))
                         .foregroundStyle(DT.textSecondary)
                         .lineSpacing(3)
@@ -319,7 +397,11 @@ private struct OutboxPrimaryCard: View {
 
     private var nativeApprovalBody: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(entry.attention.detail ?? "此请求由 Provider 原界面拥有；ActRealm 只同步等待与解决状态。")
+            Text(entry.localizedDetail(language: model.appLanguage)
+                ?? localized(
+                    "此请求由 Provider 原界面拥有；ActRealm 只同步等待与解决状态。",
+                    locale: locale
+                ))
                 .font(.system(size: 11.5))
                 .foregroundStyle(DT.textSecondary)
                 .lineSpacing(3)
@@ -349,7 +431,8 @@ private struct OutboxPrimaryCard: View {
 
     private var completionBody: some View {
         VStack(spacing: 12) {
-            Text(entry.attention.detail ?? "本轮修改已完成，等待确认。")
+            Text(entry.localizedDetail(language: model.appLanguage)
+                ?? localized("本轮修改已完成，等待确认。", locale: locale))
                 .font(.system(size: 11.5))
                 .foregroundStyle(DT.textSecondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -372,7 +455,8 @@ private struct OutboxPrimaryCard: View {
 
     private var errorBody: some View {
         VStack(spacing: 12) {
-            Text(entry.attention.detail ?? "Provider 未提供更多错误信息。")
+            Text(entry.localizedDetail(language: model.appLanguage)
+                ?? localized("Provider 未提供更多错误信息。", locale: locale))
                 .font(.system(size: 11.5))
                 .foregroundStyle(DT.redText)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -392,13 +476,26 @@ private struct OutboxPrimaryCard: View {
     }
 
     private var waitText: String {
-        "已等 \(ZhFormat.waitDuration(model.now.timeIntervalSince(entry.createdAt)))"
+        localizedFormat(
+            "已等 %@",
+            locale: locale,
+            ZhFormat.waitDuration(
+                model.now.timeIntervalSince(entry.createdAt),
+                language: model.appLanguage
+            )
+        )
     }
 
     private var expiryLine: String {
-        guard let expiresAt = entry.expiresAt else { return "等待处理" }
+        guard let expiresAt = entry.expiresAt else {
+            return localized("等待处理", locale: locale)
+        }
         let minutes = max(0, Int(round(expiresAt.timeIntervalSince(model.now) / 60)))
-        return "等待处理 · \(minutes) 分钟后过期"
+        return localizedFormat(
+            "等待处理 · %lld 分钟后过期",
+            locale: locale,
+            Int64(minutes)
+        )
     }
 
     private var providerName: String {
@@ -442,6 +539,7 @@ private struct OutboxPrimaryCard: View {
 
 private struct QueueRow: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.locale) private var locale
     let entry: OutboxEntry
     let action: () -> Void
 
@@ -449,12 +547,15 @@ private struct QueueRow: View {
         Button(action: action) {
             HStack(spacing: 9) {
                 Chip(text: entry.kind.badgeText, tone: .forOutboxKind(entry.kind), fontSize: 9.5)
-                Text(entry.actionTitle)
+                Text(entry.localizedActionTitle(language: model.appLanguage))
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(DT.textPrimary)
                     .lineLimit(1)
                 Spacer(minLength: 2)
-                Text(ZhFormat.shortAge(model.now.timeIntervalSince(entry.createdAt)))
+                Text(ZhFormat.shortAge(
+                    model.now.timeIntervalSince(entry.createdAt),
+                    language: model.appLanguage
+                ))
                     .font(.system(size: 10.5))
                     .foregroundStyle(DT.textWeak)
             }
@@ -471,6 +572,7 @@ private struct QueueRow: View {
 
 private struct OutboxEmpty: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.locale) private var locale
 
     var body: some View {
         VStack(spacing: 10) {
@@ -480,16 +582,22 @@ private struct OutboxEmpty: View {
                 .frame(width: 52, height: 52)
                 .background(model.setupInfo == nil ? DT.cardFaint : DT.greenBg, in: Circle())
                 .overlay(Circle().strokeBorder(model.setupInfo == nil ? DT.hairline : DT.greenStroke, lineWidth: 1))
-            Text(model.setupInfo == nil
-                ? "正在检测本机 Agent"
-                : model.isFirstRun ? "还没有需要处理的事项" : "全部处理完毕")
+            Text(localized(
+                model.setupInfo == nil
+                    ? "正在检测本机 Agent"
+                    : model.isFirstRun ? "还没有需要处理的事项" : "全部处理完毕",
+                locale: locale
+            ))
                 .font(.system(size: 13, weight: .bold))
                 .foregroundStyle(DT.textSecondary)
-            Text(model.setupInfo == nil
-                ? "接入状态确认前不会显示缓存或演示数据"
-                : model.isFirstRun
-                    ? "连接 Agent 后，审批、提问和完成确认会出现在这里"
-                    : "新事件会先以 HUD 胶囊出现")
+            Text(localized(
+                model.setupInfo == nil
+                    ? "接入状态确认前不会显示缓存或演示数据"
+                    : model.isFirstRun
+                        ? "连接 Agent 后，审批、提问和完成确认会出现在这里"
+                        : "新事件会先以 HUD 胶囊出现",
+                locale: locale
+            ))
                 .font(.system(size: 10.5))
                 .foregroundStyle(DT.textWeak)
         }
@@ -499,6 +607,7 @@ private struct OutboxEmpty: View {
 
 private struct UndoBar: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.locale) private var locale
     let pending: PendingDecision
 
     var body: some View {
@@ -509,7 +618,7 @@ private struct UndoBar: View {
                     .font(.system(size: 8, weight: .heavy))
                     .foregroundStyle(DT.greenText)
             }
-            Text(pending.summary)
+            Text(pending.localizedSummary(language: model.appLanguage))
                 .font(.system(size: 10.5, weight: .bold))
                 .foregroundStyle(DT.textPrimary)
                 .lineLimit(1)
@@ -537,11 +646,12 @@ private struct UndoBar: View {
     private var fraction: Double { min(1, remaining / DerivedState.undoWindow) }
     private var secondsLabel: String { "\(Int(ceil(remaining)))s" }
     private var phaseText: String {
-        switch pending.phase {
+        let key = switch pending.phase {
         case .undoable: "· 尚未写给 Provider"
         case .sent: "· 已写给 Provider，等待后续事件"
         case .confirmed: "· Provider 后续事件已确认继续"
         }
+        return localized(key, locale: locale)
     }
 }
 

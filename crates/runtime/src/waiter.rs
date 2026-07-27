@@ -29,6 +29,7 @@ pub struct InteractivePrompt {
     pub kind: String,
     pub provider: String,
     pub title: String,
+    pub title_code: String,
     pub message: Option<String>,
     pub expires_at: u64,
     pub supports_native: bool,
@@ -342,7 +343,8 @@ fn parse_claude_question(
     for (index, question) in source.iter().enumerate() {
         let prompt =
             bounded_text(question.get("question"), 2_000).ok_or(WaiterError::NotInteractive)?;
-        let label = bounded_text(question.get("header"), 64).unwrap_or_else(|| "问题".to_owned());
+        let label =
+            bounded_text(question.get("header"), 64).unwrap_or_else(|| "Question".to_owned());
         let options = question
             .get("options")
             .and_then(Value::as_array)
@@ -378,7 +380,8 @@ fn parse_claude_question(
         request_id,
         kind: "claude_question".to_owned(),
         provider: "claude".to_owned(),
-        title: "Claude 正在询问".to_owned(),
+        title: "Claude is asking".to_owned(),
+        title_code: "interaction.claude_question.title".to_owned(),
         message: None,
         expires_at,
         supports_native: true,
@@ -469,7 +472,8 @@ fn parse_claude_elicitation(
         request_id,
         kind: "claude_elicitation".to_owned(),
         provider: "claude".to_owned(),
-        title: "Claude 需要补充信息".to_owned(),
+        title: "Claude needs more information".to_owned(),
+        title_code: "interaction.claude_elicitation.title".to_owned(),
         message: bounded_text(raw.get("message"), 2_000),
         expires_at,
         supports_native: true,
@@ -520,7 +524,8 @@ fn parse_codex_user_input(
         };
         questions.push(InteractiveQuestion {
             id,
-            label: bounded_text(question.get("header"), 200).unwrap_or_else(|| "问题".to_owned()),
+            label: bounded_text(question.get("header"), 200)
+                .unwrap_or_else(|| "Question".to_owned()),
             prompt: bounded_text(question.get("question"), 2_000)
                 .ok_or(WaiterError::NotInteractive)?,
             input_type: if options.is_empty() { "text" } else { "choice" }.to_owned(),
@@ -538,7 +543,8 @@ fn parse_codex_user_input(
         request_id,
         kind: "codex_user_input".to_owned(),
         provider: "codex".to_owned(),
-        title: "Codex 正在询问".to_owned(),
+        title: "Codex is asking".to_owned(),
+        title_code: "interaction.codex_user_input.title".to_owned(),
         message: None,
         expires_at,
         supports_native: false,

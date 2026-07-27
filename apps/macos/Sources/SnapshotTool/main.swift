@@ -3,6 +3,46 @@ import ActRealmKit
 import ActRealmUI
 import SwiftUI
 
+let snapshotArguments = Array(CommandLine.arguments.dropFirst())
+let snapshotLanguage = snapshotArguments
+    .first(where: { $0.hasPrefix("--language=") })
+    .flatMap { AppLanguage(rawValue: String($0.dropFirst("--language=".count))) }
+    ?? .system
+
+/// SwiftUI resolves literal `Text` keys from the executable's main bundle.
+/// The shipped app receives these tables during packaging, while SwiftPM keeps
+/// the authoritative package resources in ActRealmKit's separate bundle.
+/// Mirror only the localization tables into SnapshotTool's generated product
+/// directory so a clean build renders the same language as the packaged app.
+func installSnapshotLocalizations() throws {
+    guard let resourceRoot = Bundle.main.resourceURL else {
+        throw CocoaError(.fileNoSuchFile)
+    }
+    let sourceRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("ActRealmKit/Resources", isDirectory: true)
+    let fileManager = FileManager.default
+    for localization in ["en.lproj", "zh-Hans.lproj"] {
+        let source = sourceRoot
+            .appendingPathComponent(localization, isDirectory: true)
+            .appendingPathComponent("Localizable.strings")
+        let destinationDirectory = resourceRoot
+            .appendingPathComponent(localization, isDirectory: true)
+        let destination = destinationDirectory.appendingPathComponent("Localizable.strings")
+        try fileManager.createDirectory(
+            at: destinationDirectory,
+            withIntermediateDirectories: true
+        )
+        if fileManager.fileExists(atPath: destination.path) {
+            try fileManager.removeItem(at: destination)
+        }
+        try fileManager.copyItem(at: source, to: destination)
+    }
+}
+
+try installSnapshotLocalizations()
+
 /// Offscreen renderer: captures screens that support SwiftUI ImageRenderer
 /// with demo data so they can be verified without screen recording
 /// permissions. NavigationSplitView-based settings are checked in the hosted
@@ -23,7 +63,11 @@ func writePNG(_ image: NSImage, to path: String, scale: CGFloat) {
 
 @MainActor
 func render(_ view: some View, size: CGSize?, to path: String, scale: CGFloat = 2) {
-    let renderer = ImageRenderer(content: AnyView(view.environment(\.snapshotRendering, true)))
+    let renderer = ImageRenderer(content: AnyView(
+        view
+            .environment(\.snapshotRendering, true)
+            .environment(\.locale, snapshotLanguage.locale)
+    ))
     renderer.scale = scale
     if let size {
         renderer.proposedSize = ProposedViewSize(size)
@@ -33,6 +77,44 @@ func render(_ view: some View, size: CGSize?, to path: String, scale: CGFloat = 
         return
     }
     writePNG(image, to: path, scale: scale)
+}
+
+/// Window-hosted renderer for AppKit-backed SwiftUI containers such as Form.
+/// ImageRenderer does not instantiate their cell hierarchy offscreen.
+@MainActor
+func renderHosted(_ view: some View, size: CGSize, to path: String) {
+    let hostingView = NSHostingView(rootView: AnyView(
+        view
+            .environment(\.snapshotRendering, true)
+            .environment(\.locale, snapshotLanguage.locale)
+    ))
+    hostingView.frame = CGRect(origin: .zero, size: size)
+
+    let window = NSWindow(
+        contentRect: CGRect(origin: .zero, size: size),
+        styleMask: [.borderless],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    window.contentView = hostingView
+    window.setFrameOrigin(NSPoint(x: -20_000, y: -20_000))
+    window.orderFrontRegardless()
+
+    hostingView.needsLayout = true
+    hostingView.layoutSubtreeIfNeeded()
+    RunLoop.main.run(until: Date().addingTimeInterval(0.15))
+
+    guard let representation = hostingView.bitmapImageRepForCachingDisplay(in: hostingView.bounds) else {
+        FileHandle.standardError.write(Data("failed to render hosted view \(path)\n".utf8))
+        window.orderOut(nil)
+        return
+    }
+    hostingView.cacheDisplay(in: hostingView.bounds, to: representation)
+    let image = NSImage(size: size)
+    image.addRepresentation(representation)
+    writePNG(image, to: path, scale: window.backingScaleFactor)
+    window.orderOut(nil)
 }
 
 /// Colorful desktop stand-in matching the prototype's backdrop, so glass
@@ -87,14 +169,17 @@ struct Backdrop<Content: View>: View {
     }
 }
 
-let outDir = CommandLine.arguments.count > 1
-    ? CommandLine.arguments[1]
-    : FileManager.default.currentDirectoryPath + "/snapshots"
+let outDir = snapshotArguments.first(where: { !$0.hasPrefix("--language=") })
+    ?? FileManager.default.currentDirectoryPath + "/snapshots"
 try? FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
 
 Task { @MainActor in
     NSApplication.shared.setActivationPolicy(.prohibited)
-    let model = AppModel(demo: true)
+    let defaultsSuite = "ActRealmSnapshotTool.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: defaultsSuite)!
+    defer { defaults.removePersistentDomain(forName: defaultsSuite) }
+    let model = AppModel(defaults: defaults, demo: true)
+    model.setAppLanguage(snapshotLanguage)
     model.start()
 
     // Main window — light and dark.
@@ -114,6 +199,46 @@ Task { @MainActor in
         )
     }
 
+    renderHosted(
+        Backdrop(dark: false) {
+            MainWindowView()
+                .environmentObject(model)
+                .frame(width: 1160, height: 820)
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .padding(40)
+        },
+        size: CGSize(width: 1240, height: 900),
+        to: "\(outDir)/main-narrow-light.png"
+    )
+
+    model.updateUISettings { $0.quotaDisplayMode = .compact }
+    render(
+        Backdrop(dark: false) {
+            MainWindowView()
+                .environmentObject(model)
+                .frame(width: 1160, height: 820)
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .padding(40)
+        },
+        size: CGSize(width: 1240, height: 900),
+        to: "\(outDir)/quota-compact-narrow-light.png"
+    )
+    model.updateUISettings { $0.quotaDisplayMode = .full }
+
+    model.updateUISettings { $0.quotaDisplayMode = .singleLine }
+    render(
+        Backdrop(dark: false) {
+            MainWindowView()
+                .environmentObject(model)
+                .frame(width: 1160, height: 820)
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .padding(40)
+        },
+        size: CGSize(width: 1240, height: 900),
+        to: "\(outDir)/quota-single-line-narrow-light.png"
+    )
+    model.updateUISettings { $0.quotaDisplayMode = .full }
+
     model.expandedTaskId = "claude-quota-fix"
     model.pinnedSessionId = "claude-quota-fix"
     render(
@@ -131,14 +256,15 @@ Task { @MainActor in
     if let question = model.derived.openOutbox.first(where: { $0.kind == .question }) {
         model.selectOutbox(id: question.id)
     }
-    render(
+    renderHosted(
         Backdrop(dark: false) {
             MainWindowView()
                 .environmentObject(model)
                 .frame(width: 1536, height: 980)
                 .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
                 .padding(40)
-        },
+        }
+        .environment(\.colorScheme, .light),
         size: CGSize(width: 1616, height: 1060),
         to: "\(outDir)/interactive-question-light.png"
     )
@@ -146,16 +272,30 @@ Task { @MainActor in
         model.selectOutbox(id: first.id)
     }
 
-    render(
+    renderHosted(
         Backdrop(dark: false) {
             MainWindowView(initialPage: .agentSetup)
                 .environmentObject(model)
                 .frame(width: 1536, height: 980)
-                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-                .padding(40)
-        },
+                    .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                    .padding(40)
+        }
+        .environment(\.colorScheme, .light),
         size: CGSize(width: 1616, height: 1060),
         to: "\(outDir)/agent-setup-light.png"
+    )
+
+    renderHosted(
+        Backdrop(dark: false) {
+            MainWindowView(initialPage: .agentSetup)
+                .environmentObject(model)
+                .frame(width: 1160, height: 820)
+                    .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                    .padding(40)
+        }
+        .environment(\.colorScheme, .light),
+        size: CGSize(width: 1240, height: 900),
+        to: "\(outDir)/agent-setup-narrow-light.png"
     )
 
     // Foreground scheduling management page. The taller viewport captures the
@@ -172,6 +312,35 @@ Task { @MainActor in
         size: CGSize(width: 1616, height: 1740),
         to: "\(outDir)/foreground-scheduling-light.png"
     )
+
+    render(
+        Backdrop(dark: false) {
+            MainWindowView(initialPage: .foregroundScheduling)
+                .environmentObject(model)
+                .frame(width: 1160, height: 1660)
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .padding(40)
+        },
+        size: CGSize(width: 1240, height: 1740),
+        to: "\(outDir)/foreground-scheduling-narrow-light.png"
+    )
+
+    // Every settings section is rendered in both languages by the caller.
+    // This catches sidebar, row-label, control, and helper-text regressions
+    // without mutating the user's real preferences.
+    for section in SettingsSection.allCases {
+        renderHosted(
+            Backdrop(dark: false) {
+                SettingsView(initialSection: section)
+                    .environmentObject(model)
+                    .frame(width: 920, height: 660)
+                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    .padding(40)
+            },
+            size: CGSize(width: 1000, height: 740),
+            to: "\(outDir)/settings-\(section.rawValue)-light.png"
+        )
+    }
 
     // HUD capsule.
     for dark in [false, true] {

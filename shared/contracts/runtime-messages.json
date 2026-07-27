@@ -1,0 +1,367 @@
+{
+  "schemaVersion": 1,
+  "contract": "actrealm.runtime-message",
+  "locales": [
+    "en",
+    "zh-Hans"
+  ],
+  "messages": [
+    {
+      "code": "session.activity.idle",
+      "parameters": [],
+      "en": "Waiting for a new task",
+      "zh-Hans": "等待新任务"
+    },
+    {
+      "code": "session.activity.ended",
+      "parameters": [],
+      "en": "Session ended",
+      "zh-Hans": "会话已结束"
+    },
+    {
+      "code": "session.activity.thinking",
+      "parameters": [],
+      "en": "Thinking",
+      "zh-Hans": "正在思考"
+    },
+    {
+      "code": "session.activity.tool_running",
+      "parameters": [
+        "tool"
+      ],
+      "en": "Running {tool}",
+      "zh-Hans": "正在运行 {tool}"
+    },
+    {
+      "code": "session.activity.awaiting_approval",
+      "parameters": [],
+      "en": "Waiting for your approval",
+      "zh-Hans": "等待你批准"
+    },
+    {
+      "code": "session.activity.awaiting_answer",
+      "parameters": [],
+      "en": "Waiting for your answer",
+      "zh-Hans": "等待你回答"
+    },
+    {
+      "code": "session.activity.compacting",
+      "parameters": [],
+      "en": "Compacting context",
+      "zh-Hans": "正在压缩记忆"
+    },
+    {
+      "code": "session.activity.completed",
+      "parameters": [],
+      "en": "Turn completed",
+      "zh-Hans": "本轮已完成"
+    },
+    {
+      "code": "session.activity.interrupted",
+      "parameters": [],
+      "en": "Turn interrupted",
+      "zh-Hans": "本轮已中断"
+    },
+    {
+      "code": "session.activity.failed",
+      "parameters": [],
+      "en": "Run failed",
+      "zh-Hans": "运行失败"
+    },
+    {
+      "code": "session.activity.plan_progress",
+      "parameters": [
+        "done",
+        "total"
+      ],
+      "en": "Plan progress {done}/{total}",
+      "zh-Hans": "计划进度 {done}/{total}"
+    },
+    {
+      "code": "session.activity.subagents_running",
+      "parameters": [
+        "count"
+      ],
+      "en": "{count} subagents running",
+      "zh-Hans": "{count} 个子 Agent 正在运行"
+    },
+    {
+      "code": "session.activity.background_tasks_running",
+      "parameters": [
+        "count"
+      ],
+      "en": "{count} background tasks still running",
+      "zh-Hans": "{count} 个后台任务仍在运行"
+    },
+    {
+      "code": "session.activity.permission_denied",
+      "parameters": [],
+      "en": "The operation was denied in the Agent",
+      "zh-Hans": "操作已在 Agent 中拒绝"
+    },
+    {
+      "code": "session.activity.waiting_for_provider_event",
+      "parameters": [],
+      "en": "Waiting for the Agent's next event",
+      "zh-Hans": "等待 Agent 后续事件"
+    },
+    {
+      "code": "session.activity.unknown_event",
+      "parameters": [],
+      "en": "Unrecognized event; the Provider version may be incompatible",
+      "zh-Hans": "事件不识别，Provider 版本可能不兼容"
+    },
+    {
+      "code": "attention.approval.title",
+      "parameters": [],
+      "en": "Approval required",
+      "zh-Hans": "等待批准"
+    },
+    {
+      "code": "attention.native_approval.title",
+      "parameters": [
+        "provider"
+      ],
+      "en": "Approve in {provider}",
+      "zh-Hans": "请在 {provider} 中批准"
+    },
+    {
+      "code": "attention.question.title",
+      "parameters": [
+        "provider"
+      ],
+      "en": "{provider} is asking a question",
+      "zh-Hans": "{provider} 正在询问"
+    },
+    {
+      "code": "attention.error.title",
+      "parameters": [],
+      "en": "Agent run failed",
+      "zh-Hans": "Agent 运行失败"
+    },
+    {
+      "code": "attention.interrupted.title",
+      "parameters": [],
+      "en": "Agent turn interrupted",
+      "zh-Hans": "Agent 本轮已中断"
+    },
+    {
+      "code": "attention.completion.title",
+      "parameters": [],
+      "en": "Task completed; waiting for confirmation",
+      "zh-Hans": "任务已完成，等待确认"
+    },
+    {
+      "code": "attention.approval.detail",
+      "parameters": [],
+      "en": "Review the operation and its impact in the original conversation.",
+      "zh-Hans": "请在原对话中核对操作内容和影响。"
+    },
+    {
+      "code": "attention.native_approval.detail",
+      "parameters": [
+        "provider"
+      ],
+      "en": "Review and handle this request in {provider}.",
+      "zh-Hans": "请在 {provider} 中查看并处理此请求。"
+    },
+    {
+      "code": "attention.question.detail",
+      "parameters": [],
+      "en": "Answer directly in ActRealm. Answers are not written to local history.",
+      "zh-Hans": "可直接在 ActRealm 回答；答案不会写入本地历史。"
+    },
+    {
+      "code": "attention.risk.high_impact",
+      "parameters": [],
+      "en": "High-impact operation detected",
+      "zh-Hans": "已识别到高影响操作"
+    },
+    {
+      "code": "attention.risk.irreversible",
+      "parameters": [],
+      "en": "The operation cannot be undone after it is submitted",
+      "zh-Hans": "提交后动作本身不可撤销"
+    },
+    {
+      "code": "attention.risk.compound_syntax",
+      "parameters": [],
+      "en": "The command contains compound syntax",
+      "zh-Hans": "命令包含组合语法"
+    },
+    {
+      "code": "attention.risk.read_only_intent",
+      "parameters": [],
+      "en": "Read-only intent; this rule is not a security guarantee",
+      "zh-Hans": "只读意图；规则提示不构成安全保证"
+    },
+    {
+      "code": "attention.risk.undo_window",
+      "parameters": [],
+      "en": "The approval decision can be undone for 3 seconds",
+      "zh-Hans": "批准决定可在 3 秒内撤回"
+    },
+    {
+      "code": "attention.risk.side_effects",
+      "parameters": [],
+      "en": "May run project code or produce side effects",
+      "zh-Hans": "可能执行项目代码或产生副作用"
+    },
+    {
+      "code": "attention.risk.unknown_impact",
+      "parameters": [],
+      "en": "The impact of this operation is unknown",
+      "zh-Hans": "此操作的影响未知"
+    },
+    {
+      "code": "attention.risk.review_original",
+      "parameters": [],
+      "en": "Review the original window",
+      "zh-Hans": "建议查看原窗口"
+    },
+    {
+      "code": "interaction.claude_question.title",
+      "parameters": [],
+      "en": "Claude is asking",
+      "zh-Hans": "Claude 正在询问"
+    },
+    {
+      "code": "interaction.claude_elicitation.title",
+      "parameters": [],
+      "en": "Claude needs more information",
+      "zh-Hans": "Claude 需要补充信息"
+    },
+    {
+      "code": "interaction.codex_user_input.title",
+      "parameters": [],
+      "en": "Codex is asking",
+      "zh-Hans": "Codex 正在询问"
+    },
+    {
+      "code": "jump.exact_conversation",
+      "parameters": [],
+      "en": "Open exact conversation",
+      "zh-Hans": "精确打开对话"
+    },
+    {
+      "code": "jump.terminal",
+      "parameters": [],
+      "en": "Open terminal",
+      "zh-Hans": "打开对应终端"
+    },
+    {
+      "code": "jump.app_only",
+      "parameters": [],
+      "en": "Open application",
+      "zh-Hans": "只能打开应用"
+    },
+    {
+      "code": "jump.unsupported",
+      "parameters": [],
+      "en": "Jump is not supported",
+      "zh-Hans": "当前环境不支持跳转"
+    },
+    {
+      "code": "quota.window.months",
+      "parameters": [
+        "count"
+      ],
+      "en": "{count} months",
+      "zh-Hans": "{count} 个月"
+    },
+    {
+      "code": "quota.window.weeks",
+      "parameters": [
+        "count"
+      ],
+      "en": "{count} weeks",
+      "zh-Hans": "{count} 周"
+    },
+    {
+      "code": "quota.window.days",
+      "parameters": [
+        "count"
+      ],
+      "en": "{count} days",
+      "zh-Hans": "{count} 天"
+    },
+    {
+      "code": "quota.window.hours",
+      "parameters": [
+        "count"
+      ],
+      "en": "{count} hours",
+      "zh-Hans": "{count} 小时"
+    },
+    {
+      "code": "quota.window.minutes",
+      "parameters": [
+        "count"
+      ],
+      "en": "{count} minutes",
+      "zh-Hans": "{count} 分钟"
+    },
+    {
+      "code": "quota.window.current_week",
+      "parameters": [],
+      "en": "This week",
+      "zh-Hans": "本周"
+    },
+    {
+      "code": "quota.window.extra_usage",
+      "parameters": [],
+      "en": "Extra usage",
+      "zh-Hans": "额外用量"
+    },
+    {
+      "code": "quota.reason.cache_missing",
+      "parameters": [],
+      "en": "Quota cache is missing. Enable the Claude quota bridge and complete one conversation.",
+      "zh-Hans": "额度缓存不存在，请开启 Claude 额度桥并完成一次对话。"
+    },
+    {
+      "code": "quota.reason.cache_unreadable",
+      "parameters": [
+        "error"
+      ],
+      "en": "Quota cache could not be read: {error}",
+      "zh-Hans": "额度缓存不可读：{error}"
+    },
+    {
+      "code": "quota.reason.cache_incompatible",
+      "parameters": [],
+      "en": "Quota cache schema is incompatible.",
+      "zh-Hans": "额度缓存版本不兼容。"
+    },
+    {
+      "code": "quota.reason.cache_invalid",
+      "parameters": [],
+      "en": "Quota cache could not be parsed.",
+      "zh-Hans": "额度缓存解析失败。"
+    },
+    {
+      "code": "quota.reason.cache_from_future",
+      "parameters": [],
+      "en": "Quota cache timestamp is later than the local clock.",
+      "zh-Hans": "额度缓存时间晚于本机时间。"
+    },
+    {
+      "code": "quota.reason.no_valid_window",
+      "parameters": [],
+      "en": "No verifiable quota window was found.",
+      "zh-Hans": "没有找到可验证的额度窗口。"
+    },
+    {
+      "code": "quota.reason.codex_rollout_missing",
+      "parameters": [],
+      "en": "No Codex rollout file was found.",
+      "zh-Hans": "未找到 Codex rollout 文件。"
+    },
+    {
+      "code": "quota.reason.codex_window_missing",
+      "parameters": [],
+      "en": "No verifiable quota window was found in the Codex rollout.",
+      "zh-Hans": "Codex rollout 中没有可验证的额度窗口。"
+    }
+  ]
+}

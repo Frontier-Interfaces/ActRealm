@@ -13,6 +13,7 @@ actrealm-core = { path = "../core" }
 actrealm-quota = { path = "../quota" }
 actrealm-runtime = { path = "../runtime" }
 actrealm-usage = { path = "../usage" }
+getrandom.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true

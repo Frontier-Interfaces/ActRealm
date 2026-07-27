@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use actrealm_runtime::RuntimeStore;
+use actrealm_runtime::{RuntimeStore, StoreSnapshot};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -43,6 +43,20 @@ fn wait_until_for(description: &str, timeout: Duration, condition: impl Fn() -> 
     }
 }
 
+fn wait_for_store_snapshot(
+    database: &Path,
+    description: &str,
+    condition: impl Fn(&StoreSnapshot) -> bool,
+) {
+    // Keep one observer alive for the transition. Reopening RuntimeStore on
+    // every 20 ms poll starts and joins a SQLite writer thread each time,
+    // which can starve the Runtime process on a busy CI worker.
+    let store = RuntimeStore::open(database).unwrap();
+    wait_until(description, || {
+        store.snapshot().is_ok_and(|snapshot| condition(&snapshot))
+    });
+}
+
 fn write_payload(child: &mut Child, payload: &Value) {
     serde_json::to_writer(child.stdin.as_mut().unwrap(), payload).unwrap();
     drop(child.stdin.take());
@@ -62,6 +76,9 @@ fn spawn_provider_hook_with_timeout(
     payload: &Value,
     timeout_ms: u64,
 ) -> Child {
+    let isolated_home = socket
+        .parent()
+        .expect("integration test socket must have a parent directory");
     let mut child = Command::new(env!("CARGO_BIN_EXE_actrealm"))
         .args([
             "hook",
@@ -70,6 +87,7 @@ fn spawn_provider_hook_with_timeout(
             "--socket",
             socket.to_str().unwrap(),
         ])
+        .env("ACTREALM_HOME", isolated_home)
         .env("ACTREALM_HOOK_REPLY_TIMEOUT_MS", timeout_ms.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -391,13 +409,7 @@ fn codex_native_permission_hook_lifecycle_is_observed_neutrally_for_five_rounds(
             "native observation must never reply"
         );
 
-        wait_until("native permission attention", || {
-            let Ok(store) = RuntimeStore::open(&database) else {
-                return false;
-            };
-            let Ok(snapshot) = store.snapshot() else {
-                return false;
-            };
+        wait_for_store_snapshot(&database, "native permission attention", |snapshot| {
             let Some(session) = snapshot
                 .sessions
                 .iter()
@@ -463,15 +475,10 @@ fn codex_native_permission_hook_lifecycle_is_observed_neutrally_for_five_rounds(
         // Codex Desktop can emit both events above while its native sheet is
         // still open. The end-to-end transport must preserve the request just
         // like the reducer-level regression test and packaged UI acceptance.
-        wait_until(
+        wait_for_store_snapshot(
+            &database,
             "native permission preserved after PostToolUse and Stop",
-            || {
-                let Ok(store) = RuntimeStore::open(&database) else {
-                    return false;
-                };
-                let Ok(snapshot) = store.snapshot() else {
-                    return false;
-                };
+            |snapshot| {
                 let Some(session) = snapshot
                     .sessions
                     .iter()
@@ -504,33 +511,31 @@ fn codex_native_permission_hook_lifecycle_is_observed_neutrally_for_five_rounds(
         assert_success(&output);
         assert!(output.stdout.is_empty());
 
-        wait_until("native permission authoritative resolution", || {
-            let Ok(store) = RuntimeStore::open(&database) else {
-                return false;
-            };
-            let Ok(snapshot) = store.snapshot() else {
-                return false;
-            };
-            let Some(session) = snapshot
-                .sessions
-                .iter()
-                .find(|session| session.provider_session_id == provider_session_id)
-            else {
-                return false;
-            };
-            session.approval_owner.is_none()
-                && !snapshot.attention.iter().any(|item| {
-                    item.session_id == session.id
-                        && item.kind == "native_approval"
-                        && matches!(item.state.as_str(), "open" | "snoozed")
-                })
-                && snapshot.attention.iter().any(|item| {
-                    item.session_id == session.id
-                        && item.kind == "native_approval"
-                        && item.state == "resolved"
-                        && item.resolution.as_deref() == Some("provider_advanced")
-                })
-        });
+        wait_for_store_snapshot(
+            &database,
+            "native permission authoritative resolution",
+            |snapshot| {
+                let Some(session) = snapshot
+                    .sessions
+                    .iter()
+                    .find(|session| session.provider_session_id == provider_session_id)
+                else {
+                    return false;
+                };
+                session.approval_owner.is_none()
+                    && !snapshot.attention.iter().any(|item| {
+                        item.session_id == session.id
+                            && item.kind == "native_approval"
+                            && matches!(item.state.as_str(), "open" | "snoozed")
+                    })
+                    && snapshot.attention.iter().any(|item| {
+                        item.session_id == session.id
+                            && item.kind == "native_approval"
+                            && item.state == "resolved"
+                            && item.resolution.as_deref() == Some("provider_advanced")
+                    })
+            },
+        );
     }
 
     runtime.kill().unwrap();

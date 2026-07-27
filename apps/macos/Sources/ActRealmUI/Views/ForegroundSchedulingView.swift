@@ -6,6 +6,7 @@ import SwiftUI
 public struct ForegroundSchedulingView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.snapshotRendering) private var snapshotRendering
+    @Environment(\.locale) private var locale
     private let onBack: () -> Void
 
     public init(onBack: @escaping () -> Void) {
@@ -74,7 +75,7 @@ public struct ForegroundSchedulingView: View {
                 shadowRadius: 8,
                 shadowY: 2
             )
-            .help("返回 ActRealm 工作区")
+            .help(localized("返回 ActRealm 工作区", locale: locale))
 
             VStack(alignment: .leading, spacing: 4) {
                 Text("智能聚焦")
@@ -103,10 +104,20 @@ public struct ForegroundSchedulingView: View {
     }
 
     private var pageStatusText: String {
-        if !settings.isEnabled { return "当前：智能聚焦已关闭" }
-        if settings.workspaceApps.isEmpty { return "当前：待绑定桌面" }
-        if model.foregroundQueuedCount > 0 { return "当前：队列中 (model.foregroundQueuedCount) 项" }
-        return "当前：运行正常"
+        if !settings.isEnabled {
+            return localized("当前：智能聚焦已关闭", locale: locale)
+        }
+        if settings.workspaceApps.isEmpty {
+            return localized("当前：待绑定桌面", locale: locale)
+        }
+        if model.foregroundQueuedCount > 0 {
+            return localizedFormat(
+                "当前：队列中 %lld 项",
+                locale: locale,
+                Int64(model.foregroundQueuedCount)
+            )
+        }
+        return localized("当前：运行正常", locale: locale)
     }
 
     private var pageStatusColor: Color {
@@ -244,11 +255,14 @@ public struct ForegroundSchedulingView: View {
 
                         HStack {
                             Label(
-                                workspace.isPointerInsideSchedulingWorkspace
+                                localized(
+                                    workspace.isPointerInsideSchedulingWorkspace
                                     ? "鼠标已进入绑定工作区"
                                     : workspace.isSchedulingWorkspaceActive
                                         ? "绑定工作区可见，等待鼠标进入"
                                         : "当前位于其他工作区",
+                                    locale: locale
+                                ),
                                 systemImage: workspace.isPointerInsideSchedulingWorkspace
                                     ? "cursorarrow.motionlines.click"
                                     : "circle.dashed"
@@ -504,7 +518,7 @@ public struct ForegroundSchedulingView: View {
         case .remind: label = "提醒后聚焦"
         case .actRealmWorkspace: label = "仅进入 ActRealm"
         }
-        model.showToast("聚焦方式：\(label)")
+        model.showToast(localizedFormat("聚焦方式：%@", locale: locale, localized(label, locale: locale)))
     }
 
     private func binding<Value>(
@@ -562,10 +576,10 @@ private struct SchedulingToggleRow: View {
     var body: some View {
         HStack(spacing: 14) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(title)
+                Text(LocalizedStringKey(title))
                     .font(.system(size: 13.5, weight: .heavy))
                     .foregroundStyle(DT.textPrimary)
-                Text(detail)
+                Text(LocalizedStringKey(detail))
                     .font(DT.body(11))
                     .foregroundStyle(DT.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -579,6 +593,7 @@ private struct SchedulingToggleRow: View {
 }
 
 private struct SchedulingSwitch: View {
+    @Environment(\.locale) private var locale
     @Binding var isOn: Bool
 
     var body: some View {
@@ -599,7 +614,7 @@ private struct SchedulingSwitch: View {
         }
         .buttonStyle(.plain)
         .animation(.spring(response: 0.28, dampingFraction: 0.72), value: isOn)
-        .accessibilityValue(isOn ? "开启" : "关闭")
+        .accessibilityValue(localized(isOn ? "开启" : "关闭", locale: locale))
     }
 }
 
@@ -611,10 +626,10 @@ private struct AgentFocusEventToggle: View {
     var body: some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(title)
+                Text(LocalizedStringKey(title))
                     .font(.system(size: 12.5, weight: .bold))
                     .foregroundStyle(DT.textPrimary)
-                Text(detail)
+                Text(LocalizedStringKey(detail))
                     .font(DT.body(10.5))
                     .foregroundStyle(DT.textWeak)
             }
@@ -644,7 +659,7 @@ private struct RestoreTimingButton: View {
         Button(action: action) {
             HStack(spacing: 7) {
                 Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                Text(title)
+                Text(LocalizedStringKey(title))
                 if recommended {
                     Text("推荐")
                         .font(.system(size: 8.5, weight: .heavy))
@@ -677,7 +692,7 @@ private struct WorkspaceMetric<Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(title.uppercased())
+            Text(LocalizedStringKey(title.uppercased()))
                 .font(.system(size: 9.5, weight: .bold))
                 .kerning(0.5)
                 .foregroundStyle(DT.textWeak)
@@ -713,13 +728,14 @@ private struct WorkspaceAvailabilityValue: View {
                 .frame(width: 17, height: 17)
                 .background(available ? DT.greenBg : DT.amberBg, in: Circle())
                 .overlay(Circle().strokeBorder(available ? DT.greenStroke : DT.amberStroke, lineWidth: 1))
-            Text(available ? readyText : unavailableText)
+            Text(LocalizedStringKey(available ? readyText : unavailableText))
                 .foregroundStyle(available ? DT.textPrimary : DT.amberText)
         }
     }
 }
 
 private struct WorkspaceReadinessPill: View {
+    @Environment(\.locale) private var locale
     let status: ForegroundWorkspaceStatus
 
     var body: some View {
@@ -738,9 +754,13 @@ private struct WorkspaceReadinessPill: View {
     private var isReady: Bool { status.isActRealmWorkspaceReady && status.isAgentAvailable }
 
     private var label: String {
-        if !status.isActRealmWorkspaceReady { return "ActRealm 工作区尚未就位" }
-        if !status.isAgentAvailable { return "目标 Agent 当前未运行" }
-        return "智能聚焦已就绪"
+        if !status.isActRealmWorkspaceReady {
+            return localized("ActRealm 工作区尚未就位", locale: locale)
+        }
+        if !status.isAgentAvailable {
+            return localized("目标 Agent 当前未运行", locale: locale)
+        }
+        return localized("智能聚焦已就绪", locale: locale)
     }
 
     private var dotColor: Color {
@@ -790,12 +810,12 @@ private struct StrategyCard: View {
                 }
                 .frame(width: 19, height: 19)
 
-                Text(title)
+                Text(LocalizedStringKey(title))
                     .font(.system(size: 13.5, weight: .heavy))
                     .foregroundStyle(DT.textPrimary)
             }
 
-            Text(detail)
+            Text(LocalizedStringKey(detail))
                 .font(DT.body(11.5))
                 .foregroundStyle(DT.textSecondary)
                 .lineSpacing(2)
@@ -827,14 +847,13 @@ private struct StrategyCard: View {
             }
         }
         .padding(15)
-        .frame(maxWidth: .infinity, minHeight: selected && strategy == .remind ? 211 : 172, alignment: .topLeading)
+        .frame(maxWidth: .infinity, minHeight: 211, alignment: .topLeading)
         .background(cardBackground, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .strokeBorder(selected ? DT.logoTint.opacity(0.75) : DT.hairline, lineWidth: selected ? 1.5 : 1)
         )
         .shadow(color: selected ? DT.logoTint.opacity(0.2) : DT.softShadow, radius: selected ? 16 : 3, y: selected ? 8 : 1)
-        .offset(y: selected ? -2 : 0)
         .overlay(alignment: .topTrailing) {
             if recommended {
                 Text("推荐")
@@ -912,7 +931,7 @@ private struct TokenFlow: View {
     var body: some View {
         HStack(spacing: compact ? 4 : 7) {
             ForEach(Array(tokens.enumerated()), id: \.element.id) { index, token in
-                Text(token.text)
+                Text(LocalizedStringKey(token.text))
                     .font(.system(size: compact ? 9.2 : 11, weight: .bold))
                     .foregroundStyle(token.tone.text)
                     .padding(.horizontal, compact ? 7 : 11)
@@ -978,13 +997,18 @@ private struct FlowTrack: View {
 }
 
 private struct SecondsPicker: View {
+    @Environment(\.locale) private var locale
     let selected: Int
     let onSelect: (Int) -> Void
 
     var body: some View {
         HStack(spacing: 5) {
             ForEach([5, 10, 30], id: \.self) { seconds in
-                Button("\(seconds) 秒") {
+                Button(localizedFormat(
+                    "%lld 秒",
+                    locale: locale,
+                    Int64(seconds)
+                )) {
                     onSelect(seconds)
                 }
                 .buttonStyle(SecondsButtonStyle(selected: selected == seconds))
@@ -1106,7 +1130,7 @@ private struct AcceptanceRule: View {
                 .foregroundStyle(tone.text)
                 .frame(width: 18, height: 18)
                 .background(tone.background, in: Circle())
-            Text(text)
+            Text(LocalizedStringKey(text))
                 .font(DT.body(11))
                 .foregroundStyle(DT.textSecondary)
         }
@@ -1127,13 +1151,13 @@ private struct DesktopDiagram: View {
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
             VStack(alignment: .leading, spacing: 9) {
-                Text(title)
+                Text(LocalizedStringKey(title))
                     .font(.system(size: 9.5, weight: .heavy))
                     .kerning(0.3)
                     .foregroundStyle(selected ? DT.blueText : DT.textSecondary)
                 HStack(spacing: 7) {
                     ForEach(labels, id: \.self) { label in
-                        Text(label)
+                        Text(LocalizedStringKey(label))
                             .font(.system(size: 10, weight: label == "ActRealm 工作区" ? .bold : .semibold))
                             .foregroundStyle(label == "ActRealm 工作区" ? DT.blueText : DT.textSecondary)
                             .padding(.horizontal, 9)
@@ -1171,6 +1195,7 @@ private struct DesktopDiagram: View {
 // MARK: - Live rule preview
 
 private struct RulePreviewContent: View {
+    @Environment(\.locale) private var locale
     let settings: ForegroundSchedulingSettings
 
     var body: some View {
@@ -1217,7 +1242,11 @@ private struct RulePreviewContent: View {
                 .init(settings.allowsStageManager ? "记录系统状态" : "保持系统状态", tone: .amber),
                 .init("聚焦具体任务", tone: .blue),
                 .init(
-                    "等待鼠标进入 \(settings.acceptanceSeconds) 秒",
+                    localizedFormat(
+                        "等待鼠标进入 %lld 秒",
+                        locale: locale,
+                        Int64(settings.acceptanceSeconds)
+                    ),
                     tone: .green,
                     branch: settings.returnsToActRealmWorkspace ? "未接收 → 返回 ActRealm" : "未接收 → 保持 Agent 页面",
                     branchTone: settings.returnsToActRealmWorkspace ? .amber : .green
@@ -1226,10 +1255,23 @@ private struct RulePreviewContent: View {
         case .remind:
             return [
                 .init("允许触发的事件", tone: .neutral),
-                .init("HUD \(settings.reminderSeconds) 秒", tone: .amber, branch: "已解决或稍后处理 → 取消", branchTone: .amber),
+                .init(
+                    localizedFormat(
+                        "HUD %lld 秒",
+                        locale: locale,
+                        Int64(settings.reminderSeconds)
+                    ),
+                    tone: .amber,
+                    branch: "已解决或稍后处理 → 取消",
+                    branchTone: .amber
+                ),
                 .init("聚焦具体任务", tone: .blue),
                 .init(
-                    "等待鼠标进入 \(settings.acceptanceSeconds) 秒",
+                    localizedFormat(
+                        "等待鼠标进入 %lld 秒",
+                        locale: locale,
+                        Int64(settings.acceptanceSeconds)
+                    ),
                     tone: .green,
                     branch: settings.returnsToActRealmWorkspace ? "未接收 → 返回 ActRealm" : "未接收 → 保持 Agent 页面",
                     branchTone: settings.returnsToActRealmWorkspace ? .amber : .green
@@ -1246,21 +1288,43 @@ private struct RulePreviewContent: View {
 
     private var summary: String {
         guard settings.isEnabled else {
-            return "智能聚焦已关闭：事件照常进入 ActRealm，不显示聚焦倒计时，也不切换页面"
+            return localized(
+                "智能聚焦已关闭：事件照常进入 ActRealm，不显示聚焦倒计时，也不切换页面",
+                locale: locale
+            )
         }
         switch settings.strategy {
         case .immediate:
-            let ending = settings.returnsToActRealmWorkspace
-                ? "，\(settings.acceptanceSeconds) 秒内鼠标未进入绑定工作区则返回 ActRealm"
-                : "，不自动返回"
-            return "允许触发的事件会立即聚焦对应 Agent 的具体任务\(ending)"
+            if settings.returnsToActRealmWorkspace {
+                return localizedFormat(
+                    "允许触发的事件会立即聚焦对应 Agent 的具体任务，%lld 秒内鼠标未进入绑定工作区则返回 ActRealm",
+                    locale: locale,
+                    Int64(settings.acceptanceSeconds)
+                )
+            }
+            return localized(
+                "允许触发的事件会立即聚焦对应 Agent 的具体任务，不自动返回",
+                locale: locale
+            )
         case .remind:
-            let ending = settings.returnsToActRealmWorkspace
-                ? "；\(settings.acceptanceSeconds) 秒未接收则返回 ActRealm"
-                : ""
-            return "先显示 \(settings.reminderSeconds) 秒 HUD，可立即查看或稍后处理；倒计时后聚焦 Agent\(ending)"
+            if settings.returnsToActRealmWorkspace {
+                return localizedFormat(
+                    "先显示 %lld 秒 HUD，可立即查看或稍后处理；倒计时后聚焦 Agent；%lld 秒未接收则返回 ActRealm",
+                    locale: locale,
+                    Int64(settings.reminderSeconds),
+                    Int64(settings.acceptanceSeconds)
+                )
+            }
+            return localizedFormat(
+                "先显示 %lld 秒 HUD，可立即查看或稍后处理；倒计时后聚焦 Agent",
+                locale: locale,
+                Int64(settings.reminderSeconds)
+            )
         case .actRealmWorkspace:
-            return "事件只进入 ActRealm，不显示聚焦倒计时，也不自动切换页面"
+            return localized(
+                "事件只进入 ActRealm，不显示聚焦倒计时，也不自动切换页面",
+                locale: locale
+            )
         }
     }
 }
@@ -1284,7 +1348,7 @@ private struct PreviewStep: View {
 
     var body: some View {
         VStack(spacing: 5) {
-            Text(step.label)
+            Text(LocalizedStringKey(step.label))
                 .font(.system(size: 11, weight: .bold))
                 .foregroundStyle(step.tone.text)
                 .padding(.horizontal, 11)
@@ -1296,7 +1360,7 @@ private struct PreviewStep: View {
                 Image(systemName: "arrow.down")
                     .font(.system(size: 8, weight: .semibold))
                     .foregroundStyle(DT.textFaint)
-                Text(branch)
+                Text(LocalizedStringKey(branch))
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(step.branchTone.text)
                     .padding(.horizontal, 9)
