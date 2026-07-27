@@ -29,6 +29,23 @@ struct BootstrapParsingTests {
         #expect(redacted == "ActRealm control panel: http://127.0.0.1:54321/#bootstrap=<redacted>")
     }
 
+    @Test func nativeWebSocketUsesOneTimeTicketProtocolWithoutCredentialsInURL() throws {
+        let request = try #require(RuntimeClient.webSocketRequest(
+            baseURL: URL(string: "http://127.0.0.1:54321/")!,
+            cookie: "session-secret",
+            ticket: "one-time-ticket"
+        ))
+
+        #expect(request.url?.absoluteString == "ws://127.0.0.1:54321/api/v1/ws")
+        #expect(request.url?.query == nil)
+        #expect(request.value(forHTTPHeaderField: "Cookie") == "actrealm_session=session-secret")
+        #expect(request.value(forHTTPHeaderField: "Origin") == "http://127.0.0.1:54321")
+        #expect(
+            request.value(forHTTPHeaderField: "Sec-WebSocket-Protocol")
+                == "actrealm.one-time-ticket"
+        )
+    }
+
     @Test func parsesRuntimeLockOwnerPID() {
         #expect(RuntimeSupervisor.parseLockOwnerPID("27489\n") == 27489)
         #expect(RuntimeSupervisor.parseLockOwnerPID("  42  ") == 42)
@@ -85,6 +102,29 @@ struct BootstrapParsingTests {
             candidateOwnerID: 501,
             currentUserID: 501
         ))
+    }
+
+    @Test func asyncProcessRunnerDrainsLargePipesOffMainThreadAndRedactsDiagnostics() async {
+        let secret = "one-time-test-secret"
+        let program = """
+        BEGIN {
+          for (i = 0; i < 200000; i++) printf "x";
+          print "TAIL";
+          print "http://127.0.0.1/#bootstrap=(secret)" > "/dev/stderr";
+        }
+        """
+        let result = await RuntimeSupervisor.runProcess(
+            executable: "/usr/bin/awk",
+            arguments: [program],
+            retainedBytes: 64 * 1024
+        )
+
+        #expect(result.status == 0)
+        #expect(!result.executedOnMainThread)
+        #expect(result.stdout.utf8.count <= 64 * 1024)
+        #expect(result.stdout.hasSuffix("TAIL\n"))
+        #expect(!result.stderr.contains(secret))
+        #expect(result.stderr.contains("#bootstrap=<redacted>"))
     }
 
     @Test func packagedHelperWinsOverAuxiliaryExecutableLookup() throws {

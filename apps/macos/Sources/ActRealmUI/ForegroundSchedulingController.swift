@@ -17,14 +17,14 @@ public struct WorkspaceDisplayOption: Identifiable, Equatable, Sendable {
     public var label: String { isPrimary ? "\(name)（主显示器）" : name }
 }
 
-protocol StageManagerControlling {
-    func isEnabled() -> Bool?
-    @discardableResult func setEnabled(_ enabled: Bool) -> Bool
+@MainActor protocol StageManagerControlling {
+    func isEnabled() async -> Bool?
+    @discardableResult func setEnabled(_ enabled: Bool) async -> Bool
 }
 
 struct SystemStageManagerController: StageManagerControlling {
     typealias CommandResult = (status: Int32, output: String)
-    typealias CommandRunner = (_ executable: String, _ arguments: [String]) -> CommandResult
+    typealias CommandRunner = (_ executable: String, _ arguments: [String]) async -> CommandResult
 
     private let commandRunner: CommandRunner
 
@@ -32,8 +32,8 @@ struct SystemStageManagerController: StageManagerControlling {
         self.commandRunner = commandRunner
     }
 
-    func isEnabled() -> Bool? {
-        let result = commandRunner("/usr/bin/defaults", [
+    func isEnabled() async -> Bool? {
+        let result = await commandRunner("/usr/bin/defaults", [
             "read", "com.apple.WindowManager", "GloballyEnabled",
         ])
         guard result.status == 0 else { return nil }
@@ -45,8 +45,8 @@ struct SystemStageManagerController: StageManagerControlling {
     }
 
     @discardableResult
-    func setEnabled(_ enabled: Bool) -> Bool {
-        let write = commandRunner("/usr/bin/defaults", [
+    func setEnabled(_ enabled: Bool) async -> Bool {
+        let write = await commandRunner("/usr/bin/defaults", [
             "write", "com.apple.WindowManager", "GloballyEnabled", "-bool",
             enabled ? "true" : "false",
         ])
@@ -54,24 +54,15 @@ struct SystemStageManagerController: StageManagerControlling {
         // WindowManager observes this preference on supported macOS versions.
         // Do not terminate or relaunch it: that causes a visible desktop flash
         // and can disturb the user's current windows and Spaces.
-        return isEnabled() == enabled
+        return await isEnabled() == enabled
     }
 
-    private static func run(_ executable: String, _ arguments: [String]) -> CommandResult {
-        let process = Process()
-        let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        process.standardOutput = pipe
-        process.standardError = pipe
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            return (-1, "")
-        }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+    private static func run(_ executable: String, _ arguments: [String]) async -> CommandResult {
+        let result = await RuntimeSupervisor.runProcess(
+            executable: executable,
+            arguments: arguments
+        )
+        return (result.status, result.stdout + result.stderr)
     }
 }
 
@@ -79,9 +70,10 @@ enum StageManagerRestoreTrigger: Equatable {
     case acceptance
     case actRealmReturn
     case focusDisabled
+    case relaunch
 }
 
-struct StageManagerLease: Equatable {
+struct StageManagerLease: Codable, Equatable {
     private(set) var didEnableStageManager = false
     private(set) var restoreTiming: StageManagerRestoreTiming = .onReturnToActRealm
 
@@ -98,6 +90,7 @@ struct StageManagerLease: Equatable {
 
     func shouldRestore(for trigger: StageManagerRestoreTrigger) -> Bool {
         guard didEnableStageManager else { return false }
+        if trigger == .relaunch { return restoreTiming != .keepEnabled }
         switch restoreTiming {
         case .afterAcceptance: return trigger == .acceptance || trigger == .focusDisabled
         case .onReturnToActRealm: return trigger == .actRealmReturn || trigger == .focusDisabled
@@ -131,6 +124,7 @@ enum ForegroundWorkspacePresence {
 /// state that this focus session changed. ActRealmKit owns policy and timers.
 @MainActor
 public final class ForegroundSchedulingController: ObservableObject {
+    private static let stageManagerLeaseKey = "actrealm.stage-manager-lease.v1"
     @Published private(set) var visibleWorkspaceApps: [ForegroundWorkspaceApp] = []
     @Published private(set) var availableWorkspaceDisplays: [WorkspaceDisplayOption] = []
     @Published private(set) var selectedWorkspaceDisplayID: UInt32?
@@ -145,15 +139,23 @@ public final class ForegroundSchedulingController: ObservableObject {
     private var dispatchObservationTask: Task<Void, Never>?
     private var openingTask: Task<Void, Never>?
     private let stageManagerController: any StageManagerControlling
-    private var stageManagerLease = StageManagerLease()
+    private let stageManagerDefaults: UserDefaults
+    private var stageManagerLease: StageManagerLease
+    private var stageManagerTransitionInFlight = false
 
     public convenience init(model: AppModel) {
         self.init(model: model, stageManagerController: SystemStageManagerController())
     }
 
-    init(model: AppModel, stageManagerController: any StageManagerControlling) {
+    init(
+        model: AppModel,
+        stageManagerController: any StageManagerControlling,
+        stageManagerDefaults: UserDefaults = .standard
+    ) {
         self.model = model
         self.stageManagerController = stageManagerController
+        self.stageManagerDefaults = stageManagerDefaults
+        self.stageManagerLease = Self.loadStageManagerLease(from: stageManagerDefaults)
 
         model.$foregroundDispatch
             .receive(on: RunLoop.main)
@@ -188,7 +190,9 @@ public final class ForegroundSchedulingController: ObservableObject {
                         as? NSRunningApplication,
                       application.bundleIdentifier == Bundle.main.bundleIdentifier
                 else { return }
-                self.restoreStageManagerIfNeeded(for: .actRealmReturn)
+                Task { @MainActor [weak self] in
+                    await self?.restoreStageManagerIfNeeded(for: .actRealmReturn)
+                }
             }
             .store(in: &cancellables)
 
@@ -211,6 +215,13 @@ public final class ForegroundSchedulingController: ObservableObject {
             await Task.yield()
             self?.refreshWorkspaceDisplays()
             self?.refreshWorkspaceStatus()
+            guard let self else { return }
+            if self.stageManagerLease.restoreTiming == .keepEnabled {
+                self.stageManagerLease.finishRestore(succeeded: true)
+                self.persistStageManagerLease()
+            } else {
+                await self.restoreStageManagerIfNeeded(for: .relaunch)
+            }
         }
     }
 
@@ -225,10 +236,13 @@ public final class ForegroundSchedulingController: ObservableObject {
             dispatchObservationTask?.cancel()
             openingTask?.cancel()
             if !model.foregroundScheduling.isEnabled {
-                restoreStageManagerIfNeeded(for: .focusDisabled)
+                Task { @MainActor [weak self] in
+                    await self?.restoreStageManagerIfNeeded(for: .focusDisabled)
+                }
             }
             if stageManagerLease.restoreTiming == .keepEnabled {
                 stageManagerLease.finishRestore(succeeded: true)
+                persistStageManagerLease()
             }
             lastHandledID = nil
             lastHandledPhase = nil
@@ -257,15 +271,17 @@ public final class ForegroundSchedulingController: ObservableObject {
             }
         case .returnedToActRealmWorkspace:
             activateActRealmWorkspace()
-            restoreStageManagerIfNeeded(for: .actRealmReturn)
+            Task { @MainActor [weak self] in
+                await self?.restoreStageManagerIfNeeded(for: .actRealmReturn)
+            }
         }
     }
 
     private func beginOpening(_ dispatch: ForegroundDispatchState) {
-        prepareStageManagerIfNeeded()
         openingTask?.cancel()
         openingTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            await self.prepareStageManagerIfNeeded()
             let openedSpecificTask = await self.model.focusSpecificTask(attentionID: dispatch.id)
             guard !Task.isCancelled,
                   self.model.foregroundDispatch?.id == dispatch.id,
@@ -323,11 +339,15 @@ public final class ForegroundSchedulingController: ObservableObject {
         }
         switch dispatch.phase {
         case .reminding, .opening:
-            restoreStageManagerIfNeeded(for: .acceptance)
+            Task { @MainActor [weak self] in
+                await self?.restoreStageManagerIfNeeded(for: .acceptance)
+            }
             model.acceptForegroundInPlace()
             return true
         case .awaitingWorkspace:
-            restoreStageManagerIfNeeded(for: .acceptance)
+            Task { @MainActor [weak self] in
+                await self?.restoreStageManagerIfNeeded(for: .acceptance)
+            }
             model.acceptForegroundWorkspace()
             return true
         case .returnedToActRealmWorkspace:
@@ -405,18 +425,27 @@ public final class ForegroundSchedulingController: ObservableObject {
         }
     }
 
-    private func prepareStageManagerIfNeeded() {
+    private func prepareStageManagerIfNeeded() async {
         guard !stageManagerLease.didEnableStageManager,
-              model.foregroundScheduling.allowsStageManager
+              model.foregroundScheduling.allowsStageManager,
+              !stageManagerTransitionInFlight
         else { return }
-        let originalState = stageManagerController.isEnabled()
-        let enabled = originalState == false && stageManagerController.setEnabled(true)
+        stageManagerTransitionInFlight = true
+        defer { stageManagerTransitionInFlight = false }
+        let originalState = await stageManagerController.isEnabled()
+        let enabled: Bool
+        if originalState == false {
+            enabled = await stageManagerController.setEnabled(true)
+        } else {
+            enabled = false
+        }
         stageManagerLease.begin(
             allowed: true,
             restoreTiming: model.foregroundScheduling.stageManagerRestoreTiming,
             originalState: originalState,
             enableSucceeded: enabled
         )
+        persistStageManagerLease()
         if originalState == nil || (originalState == false && !enabled) {
             model.showToast(AppLocalization.localized(
                 "无法更改 macOS 台前调度；仍继续聚焦 Agent",
@@ -425,16 +454,36 @@ public final class ForegroundSchedulingController: ObservableObject {
         }
     }
 
-    private func restoreStageManagerIfNeeded(for trigger: StageManagerRestoreTrigger) {
-        guard stageManagerLease.shouldRestore(for: trigger) else { return }
-        let restored = stageManagerController.setEnabled(false)
+    private func restoreStageManagerIfNeeded(for trigger: StageManagerRestoreTrigger) async {
+        guard stageManagerLease.shouldRestore(for: trigger), !stageManagerTransitionInFlight else { return }
+        stageManagerTransitionInFlight = true
+        defer { stageManagerTransitionInFlight = false }
+        let restored = await stageManagerController.setEnabled(false)
         stageManagerLease.finishRestore(succeeded: restored)
+        persistStageManagerLease()
         if !restored {
             model.showToast(AppLocalization.localized(
                 "无法恢复台前调度进入前状态，请在控制中心检查",
                 language: model.appLanguage
             ))
         }
+    }
+
+    private static func loadStageManagerLease(from defaults: UserDefaults) -> StageManagerLease {
+        guard let data = defaults.data(forKey: stageManagerLeaseKey),
+              let lease = try? JSONDecoder().decode(StageManagerLease.self, from: data)
+        else { return StageManagerLease() }
+        return lease
+    }
+
+    private func persistStageManagerLease() {
+        guard stageManagerLease.didEnableStageManager,
+              let data = try? JSONEncoder().encode(stageManagerLease)
+        else {
+            stageManagerDefaults.removeObject(forKey: Self.stageManagerLeaseKey)
+            return
+        }
+        stageManagerDefaults.set(data, forKey: Self.stageManagerLeaseKey)
     }
 
     private func presentWorkspaceSelection() {

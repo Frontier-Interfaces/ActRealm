@@ -177,7 +177,11 @@ private struct TaskRow: View {
                 Chip(text: badge, tone: .forStatus(task.status), fontSize: 9.5)
                 Spacer(minLength: 5)
                 if fieldVisible("activity") {
-                    Text(rightStatus)
+                    TaskRelativeStatusLabel(
+                        task: task,
+                        language: model.appLanguage,
+                        locale: locale
+                    )
                         .font(.system(size: 10.5, weight: .semibold))
                         .foregroundStyle(rightColor)
                         .multilineTextAlignment(.trailing)
@@ -507,13 +511,13 @@ private struct TaskRow: View {
             : String(format: "$%.2f", dollars)
     }
     private var recoveryText: String {
-        let key = switch task.session.recoveryState {
-        case "controllable": "已重新连接，可控制"
-        case "observing": "仍在运行，仅可观察"
-        case "waiting_for_event": "历史已恢复，等待新事件"
-        case "lost_control": "已失去控制"
-        case "ended": "已结束"
-        default: "等待确认状态"
+        let key = switch task.recoveryPresentation {
+        case .controllable: "已重新连接，可控制"
+        case .observing: "仍在运行，仅可观察"
+        case .waitingForEvent: "历史已恢复，等待新事件"
+        case .lostControl: "已失去控制"
+        case .ended: "已结束"
+        case .unknown: "等待确认状态"
         }
         return localized(key, locale: locale)
     }
@@ -575,7 +579,10 @@ private struct TaskRow: View {
             }
         }
         if fieldVisible("cost") { items.append(("估算 API 价格", estimatedCostText, false)) }
-        if fieldVisible("tool") { items.append(("当前工具", task.session.currentTool ?? "—", false)) }
+        if fieldVisible("tool"),
+           let tool = task.detailRows.first(where: { $0.field == "tool" })?.value {
+            items.append(("当前工具", tool, false))
+        }
         if fieldVisible("permissionMode") { items.append(("权限模式", task.session.permissionMode ?? "—", false)) }
         if fieldVisible("subagents") { items.append(("运行中的子 Agent", "\(task.session.activeSubagents ?? 0)", false)) }
         if fieldVisible("recovery") { items.append(("恢复状态", recoveryText, false)) }
@@ -611,90 +618,18 @@ private struct TaskRow: View {
         }
         return localized(key, locale: locale)
     }
-    private var rightStatus: String {
-        switch task.status {
-        case .waiting:
-            let since = task.oldestOpenOutboxAt ?? task.activitySince ?? task.lastEventAt
-            let verb: String
-            switch task.primaryAttentionKind {
-            case .approval: verb = "等待批准"
-            case .nativeApproval: verb = "原界面请求"
-            case .question: verb = "等待回答"
-            case .completion: verb = "等待确认"
-            case .error: verb = "需要处理"
-            case nil: verb = task.session.execState == "awaiting_approval" ? "等待批准" : "等待处理"
-            }
-            return localizedFormat(
-                "%@ · 已等 %@",
-                locale: locale,
-                localized(verb, locale: locale),
-                ZhFormat.waitDuration(
-                    model.now.timeIntervalSince(since),
-                    language: model.appLanguage
-                )
-            )
-        case .running:
-            let activity = task.localizedActivity(language: model.appLanguage)
-                ?? localized("运行中", locale: locale)
-            return "\(activity) · \(turnTiming)"
-        case .failed:
-            return localizedFormat(
-                "运行失败 · %@",
-                locale: locale,
-                ZhFormat.relativeAgo(
-                    model.now.timeIntervalSince(task.lastEventAt),
-                    language: model.appLanguage
-                )
-            )
-        case .done:
-            return localizedFormat(
-                "本轮已完成 · %@",
-                locale: locale,
-                ZhFormat.relativeAgo(
-                    model.now.timeIntervalSince(task.lastEventAt),
-                    language: model.appLanguage
-                )
-            )
-        case .idle:
-            return localizedFormat(
-                "最近活动 · %@",
-                locale: locale,
-                ZhFormat.relativeAgo(
-                    model.now.timeIntervalSince(task.lastEventAt),
-                    language: model.appLanguage
-                )
-            )
-        }
-    }
-    private var turnTiming: String {
-        let started = task.turnStartedAt ?? task.activitySince ?? task.lastEventAt
-        let ended = task.turnEndedAt ?? model.now
-        let total = ZhFormat.waitDuration(
-            max(0, ended.timeIntervalSince(started)),
-            language: model.appLanguage
-        )
-        if task.turnEndedAt == nil,
-           let phase = task.activitySince,
-           phase > started {
-            return localizedFormat(
-                "本轮 %@ · 当前阶段 %@",
-                locale: locale,
-                total,
-                ZhFormat.waitDuration(
-                    max(0, model.now.timeIntervalSince(phase)),
-                    language: model.appLanguage
-                )
-            )
-        }
-        return localizedFormat("本轮 %@", locale: locale, total)
-    }
     private var rightColor: Color {
         switch task.status {
-        case .waiting: DT.amberText
-        case .running: DT.blueText
-        case .failed: DT.redText
-        case .done: DT.textSecondary
-        case .idle: DT.textWeak
+        case .waiting:
+            return DT.amberText
+        case .running:
+            return DT.blueText
+        case .failed:
+            return DT.redText
+        case .done:
+            return DT.textSecondary
+        case .idle:
+            return DT.textWeak
         }
     }
     private var titleColor: Color {
@@ -720,6 +655,85 @@ private struct TaskRow: View {
         case .failed: return DT.redStroke
         case .done, .idle: return DT.hairlineSoft
         }
+    }
+}
+
+/// Only the visible relative-time label owns a clock. Task-card facts stay
+/// stable while elapsed text advances, including when ActRealm is visible but
+/// another app has focus.
+private struct TaskRelativeStatusLabel: View {
+    let task: LaneTask
+    let language: AppLanguage
+    let locale: Locale
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { timeline in
+            Text(statusText(now: timeline.date))
+        }
+    }
+
+    private func statusText(now: Date) -> String {
+        switch task.status {
+        case .waiting:
+            let since = task.oldestOpenOutboxAt ?? task.activitySince ?? task.lastEventAt
+            let verb: String
+            switch task.primaryAttentionKind {
+            case .approval: verb = "等待批准"
+            case .nativeApproval: verb = "原界面请求"
+            case .question: verb = "等待回答"
+            case .completion: verb = "等待确认"
+            case .error: verb = "需要处理"
+            case nil: verb = task.session.execState == "awaiting_approval" ? "等待批准" : "等待处理"
+            }
+            return localizedFormat(
+                "%@ · 已等 %@",
+                locale: locale,
+                localized(verb, locale: locale),
+                ZhFormat.waitDuration(now.timeIntervalSince(since), language: language)
+            )
+        case .running:
+            let activity = task.localizedActivity(language: language)
+                ?? localized(task.activityLabel, locale: locale)
+            return "\(activity) · \(turnTiming(now: now))"
+        case .failed:
+            return localizedFormat(
+                "运行失败 · %@",
+                locale: locale,
+                ZhFormat.relativeAgo(now.timeIntervalSince(task.lastEventAt), language: language)
+            )
+        case .done:
+            return localizedFormat(
+                "本轮已完成 · %@",
+                locale: locale,
+                ZhFormat.relativeAgo(now.timeIntervalSince(task.lastEventAt), language: language)
+            )
+        case .idle:
+            return localizedFormat(
+                "最近活动 · %@",
+                locale: locale,
+                ZhFormat.relativeAgo(now.timeIntervalSince(task.lastEventAt), language: language)
+            )
+        }
+    }
+
+    private func turnTiming(now: Date) -> String {
+        let started = task.turnStartedAt ?? task.activitySince ?? task.lastEventAt
+        let ended = task.turnEndedAt ?? now
+        let total = ZhFormat.waitDuration(
+            max(0, ended.timeIntervalSince(started)),
+            language: language
+        )
+        if task.turnEndedAt == nil,
+           let phase = task.activitySince,
+           phase > started {
+            return localizedFormat(
+                "本轮 %@ · 当前阶段 %@",
+                locale: locale,
+                total,
+                ZhFormat.waitDuration(max(0, now.timeIntervalSince(phase)), language: language)
+            )
+        }
+        return localizedFormat("本轮 %@", locale: locale, total)
     }
 }
 

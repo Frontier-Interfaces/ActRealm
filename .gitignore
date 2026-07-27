@@ -13,3 +13,8 @@
 /.vscode/
 **/.DS_Store
 *.log
+
+# Raw local test evidence can contain paths, process data, prompts, or machine identifiers.
+/docs/reports/evidence/**
+!/docs/reports/evidence/**/
+!/docs/reports/evidence/**/00-evidence-index.txt

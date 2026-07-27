@@ -14,11 +14,13 @@ use actrealm_runtime::{
 use actrealm_usage::{UsageCollector, UsagePaths, UsageRecord};
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE, HOST, ORIGIN, SET_COOKIE,
+    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE, HOST, ORIGIN, SEC_WEBSOCKET_PROTOCOL,
+    SET_COOKIE,
 };
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -33,6 +35,8 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path as FilePath, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::Barrier;
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -44,6 +48,9 @@ use crate::status_messages;
 
 const SESSION_COOKIE: &str = "actrealm_session";
 const CSRF_HEADER: &str = "x-actrealm-csrf";
+const WS_PROTOCOL_PREFIX: &str = "actrealm.";
+const WS_TICKET_TTL: Duration = Duration::from_secs(10);
+const MAX_WS_TICKETS: usize = 16;
 const SETTINGS_KEY: &str = "ui_settings";
 const MANAGED_CODEX_THREADS_KEY: &str = "managed_codex_threads";
 const MAX_MANAGED_CODEX_THREADS: usize = 32;
@@ -75,8 +82,10 @@ const TASK_CARD_DISPLAY_FIELDS: &[&str] = &[
 ];
 const SESSION_LIST_RETENTION_MS: u64 = 30 * 60 * 1_000;
 const USAGE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const USAGE_FAILURE_BACKOFF: Duration = Duration::from_millis(100);
 const INDEX_HTML: &str = include_str!("../../../web/index.html");
 const APP_CSS: &str = include_str!("../../../web/app.css");
+const I18N_JS: &str = include_str!("../../../web/i18n.js");
 const APP_JS: &str = include_str!("../../../web/app.js");
 const CLAUDE_ICON: &[u8] = include_bytes!("../../../web/assets/claude.png");
 const CODEX_ICON: &[u8] = include_bytes!("../../../web/assets/codex.png");
@@ -105,10 +114,8 @@ impl Default for ApiServerConfig {
             runtime_started_at: now_millis(),
             restart_count: 0,
             commit_delay: Duration::from_secs(3),
-            // Runtime mutations invalidate the shared snapshot cache
-            // immediately, so the 100 ms transport cadence keeps the
-            // event-to-UI p95 gate while unchanged large histories are read
-            // from the writer-thread cache instead of querying SQLite 10x/s.
+            // The Runtime projects only recent or actionable sessions in SQL,
+            // so the 100 ms transport cadence never materializes long history.
             snapshot_interval: Duration::from_millis(100),
             heartbeat_interval: Duration::from_secs(10),
             quota_poll_interval: Duration::from_secs(60),
@@ -174,6 +181,8 @@ pub enum ApiServerError {
     Thread(String),
     #[error("setup service failed: {0}")]
     Setup(String),
+    #[error("secure random generator unavailable")]
+    SecureRandom,
 }
 
 pub struct ApiServer {
@@ -182,6 +191,8 @@ pub struct ApiServer {
     shutdown: Option<oneshot::Sender<()>>,
     shutdown_flag: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
+    usage_thread: Option<thread::JoinHandle<()>>,
+    usage_worker_failures: Arc<AtomicUsize>,
 }
 
 impl ApiServer {
@@ -199,10 +210,10 @@ impl ApiServer {
                 "ActRealm API must bind to loopback",
             )));
         }
-        let bootstrap_token = config
-            .bootstrap_token
-            .clone()
-            .unwrap_or_else(|| Uuid::now_v7().to_string());
+        let bootstrap_token = match config.bootstrap_token.clone() {
+            Some(token) => token,
+            None => generate_secret().map_err(|_| ApiServerError::SecureRandom)?,
+        };
         let instance_id = Uuid::now_v7().to_string();
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let websocket_connections = Arc::new(AtomicUsize::new(0));
@@ -251,6 +262,7 @@ impl ApiServer {
                 bootstrap_token: Some(bootstrap_token.clone()),
                 session_token: None,
                 csrf_token: None,
+                websocket_tickets: Vec::new(),
             })),
             expected_host: address.to_string(),
             expected_origin: format!("http://{address}"),
@@ -277,11 +289,16 @@ impl ApiServer {
                 collector: UsageCollector::new(usage_paths),
                 refreshed_at: None,
             })),
+            usage_worker_failures: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            usage_test_control: None,
             data_paths,
             codex,
             runtime_restart: config.runtime_restart,
         };
         let quota_scheduler_state = state.clone();
+        let usage_scheduler_state = state.clone();
+        let usage_worker_failures = state.usage_worker_failures.clone();
         let router = router(state);
         let (shutdown, shutdown_receiver) = oneshot::channel();
         let api_thread = thread::Builder::new()
@@ -306,12 +323,26 @@ impl ApiServer {
                 });
             })
             .map_err(|error| ApiServerError::Thread(error.to_string()))?;
+        let usage_thread = match thread::Builder::new()
+            .name("actrealm-usage".to_owned())
+            .spawn(move || usage_refresh_loop(usage_scheduler_state))
+        {
+            Ok(thread) => thread,
+            Err(error) => {
+                shutdown_flag.store(true, Ordering::Release);
+                let _ = shutdown.send(());
+                let _ = api_thread.join();
+                return Err(ApiServerError::Thread(error.to_string()));
+            }
+        };
         Ok(Self {
             address,
             bootstrap_token,
             shutdown: Some(shutdown),
             shutdown_flag,
             thread: Some(api_thread),
+            usage_thread: Some(usage_thread),
+            usage_worker_failures,
         })
     }
 
@@ -330,6 +361,11 @@ impl ApiServer {
     pub fn bootstrap_url(&self) -> String {
         format!("{}/#bootstrap={}", self.origin(), self.bootstrap_token)
     }
+
+    /// Counts local usage worker failures without exposing provider content.
+    pub fn usage_worker_failure_count(&self) -> usize {
+        self.usage_worker_failures.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for ApiServer {
@@ -339,6 +375,9 @@ impl Drop for ApiServer {
             let _ = shutdown.send(());
         }
         if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.usage_thread.take() {
             let _ = thread.join();
         }
     }
@@ -365,9 +404,97 @@ struct AppState {
     installer: Arc<Installer>,
     quota: Arc<Mutex<QuotaState>>,
     usage: Arc<Mutex<UsageState>>,
+    usage_worker_failures: Arc<AtomicUsize>,
+    #[cfg(test)]
+    usage_test_control: Option<UsageRefreshTestControl>,
     data_paths: DataPaths,
     codex: CodexManager,
     runtime_restart: Option<RuntimeRestartHandle>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct UsageRefreshTestControl {
+    action: Arc<Mutex<Option<UsageRefreshTestAction>>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+enum UsageRefreshTestAction {
+    Panic {
+        used: Arc<AtomicBool>,
+    },
+    Block {
+        started: Arc<Barrier>,
+        release: Arc<Barrier>,
+        used: Arc<AtomicBool>,
+    },
+}
+
+#[cfg(test)]
+impl UsageRefreshTestControl {
+    fn panic_once() -> Self {
+        Self {
+            action: Arc::new(Mutex::new(Some(UsageRefreshTestAction::Panic {
+                used: Arc::new(AtomicBool::new(false)),
+            }))),
+        }
+    }
+
+    fn block_once() -> Self {
+        Self {
+            action: Arc::new(Mutex::new(Some(UsageRefreshTestAction::Block {
+                started: Arc::new(Barrier::new(2)),
+                release: Arc::new(Barrier::new(2)),
+                used: Arc::new(AtomicBool::new(false)),
+            }))),
+        }
+    }
+
+    fn wait_until_collecting(&self) {
+        let action = self
+            .action
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(UsageRefreshTestAction::Block { started, .. }) = action {
+            started.wait();
+        }
+    }
+
+    fn release_collection(&self) {
+        let action = self
+            .action
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(UsageRefreshTestAction::Block { release, .. }) = action {
+            release.wait();
+        }
+    }
+
+    fn before_collect(&self) {
+        let action = self
+            .action
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        match action {
+            Some(UsageRefreshTestAction::Panic { used }) if !used.swap(true, Ordering::AcqRel) => {
+                panic!("usage refresh test panic");
+            }
+            Some(UsageRefreshTestAction::Block {
+                started,
+                release,
+                used,
+            }) if !used.swap(true, Ordering::AcqRel) => {
+                started.wait();
+                release.wait();
+            }
+            None => {}
+            _ => {}
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -416,6 +543,7 @@ struct AuthState {
     bootstrap_token: Option<String>,
     session_token: Option<String>,
     csrf_token: Option<String>,
+    websocket_tickets: Vec<(String, Instant)>,
 }
 
 impl CodexManager {
@@ -630,7 +758,7 @@ impl CodexManager {
             };
             return ("managed".to_owned(), recovery.to_owned(), false, status);
         }
-        let ended = matches!(exec_state, "idle" | "response_finished" | "failed");
+        let ended = terminal_execution_state(exec_state);
         (
             "external_hook".to_owned(),
             if ended { "ended" } else { "observing" }.to_owned(),
@@ -638,6 +766,20 @@ impl CodexManager {
             status,
         )
     }
+}
+
+fn terminal_execution_state(exec_state: &str) -> bool {
+    matches!(exec_state, "idle" | "response_finished" | "failed")
+}
+
+fn recovery_for_execution(exec_state: &str, recovery: String) -> String {
+    if !terminal_execution_state(exec_state) && recovery == "ended" {
+        // A connector snapshot can be stale or omit a currently executing
+        // turn. Execution remains Runtime-owned truth, so recovery must wait
+        // for another Provider event instead of declaring the work ended.
+        return "waiting_for_event".to_owned();
+    }
+    recovery
 }
 
 fn spawn_codex_handlers(
@@ -1369,6 +1511,7 @@ fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/app.css", get(styles))
+        .route("/i18n.js", get(i18n_script))
         .route("/app.js", get(script))
         .route("/assets/claude.png", get(claude_icon))
         .route("/assets/codex.png", get(codex_icon))
@@ -1386,14 +1529,49 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/metrics", post(record_metric))
         .route("/api/v1/metrics/export", get(export_metrics))
         .route("/api/v1/data/clear", post(clear_data))
+        .route("/api/v1/backups/clear", post(clear_backups))
         .route("/api/v1/commands", post(command))
         .route("/api/v1/questions/{id}/answer", post(answer_question))
         .route("/api/v1/commands/{id}/undo", post(undo))
         .route("/api/v1/sessions/{id}/jump", post(jump_session))
         .route("/api/v1/sessions/{id}/manage", post(manage_session))
+        .route("/api/v1/ws-ticket", post(issue_websocket_ticket))
         .route("/api/v1/ws", get(websocket))
         .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(middleware::map_response(security_headers))
         .with_state(state)
+}
+
+async fn security_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(
+            "default-src 'self'; connect-src 'self' ws://127.0.0.1:* ws://[::1]:*; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'",
+        ),
+    );
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+    );
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    response
 }
 
 async fn index() -> Response {
@@ -1402,6 +1580,10 @@ async fn index() -> Response {
 
 async fn styles() -> Response {
     static_response("text/css; charset=utf-8", APP_CSS)
+}
+
+async fn i18n_script() -> Response {
+    static_response("text/javascript; charset=utf-8", I18N_JS)
 }
 
 async fn script() -> Response {
@@ -1773,14 +1955,23 @@ async fn bootstrap(
     let Ok(mut auth) = state.auth.lock() else {
         return api_error(StatusCode::INTERNAL_SERVER_ERROR, "AUTH_UNAVAILABLE");
     };
-    if auth.bootstrap_token.as_deref() != Some(request.token.as_str()) {
+    if !auth
+        .bootstrap_token
+        .as_deref()
+        .is_some_and(|token| constant_time_eq(token, &request.token))
+    {
         return api_error(StatusCode::UNAUTHORIZED, "INVALID_BOOTSTRAP");
     }
+    let Ok(session_token) = generate_secret() else {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "AUTH_UNAVAILABLE");
+    };
+    let Ok(csrf_token) = generate_secret() else {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "AUTH_UNAVAILABLE");
+    };
     auth.bootstrap_token = None;
-    let session_token = Uuid::now_v7().to_string();
-    let csrf_token = Uuid::now_v7().to_string();
     auth.session_token = Some(session_token.clone());
     auth.csrf_token = Some(csrf_token.clone());
+    auth.websocket_tickets.clear();
     let cookie = format!("{SESSION_COOKIE}={session_token}; HttpOnly; SameSite=Strict; Path=/");
     let mut response = Json(BootstrapResponse { csrf_token }).into_response();
     if let Ok(cookie) = HeaderValue::from_str(&cookie) {
@@ -2252,6 +2443,10 @@ fn settings_value(state: &AppState) -> Result<Value, String> {
         .installer
         .inspect_claude_statusline()
         .map_err(|error| error.to_string())?;
+    let backups = state
+        .installer
+        .backup_summary()
+        .map_err(|error| error.to_string())?;
     Ok(json!({
         "settings": settings,
         "displayCatalog": [
@@ -2285,7 +2480,8 @@ fn settings_value(state: &AppState) -> Result<Value, String> {
             "configPath": bridge.config_path,
             "helperPath": bridge.helper_path,
             "customConflict": bridge.status == ClaudeStatuslineStatus::CustomConflict,
-        }
+        },
+        "backups": backups
     }))
 }
 
@@ -2425,6 +2621,44 @@ async fn record_metric(
 #[derive(Debug, Deserialize)]
 struct ClearDataRequest {
     confirmation: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClearBackupsRequest {
+    confirmation: String,
+}
+
+async fn clear_backups(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ClearBackupsRequest>,
+) -> Response {
+    if !authorized_mutation(&state, &headers) {
+        return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_MUTATION");
+    }
+    if request.confirmation != "DELETE BACKUPS" {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "BACKUP_DELETE_CONFIRMATION_REQUIRED",
+        );
+    }
+    match state.installer.clear_backups() {
+        Ok(report) => Json(json!({
+            "removedCount": report.removed_count,
+            "removedBytes": report.removed_bytes,
+            "backups": {
+                "count": 0,
+                "totalBytes": 0
+            }
+        }))
+        .into_response(),
+        Err(error) => api_error_detail(
+            StatusCode::CONFLICT,
+            "BACKUP_CLEAR_FAILED",
+            &error.to_string(),
+        ),
+    }
 }
 
 async fn clear_data(
@@ -2937,24 +3171,57 @@ async fn undo(
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct WebSocketQuery {
-    csrf: String,
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebSocketTicketResponse {
+    ticket: String,
+    expires_in_ms: u64,
+}
+
+async fn issue_websocket_ticket(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized_mutation(&state, &headers) {
+        return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_MUTATION");
+    }
+    let Ok(ticket) = generate_secret() else {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "AUTH_UNAVAILABLE");
+    };
+    let Ok(mut auth) = state.auth.lock() else {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "AUTH_UNAVAILABLE");
+    };
+    let now = Instant::now();
+    auth.websocket_tickets
+        .retain(|(_, expires_at)| *expires_at > now);
+    if auth.websocket_tickets.len() >= MAX_WS_TICKETS {
+        auth.websocket_tickets.remove(0);
+    }
+    auth.websocket_tickets
+        .push((ticket.clone(), now + WS_TICKET_TTL));
+    Json(WebSocketTicketResponse {
+        ticket,
+        expires_in_ms: WS_TICKET_TTL.as_millis() as u64,
+    })
+    .into_response()
 }
 
 async fn websocket(
     State(state): State<AppState>,
-    Query(query): Query<WebSocketQuery>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    let Some(protocol) = websocket_protocol(&headers) else {
+        return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_WEBSOCKET");
+    };
+    let Some(ticket) = protocol.strip_prefix(WS_PROTOCOL_PREFIX) else {
+        return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_WEBSOCKET");
+    };
     if !authorized(&state, &headers)
         || !valid_same_origin(&state, &headers)
-        || !valid_csrf_value(&state, &query.csrf)
+        || !consume_websocket_ticket(&state, ticket)
     {
         return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_WEBSOCKET");
     }
     upgrade
+        .protocols([protocol])
         .on_upgrade(move |socket| websocket_loop(socket, state))
         .into_response()
 }
@@ -3014,23 +3281,9 @@ async fn websocket_loop(mut socket: WebSocket, state: AppState) {
 fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
     let now = now_millis();
     state.codex.retry_unsynced_native_approvals();
-    refresh_session_usage(state, now)?;
-    let mut snapshot = state.store.snapshot()?;
-    let visible_attention_sessions = snapshot
-        .attention
-        .iter()
-        .filter(|item| {
-            matches!(
-                item.state.as_str(),
-                "open" | "committing" | "decision_sent" | "snoozed"
-            )
-        })
-        .map(|item| item.session_id.as_str())
-        .collect::<HashSet<_>>();
-    let cutoff = now.saturating_sub(SESSION_LIST_RETENTION_MS);
-    snapshot
-        .sessions
-        .retain(|session| session_is_visible(session, &visible_attention_sessions, cutoff));
+    let snapshot = state
+        .store
+        .ui_snapshot(now.saturating_sub(SESSION_LIST_RETENTION_MS))?;
     let mut sessions = serde_json::to_value(&snapshot.sessions)
         .map_err(|error| StoreError::Storage(error.to_string()))?;
     if let Some(items) = sessions.as_array_mut() {
@@ -3041,10 +3294,7 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
                         .codex
                         .recovery_for(&session.provider_session_id, &session.exec_state)
                 } else {
-                    let ended = matches!(
-                        session.exec_state.as_str(),
-                        "idle" | "response_finished" | "failed"
-                    );
+                    let ended = terminal_execution_state(&session.exec_state);
                     (
                         "external_hook".to_owned(),
                         if ended { "ended" } else { "observing" }.to_owned(),
@@ -3052,18 +3302,19 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
                         None,
                     )
                 };
-            if control == "external_hook"
-                && !matches!(
-                    session.exec_state.as_str(),
-                    "idle" | "response_finished" | "failed"
-                )
-            {
+            if control == "external_hook" && !terminal_execution_state(&session.exec_state) {
                 recovery = match session.provider_pid {
-                    Some(pid) if process_alive(pid) => "observing".to_owned(),
-                    Some(_) => "lost_control".to_owned(),
+                    Some(pid) => external_process_recovery_state(
+                        &session.provider,
+                        pid,
+                        session.term_bundle_id.as_deref(),
+                        session.term_surface.as_deref(),
+                    )
+                    .to_owned(),
                     None => "waiting_for_event".to_owned(),
                 };
             }
+            recovery = recovery_for_execution(&session.exec_state, recovery);
             if let Some(object) = items.get_mut(index).and_then(Value::as_object_mut) {
                 let blocking_attention_kind = snapshot.attention.iter().find_map(|item| {
                     (item.session_id == session.id
@@ -3151,6 +3402,7 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
     }))
 }
 
+#[cfg(test)]
 fn session_is_visible(
     session: &SessionRecord,
     visible_attention_sessions: &HashSet<&str>,
@@ -3169,23 +3421,76 @@ fn session_is_visible(
 
 fn refresh_session_usage(state: &AppState, now: u64) -> Result<(), StoreError> {
     let records = {
-        let mut usage = state
-            .usage
-            .lock()
-            .map_err(|_| StoreError::Storage("usage collector lock is poisoned".to_owned()))?;
+        let mut usage = match state.usage.lock() {
+            Ok(usage) => usage,
+            Err(poisoned) => {
+                let mut usage = poisoned.into_inner();
+                let paths = usage.collector.paths().clone();
+                *usage = UsageState {
+                    collector: UsageCollector::new(paths),
+                    refreshed_at: None,
+                };
+                state.usage.clear_poison();
+                usage
+            }
+        };
         if usage
             .refreshed_at
             .is_some_and(|instant| instant.elapsed() < USAGE_POLL_INTERVAL)
         {
             return Ok(());
         }
-        let records = usage.collector.collect(now);
+        let generation = state.store.begin_usage_collection_generation()?;
+        #[cfg(test)]
+        if let Some(control) = state.usage_test_control.as_ref() {
+            control.before_collect();
+        }
+        let records = usage
+            .collector
+            .collect_until_shutdown(now, &state.shutdown_flag);
         usage.refreshed_at = Some(Instant::now());
-        records
+        (records, generation)
     };
+    if state.shutdown_flag.load(Ordering::Acquire) {
+        return Ok(());
+    }
     state
         .store
-        .upsert_session_usages(records.into_iter().map(runtime_usage_record).collect())
+        .replace_session_usages_for_generation(
+            records.0.into_iter().map(runtime_usage_record).collect(),
+            now,
+            records.1,
+        )
+        .map(|_| ())
+}
+
+fn run_usage_refresh_iteration(state: &AppState) -> bool {
+    let refreshed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        refresh_session_usage(state, now_millis())
+    }));
+    if matches!(refreshed, Ok(Ok(()))) {
+        true
+    } else {
+        state.usage_worker_failures.fetch_add(1, Ordering::AcqRel);
+        false
+    }
+}
+
+fn usage_refresh_loop(state: AppState) {
+    while !state.shutdown_flag.load(Ordering::Acquire) {
+        let delay = if run_usage_refresh_iteration(&state) {
+            USAGE_POLL_INTERVAL
+        } else {
+            USAGE_FAILURE_BACKOFF
+        };
+        let steps = (delay.as_millis() / 100).max(1);
+        for _ in 0..steps {
+            if state.shutdown_flag.load(Ordering::Acquire) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 fn runtime_usage_record(record: UsageRecord) -> SessionUsageRecord {
@@ -3221,6 +3526,90 @@ fn process_alive(pid: u32) -> bool {
     }
     let result = unsafe { libc::kill(pid, 0) };
     result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn external_process_recovery_state(
+    provider: &str,
+    pid: u32,
+    bundle_id: Option<&str>,
+    surface: Option<&str>,
+) -> &'static str {
+    if !process_alive(pid) {
+        return "lost_control";
+    }
+    match direct_app_identity_matches(
+        provider,
+        bundle_id,
+        surface,
+        process_executable_path(pid).as_deref(),
+    ) {
+        Some(true) | None => "observing",
+        Some(false) => "lost_control",
+    }
+}
+
+/// Returns `None` when the Hook only identifies a terminal surface. A terminal
+/// can legitimately host many shells and provider launchers, so its bundle ID
+/// is not executable identity evidence. Desktop app surfaces are direct
+/// evidence and must match the live PID path before ActRealm claims observing.
+fn direct_app_identity_matches(
+    provider: &str,
+    bundle_id: Option<&str>,
+    surface: Option<&str>,
+    executable_path: Option<&str>,
+) -> Option<bool> {
+    let provider = provider.to_ascii_lowercase();
+    let bundle = bundle_id.unwrap_or_default().to_ascii_lowercase();
+    let surface = surface.unwrap_or_default().to_ascii_lowercase();
+    let (expected_provider, expected): (&str, &[&str]) = if surface == "codex_app"
+        || matches!(bundle.as_str(), "com.openai.chat" | "com.openai.codex")
+    {
+        ("codex", &["codex", "chatgpt"])
+    } else if surface == "claude_app" || bundle.contains("anthropic.claude") {
+        ("claude", &["claude"])
+    } else {
+        return None;
+    };
+    if provider != expected_provider {
+        return Some(false);
+    }
+    let Some(path) = executable_path else {
+        return Some(false);
+    };
+    let path = path.to_ascii_lowercase();
+    Some(expected.iter().any(|token| path.contains(token)))
+}
+
+#[cfg(target_os = "macos")]
+fn process_executable_path(pid: u32) -> Option<String> {
+    unsafe extern "C" {
+        fn proc_pidpath(
+            pid: libc::c_int,
+            buffer: *mut libc::c_void,
+            buffersize: u32,
+        ) -> libc::c_int;
+    }
+    let pid = i32::try_from(pid).ok()?;
+    let mut buffer = vec![0_u8; 4096];
+    let count = unsafe {
+        proc_pidpath(
+            pid,
+            buffer.as_mut_ptr().cast::<libc::c_void>(),
+            u32::try_from(buffer.len()).ok()?,
+        )
+    };
+    if count <= 0 {
+        return None;
+    }
+    buffer.truncate(usize::try_from(count).ok()?);
+    String::from_utf8(buffer).ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_executable_path(pid: u32) -> Option<String> {
+    fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
 }
 
 fn quota_entries(state: &AppState) -> Result<Vec<QuotaEntry>, StoreError> {
@@ -3329,12 +3718,11 @@ fn api_error(status: StatusCode, code: &'static str) -> Response {
     (status, Json(json!({ "error": { "code": code } }))).into_response()
 }
 
-fn api_error_detail(status: StatusCode, code: &'static str, detail: &str) -> Response {
-    (
-        status,
-        Json(json!({ "error": { "code": code, "detail": detail } })),
-    )
-        .into_response()
+fn api_error_detail(status: StatusCode, code: &'static str, _detail: &str) -> Response {
+    // Provider, filesystem and process errors may contain local paths, command
+    // arguments or credentials. The UI maps stable codes to actionable copy;
+    // raw internal detail remains out of the HTTP boundary.
+    api_error(status, code)
 }
 
 fn valid_host(state: &AppState, headers: &HeaderMap) -> bool {
@@ -3361,7 +3749,9 @@ fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
     let Ok(auth) = state.auth.lock() else {
         return false;
     };
-    auth.session_token.as_deref() == Some(cookie)
+    auth.session_token
+        .as_deref()
+        .is_some_and(|token| constant_time_eq(token, cookie))
 }
 
 fn authorized_mutation(state: &AppState, headers: &HeaderMap) -> bool {
@@ -3377,7 +3767,65 @@ fn valid_csrf_value(state: &AppState, value: &str) -> bool {
     let Ok(auth) = state.auth.lock() else {
         return false;
     };
-    auth.csrf_token.as_deref() == Some(value)
+    auth.csrf_token
+        .as_deref()
+        .is_some_and(|token| constant_time_eq(token, value))
+}
+
+fn websocket_protocol(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .find(|protocol| protocol.starts_with(WS_PROTOCOL_PREFIX))
+        })
+        .map(ToOwned::to_owned)
+}
+
+fn consume_websocket_ticket(state: &AppState, candidate: &str) -> bool {
+    let Ok(mut auth) = state.auth.lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    auth.websocket_tickets
+        .retain(|(_, expires_at)| *expires_at > now);
+    let Some(index) = auth
+        .websocket_tickets
+        .iter()
+        .position(|(ticket, _)| constant_time_eq(ticket, candidate))
+    else {
+        return false;
+    };
+    auth.websocket_tickets.swap_remove(index);
+    true
+}
+
+fn generate_secret() -> Result<String, getrandom::Error> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)?;
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(encoded)
+}
+
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let maximum = left.len().max(right.len());
+    let mut difference = left.len() ^ right.len();
+    for index in 0..maximum {
+        let left_byte = left.get(index).copied().unwrap_or_default();
+        let right_byte = right.get(index).copied().unwrap_or_default();
+        difference |= usize::from(left_byte ^ right_byte);
+    }
+    difference == 0
 }
 
 fn cookie_value<'a>(header: &'a str, name: &str) -> Option<&'a str> {
@@ -3453,6 +3901,7 @@ mod tests {
                 bootstrap_token: Some("one-time-token".to_owned()),
                 session_token: None,
                 csrf_token: None,
+                websocket_tickets: Vec::new(),
             })),
             expected_host: "127.0.0.1:43111".to_owned(),
             expected_origin: "http://127.0.0.1:43111".to_owned(),
@@ -3479,6 +3928,8 @@ mod tests {
                 collector: UsageCollector::new(usage_paths),
                 refreshed_at: None,
             })),
+            usage_worker_failures: Arc::new(AtomicUsize::new(0)),
+            usage_test_control: None,
             data_paths: DataPaths {
                 cache: root.join("actrealm-home/cache"),
                 spool: root.join("actrealm-home/spool"),
@@ -3487,6 +3938,63 @@ mod tests {
             codex,
             runtime_restart: None,
         }
+    }
+
+    #[test]
+    fn usage_worker_recovers_after_a_collector_panic() {
+        let root = std::env::temp_dir().join(format!(
+            "actrealm-server-usage-panic-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let mut state = test_state(store.clone(), &root);
+        let control = UsageRefreshTestControl::panic_once();
+        state.usage_test_control = Some(control);
+
+        assert!(!run_usage_refresh_iteration(&state));
+        assert_eq!(state.usage_worker_failures.load(Ordering::Acquire), 1);
+        assert!(
+            state.usage.lock().is_err(),
+            "panic must poison the old state"
+        );
+
+        assert!(run_usage_refresh_iteration(&state));
+        assert_eq!(state.usage_worker_failures.load(Ordering::Acquire), 1);
+        assert!(
+            state.usage.lock().is_ok(),
+            "the next iteration must rebuild and clear poisoned collector state"
+        );
+        drop(state);
+        drop(store);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snapshot_stays_responsive_while_usage_collection_is_in_flight() {
+        let root = std::env::temp_dir().join(format!(
+            "actrealm-server-usage-isolation-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let mut state = test_state(store.clone(), &root);
+        let control = UsageRefreshTestControl::block_once();
+        state.usage_test_control = Some(control.clone());
+        let worker_state = state.clone();
+        let worker = thread::spawn(move || refresh_session_usage(&worker_state, now_millis()));
+        control.wait_until_collecting();
+
+        let started = Instant::now();
+        let snapshot = snapshot_value(&state).expect("snapshot while collection is blocked");
+        assert!(started.elapsed() < Duration::from_millis(300));
+        assert!(snapshot.get("sessions").is_some());
+
+        control.release_collection();
+        worker.join().expect("usage worker join").unwrap();
+        drop(state);
+        drop(store);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4506,7 +5014,10 @@ mod tests {
                 }),
                 now_millis(),
             );
-            request.term.as_mut().unwrap().provider_pid = Some(pid);
+            let term = request.term.as_mut().unwrap();
+            term.provider_pid = Some(pid);
+            term.bundle_id = None;
+            term.surface = None;
             store.ingest(request).unwrap();
         }
         let mut managed = actrealm_core::BridgeRequest::from_hook_at(
@@ -4561,6 +5072,98 @@ mod tests {
             .find(|session| session["providerSessionId"] == "managed-thread")
             .unwrap();
         assert_eq!(managed_session["controlCapability"], "managed");
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reused_desktop_pid_identity_never_projects_observing() {
+        assert_eq!(
+            direct_app_identity_matches(
+                "codex",
+                Some("com.openai.chat"),
+                Some("codex_app"),
+                Some("/Applications/Other.app/Contents/MacOS/Other"),
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            direct_app_identity_matches(
+                "codex",
+                Some("com.openai.chat"),
+                Some("codex_app"),
+                Some("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"),
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            direct_app_identity_matches(
+                "claude",
+                Some("com.apple.Terminal"),
+                Some("terminal"),
+                Some("/bin/zsh"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn running_execution_never_projects_recovery_as_ended() {
+        let root = std::env::temp_dir().join(format!(
+            "actrealm-server-recovery-precedence-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        store
+            .ingest(actrealm_core::BridgeRequest::from_hook_at(
+                actrealm_core::Provider::Codex,
+                json!({
+                    "hook_event_name":"PreToolUse",
+                    "session_id":"managed-live-thread",
+                    "tool_name":"Bash",
+                    "tool_input":{}
+                }),
+                now_millis(),
+            ))
+            .unwrap();
+        assert_eq!(
+            store.snapshot().unwrap().sessions[0].exec_state,
+            "tool_running"
+        );
+
+        let mut state = test_state(store.clone(), &root);
+        state.codex.state = Arc::new(Mutex::new(CodexManagerState {
+            status: "connected".to_owned(),
+            managed: HashSet::from(["managed-live-thread".to_owned()]),
+            threads: HashMap::from([(
+                "managed-live-thread".to_owned(),
+                CodexThread {
+                    id: "managed-live-thread".to_owned(),
+                    name: None,
+                    cwd: None,
+                    status: "idle".to_owned(),
+                    active_flags: vec![],
+                    updated_at: None,
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox_mode: None,
+                },
+            )]),
+            ..CodexManagerState::default()
+        }));
+
+        let snapshot = snapshot_value(&state).unwrap();
+        let session = snapshot["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["providerSessionId"] == "managed-live-thread")
+            .unwrap();
+        assert_eq!(session["execState"], "tool_running");
+        assert_eq!(session["recoveryState"], "waiting_for_event");
+
         drop(state);
         drop(store);
         fs::remove_dir_all(root).unwrap();
@@ -5207,5 +5810,32 @@ done
             )),
             "The Claude quota endpoint is temporarily rate limited. Try again later."
         );
+    }
+
+    #[test]
+    fn auth_secrets_and_error_boundary_do_not_expose_internal_detail() {
+        let first = generate_secret().unwrap();
+        let second = generate_secret().unwrap();
+        assert_eq!(first.len(), 64);
+        assert_eq!(second.len(), 64);
+        assert_ne!(first, second);
+        assert!(constant_time_eq(&first, &first));
+        assert!(!constant_time_eq(&first, &second));
+        assert!(!constant_time_eq(&first, &first[..63]));
+
+        let response = api_error_detail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_FAILURE",
+            "/Users/private/.claude/credentials: bearer-secret",
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let body = runtime.block_on(json_body(response));
+        assert_eq!(body["error"]["code"], "INTERNAL_FAILURE");
+        assert!(body["error"].get("detail").is_none());
+        assert!(!body.to_string().contains("/Users/private"));
+        assert!(!body.to_string().contains("bearer-secret"));
     }
 }

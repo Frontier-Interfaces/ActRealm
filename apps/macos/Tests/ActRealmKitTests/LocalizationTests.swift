@@ -38,6 +38,36 @@ import Testing
             Int64(3),
             language: .english
         ) == "5 tasks · 3 waiting")
+        #expect(AppLocalization.localized("恢复状态", language: .english) == "Recovery status")
+        #expect(AppLocalization.localized("settings.tab.agents", language: .english) == "Agents")
+        #expect(AppLocalization.localized("Agent", language: .english) == "Agent")
+    }
+
+    @Test func runtimeSupervisorFailuresLocalizeDynamicArguments() {
+        #expect(AppLocalization.localizedRuntimeSupervisorText(
+            "无法停止旧 Runtime（PID 42）",
+            language: .english
+        ) == "Could not stop the previous Runtime (PID 42)")
+        #expect(AppLocalization.localizedRuntimeSupervisorText(
+            "runtime.lock 由未识别进程 PID 42 持有（/tmp/helper），为避免误杀未自动停止",
+            language: .english
+        ) == "runtime.lock is held by unrecognized process PID 42 (/tmp/helper), so ActRealm did not stop it")
+        #expect(AppLocalization.localizedRuntimeSupervisorText(
+            "cargo build --release -p actrealm failed",
+            language: .english
+        ) == "Could not build the local Runtime helper")
+    }
+
+    @Test func clientOwnedToastCopyUsesSelectedLanguage() {
+        #expect(AppLocalization.localized(
+            "Codex 启动命令已复制；运行后输入 /hooks",
+            language: .english
+        ) == "Codex launch command copied. Run it, then enter /hooks.")
+        #expect(AppLocalization.formatted(
+            "保存失败：%@",
+            "Disk full",
+            language: .english
+        ) == "Could not save: Disk full")
     }
 
     @Test func compactDurationsSupportBothLanguages() {

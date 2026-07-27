@@ -1,218 +1,115 @@
 # ActRealm current status
 
-Last reviewed: 2026-07-25
+Last reviewed: 2026-07-27
 
-Source branch: `agent/runtime-client-localization-hardening`
+Source baseline: `1dff02d879443876a1ab59aca1654ca9d084e7ed`
 
-Current functional baseline: the macOS/Web localization and Runtime
-status-code candidate based on tagged commit
-`0.1.0-early-preview.1` (`a93e01e`). It includes M15 plus the post-M14
-live-state, Runtime-recovery, usage/OAuth, setup-center, internal-session,
-native/Web parity, and Provider-lifecycle work recorded below.
+Candidate state: the exact ad-hoc-signed Apple Silicon candidate is installed
+locally, Doctor passes, and the user accepted it on 2026-07-27. Delivery is on
+`agent/runtime-client-localization-hardening`; it has not been merged, tagged,
+signed for public distribution, or released.
 
-This file is the short, current source of truth. The
-[implementation plan](WIDGET_V1_PLAN.md),
-[acceptance contract](V1_ACCEPTANCE.md), and milestone verification records
-provide the detailed requirements and evidence.
+This is the short current source of truth. Historical milestone detail remains
+in `V1_ACCEPTANCE.md` and the milestone verification records.
 
-## Status at a glance
+## Supported candidate scope
 
-- **Committed functional implementation:** delivered through M14 plus the
-  ActRealm design alignment on `agent/v1-full`.
-- **P0 release-remediation candidate (uncommitted):** the 2026-07-22 global
-  release audit is being addressed on frozen baseline `50b891a`. The candidate
-  binds OUTBOX selection to stable Attention IDs, renders Claude questions and
-  Elicitation in the native primary card, disables stale controls while the
-  Runtime is offline, adds supervised Runtime restart and safe abandoned-child
-  takeover, releases sessions atomically when their reply channel ends, moves
-  the Codex app-server Connector to directly owned stdio transport, and pauses
-  background native projection/animation work while the workspace is hidden.
-  Local automated and targeted resource gates are recorded in the P0
-  remediation report; remote GitHub CI, Developer ID notarization, clean-Mac
-  install, and the continuous 48-hour soak remain external release gates.
-- **M14 acceptance:** automated/local gates passed; the exact release was
-  installed with a matching SHA-256, live session/OAuth records were verified,
-  and the user accepted the candidate and authorized the local commit on
-  2026-07-18. Push remains separately gated.
-- **M15 managed Codex approvals candidate:** request-keyed command,
-  file-change, and permission approvals arriving on the ActRealm-owned
-  app-server channel can be answered after the generated 0.144 schema gate
-  passes. Merely attaching an independently running Codex Desktop Thread does
-  not transfer its current Turn or native approval sheet. Such requests remain
-  visible and actionable only through truthful “open Codex / handled / snooze”
-  controls. One-turn allow/deny, least-privilege responses and Provider
-  reconciliation have automated coverage.
-- **Post-M14 UI refinement:** the redundant simulated macOS menu bar and
-  traffic lights were removed; Notification & Data, local time, and Runtime
-  state now share the single ActRealm toolbar. Focused checks and local visual
-  acceptance passed on 2026-07-18; commit was authorized separately from push.
-- **Post-M14 live-state refinement:** WebSocket heartbeats, stale-channel
-  detection, snapshot fallback, stable in-place timer updates, and render
-  signatures keep Agent state current without rebuilding unchanged cards.
-- **Post-M14 Runtime recovery:** the settings page exposes authenticated local
-  health details and one controlled Runtime restart action. The process
-  re-execs on the same loopback port, recreates `bridge.sock`, restores durable
-  sessions from SQLite, rotates browser authentication, and safely expires
-  non-restorable reply waiters. See the
-  [verification record](POST_M14_REALTIME_RECOVERY.md).
-- **Post-M14 usage/OAuth hardening candidate:** adds source-labelled Claude and
-  Codex computed prices, OAuth expiry preflight plus bounded official-CLI
-  delegation, fixed-first cached Keychain lookup, and a bounded incremental
-  transcript accumulator. The 172-test workspace suite, zero-warning Clippy,
-  release build, language contract, and two-minute resource gate pass; exact
-  local-candidate installation and user acceptance are still pending. See the
-  [verification record](POST_M14_USAGE_OAUTH_HARDENING.md).
-- **Post-M14 first-run/setup candidate:** adds one truthful empty first-run
-  workspace and a unified Claude/Codex setup center backed by the existing
-  authenticated setup API. Unsupported Provider placeholders are omitted,
-  Codex trust remains user-controlled, and the GitHub guide is linked from the
-  interface. The isolated 300-second preview and board 6/7 visual acceptance
-  passed on 2026-07-20. The stable helper matched that first-run candidate at
-  acceptance time. After the company sync, the installed helper remains
-  `340bf2f5...d429` while the synchronized release is `d70d2ea8...935b`, so the
-  latest binary is not installed. Current Doctor still passes Hook manifests,
-  helper execution, the canonical Codex feature, private Socket permissions,
-  and silent fail-open, but reports Codex trust review and fresh real Claude/
-  Codex events as pending. Push also remains open. See the
-  [verification record](POST_M14_FIRST_RUN_ONBOARDING.md).
-- **Post-M14 Codex internal-session filtering:** synced from company branch
-  commit `43a268d`. Known Codex App overview-suggestion and safety-review
-  background sessions are discarded at Runtime ingest; an already-created
-  provisional row, its local metric, related events/Attention/usage, and later
-  lifecycle are removed without adding a fake visibility state. Ordinary user
-  sessions remain visible and suppressed waiters fail open. Schema advances to
-  9. The exact synchronized tree passes the focused regression, 177-test Rust
-  suite, zero-warning Clippy, release build, language contract, and two-minute
-  resource gate. Latest-binary installation and macOS Swift rerun remain open.
-  See the
-  [verification record](POST_M14_CODEX_INTERNAL_SESSION_FILTERING.md).
-- **Post-M14 macOS/Web parity candidate:** the native macOS client now consumes
-  the setup, settings, question, session-control, quota, export, clear-data,
-  and metrics contracts already used by Web. It adds the unified Agent setup
-  center, real interactive-question forms, dynamic session/usage/quota fields,
-  and matching local controls while retaining macOS-only foreground
-  scheduling. The isolated ActRealmKit suite passes 39 tests. Full SwiftUI
-  compilation and visual acceptance remain open because the installed Command
-  Line Tools do not include `SwiftUIMacros`; see the
-  [verification record](POST_M14_MACOS_WEB_PARITY.md).
-- **Post-M14 Provider lifecycle projection candidate:** successful Provider
-  turn completion is no longer restricted to write tools; managed Codex plan,
-  auto-review, interruption, and collab/sub-Agent events now enter the same
-  Runtime projection used by Claude Hooks. The native task detail shows real
-  plan steps and active sub-Agent records, and future adapter names receive a
-  dynamic lane instead of being dropped. Full Rust, release, language, and
-  macOS gates pass; fresh real-Provider visual acceptance remains pending. See the
-  [verification record](POST_M14_PROVIDER_LIFECYCLE_PROJECTION.md).
-- **Post-M14 macOS localization candidate:** the native app now follows the
-  first macOS preferred language by default and offers local overrides for
-  Simplified Chinese and English. The main window, Settings, menu-bar popover,
-  HUD, generated status text, counts, durations, and quota presentation switch
-  without changing Runtime facts or Provider-authored content. Runtime-owned
-  generated presentation now uses stable codes with English compatibility
-  text, while API errors and display-field labels are rendered by each
-  client. The complete SwiftUI build and all 115 macOS tests pass; 23 English
-  and 23 Simplified Chinese deterministic snapshots pass visual review. Live
-  in-app language-switch acceptance remains pending because the local UI
-  automation channel was unavailable. See the
-  [verification record](POST_M14_MACOS_LOCALIZATION.md).
-- **Latest synchronized-tree gates:** 199 Rust tests passed, with three
-  explicitly manual/resource tests ignored in the ordinary workspace run;
-  zero-warning Clippy, format, JavaScript syntax, release build, language
-  contract, M0 end-to-end path, and the explicit two-minute resource gate
-  passed. The resource sample recorded 0.003% average idle CPU and 7,024 KiB
-  maximum Runtime RSS across 118 samples. The exact ad-hoc package launched
-  its arm64 App and bundled Helper, owned the live Runtime lock, passed deep
-  code-sign verification, and returned `overall: pass` from `doctor --json`.
-- **M13 real-Provider acceptance:** still pending. The milestone was committed
-  and pushed at the user's direction before this final manual confirmation.
-- **Final v1 release:** not yet declared. The required continuous 48-hour
-  Runtime RSS soak remains unchecked.
-- **Default branch alignment:** the user separately approved the alignment on
-  2026-07-17. `main` was fast-forwarded to the reviewed `agent/v1-full`
-  history without restarting Runtime, reinstalling ActRealm, or touching the
-  live data directory.
-- **Version/tag:** Cargo remains `0.1.0`; no release tag has been created.
+- Apple Silicon only.
+- macOS 26; native CI uses Xcode 26.6.
+- Rust 1.97.
+- Local Claude Code and Codex sessions through installed Provider Hooks.
+- Direct actions only when ActRealm owns a live official reply channel.
+- Native macOS and embedded Web clients.
+- System/Simplified Chinese/English presentation. Provider-authored and
+  user-authored text remains verbatim.
+- Loopback HTTP/WebSocket and current-user Unix sockets only.
+- Local SQLite persistence, bounded retention, explicit export, diagnostics,
+  and source-aware backups.
 
-## Milestone matrix
+The candidate does not claim Intel support, automatic updates, a completed
+48-hour soak, accessibility qualification, Windows support, Gemini support, or
+a publicly signed installer.
 
-| Milestone | Scope | Implementation | Evidence |
-| --- | --- | --- | --- |
-| M0 | Provider Hook control path | Complete | [M0](M0_VERIFICATION.md) |
-| M1 | Persistent Runtime core | Complete | [M1](M1_VERIFICATION.md) |
-| M2 | Authenticated API and minimum UI | Complete | [M2](M2_VERIFICATION.md) |
-| M3 | Safe install, onboarding, and Doctor | Complete | [M3](M3_VERIFICATION.md) |
-| M4 | Quota, settings, and local data controls | Complete | [M4](M4_VERIFICATION.md) |
-| M5 | Release hardening and evidence | Partial | [M5](M5_VERIFICATION.md); 48-hour soak pending |
-| M6 | Live sessions and Attention linkage | Complete | [M6](M6_VERIFICATION.md) |
-| M7 | Dynamic quota and truthful timing | Complete | [M7](M7_VERIFICATION.md) |
-| M8 | Desktop compatibility, ignore, jump, and recovery truth | Complete | [M8](M8_VERIFICATION.md) |
-| M9 | Provider conversation-title consistency | Complete | [M9](M9_VERIFICATION.md) |
-| M10 | Configurable safe display | Complete | [M10-M12](M10_M12_VERIFICATION.md) |
-| M11 | Direct Claude questions and secret handling | Complete | [M10-M12](M10_M12_VERIFICATION.md) |
-| M12 | Codex Connector and restart recovery | Complete within the recorded boundary | [M10-M12](M10_M12_VERIFICATION.md) |
-| M13 | Provider-owned approval-state coordination | Code and automated gates complete; real-Provider acceptance pending | [M13](M13_PROVIDER_STATE_COORDINATION.md) |
-| M14 | Live usage, context, price, and OAuth quota | Complete; exact release installed and accepted locally | [M14](M14_USAGE_CONTEXT_QUOTA.md) |
-| M15 | Version-gated Codex managed approvals | Code and automated gates complete; real Codex acceptance pending | [M15](M15_CODEX_MANAGED_APPROVALS.md) |
-| Post-M14 | Stable live rendering and controlled Runtime recovery | Implemented; merged with the ActRealm identity baseline | [verification](POST_M14_REALTIME_RECOVERY.md) |
-| Post-M14 | Usage, pricing, and OAuth hardening | Full automated/resource gates pass; exact local installation and user acceptance pending | [verification](POST_M14_USAGE_OAUTH_HARDENING.md) |
-| Post-M14 | First-run workspace and Agent setup center | Visual acceptance passed; real-Provider install/function gates pending | [verification](POST_M14_FIRST_RUN_ONBOARDING.md) |
-| Post-M14 | Codex internal-session filtering | Synchronized Rust/resource gates pass; latest installation and macOS Swift rerun pending | [verification](POST_M14_CODEX_INTERNAL_SESSION_FILTERING.md) |
-| Post-M14 | macOS/Web feature parity | Native source and focused Kit tests complete; full SwiftUI build and visual/real-Provider acceptance pending | [verification](POST_M14_MACOS_WEB_PARITY.md) |
-| Post-M14 | Provider lifecycle projection | Full automated/release/macOS gates pass; real Claude/Codex visual acceptance pending | [verification](POST_M14_PROVIDER_LIFECYCLE_PROJECTION.md) |
-| Post-M14 | macOS interface localization | Full SwiftUI build, 115 tests, and 23×2 deterministic snapshots pass; live in-app switch acceptance pending | [verification](POST_M14_MACOS_LOCALIZATION.md) |
+## Release-hardening progress
 
-M5 is a release-qualification track, not the chronological end of feature
-development. Later functional milestones may be implemented while M5's
-long-running release gate remains open; that does not make the final v1 release
-complete.
+The 2026-07-27 plan contains ten tasks.
 
-## Capability boundary after M15
+| Task | Result | Verified outcome |
+| --- | --- | --- |
+| 1. Session truth and recovery | Complete | Execution state and recovery/control capability no longer contradict each other; stale local ownership is normalized |
+| 2. Bounded snapshots and retention | Complete | UI snapshots filter at SQL level, related rows are batched, expired closed graphs are pruned transactionally, actionable work is preserved |
+| 3. Bounded usage discovery | Complete | Directory traversal and oversized first reads are bounded and report partial/unavailable truth instead of false totals |
+| 4. Incremental native projection | Complete | Stable per-session facts prevent quota/metric/clock changes from rebuilding unchanged task cards |
+| 5. macOS English localization | Complete | ActRealm-owned native copy uses stable localized keys; Provider/user text remains unchanged |
+| 6. Web English localization | Complete | Web supports System, Simplified Chinese, and English without mutating Runtime settings |
+| 7. Stage Manager and process safety | Complete | Ownership survives relaunch, process execution is asynchronous, and PID reuse is identity-checked |
+| 8. Local Web security | Complete | CSPRNG secrets, constant-time comparison, one-use WebSocket tickets, strict Origin/Cookie/CSRF checks, CSP/security headers |
+| 9. Backup governance and reproducible CI | Complete | Private source-aware backups, explicit deletion, immutable Action SHAs, pinned tools, raw evidence removed from the current tree |
+| 10. Documentation, full verification, installation | Complete | Documentation, full gates, final review, package/signature checks, local installation, Doctor, and user acceptance passed |
 
-ActRealm can directly respond only when it owns a live, official reply
-channel:
+## Current verified gates
 
-- request-keyed Claude/Codex Hook `PermissionRequest` allow, deny, or
-  pass-through;
-- Claude `AskUserQuestion` and `Elicitation` Hook replies;
-- Codex app-server `item/tool/requestUserInput` when the request arrives on
-  the ActRealm-owned connection after explicit managed attach;
-- Codex app-server command, file-change, and permission approvals when the
-  request arrives on that same connection and passes the versioned gate.
+Task 9 completed with:
 
-When Codex or Claude exposes an approval only in its own native interface,
-ActRealm observes and synchronizes the waiting/resolved state. It must not show
-fake allow/deny controls or infer whether the user approved, denied, or ran the
-command.
+- installer: 16 integration tests and 4 statusline tests passed;
+- server: 27 unit, 7 API, and 3 performance tests passed; 2 manual previews
+  remained intentionally ignored;
+- macOS: 23 suites and 130 tests passed;
+- CI immutability, language contracts, and `git diff --check`: passed.
 
-## M15 implemented: version-gated Codex managed approvals
+These are scoped Task 9 results, not the final Task 10 release result. The final
+whole-workspace counts and performance/security checks will be recorded in
+`reports/ACTREALM_RELEASE_HARDENING_2026-07-27.md`.
 
-M15 implements the three current Codex app-server approval methods:
+## Product truth
 
-- `item/commandExecution/requestApproval`;
-- `item/fileChange/requestApproval`;
-- `item/permissions/requestApproval`;
-- one-turn allow/deny responses that never grant more than the requested
-  permission profile;
-- `serverRequest/resolved` and Provider item completion reconciliation;
-- explicit UI capability labels and compatibility tests.
+### Provider control
 
-The currently verified schema family is Codex app-server 0.144.5–0.144.x.
-Unknown earlier or later protocol families disable the direct controls and
-truthfully fall back to observation. M15 does not promise control of an
-arbitrary independently running Codex Desktop conversation: explicit attach
-is necessary but is not sufficient to take ownership of an already-running
-Turn or an approval request delivered to Codex Desktop's own connection.
+- External Hook approval is request-keyed and supports allow, deny, or
+  pass-through.
+- Claude `AskUserQuestion` and `Elicitation` can be answered only while their
+  official blocking Hook waiter is alive. Answers remain memory-only.
+- Codex direct question/approval actions require an explicitly attached,
+  version-gated app-server connection and a matching live request.
+- Provider-native `request_permissions` / `waitingOnApproval` is observation
+  only. ActRealm opens the Provider interface; it does not invent allow/deny
+  controls or infer the result.
+- Restart never restores an old Hook stdout/RPC waiter. Durable history may be
+  shown, while control returns only after a new verified Provider event or a
+  managed Thread reconnection.
+
+### Data and retention
+
+- Raw prompts, complete commands, tool input/output, transcripts, file contents,
+  tokens, and complete local paths are not persisted by default.
+- UI snapshots include only recent or actionable sessions; full export remains
+  a separate path.
+- Client retention choices are 30, 90, 180 days, or forever. Closed expired
+  session graphs are removed transactionally; actionable attention and live
+  state are preserved.
+- Provider configuration backups are source-aware, private (`0700` directory,
+  `0600` files), and never deleted automatically.
+- Settings shows backup count/size. Deletion is a separate operation requiring
+  exact `DELETE BACKUPS`; unsafe or unknown entries cause refusal.
+
+### Security
+
+- The Web UI is embedded in the Runtime and served on a random loopback port.
+- Session and CSRF credentials are 32-byte OS-random secrets and are never put
+  in the WebSocket URL.
+- WebSocket access uses a short-lived single-use ticket sent as a subprotocol.
+- Web and native clients use authenticated Runtime APIs and never open SQLite
+  directly.
+- No telemetry, cloud SDK, CDN, or outbound update check is present.
 
 ## Remaining release work
 
-1. Complete M13 manual reproduction against the real Provider surfaces and
-   record the user's result.
-2. Run the new required GitHub core-gate workflow and protect the release
-   branch after the P0 remediation candidate is reviewed and pushed.
-3. Run Developer ID signing/notarization and clean-macOS-26 installation for
-   the exact release artifact; the current support target is Apple Silicon.
-4. Run and retain the continuous 48-hour Runtime RSS soak on the exact frozen
-   release candidate.
-5. Re-run the full release gate after any resulting change.
-6. Obtain separate approval before bumping the version, tagging, publishing a
-   release, or changing the default branch again.
+1. Request separate authorization for merge, tag, public signing/notarization,
+   and release.
+
+## Release decision
+
+- Development testing: allowed.
+- Exact local candidate acceptance: passed on 2026-07-27.
+- Commit/push to `agent/runtime-client-localization-hardening`: authorized.
+- Public v1 release: not declared.

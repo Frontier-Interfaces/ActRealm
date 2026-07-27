@@ -812,10 +812,23 @@ public struct ClaudeQuotaBridge: Codable, Equatable, Sendable {
     public let customConflict: Bool?
 }
 
+public struct BackupSummary: Codable, Equatable, Sendable {
+    public let count: UInt64
+    public let totalBytes: UInt64
+
+    public init(count: UInt64, totalBytes: UInt64) {
+        self.count = count
+        self.totalBytes = totalBytes
+    }
+
+    public static let empty = BackupSummary(count: 0, totalBytes: 0)
+}
+
 public struct SettingsResponse: Codable, Equatable, Sendable {
     public let settings: UISettings
     public let displayCatalog: [DisplayField]
     public let claudeQuotaBridge: ClaudeQuotaBridge
+    public let backups: BackupSummary
 }
 
 public enum AttentionAction: String, Sendable {

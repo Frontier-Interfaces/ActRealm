@@ -1,32 +1,31 @@
 # ActRealm v1 中文使用教程
 
 本教程面向准备从 GitHub 源码安装和测试 ActRealm v1 的用户。当前 v1
-优先验证 macOS arm64/x64，Claude Code 与 Codex 是正式支持的两个 Provider；
+只支持运行 macOS 26 的 Apple Silicon（arm64）Mac，不支持 Intel。Claude Code
+与 Codex 是正式支持的两个 Provider；
 二者都可以使用命令行版或本机桌面客户端。界面运行在本机浏览器中，Runtime、
 数据库和 Hook 通信都留在本机。
 
-> 当前 `agent/v1-full` 分支功能实现到 M14，并包含后续的实时状态与 Runtime
-> 受控恢复优化。实时用量、上下文、估算 API 价和 Claude OAuth 额度已完成原 M14
-> 本机验收；后续用量/OAuth 加固候选已通过自动化/资源门禁，仍需精确安装后的
-> 本机验收。M13 真实 Provider
-> 最终复验和连续 48 小时发布门禁
-> 仍未完成，因此不应称为最终 v1 Release。实时状态见
-> [STATUS.md](STATUS.md)。
+> 当前发布加固候选基于
+> `1dff02d879443876a1ab59aca1654ca9d084e7ed` 加本地未提交修改。第 1–9 项专项
+> 门禁已通过，第 10 项全量门禁、候选安装和用户真实工作流验收尚未完成，因此
+> 不能称为最终 v1 Release，也尚未获得 commit/push 授权。本候选不声称完成
+> 48 小时浸泡、Intel、自动更新或无障碍资格。实时状态见 [STATUS.md](STATUS.md)。
 
 ## 1. 使用前准备
 
 需要：
 
-- macOS；
+- Apple Silicon Mac 与 macOS 26；
 - Git；
-- Rust stable 1.85 或更高版本（`rustc --version`）；
+- Rust 1.97（`rustc --version`）；
 - 至少安装一种 Provider：Claude Code CLI、Claude Desktop、Codex CLI 或
   ChatGPT/Codex 桌面客户端。只使用桌面客户端时，不要求 `claude` 或 `codex`
   出现在终端 `PATH` 中。
 
-ActRealm 不会替你安装、启动或拥有 Claude/Codex 会话。它只接收 Provider
-官方 Hook 事件，并在 Provider 发出权限请求时提供允许、拒绝或交还终端三种
-操作。
+ActRealm 不会替你安装、启动或拥有 Claude/Codex 会话。它接收 Provider
+官方 Hook 或显式托管 Connector 事件；只有拥有仍然存活的正式回复通道时才提供
+允许、拒绝或交还原界面操作。
 
 ### 1.1 终端与客户端支持矩阵
 
@@ -356,8 +355,12 @@ ActRealm 的故障原则是 fail-open：
 - 界面语言“跟随系统 / 简体中文 / English”。跟随系统时，macOS 首选语言为中文
   则使用简体中文，其他系统语言回落到英文；手动选择只保存在本机，并立即应用到
   主窗口、设置、状态栏弹窗和 HUD；
+- 嵌入式 Web 页面也支持“跟随系统 / 简体中文 / English”。选择只保存在当前
+  浏览器，不修改 Runtime 设置，也不会翻译用户或 Provider 写出的原始内容；
 - 浏览器通知、声音和免打扰；
-- 本地事件保留 30、90 或 365 天；
+- 本地事件保留 30、90、180 天或永久；选择有限期限时，到期且已经关闭的会话图
+  会按事务删除，但仍需处理的 Attention、存活任务和回复通道不会因为保留期限而
+  消失；
 - Codex 增强工具活动 Hook；
 - Claude 可选的 status-line 额度桥；
 - Claude 额度“立即更新”：直接请求一次 OAuth 刷新，并明确报告未登录、凭据失效、
@@ -376,6 +379,9 @@ ActRealm 的故障原则是 fail-open：
 分组，并标明每项在任务卡中的位置。字段选择器只接受服务端安全目录中的结构化
 字段。原始 Hook Payload、完整命令、文件内容和 transcript 不会作为可选项，也
 不能通过手工设置 API 强行开启。任务卡“详情”抽屉使用相同白名单。
+
+当前版本没有自动更新或后台版本检查。升级必须由用户明确安装另一个经过验证的
+候选或正式包。
 
 额度模块不再固定为三项。ActRealm 会展示额度来源实际返回的全部有效窗口：
 例如 Claude 5 小时、7 天或额外命名额度，以及 Codex 5 小时、7 天、月度或未来
@@ -513,7 +519,18 @@ Provider 本次实际请求的 network/fileSystem 子集，拒绝时回传空权
 其中包含私有 Socket、SQLite 数据、缓存、安装备份和稳定 Hook 帮助程序。
 运行目录使用当前用户私有权限；ActRealm 没有遥测、云后端或自动出站上报。
 
-### 完整本地备份
+### Provider 配置备份
+
+ActRealm 在修改 Claude/Codex 配置前生成带来源身份的备份，区分 Claude 设置、
+Codex hooks、Codex config 和安装状态。备份目录权限为 `0700`，文件为 `0600`；
+它们不会按时间自动轮转或删除。
+
+设置页会显示 ActRealm 所有配置备份的数量和总大小。删除备份是独立的破坏性
+操作，必须输入精确的 `DELETE BACKUPS`。删除前会先检查整个备份目录；只要发现
+符号链接、公开权限、非普通文件或无法确认由 ActRealm 创建的文件，就会拒绝整个
+操作，不做部分删除。这个动作不删除当前 Provider 配置、Hook 或 Runtime 数据。
+
+### 导出完整本地数据
 
 包含本机 SQLite 中已经脱敏的各表：
 
@@ -537,6 +554,14 @@ Provider 本次实际请求的 network/fileSystem 子集，拒绝时回传空权
 在设置页点击“彻底清除”，并输入大写 `DELETE` 确认。该操作删除本地事件、
 会话、额度缓存、设置和诊断数据，但保留 Provider Hook 接入和安装备份，避免
 把 Provider 配置留在半安装状态。
+
+### 本地 Web 安全边界
+
+控制页只由当前 Runtime 在随机 `127.0.0.1` 端口提供。浏览器会话和 CSRF 凭据
+使用系统随机数生成；WebSocket 先通过已认证 API 获取短时、单次使用的 ticket，
+并通过子协议提交，URL 中不包含 token。Runtime 同时校验 Origin、Cookie、CSRF
+和 ticket，并返回 CSP 等安全响应头。不要把旧 localhost 地址加入书签：Runtime
+退出后应关闭旧页面，并使用下一次 `serve --open` 打开的新页面。
 
 ## 11. 诊断模式
 

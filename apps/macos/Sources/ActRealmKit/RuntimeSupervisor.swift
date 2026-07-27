@@ -8,6 +8,13 @@ import Foundation
 /// off into an authenticated session.
 @MainActor
 public final class RuntimeSupervisor: ObservableObject {
+    public struct ProcessResult: Equatable, Sendable {
+        public let status: Int32
+        public let stdout: String
+        public let stderr: String
+        public let executedOnMainThread: Bool
+    }
+
     public enum State: Equatable, Sendable {
         case idle
         case buildingBackend
@@ -195,7 +202,7 @@ public final class RuntimeSupervisor: ObservableObject {
 
         if let owner = Self.lockOwnerPID(), Self.isProcessAlive(owner) {
             let ownerPath = Self.processPath(owner)
-            guard isExpectedRuntimePath(ownerPath) else {
+            guard await isExpectedRuntimePath(ownerPath) else {
                 let path = ownerPath ?? "未知路径"
                 let message = "runtime.lock 由未识别进程 PID \(owner) 持有（\(path)），为避免误杀未自动停止"
                 state = .failed(message)
@@ -220,20 +227,12 @@ public final class RuntimeSupervisor: ObservableObject {
     }
 
     private nonisolated static func buildRelease(repoPath: URL) async -> Bool {
-        await withCheckedContinuation { continuation in
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            proc.arguments = ["cargo", "build", "--release", "-p", "actrealm"]
-            proc.currentDirectoryURL = repoPath
-            proc.terminationHandler = { finished in
-                continuation.resume(returning: finished.terminationStatus == 0)
-            }
-            do {
-                try proc.run()
-            } catch {
-                continuation.resume(returning: false)
-            }
-        }
+        let result = await runProcess(
+            executable: "/usr/bin/env",
+            arguments: ["cargo", "build", "--release", "-p", "actrealm"],
+            currentDirectory: repoPath
+        )
+        return result.status == 0
     }
 
     private func launch(binary: URL, workingDirectory: URL?) {
@@ -350,7 +349,7 @@ public final class RuntimeSupervisor: ObservableObject {
               Self.isProcessAlive(owner)
         else { return true }
         let ownerPath = Self.processPath(owner)
-        guard isExpectedRuntimePath(ownerPath) else {
+        guard await isExpectedRuntimePath(ownerPath) else {
             let path = ownerPath ?? "未知路径"
             state = .failed("runtime.lock 由未识别进程 PID \(owner) 持有（\(path)），为避免误杀未自动接管")
             refreshDiagnostics()
@@ -420,7 +419,7 @@ public final class RuntimeSupervisor: ObservableObject {
         return repoPath.appendingPathComponent("target/release/actrealm")
     }
 
-    private func isExpectedRuntimePath(_ path: String?) -> Bool {
+    private func isExpectedRuntimePath(_ path: String?) async -> Bool {
         guard let path else { return false }
         var expected = [
             Self.installedHelperURL.path,
@@ -449,15 +448,15 @@ public final class RuntimeSupervisor: ObservableObject {
         guard appURL.pathExtension == "app" else { return false }
         let candidateBundleID = Self.bundleIdentifier(at: appURL)
         let currentBundleID = Bundle.main.bundleIdentifier
-        let candidateTeamID = Self.codeSigningTeamIdentifier(at: appURL)
-        let currentTeamID = Self.codeSigningTeamIdentifier(at: Bundle.main.bundleURL)
+        async let candidateTeamID = Self.codeSigningTeamIdentifier(at: appURL)
+        async let currentTeamID = Self.codeSigningTeamIdentifier(at: Bundle.main.bundleURL)
         let candidateOwnerID = (try? FileManager.default.attributesOfItem(atPath: path)[.ownerAccountID])
             .flatMap { ($0 as? NSNumber)?.uint32Value }
         return Self.isCompatibleAppHelperIdentity(
             currentBundleID: currentBundleID,
             candidateBundleID: candidateBundleID,
-            currentTeamID: currentTeamID,
-            candidateTeamID: candidateTeamID,
+            currentTeamID: await currentTeamID,
+            candidateTeamID: await candidateTeamID,
             candidateOwnerID: candidateOwnerID,
             currentUserID: getuid()
         )
@@ -487,23 +486,14 @@ public final class RuntimeSupervisor: ObservableObject {
         return dictionary["CFBundleIdentifier"] as? String
     }
 
-    private nonisolated static func codeSigningTeamIdentifier(at appURL: URL) -> String? {
+    private nonisolated static func codeSigningTeamIdentifier(at appURL: URL) async -> String? {
         guard FileManager.default.fileExists(atPath: appURL.path) else { return nil }
-        let proc = Process()
-        let output = Pipe()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-        proc.arguments = ["-dv", "--verbose=4", appURL.path]
-        proc.standardOutput = output
-        proc.standardError = output
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-        } catch {
-            return nil
-        }
-        guard let data = try? output.fileHandleForReading.readToEnd(),
-              let text = String(data: data, encoding: .utf8)
-        else { return nil }
+        let result = await runProcess(
+            executable: "/usr/bin/codesign",
+            arguments: ["-dv", "--verbose=4", appURL.path]
+        )
+        guard result.status == 0 else { return nil }
+        let text = result.stdout + result.stderr
         for line in text.split(separator: "\n") where line.hasPrefix("TeamIdentifier=") {
             let value = line.dropFirst("TeamIdentifier=".count)
             return value == "not set" || value.isEmpty ? nil : String(value)
@@ -530,21 +520,72 @@ public final class RuntimeSupervisor: ObservableObject {
 
     private func bootOutOutdatedLaunchAgent() async -> Bool {
         guard Self.launchAgentWarning() != nil else { return false }
-        return await withCheckedContinuation { continuation in
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-            proc.arguments = ["bootout", "gui/\(getuid())/com.frontier.actrealm.runtime"]
-            proc.standardOutput = Pipe()
-            proc.standardError = Pipe()
-            proc.terminationHandler = { finished in
-                continuation.resume(returning: finished.terminationStatus == 0)
-            }
+        let result = await Self.runProcess(
+            executable: "/bin/launchctl",
+            arguments: ["bootout", "gui/\(getuid())/com.frontier.actrealm.runtime"]
+        )
+        return result.status == 0
+    }
+
+    /// Runs a short-lived child away from MainActor and drains stdout/stderr
+    /// concurrently so a full pipe cannot deadlock the app. Only the bounded
+    /// tail is retained, and bootstrap credentials are redacted by default.
+    public nonisolated static func runProcess(
+        executable: String,
+        arguments: [String],
+        currentDirectory: URL? = nil,
+        retainedBytes: Int = 64 * 1024,
+        redactDiagnostics: Bool = true
+    ) async -> ProcessResult {
+        await Task.detached(priority: .utility) {
+            let process = Process()
+            let stdoutPipe = Pipe()
+            let stderrPipe = Pipe()
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = arguments
+            process.currentDirectoryURL = currentDirectory
+            process.standardOutput = stdoutPipe
+            process.standardError = stderrPipe
+            let mainThread = pthread_main_np() != 0
             do {
-                try proc.run()
+                try process.run()
             } catch {
-                continuation.resume(returning: false)
+                return ProcessResult(
+                    status: -1,
+                    stdout: "",
+                    stderr: error.localizedDescription,
+                    executedOnMainThread: mainThread
+                )
+            }
+
+            async let stdoutData = drain(stdoutPipe.fileHandleForReading, retaining: retainedBytes)
+            async let stderrData = drain(stderrPipe.fileHandleForReading, retaining: retainedBytes)
+            process.waitUntilExit()
+            let stdout = String(decoding: await stdoutData, as: UTF8.self)
+            let stderr = String(decoding: await stderrData, as: UTF8.self)
+            return ProcessResult(
+                status: process.terminationStatus,
+                stdout: redactDiagnostics ? redactedDiagnosticText(stdout) : stdout,
+                stderr: redactDiagnostics ? redactedDiagnosticText(stderr) : stderr,
+                executedOnMainThread: mainThread
+            )
+        }.value
+    }
+
+    private nonisolated static func drain(_ handle: FileHandle, retaining limit: Int) async -> Data {
+        var retained = Data()
+        while !Task.isCancelled {
+            do {
+                guard let chunk = try handle.read(upToCount: 16 * 1024), !chunk.isEmpty else { break }
+                retained.append(chunk)
+                if retained.count > max(0, limit) {
+                    retained.removeFirst(retained.count - max(0, limit))
+                }
+            } catch {
+                break
             }
         }
+        return retained
     }
 
     private nonisolated static var actRealmHome: URL {

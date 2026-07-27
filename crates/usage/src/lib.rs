@@ -9,9 +9,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -19,7 +19,11 @@ use thiserror::Error;
 const STATUS_CACHE_SCHEMA: u32 = 1;
 const MAX_STATUSLINE_BYTES: u64 = 256 * 1_024;
 const MAX_JSONL_LINE_BYTES: u64 = 10 * 1_024 * 1_024;
+const MAX_JSONL_BYTES_PER_REFRESH: u64 = MAX_JSONL_LINE_BYTES;
+const MAX_INITIAL_JSONL_BYTES: u64 = 1_024 * 1_024 * 1_024;
 const MAX_DISCOVERED_FILES: usize = 512;
+const MAX_DISCOVERY_VISITED_ENTRIES: usize = 512;
+const MAX_DISCOVERY_DURATION: Duration = Duration::from_millis(100);
 const RECENT_FILE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_RECENT_CLAUDE_ENTRIES_PER_FILE: usize = 256;
@@ -418,6 +422,9 @@ struct ClaudeFileState {
     offset: u64,
     size: u64,
     modified: SystemTime,
+    identity: Option<(u64, u64)>,
+    discarding_oversized_line: bool,
+    history_complete: bool,
     session_id: Option<String>,
     compacted: TokenAccumulator,
     recent: TokenAccumulator,
@@ -432,6 +439,9 @@ impl Default for ClaudeFileState {
             offset: 0,
             size: 0,
             modified: UNIX_EPOCH,
+            identity: None,
+            discarding_oversized_line: false,
+            history_complete: true,
             session_id: None,
             compacted: TokenAccumulator::default(),
             recent: TokenAccumulator::default(),
@@ -451,15 +461,37 @@ struct CodexUsage {
     total: u64,
 }
 
+impl CodexUsage {
+    fn is_empty(self) -> bool {
+        self.input == 0
+            && self.cached == 0
+            && self.output == 0
+            && self.reasoning == 0
+            && self.total == 0
+    }
+
+    fn add_assign(&mut self, other: Self) {
+        self.input = self.input.saturating_add(other.input);
+        self.cached = self.cached.saturating_add(other.cached);
+        self.output = self.output.saturating_add(other.output);
+        self.reasoning = self.reasoning.saturating_add(other.reasoning);
+        self.total = self.total.saturating_add(other.total);
+    }
+}
+
 #[derive(Debug)]
 struct CodexFileState {
     offset: u64,
     size: u64,
     modified: SystemTime,
+    identity: Option<(u64, u64)>,
+    discarding_oversized_line: bool,
+    history_complete: bool,
     session_id: Option<String>,
     model: Option<String>,
     context_window: Option<u64>,
     cumulative: Option<CodexUsage>,
+    incremental: CodexUsage,
     last: Option<CodexUsage>,
     computed_cost_usd_micros: f64,
     computed_cost_complete: bool,
@@ -472,10 +504,14 @@ impl Default for CodexFileState {
             offset: 0,
             size: 0,
             modified: UNIX_EPOCH,
+            identity: None,
+            discarding_oversized_line: false,
+            history_complete: true,
             session_id: None,
             model: None,
             context_window: None,
             cumulative: None,
+            incremental: CodexUsage::default(),
             last: None,
             computed_cost_usd_micros: 0.0,
             computed_cost_complete: true,
@@ -492,6 +528,7 @@ pub struct UsageCollector {
     codex_files: HashMap<PathBuf, CodexFileState>,
     known_claude: Vec<PathBuf>,
     known_codex: Vec<PathBuf>,
+    next_usage_file_index: usize,
     last_discovery: Option<Instant>,
 }
 
@@ -503,6 +540,7 @@ impl UsageCollector {
             codex_files: HashMap::new(),
             known_claude: Vec::new(),
             known_codex: Vec::new(),
+            next_usage_file_index: 0,
             last_discovery: None,
         }
     }
@@ -516,6 +554,28 @@ impl UsageCollector {
     }
 
     pub fn collect(&mut self, now_ms: u64) -> Vec<UsageRecord> {
+        self.collect_with_shutdown(now_ms, None)
+    }
+
+    /// Collects locally derived usage until `shutdown` is requested. The
+    /// collector checks between bounded JSONL reads, so a shutdown cannot be
+    /// held by an unbounded source line.
+    pub fn collect_until_shutdown(
+        &mut self,
+        now_ms: u64,
+        shutdown: &AtomicBool,
+    ) -> Vec<UsageRecord> {
+        self.collect_with_shutdown(now_ms, Some(shutdown))
+    }
+
+    fn collect_with_shutdown(
+        &mut self,
+        now_ms: u64,
+        shutdown: Option<&AtomicBool>,
+    ) -> Vec<UsageRecord> {
+        if collection_cancelled(shutdown) {
+            return Vec::new();
+        }
         if self
             .last_discovery
             .is_none_or(|last| last.elapsed() >= DISCOVERY_INTERVAL)
@@ -530,13 +590,38 @@ impl UsageCollector {
             self.codex_files.retain(|path, _| codex_set.contains(path));
         }
 
-        let known_claude = self.known_claude.clone();
-        for path in known_claude {
-            self.refresh_claude_file(&path);
+        let known_files = self
+            .known_claude
+            .iter()
+            .cloned()
+            .map(|path| (true, path))
+            .chain(self.known_codex.iter().cloned().map(|path| (false, path)))
+            .collect::<Vec<_>>();
+        if known_files.is_empty() {
+            self.next_usage_file_index = 0;
+        } else {
+            let start = self.next_usage_file_index % known_files.len();
+            let mut remaining_bytes = MAX_JSONL_BYTES_PER_REFRESH;
+            for turn in 0..known_files.len() {
+                if remaining_bytes == 0 {
+                    break;
+                }
+                if collection_cancelled(shutdown) {
+                    return Vec::new();
+                }
+                let (is_claude, path) = &known_files[(start + turn) % known_files.len()];
+                if *is_claude {
+                    self.refresh_claude_file(path, shutdown, &mut remaining_bytes);
+                } else {
+                    self.refresh_codex_file(path, shutdown, &mut remaining_bytes);
+                }
+            }
+            // Rotate one source each collection so a file that consumes the
+            // shared budget cannot permanently starve later known sources.
+            self.next_usage_file_index = (start + 1) % known_files.len();
         }
-        let known_codex = self.known_codex.clone();
-        for path in known_codex {
-            self.refresh_codex_file(&path);
+        if collection_cancelled(shutdown) {
+            return Vec::new();
         }
 
         let mut records = HashMap::<(String, String), UsageRecord>::new();
@@ -554,41 +639,95 @@ impl UsageCollector {
         records.into_values().collect()
     }
 
-    fn refresh_claude_file(&mut self, path: &Path) {
+    fn refresh_claude_file(
+        &mut self,
+        path: &Path,
+        shutdown: Option<&AtomicBool>,
+        remaining_bytes: &mut u64,
+    ) {
+        if collection_cancelled(shutdown) || *remaining_bytes == 0 {
+            return;
+        }
         let Ok(metadata) = regular_file_metadata(path) else {
             return;
         };
         let size = metadata.len();
         let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        let identity = (metadata.dev(), metadata.ino());
         let state = self.claude_files.entry(path.to_path_buf()).or_default();
-        if size == state.size && modified == state.modified {
+        if size == state.size
+            && modified == state.modified
+            && state.identity == Some(identity)
+            && state.offset >= size
+        {
             return;
         }
-        if size < state.offset {
+        // Device/inode identity catches atomic rename replacement even when
+        // size and mtime collide. An in-place truncate-and-regrow that reaches
+        // the previous offset between polls has the same identity and remains
+        // intentionally ambiguous; rewinding there could double-count usage.
+        if size < state.offset || state.identity.is_some_and(|previous| previous != identity) {
             *state = ClaudeFileState::default();
         }
-        parse_claude_tail(path, state, size);
+        if state.offset == 0 && size > MAX_INITIAL_JSONL_BYTES {
+            state.offset = size;
+            state.size = size;
+            state.modified = modified;
+            state.identity = Some(identity);
+            state.history_complete = false;
+            return;
+        }
+        parse_claude_tail_with_shutdown(path, state, size, shutdown, remaining_bytes);
         state.size = size;
         state.modified = modified;
+        state.identity = Some(identity);
     }
 
-    fn refresh_codex_file(&mut self, path: &Path) {
+    fn refresh_codex_file(
+        &mut self,
+        path: &Path,
+        shutdown: Option<&AtomicBool>,
+        remaining_bytes: &mut u64,
+    ) {
+        if collection_cancelled(shutdown) || *remaining_bytes == 0 {
+            return;
+        }
         let Ok(metadata) = regular_file_metadata(path) else {
             return;
         };
         let size = metadata.len();
         let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        let identity = (metadata.dev(), metadata.ino());
         let state = self.codex_files.entry(path.to_path_buf()).or_default();
-        if size == state.size && modified == state.modified {
+        if size == state.size
+            && modified == state.modified
+            && state.identity == Some(identity)
+            && state.offset >= size
+        {
             return;
         }
-        if size < state.offset {
+        // See the Claude path above for the unavoidable in-place
+        // truncate-and-regrow limitation between refreshes.
+        if size < state.offset || state.identity.is_some_and(|previous| previous != identity) {
             *state = CodexFileState::default();
         }
-        parse_codex_tail(path, state, size);
+        if state.offset == 0 && size > MAX_INITIAL_JSONL_BYTES {
+            state.offset = size;
+            state.size = size;
+            state.modified = modified;
+            state.identity = Some(identity);
+            state.history_complete = false;
+            return;
+        }
+        parse_codex_tail_with_shutdown(path, state, size, shutdown, remaining_bytes);
         state.size = size;
         state.modified = modified;
+        state.identity = Some(identity);
     }
+}
+
+fn collection_cancelled(shutdown: Option<&AtomicBool>) -> bool {
+    shutdown.is_some_and(|flag| flag.load(Ordering::Acquire))
 }
 
 fn claude_records<'a>(
@@ -605,6 +744,7 @@ fn claude_records<'a>(
         let group = grouped.entry(session_id.clone()).or_default();
         group.session_id = Some(session_id.clone());
         group.modified = group.modified.max(state.modified);
+        group.history_complete &= state.history_complete;
         group.compacted.add_accumulator(&state.compacted);
         for key in &state.entry_order {
             if let Some(entry) = state.entries.get(key) {
@@ -626,20 +766,134 @@ fn merge_record(records: &mut HashMap<(String, String), UsageRecord>, record: Us
         .or_insert(record);
 }
 
+struct DiscoveryResult {
+    files: Vec<PathBuf>,
+    #[cfg(test)]
+    visited_entries: usize,
+    #[cfg(test)]
+    read_dir_nexts: usize,
+    #[cfg(test)]
+    metadata_checks: usize,
+}
+
+struct DiscoveryBudget {
+    elapsed: Box<dyn Fn() -> Duration>,
+    visited_entries: usize,
+    #[cfg(test)]
+    read_dir_nexts: usize,
+    #[cfg(test)]
+    metadata_checks: usize,
+}
+
+impl DiscoveryBudget {
+    fn new() -> Self {
+        let started_at = Instant::now();
+        Self::with_elapsed(move || started_at.elapsed())
+    }
+
+    fn with_elapsed(elapsed: impl Fn() -> Duration + 'static) -> Self {
+        Self {
+            elapsed: Box::new(elapsed),
+            visited_entries: 0,
+            #[cfg(test)]
+            read_dir_nexts: 0,
+            #[cfg(test)]
+            metadata_checks: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_elapsed_for_test(elapsed: impl Fn() -> Duration + 'static) -> Self {
+        Self::with_elapsed(elapsed)
+    }
+
+    fn reserve_ticket(&mut self) -> bool {
+        if self.exhausted() {
+            return false;
+        }
+        self.visited_entries = self.visited_entries.saturating_add(1);
+        true
+    }
+
+    fn reserve_before_read_dir_next(&mut self) -> bool {
+        if !self.reserve_ticket() {
+            return false;
+        }
+        #[cfg(test)]
+        {
+            self.read_dir_nexts = self.read_dir_nexts.saturating_add(1);
+        }
+        true
+    }
+
+    fn metadata_allowed(&self) -> bool {
+        !self.time_exhausted()
+    }
+
+    fn record_metadata_check(&mut self) {
+        #[cfg(test)]
+        {
+            self.metadata_checks = self.metadata_checks.saturating_add(1);
+        }
+    }
+
+    fn time_exhausted(&self) -> bool {
+        (self.elapsed)() >= MAX_DISCOVERY_DURATION
+    }
+
+    fn exhausted(&self) -> bool {
+        self.visited_entries >= MAX_DISCOVERY_VISITED_ENTRIES || self.time_exhausted()
+    }
+}
+
 fn discover_recent_files(roots: &[PathBuf]) -> Vec<PathBuf> {
+    discover_recent_files_with_budget(roots).files
+}
+
+fn discover_recent_files_with_budget(roots: &[PathBuf]) -> DiscoveryResult {
+    let mut budget = DiscoveryBudget::new();
+    discover_recent_files_with_budget_and_budget(roots, &mut budget)
+}
+
+fn discover_recent_files_with_budget_and_budget(
+    roots: &[PathBuf],
+    budget: &mut DiscoveryBudget,
+) -> DiscoveryResult {
     let mut files = Vec::<(PathBuf, SystemTime)>::new();
     for root in roots {
-        collect_jsonl(root, 0, &mut files);
+        collect_jsonl(root, 0, &mut files, budget, false);
+        if budget.exhausted() {
+            break;
+        }
     }
     files.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
     files.truncate(MAX_DISCOVERED_FILES);
-    files.into_iter().map(|(path, _)| path).collect()
+    DiscoveryResult {
+        files: files.into_iter().map(|(path, _)| path).collect(),
+        #[cfg(test)]
+        visited_entries: budget.visited_entries,
+        #[cfg(test)]
+        read_dir_nexts: budget.read_dir_nexts,
+        #[cfg(test)]
+        metadata_checks: budget.metadata_checks,
+    }
 }
 
-fn collect_jsonl(path: &Path, depth: usize, output: &mut Vec<(PathBuf, SystemTime)>) {
-    if depth > 8 || output.len() >= MAX_DISCOVERED_FILES.saturating_mul(4) {
+fn collect_jsonl(
+    path: &Path,
+    depth: usize,
+    output: &mut Vec<(PathBuf, SystemTime)>,
+    budget: &mut DiscoveryBudget,
+    already_visited: bool,
+) {
+    if depth > 8
+        || output.len() >= MAX_DISCOVERED_FILES.saturating_mul(4)
+        || (!already_visited && !budget.reserve_ticket())
+        || !budget.metadata_allowed()
+    {
         return;
     }
+    budget.record_metadata_check();
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return;
     };
@@ -663,11 +917,27 @@ fn collect_jsonl(path: &Path, depth: usize, output: &mut Vec<(PathBuf, SystemTim
     if !metadata.is_dir() {
         return;
     }
-    let Ok(entries) = fs::read_dir(path) else {
+    let Ok(mut read_dir) = fs::read_dir(path) else {
         return;
     };
-    for entry in entries.flatten() {
-        collect_jsonl(&entry.path(), depth + 1, output);
+    let mut entries = Vec::new();
+    loop {
+        if !budget.reserve_before_read_dir_next() {
+            break;
+        }
+        let Some(entry) = read_dir.next() else {
+            break;
+        };
+        if let Ok(entry) = entry {
+            entries.push(entry);
+        }
+    }
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        if !budget.metadata_allowed() {
+            break;
+        }
+        collect_jsonl(&entry.path(), depth + 1, output, budget, true);
     }
 }
 
@@ -682,7 +952,19 @@ fn regular_file_metadata(path: &Path) -> io::Result<fs::Metadata> {
     Ok(metadata)
 }
 
+#[cfg(test)]
 fn parse_claude_tail(path: &Path, state: &mut ClaudeFileState, size: u64) {
+    let mut remaining_bytes = MAX_JSONL_BYTES_PER_REFRESH;
+    parse_claude_tail_with_shutdown(path, state, size, None, &mut remaining_bytes);
+}
+
+fn parse_claude_tail_with_shutdown(
+    path: &Path,
+    state: &mut ClaudeFileState,
+    size: u64,
+    shutdown: Option<&AtomicBool>,
+    remaining_bytes: &mut u64,
+) {
     let Ok(mut file) = File::open(path) else {
         return;
     };
@@ -691,21 +973,39 @@ fn parse_claude_tail(path: &Path, state: &mut ClaudeFileState, size: u64) {
     }
     let mut reader = BufReader::new(file);
     loop {
+        if collection_cancelled(shutdown) {
+            break;
+        }
+        let remaining = (*remaining_bytes).min(MAX_JSONL_LINE_BYTES);
+        if remaining == 0 {
+            break;
+        }
         let line_offset = state.offset;
         let Ok((line, consumed, complete, too_large)) =
-            read_bounded_line(&mut reader, MAX_JSONL_LINE_BYTES as usize)
+            read_bounded_line(&mut reader, remaining as usize)
         else {
             return;
         };
+        if collection_cancelled(shutdown) {
+            break;
+        }
         if consumed == 0 {
             break;
         }
-        if too_large {
+        *remaining_bytes = remaining_bytes.saturating_sub(consumed);
+        if state.discarding_oversized_line {
+            state.offset = state.offset.saturating_add(consumed);
             if complete {
-                state.offset = state.offset.saturating_add(consumed);
-                continue;
+                state.discarding_oversized_line = false;
             }
-            break;
+            continue;
+        }
+        if too_large {
+            // Keep the line-discard state across refreshes. We must never
+            // deserialize a later fragment as if it were a JSONL record.
+            state.offset = state.offset.saturating_add(consumed);
+            state.discarding_oversized_line = !complete;
+            continue;
         }
         let Ok(root) = serde_json::from_slice::<Value>(&line) else {
             if complete || state.offset.saturating_add(consumed) < size {
@@ -723,9 +1023,11 @@ fn parse_claude_tail(path: &Path, state: &mut ClaudeFileState, size: u64) {
                 .and_then(Value::as_str)
                 .and_then(safe_session_id)
                 .or_else(|| {
-                    path.file_stem()
-                        .and_then(|value| value.to_str())
-                        .and_then(safe_session_id)
+                    state.history_complete.then(|| {
+                        path.file_stem()
+                            .and_then(|value| value.to_str())
+                            .and_then(safe_session_id)
+                    })?
                 });
         }
 
@@ -864,7 +1166,19 @@ fn compact_claude_entries(state: &mut ClaudeFileState) {
     }
 }
 
+#[cfg(test)]
 fn parse_codex_tail(path: &Path, state: &mut CodexFileState, size: u64) {
+    let mut remaining_bytes = MAX_JSONL_BYTES_PER_REFRESH;
+    parse_codex_tail_with_shutdown(path, state, size, None, &mut remaining_bytes);
+}
+
+fn parse_codex_tail_with_shutdown(
+    path: &Path,
+    state: &mut CodexFileState,
+    size: u64,
+    shutdown: Option<&AtomicBool>,
+    remaining_bytes: &mut u64,
+) {
     let Ok(mut file) = File::open(path) else {
         return;
     };
@@ -873,20 +1187,38 @@ fn parse_codex_tail(path: &Path, state: &mut CodexFileState, size: u64) {
     }
     let mut reader = BufReader::new(file);
     loop {
+        if collection_cancelled(shutdown) {
+            break;
+        }
+        let remaining = (*remaining_bytes).min(MAX_JSONL_LINE_BYTES);
+        if remaining == 0 {
+            break;
+        }
         let Ok((line, consumed, complete, too_large)) =
-            read_bounded_line(&mut reader, MAX_JSONL_LINE_BYTES as usize)
+            read_bounded_line(&mut reader, remaining as usize)
         else {
             return;
         };
+        if collection_cancelled(shutdown) {
+            break;
+        }
         if consumed == 0 {
             break;
         }
-        if too_large {
+        *remaining_bytes = remaining_bytes.saturating_sub(consumed);
+        if state.discarding_oversized_line {
+            state.offset = state.offset.saturating_add(consumed);
             if complete {
-                state.offset = state.offset.saturating_add(consumed);
-                continue;
+                state.discarding_oversized_line = false;
             }
-            break;
+            continue;
+        }
+        if too_large {
+            // Keep the line-discard state across refreshes. We must never
+            // deserialize a later fragment as if it were a JSONL record.
+            state.offset = state.offset.saturating_add(consumed);
+            state.discarding_oversized_line = !complete;
+            continue;
         }
         let Ok(root) = serde_json::from_slice::<Value>(&line) else {
             if complete || state.offset.saturating_add(consumed) < size {
@@ -928,25 +1260,43 @@ fn parse_codex_tail(path: &Path, state: &mut CodexFileState, size: u64) {
                     .get("total_token_usage")
                     .and_then(parse_codex_usage)
                     .or(state.cumulative);
-                if let Some(current) = current {
-                    let reset =
-                        previous.is_some_and(|previous| codex_usage_decreased(current, previous));
-                    if reset {
-                        state.computed_cost_usd_micros = 0.0;
-                        state.computed_cost_complete = true;
-                        state.pricing_source = None;
-                    }
-                    let cost_previous = if reset { None } else { previous };
-                    if let Some(delta) = codex_usage_delta(Some(current), cost_previous) {
-                        record_codex_cost(state, delta);
-                    }
-                    state.cumulative = Some(current);
-                }
-                state.last = info
+                let reported_last = info
                     .get("last_token_usage")
                     .and_then(parse_codex_usage)
                     .or_else(|| codex_usage_delta(state.cumulative, previous))
                     .or(state.last);
+                if state.history_complete {
+                    if let Some(current) = current {
+                        let reset = previous
+                            .is_some_and(|previous| codex_usage_decreased(current, previous));
+                        if reset {
+                            state.computed_cost_usd_micros = 0.0;
+                            state.computed_cost_complete = true;
+                            state.pricing_source = None;
+                        }
+                        let cost_previous = if reset { None } else { previous };
+                        if let Some(delta) = codex_usage_delta(Some(current), cost_previous) {
+                            record_codex_cost(state, delta);
+                        }
+                        state.cumulative = Some(current);
+                    }
+                } else {
+                    let observed = match (previous, current) {
+                        (Some(previous), Some(current))
+                            if !codex_usage_decreased(current, previous) =>
+                        {
+                            codex_usage_delta(Some(current), Some(previous))
+                        }
+                        _ => reported_last,
+                    };
+                    if state.session_id.is_some() {
+                        if let Some(observed) = observed.filter(|usage| !usage.is_empty()) {
+                            state.incremental.add_assign(observed);
+                        }
+                    }
+                    state.cumulative = current;
+                }
+                state.last = reported_last;
                 state.context_window = info
                     .get("model_context_window")
                     .or_else(|| info.get("context_window"))
@@ -956,7 +1306,7 @@ fn parse_codex_tail(path: &Path, state: &mut CodexFileState, size: u64) {
             _ => {}
         }
     }
-    if state.session_id.is_none() {
+    if state.history_complete && state.session_id.is_none() {
         state.session_id = path
             .file_stem()
             .and_then(|value| value.to_str())
@@ -1065,25 +1415,30 @@ fn claude_record(state: &ClaudeFileState, now_ms: u64) -> Option<UsageRecord> {
     });
     let context_window = model.map(claude_context_window);
     let context_percent = percent(context_used, context_window);
-    let official_cost = aggregate.official_cost();
-    let cost = official_cost.or_else(|| aggregate.computed_cost());
-    let cost_kind = cost.map(|_| {
-        if official_cost.is_some() {
-            "provider_estimate".to_owned()
-        } else {
-            "computed".to_owned()
-        }
-    });
-    let pricing_source = cost.map(|_| {
-        if official_cost.is_some() {
-            "claude_transcript_cost".to_owned()
-        } else {
-            model
-                .and_then(|model| model_pricing("claude", model))
-                .map(|price| price.source.clone())
-                .unwrap_or_else(|| pricing_snapshot().source.clone())
-        }
-    });
+    let (cost, cost_kind, pricing_source) = if state.history_complete {
+        let official_cost = aggregate.official_cost();
+        let cost = official_cost.or_else(|| aggregate.computed_cost());
+        let cost_kind = cost.map(|_| {
+            if official_cost.is_some() {
+                "provider_estimate".to_owned()
+            } else {
+                "computed".to_owned()
+            }
+        });
+        let pricing_source = cost.map(|_| {
+            if official_cost.is_some() {
+                "claude_transcript_cost".to_owned()
+            } else {
+                model
+                    .and_then(|model| model_pricing("claude", model))
+                    .map(|price| price.source.clone())
+                    .unwrap_or_else(|| pricing_snapshot().source.clone())
+            }
+        });
+        (cost, cost_kind, pricing_source)
+    } else {
+        (None, None, None)
+    };
     Some(UsageRecord {
         provider: "claude".to_owned(),
         provider_session_id: session_id,
@@ -1101,8 +1456,16 @@ fn claude_record(state: &ClaudeFileState, now_ms: u64) -> Option<UsageRecord> {
         estimated_cost_usd_micros: cost,
         cost_kind,
         pricing_source,
-        usage_source: "claude_transcript".to_owned(),
-        usage_quality: "derived".to_owned(),
+        usage_source: if state.history_complete {
+            "claude_transcript".to_owned()
+        } else {
+            "claude_transcript_incremental".to_owned()
+        },
+        usage_quality: if state.history_complete {
+            "derived".to_owned()
+        } else {
+            "partial".to_owned()
+        },
         captured_at: system_time_millis(state.modified).unwrap_or(now_ms),
     })
 }
@@ -1113,16 +1476,25 @@ fn is_synthetic_model(model: Option<&str>) -> bool {
 
 fn codex_record(state: &CodexFileState, now_ms: u64) -> Option<UsageRecord> {
     let session_id = state.session_id.clone()?;
-    let total = state.cumulative?;
+    let total = if state.history_complete {
+        state.cumulative?
+    } else {
+        (!state.incremental.is_empty()).then_some(state.incremental)?
+    };
     let last = state.last.unwrap_or_default();
     let context_used = (last.input > 0).then_some(last.input);
     let context_percent = percent(context_used, state.context_window);
-    let cost = (state.computed_cost_complete
-        && state.pricing_source.is_some()
-        && state.computed_cost_usd_micros.is_finite()
-        && state.computed_cost_usd_micros >= 0.0
-        && state.computed_cost_usd_micros <= u64::MAX as f64)
-        .then(|| state.computed_cost_usd_micros.round() as u64);
+    let cost = state
+        .history_complete
+        .then(|| {
+            state.computed_cost_complete
+                && state.pricing_source.is_some()
+                && state.computed_cost_usd_micros.is_finite()
+                && state.computed_cost_usd_micros >= 0.0
+                && state.computed_cost_usd_micros <= u64::MAX as f64
+        })
+        .filter(|complete| *complete)
+        .map(|_| state.computed_cost_usd_micros.round() as u64);
     Some(UsageRecord {
         provider: "codex".to_owned(),
         provider_session_id: session_id,
@@ -1148,8 +1520,16 @@ fn codex_record(state: &CodexFileState, now_ms: u64) -> Option<UsageRecord> {
         estimated_cost_usd_micros: cost,
         cost_kind: cost.map(|_| "computed".to_owned()),
         pricing_source: cost.and_then(|_| state.pricing_source.clone()),
-        usage_source: "codex_rollout".to_owned(),
-        usage_quality: "official_local".to_owned(),
+        usage_source: if state.history_complete {
+            "codex_rollout".to_owned()
+        } else {
+            "codex_rollout_incremental".to_owned()
+        },
+        usage_quality: if state.history_complete {
+            "official_local".to_owned()
+        } else {
+            "partial".to_owned()
+        },
         captured_at: system_time_millis(state.modified).unwrap_or(now_ms),
     })
 }
@@ -1396,11 +1776,19 @@ fn read_bounded_line<R: BufRead>(
             .iter()
             .position(|byte| *byte == b'\n')
             .map_or(buffer.len(), |position| position + 1);
-        if output.len().saturating_add(take) <= limit {
-            output.extend_from_slice(&buffer[..take]);
-        } else {
+        let remaining = limit.saturating_sub(output.len());
+        if remaining == 0 {
             too_large = true;
+            break;
         }
+        if take > remaining {
+            output.extend_from_slice(&buffer[..remaining]);
+            consumed = consumed.saturating_add(remaining as u64);
+            reader.consume(remaining);
+            too_large = true;
+            break;
+        }
+        output.extend_from_slice(&buffer[..take]);
         consumed = consumed.saturating_add(take as u64);
         complete = buffer[..take].ends_with(b"\n");
         reader.consume(take);
@@ -1581,6 +1969,459 @@ mod tests {
         assert_eq!(
             record.pricing_source.as_deref(),
             Some("openai_standard_2026-07-20")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discovery_stops_after_entry_budget_when_all_files_are_old() {
+        let root = temp_dir("discovery-entry-budget");
+        let link_target_root = temp_dir("discovery-link-target");
+        let link_target = link_target_root.join("outside-recent.jsonl");
+        fs::write(&link_target, "{}\n").expect("write link target");
+        std::os::unix::fs::symlink(&link_target, root.join("a-link.jsonl"))
+            .expect("create symlink");
+
+        let old = SystemTime::now()
+            .checked_sub(RECENT_FILE_AGE.saturating_add(Duration::from_secs(1)))
+            .expect("old timestamp");
+        let old_directory = root.join("b-old");
+        fs::create_dir_all(&old_directory).expect("create old directory");
+        for index in 0..1_000 {
+            let path = old_directory.join(format!("{index:04}.jsonl"));
+            fs::write(&path, "{}\n").expect("write old fixture");
+            File::open(&path)
+                .expect("open old fixture")
+                .set_modified(old)
+                .expect("age old fixture");
+        }
+        let recent = root.join("z-recent.jsonl");
+        fs::write(&recent, "{}\n").expect("write recent fixture");
+        let older_recent = root.join("y-recent.jsonl");
+        fs::write(&older_recent, "{}\n").expect("write older recent fixture");
+        File::open(&older_recent)
+            .expect("open older recent fixture")
+            .set_modified(
+                SystemTime::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("older recent timestamp"),
+            )
+            .expect("age older recent fixture");
+
+        let discovery = discover_recent_files_with_budget(std::slice::from_ref(&root));
+        let discovered = discovery.files;
+
+        assert!(
+            discovery.visited_entries <= MAX_DISCOVERY_VISITED_ENTRIES,
+            "visited {} entries with a hard budget of {MAX_DISCOVERY_VISITED_ENTRIES}",
+            discovery.visited_entries
+        );
+        assert_eq!(
+            discovered,
+            vec![recent.clone(), older_recent.clone()],
+            "charged candidates must be processed newest-first even after later descent exhausts the budget"
+        );
+        assert!(
+            !discovered
+                .iter()
+                .any(|path| path == &root.join("a-link.jsonl")),
+            "symlinked JSONL sources must remain rejected"
+        );
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(link_target_root);
+    }
+
+    #[test]
+    fn discovery_charges_before_next_and_caps_metadata_work() {
+        let root = temp_dir("discovery-ticket-bound");
+        for index in 0..MAX_DISCOVERY_VISITED_ENTRIES {
+            fs::write(root.join(format!("{index:04}.jsonl")), "{}\n")
+                .expect("write recent fixture");
+        }
+
+        let mut budget = DiscoveryBudget::new();
+        let discovery =
+            discover_recent_files_with_budget_and_budget(std::slice::from_ref(&root), &mut budget);
+
+        assert_eq!(discovery.visited_entries, MAX_DISCOVERY_VISITED_ENTRIES);
+        assert_eq!(discovery.read_dir_nexts, MAX_DISCOVERY_VISITED_ENTRIES - 1);
+        assert_eq!(discovery.metadata_checks, MAX_DISCOVERY_VISITED_ENTRIES);
+        assert_eq!(discovery.files.len(), MAX_DISCOVERY_VISITED_ENTRIES - 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn expired_discovery_clock_does_no_next_or_metadata_work() {
+        let root = temp_dir("discovery-expired-clock");
+        fs::write(root.join("recent.jsonl"), "{}\n").expect("write fixture");
+        let mut budget = DiscoveryBudget::with_elapsed_for_test(|| MAX_DISCOVERY_DURATION);
+
+        let discovery =
+            discover_recent_files_with_budget_and_budget(std::slice::from_ref(&root), &mut budget);
+
+        assert!(discovery.files.is_empty());
+        assert_eq!(discovery.visited_entries, 0);
+        assert_eq!(discovery.read_dir_nexts, 0);
+        assert_eq!(discovery.metadata_checks, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn first_oversized_log_is_not_reported_as_a_complete_total() {
+        let root = temp_dir("oversized-rollout");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).expect("create sessions directory");
+        let path = sessions.join("untrusted-filename.jsonl");
+        let initial = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"authoritative-session\"}}\n",
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.6-sol\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{",
+            "\"total_token_usage\":{\"input_tokens\":1000,\"output_tokens\":100,\"total_tokens\":1100},",
+            "\"last_token_usage\":{\"input_tokens\":100,\"output_tokens\":100,\"total_tokens\":200}}}}\n"
+        );
+        fs::write(&path, initial).expect("write oversized fixture prefix");
+        // This is sparse: it exercises the 1 GiB size boundary without allocating a 1 GiB fixture.
+        File::options()
+            .write(true)
+            .open(&path)
+            .expect("open oversized fixture")
+            .set_len(1_073_741_825)
+            .expect("make sparse oversized fixture");
+
+        let paths = UsagePaths {
+            actrealm_home: root.join("actrealm-home"),
+            claude_projects: vec![],
+            codex_sessions: vec![sessions],
+        };
+        let mut collector = UsageCollector::new(paths);
+        let first = collector.collect(100);
+        assert!(
+            first
+                .iter()
+                .all(|record| record.provider_session_id != "authoritative-session"),
+            "a first tail-only read must not be emitted as complete cumulative usage"
+        );
+
+        let appended = concat!(
+            "\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{",
+            "\"total_token_usage\":{\"input_tokens\":1100,\"output_tokens\":200,\"total_tokens\":1300},",
+            "\"last_token_usage\":{\"input_tokens\":100,\"output_tokens\":100,\"total_tokens\":200}}}}\n"
+        );
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open sparse fixture for append");
+        file.write_all(appended.as_bytes())
+            .expect("append complete line");
+        file.sync_all().expect("sync appended line");
+
+        let later = collector.collect(200);
+        assert!(
+            later.is_empty(),
+            "post-checkpoint usage without authoritative metadata must not use the filename as a session id"
+        );
+
+        let authoritative = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"authoritative-session\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{",
+            "\"total_token_usage\":{\"input_tokens\":1200,\"output_tokens\":200,\"total_tokens\":1400},",
+            "\"last_token_usage\":{\"input_tokens\":100,\"output_tokens\":0,\"total_tokens\":100}}}}\n"
+        );
+        file.write_all(authoritative.as_bytes())
+            .expect("append authoritative metadata and line");
+        file.sync_all().expect("sync authoritative line");
+        let after_metadata = collector.collect(300);
+        let record = after_metadata
+            .iter()
+            .find(|record| record.provider_session_id == "authoritative-session")
+            .expect("later complete line is collected");
+        assert_eq!(record.token_total, Some(100));
+        assert_eq!(record.usage_source, "codex_rollout_incremental");
+        assert_eq!(record.usage_quality, "partial");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_claude_history_never_computes_partial_cost() {
+        let root = temp_dir("oversized-claude");
+        let projects = root.join("projects");
+        fs::create_dir_all(&projects).expect("create projects directory");
+        let path = projects.join("untrusted-claude-filename.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"sessionId\":\"authoritative-claude\",\"timestamp\":\"1\",",
+                "\"message\":{\"id\":\"old\",\"model\":\"claude-sonnet-5\",",
+                "\"usage\":{\"input_tokens\":1000}},\"requestId\":\"old\"}\n"
+            ),
+        )
+        .expect("write oversized Claude prefix");
+        File::options()
+            .write(true)
+            .open(&path)
+            .expect("open oversized Claude fixture")
+            .set_len(1_073_741_825)
+            .expect("make sparse oversized Claude fixture");
+
+        let paths = UsagePaths {
+            actrealm_home: root.join("actrealm-home"),
+            claude_projects: vec![projects],
+            codex_sessions: vec![],
+        };
+        let mut collector = UsageCollector::new(paths);
+        assert!(collector.collect(100).is_empty());
+
+        let appended = concat!(
+            "\n{\"sessionId\":\"authoritative-claude\",\"timestamp\":\"2\",",
+            "\"message\":{\"id\":\"new\",\"model\":\"claude-sonnet-5\",",
+            "\"usage\":{\"input_tokens\":100}},\"requestId\":\"new\"}\n"
+        );
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open sparse Claude fixture for append");
+        file.write_all(appended.as_bytes())
+            .expect("append Claude line");
+        file.sync_all().expect("sync Claude line");
+        let record = collector
+            .collect(200)
+            .into_iter()
+            .find(|record| record.provider_session_id == "authoritative-claude")
+            .expect("partial Claude usage is collected");
+        assert_eq!(record.usage_quality, "partial");
+        assert_eq!(record.estimated_cost_usd_micros, None);
+        assert_eq!(record.cost_kind, None);
+        assert_eq!(record.pricing_source, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn atomic_rollout_replacement_resets_usage_even_when_size_and_mtime_match() {
+        let root = temp_dir("rollout-replacement");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).expect("create sessions directory");
+        let path = sessions.join("rollout.jsonl");
+        let fixture = |session: &str, total: u64| {
+            let meta = serde_json::json!({
+                "type": "session_meta",
+                "payload": { "id": session }
+            });
+            let token_count = serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": { "input_tokens": total, "total_tokens": total },
+                        "last_token_usage": { "input_tokens": total, "total_tokens": total }
+                    }
+                }
+            });
+            format!("{meta}\n{token_count}\n")
+        };
+        let first = fixture("session-a", 100);
+        let replacement = fixture("session-b", 200);
+        assert_eq!(first.len(), replacement.len());
+        fs::write(&path, first).expect("write first rollout");
+        let original_modified = fs::metadata(&path)
+            .expect("first rollout metadata")
+            .modified()
+            .expect("first rollout modified time");
+
+        let paths = UsagePaths {
+            actrealm_home: root.join("actrealm-home"),
+            claude_projects: vec![],
+            codex_sessions: vec![sessions.clone()],
+        };
+        let mut collector = UsageCollector::new(paths);
+        assert_eq!(collector.collect(100)[0].provider_session_id, "session-a");
+
+        let staged = root.join("rollout-staged.jsonl");
+        fs::write(&staged, replacement).expect("write replacement rollout");
+        File::open(&staged)
+            .expect("open replacement rollout")
+            .set_modified(original_modified)
+            .expect("preserve replacement mtime");
+        fs::rename(&staged, &path).expect("atomically replace rollout");
+        let after_same_size = collector.collect(200);
+        assert_eq!(after_same_size.len(), 1);
+        assert_eq!(after_same_size[0].provider_session_id, "session-b");
+        assert_eq!(after_same_size[0].token_total, Some(200));
+
+        let larger = fixture("session-c", 3_000);
+        let staged = root.join("rollout-staged-larger.jsonl");
+        fs::write(&staged, larger).expect("write larger replacement rollout");
+        fs::rename(&staged, &path).expect("atomically replace larger rollout");
+        let after_larger = collector.collect(300);
+        assert_eq!(after_larger.len(), 1);
+        assert_eq!(after_larger[0].provider_session_id, "session-c");
+        assert_eq!(after_larger[0].token_total, Some(3_000));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_jsonl_line_never_reads_past_the_per_refresh_cap() {
+        let mut bytes = vec![b'x'; MAX_JSONL_LINE_BYTES as usize + 1];
+        bytes.push(b'\n');
+        let mut reader = BufReader::new(std::io::Cursor::new(bytes));
+
+        let (line, consumed, complete, too_large) =
+            read_bounded_line(&mut reader, MAX_JSONL_LINE_BYTES as usize)
+                .expect("read bounded prefix");
+        assert_eq!(line.len(), MAX_JSONL_LINE_BYTES as usize);
+        assert_eq!(consumed, MAX_JSONL_LINE_BYTES);
+        assert!(!complete);
+        assert!(too_large);
+
+        let (_, remaining, complete, too_large) =
+            read_bounded_line(&mut reader, MAX_JSONL_LINE_BYTES as usize)
+                .expect("read bounded suffix");
+        assert_eq!(remaining, 2);
+        assert!(complete);
+        assert!(!too_large);
+    }
+
+    #[test]
+    fn collector_resumes_an_unchanged_oversized_line_across_refreshes() {
+        let root = temp_dir("collector-oversized-resume");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).expect("create sessions directory");
+        let path = sessions.join("rollout.jsonl");
+        let meta = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"resume-session\"}}\n";
+        let token = concat!(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{",
+            "\"total_token_usage\":{\"input_tokens\":42,\"total_tokens\":42},",
+            "\"last_token_usage\":{\"input_tokens\":42,\"total_tokens\":42}}}}\n"
+        );
+        let mut fixture = meta.as_bytes().to_vec();
+        fixture.extend(std::iter::repeat_n(
+            b'x',
+            MAX_JSONL_BYTES_PER_REFRESH as usize * 2,
+        ));
+        fixture.push(b'\n');
+        fixture.extend_from_slice(token.as_bytes());
+        fs::write(&path, fixture).expect("write oversized fixture");
+        let metadata = fs::metadata(&path).expect("fixture metadata");
+        let modified = metadata.modified().expect("fixture mtime");
+
+        let mut collector = UsageCollector::new(UsagePaths {
+            actrealm_home: root.join("actrealm-home"),
+            claude_projects: vec![],
+            codex_sessions: vec![sessions],
+        });
+        assert!(collector.collect(100).is_empty());
+        let after_first = collector
+            .codex_files
+            .get(&path)
+            .expect("known Codex state after first refresh");
+        assert!(after_first.discarding_oversized_line);
+        let first_offset = after_first.offset;
+        assert!(first_offset <= MAX_JSONL_BYTES_PER_REFRESH);
+        assert!(after_first.cumulative.is_none());
+
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("unchanged fixture metadata")
+                .modified()
+                .expect("unchanged fixture mtime"),
+            modified
+        );
+        assert!(collector.collect(200).is_empty());
+        let after_second = collector
+            .codex_files
+            .get(&path)
+            .expect("known Codex state after second refresh");
+        assert!(after_second.discarding_oversized_line);
+        assert!(after_second.offset.saturating_sub(first_offset) <= MAX_JSONL_BYTES_PER_REFRESH);
+        assert!(after_second.cumulative.is_none());
+
+        let records = collector.collect(300);
+        let record = records
+            .iter()
+            .find(|record| record.provider_session_id == "resume-session")
+            .expect("valid full line eventually parses without append");
+        assert_eq!(record.token_total, Some(42));
+        assert!(
+            !collector
+                .codex_files
+                .get(&path)
+                .expect("final Codex state")
+                .discarding_oversized_line
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collector_shares_the_byte_budget_fairly_across_known_files() {
+        let root = temp_dir("collector-shared-byte-budget");
+        let first = root.join("a-first.jsonl");
+        let second = root.join("b-second.jsonl");
+        for path in [&first, &second] {
+            fs::write(path, b"x").expect("write oversized prefix");
+            File::options()
+                .write(true)
+                .open(path)
+                .expect("open oversized fixture")
+                .set_len(MAX_JSONL_BYTES_PER_REFRESH * 2 + 1)
+                .expect("make sparse oversized fixture");
+        }
+        let mut collector = UsageCollector::new(UsagePaths {
+            actrealm_home: root.join("actrealm-home"),
+            claude_projects: vec![],
+            codex_sessions: vec![],
+        });
+        collector.known_codex = vec![first.clone(), second.clone()];
+        collector.last_discovery = Some(Instant::now());
+
+        assert!(collector.collect(100).is_empty());
+        let first_round = collector
+            .codex_files
+            .get(&first)
+            .expect("first file receives the initial turn")
+            .offset;
+        assert!(first_round <= MAX_JSONL_BYTES_PER_REFRESH);
+        assert!(!collector.codex_files.contains_key(&second));
+
+        assert!(collector.collect(200).is_empty());
+        let second_round = collector
+            .codex_files
+            .get(&second)
+            .expect("second file receives the next turn")
+            .offset;
+        let first_after_second = collector
+            .codex_files
+            .get(&first)
+            .expect("first state remains known")
+            .offset;
+        assert_eq!(first_after_second, first_round);
+        assert!(second_round <= MAX_JSONL_BYTES_PER_REFRESH);
+        assert!(
+            first_after_second
+                .saturating_add(second_round)
+                .saturating_sub(first_round)
+                <= MAX_JSONL_BYTES_PER_REFRESH,
+            "all files share one byte budget per collection"
+        );
+
+        assert!(collector.collect(300).is_empty());
+        let first_after_third = collector
+            .codex_files
+            .get(&first)
+            .expect("first file receives a later turn")
+            .offset;
+        assert!(
+            first_after_third.saturating_sub(first_after_second) <= MAX_JSONL_BYTES_PER_REFRESH
+        );
+        assert_eq!(
+            collector
+                .codex_files
+                .get(&second)
+                .expect("second state remains known")
+                .offset,
+            second_round
+        );
+        assert!(
+            first_after_third.saturating_sub(first_after_second) <= MAX_JSONL_BYTES_PER_REFRESH,
+            "the next deterministic turn also stays within the shared budget"
         );
         let _ = fs::remove_dir_all(root);
     }

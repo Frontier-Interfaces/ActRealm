@@ -506,7 +506,7 @@ private struct AgentSettingsPage: View {
         guard let command = provider.reviewCommand else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(command, forType: .string)
-        model.showToast("Codex 启动命令已复制；运行后输入 /hooks")
+        model.showToast(localized("Codex 启动命令已复制；运行后输入 /hooks", locale: locale))
     }
 
     private func openGuide() {
@@ -1332,8 +1332,11 @@ private struct DisplaySettingsPage: View {
 
 private struct DataSettingsPage: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.locale) private var locale
     @State private var showingClearConfirmation = false
     @State private var clearConfirmation = ""
+    @State private var showingBackupClearConfirmation = false
+    @State private var backupClearConfirmation = ""
     @State private var exporting = false
 
     var body: some View {
@@ -1371,6 +1374,60 @@ private struct DataSettingsPage: View {
                     Text("使用统计")
                 } footer: {
                     Text("统计只在这台 Mac 上累计。")
+                }
+
+                Section {
+                    LabeledContent {
+                        Text(backupSummaryText)
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    } label: {
+                        SettingsLabel(
+                            "配置备份",
+                            detail: "ActRealm 修改 Agent 配置前创建；不会自动删除"
+                        )
+                    }
+
+                    if showingBackupClearConfirmation {
+                        SettingsLabel(
+                            "确认清除配置备份",
+                            detail: "输入 DELETE BACKUPS；不会删除当前 Agent 配置"
+                        )
+                        TextField("DELETE BACKUPS", text: $backupClearConfirmation)
+                        HStack {
+                            Button("取消") {
+                                showingBackupClearConfirmation = false
+                                backupClearConfirmation = ""
+                            }
+                            Spacer()
+                            Button("清除配置备份", role: .destructive) {
+                                Task {
+                                    if await model.clearConfigurationBackups(
+                                        confirmation: backupClearConfirmation
+                                    ) {
+                                        showingBackupClearConfirmation = false
+                                        backupClearConfirmation = ""
+                                    }
+                                }
+                            }
+                            .disabled(backupClearConfirmation != "DELETE BACKUPS")
+                        }
+                    } else {
+                        HStack {
+                            Text("只删除 ActRealm 所有的私有备份；发现符号链接或陌生文件会拒绝操作。")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button("清除备份…", role: .destructive) {
+                                showingBackupClearConfirmation = true
+                            }
+                            .disabled(model.isDemo || model.backupSummary.count == 0)
+                        }
+                    }
+                } header: {
+                    Text("配置备份")
+                } footer: {
+                    Text("备份用于配置恢复。只有你明确确认后才会删除。")
                 }
 
                 Section {
@@ -1414,6 +1471,17 @@ private struct DataSettingsPage: View {
         }
     }
 
+    private var backupSummaryText: String {
+        let byteCount = Int64(clamping: model.backupSummary.totalBytes)
+        let size = ByteCountFormatter.string(fromByteCount: byteCount, countStyle: .file)
+        return localizedFormat(
+            "%llu 个 · %@",
+            locale: locale,
+            model.backupSummary.count,
+            size
+        )
+    }
+
     private var metricsGrid: some View {
         let metrics = model.client.snapshot.stats.metrics
         let requests = metrics.approvalRequests
@@ -1440,7 +1508,7 @@ private struct DataSettingsPage: View {
             GridRow {
                 metric(timeoutRate, "超时交还率")
                 metric(average, "平均响应")
-                metric(model.eventUIP95Ms.map { "\($0)ms" } ?? "—", "界面更新 p95")
+                metric(model.nativePresentationP95Ms.map { "\($0)ms" } ?? "—", "原生呈现 p95")
             }
         }
         .frame(maxWidth: .infinity)
@@ -1470,9 +1538,12 @@ private struct DataSettingsPage: View {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
             try data.write(to: url, options: .atomic)
-            model.showToast(metricsOnly ? "统计已导出" : "本地数据已导出")
+            model.showToast(localized(metricsOnly ? "统计已导出" : "本地数据已导出", locale: locale))
         } catch {
-            model.showToast("保存失败：\(error.localizedDescription)")
+            model.showToast(
+                localizedFormat("保存失败：%@", locale: locale, error.localizedDescription),
+                priority: .error
+            )
         }
     }
 }

@@ -86,7 +86,8 @@ public enum DemoData {
             configPath: "~/.claude/settings.json",
             helperPath: "~/.actrealm/bin/claude-statusline",
             customConflict: false
-        )
+        ),
+        backups: BackupSummary(count: 3, totalBytes: 18_432)
     )
 
     public static func derivedState(now: Date = Date()) -> DerivedState {

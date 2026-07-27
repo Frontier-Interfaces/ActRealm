@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use actrealm_core::{BridgeRequest, Decision, Provider};
+use actrealm_core::{BridgeRequest, Decision, Provider, TermContext};
 use actrealm_runtime::{RuntimeStore, WaiterRegistry};
 use actrealm_server::{ApiServer, ApiServerConfig};
 use futures_util::StreamExt;
@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -16,6 +17,7 @@ use uuid::Uuid;
 
 const INDEX_HTML: &str = include_str!("../../../web/index.html");
 const APP_CSS: &str = include_str!("../../../web/app.css");
+const I18N_JS: &str = include_str!("../../../web/i18n.js");
 const APP_JS: &str = include_str!("../../../web/app.js");
 
 struct HttpResponse {
@@ -146,6 +148,23 @@ fn authenticate(server: &ApiServer) -> (String, String) {
     (cookie, csrf)
 }
 
+fn websocket_ticket(server: &ApiServer, cookie: &str, csrf: &str) -> String {
+    let origin = server.origin();
+    let response = request(
+        server.address(),
+        "POST",
+        "/api/v1/ws-ticket",
+        &[
+            ("Origin", &origin),
+            ("Cookie", cookie),
+            ("X-ActRealm-CSRF", csrf),
+        ],
+        None,
+    );
+    assert_eq!(response.status, 200);
+    response.body["ticket"].as_str().unwrap().to_owned()
+}
+
 fn auth_headers<'a>(origin: &'a str, cookie: &'a str, csrf: &'a str) -> [(&'a str, &'a str); 3] {
     [
         ("Origin", origin),
@@ -178,6 +197,225 @@ fn start(name: &str) -> (PathBuf, RuntimeStore, WaiterRegistry, ApiServer) {
     (root, store, waiters, server)
 }
 
+fn websocket_error_status(error: tokio_tungstenite::tungstenite::Error) -> u16 {
+    match error {
+        tokio_tungstenite::tungstenite::Error::Http(response) => response.status().as_u16(),
+        other => panic!("expected an HTTP handshake rejection, got {other}"),
+    }
+}
+
+#[test]
+fn local_http_authentication_uses_random_secrets_security_headers_and_one_use_ws_tickets() {
+    let (root, store, _waiters, server) = start("web-auth-hardening");
+    assert_eq!(server.bootstrap_token().len(), 64);
+    assert!(server
+        .bootstrap_token()
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit()));
+
+    let health = request(server.address(), "GET", "/api/v1/health", &[], None);
+    assert_eq!(health.status, 200);
+    for (name, expected) in [
+        ("cache-control", "no-store"),
+        ("referrer-policy", "no-referrer"),
+        ("x-content-type-options", "nosniff"),
+        ("x-frame-options", "DENY"),
+        ("cross-origin-resource-policy", "same-origin"),
+    ] {
+        assert_eq!(
+            health
+                .headers
+                .iter()
+                .find(|(header, _)| header == name)
+                .map(|(_, value)| value.as_str()),
+            Some(expected),
+            "missing or invalid {name}",
+        );
+    }
+    assert!(health
+        .headers
+        .iter()
+        .any(|(name, value)| name == "content-security-policy"
+            && value.contains("frame-ancestors 'none'")));
+
+    let (cookie, csrf) = authenticate(&server);
+    assert_eq!(cookie.split_once('=').unwrap().1.len(), 64);
+    assert_eq!(csrf.len(), 64);
+    let origin = server.origin();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let ticket = websocket_ticket(&server, &cookie, &csrf);
+        assert_eq!(ticket.len(), 64);
+        let protocol = format!("actrealm.{ticket}");
+
+        let mut missing_protocol = format!("ws://{}/api/v1/ws", server.address())
+            .into_client_request()
+            .unwrap();
+        missing_protocol
+            .headers_mut()
+            .insert("Origin", HeaderValue::from_str(&origin).unwrap());
+        missing_protocol
+            .headers_mut()
+            .insert("Cookie", HeaderValue::from_str(&cookie).unwrap());
+        let error = tokio_tungstenite::connect_async(missing_protocol)
+            .await
+            .unwrap_err();
+        assert_eq!(websocket_error_status(error), 403);
+
+        let mut wrong_origin = format!("ws://{}/api/v1/ws", server.address())
+            .into_client_request()
+            .unwrap();
+        wrong_origin
+            .headers_mut()
+            .insert("Origin", HeaderValue::from_static("http://127.0.0.1:9"));
+        wrong_origin
+            .headers_mut()
+            .insert("Cookie", HeaderValue::from_str(&cookie).unwrap());
+        wrong_origin.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_str(&protocol).unwrap(),
+        );
+        let error = tokio_tungstenite::connect_async(wrong_origin)
+            .await
+            .unwrap_err();
+        assert_eq!(websocket_error_status(error), 403);
+
+        let mut missing_cookie = format!("ws://{}/api/v1/ws", server.address())
+            .into_client_request()
+            .unwrap();
+        missing_cookie
+            .headers_mut()
+            .insert("Origin", HeaderValue::from_str(&origin).unwrap());
+        missing_cookie.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_str(&protocol).unwrap(),
+        );
+        let error = tokio_tungstenite::connect_async(missing_cookie)
+            .await
+            .unwrap_err();
+        assert_eq!(websocket_error_status(error), 403);
+
+        let mut accepted = format!("ws://{}/api/v1/ws", server.address())
+            .into_client_request()
+            .unwrap();
+        accepted
+            .headers_mut()
+            .insert("Origin", HeaderValue::from_str(&origin).unwrap());
+        accepted
+            .headers_mut()
+            .insert("Cookie", HeaderValue::from_str(&cookie).unwrap());
+        accepted.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_str(&protocol).unwrap(),
+        );
+        let (mut websocket, response) = tokio_tungstenite::connect_async(accepted).await.unwrap();
+        assert_eq!(response.status(), 101);
+        assert_eq!(
+            response
+                .headers()
+                .get("Sec-WebSocket-Protocol")
+                .and_then(|value| value.to_str().ok()),
+            Some(protocol.as_str()),
+        );
+        websocket.close(None).await.unwrap();
+
+        let mut reused = format!("ws://{}/api/v1/ws", server.address())
+            .into_client_request()
+            .unwrap();
+        reused
+            .headers_mut()
+            .insert("Origin", HeaderValue::from_str(&origin).unwrap());
+        reused
+            .headers_mut()
+            .insert("Cookie", HeaderValue::from_str(&cookie).unwrap());
+        reused.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_str(&protocol).unwrap(),
+        );
+        let error = tokio_tungstenite::connect_async(reused).await.unwrap_err();
+        assert_eq!(websocket_error_status(error), 403);
+
+        let wrong_ticket = format!("actrealm.{}", "0".repeat(64));
+        let mut invalid = format!("ws://{}/api/v1/ws", server.address())
+            .into_client_request()
+            .unwrap();
+        invalid
+            .headers_mut()
+            .insert("Origin", HeaderValue::from_str(&origin).unwrap());
+        invalid
+            .headers_mut()
+            .insert("Cookie", HeaderValue::from_str(&cookie).unwrap());
+        invalid.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_str(&wrong_ticket).unwrap(),
+        );
+        let error = tokio_tungstenite::connect_async(invalid).await.unwrap_err();
+        assert_eq!(websocket_error_status(error), 403);
+    });
+
+    drop(server);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn backup_inventory_and_deletion_require_separate_explicit_confirmation() {
+    let (root, store, _waiters, server) = start("backup-governance");
+    let backups = root.join("actrealm-home/backups");
+    fs::create_dir_all(&backups).unwrap();
+    fs::set_permissions(&backups, fs::Permissions::from_mode(0o700)).unwrap();
+    let backup = backups.join("settings.json.123456");
+    fs::write(&backup, b"{\"original\":true}").unwrap();
+    fs::set_permissions(&backup, fs::Permissions::from_mode(0o600)).unwrap();
+    let (cookie, csrf) = authenticate(&server);
+    let origin = server.origin();
+    let headers = auth_headers(&origin, &cookie, &csrf);
+
+    let settings = request(
+        server.address(),
+        "GET",
+        "/api/v1/settings",
+        &[("Cookie", &cookie)],
+        None,
+    );
+    assert_eq!(settings.status, 200);
+    assert_eq!(settings.body["backups"]["count"], 1);
+    assert!(settings.body["backups"]["totalBytes"].as_u64().unwrap() > 0);
+
+    let refused = request(
+        server.address(),
+        "POST",
+        "/api/v1/backups/clear",
+        &headers,
+        Some(&json!({"confirmation":"DELETE"})),
+    );
+    assert_eq!(refused.status, 400);
+    assert_eq!(
+        refused.body["error"]["code"],
+        "BACKUP_DELETE_CONFIRMATION_REQUIRED"
+    );
+    assert!(backup.exists());
+
+    let cleared = request(
+        server.address(),
+        "POST",
+        "/api/v1/backups/clear",
+        &headers,
+        Some(&json!({"confirmation":"DELETE BACKUPS"})),
+    );
+    assert_eq!(cleared.status, 200);
+    assert_eq!(cleared.body["removedCount"], 1);
+    assert_eq!(cleared.body["backups"]["count"], 0);
+    assert!(!backup.exists());
+
+    drop(server);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn ingest_waiting(
     store: &RuntimeStore,
     waiters: &WaiterRegistry,
@@ -192,7 +430,7 @@ fn embedded_ui_contract_is_bounded_honest_and_complete() {
     // This is a product-size budget, not a Runtime, HTTP, or WebView transport limit.
     // Revisit it deliberately with the architecture documentation as the UI evolves.
     const MAX_EMBEDDED_UI_ASSET_BYTES: usize = 128 * 1024;
-    for asset in [INDEX_HTML, APP_CSS, APP_JS] {
+    for asset in [INDEX_HTML, APP_CSS, I18N_JS, APP_JS] {
         assert!(
             asset.len() < MAX_EMBEDDED_UI_ASSET_BYTES,
             "embedded UI asset exceeds the 128 KiB engineering budget"
@@ -209,6 +447,9 @@ fn embedded_ui_contract_is_bounded_honest_and_complete() {
     assert!(INDEX_HTML.contains("id=\"settings-save-feedback\""));
     assert!(INDEX_HTML.contains("id=\"settings-save-retry\""));
     assert!(INDEX_HTML.contains("id=\"runtime-action-feedback\""));
+    assert!(INDEX_HTML.contains("<script src=\"/i18n.js\" defer></script>"));
+    assert!(I18N_JS.contains("bootstrapPlan"));
+    assert!(I18N_JS.contains("actrealm:language-changed"));
     assert!(APP_JS.contains("setSettingsFeedback"));
     assert!(APP_JS.contains("setRuntimeActionFeedback"));
     assert!(APP_JS.contains("question-error"));
@@ -274,7 +515,7 @@ fn embedded_ui_contract_is_bounded_honest_and_complete() {
     assert!(APP_JS.contains("当前环境不支持跳转"));
     assert!(APP_JS.contains("session.providerTitle"));
     assert!(APP_JS.contains("const clientTitle = session.providerTitle || session.title"));
-    assert!(APP_JS.contains("session.model || \"模型未知\""));
+    assert!(APP_JS.contains("session.model || tr(\"模型未知\")"));
     assert!(APP_JS.contains("sessionActivityRefs.set(session.id"));
     assert!(APP_JS.contains("data-live-elapsed-since"));
     assert!(APP_JS.contains("attentionRenderSignature() !== lastAttentionRenderSignature"));
@@ -491,6 +732,55 @@ fn authenticated_api_controls_approval_and_preserves_three_second_undo_semantics
 }
 
 #[test]
+fn running_execution_never_projects_recovery_as_ended() {
+    let (root, store, _waiters, server) = start("running-recovery");
+    let mut tool = BridgeRequest::from_hook_at(
+        Provider::Claude,
+        json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "live-external-session",
+            "turn_id": "turn-1",
+            "cwd": "/tmp/real-project",
+            "tool_name": "Bash",
+            "tool_input": {}
+        }),
+        now_millis(),
+    );
+    tool.term = Some(TermContext {
+        app: None,
+        session_id: None,
+        tty: None,
+        title: None,
+        bundle_id: None,
+        surface: None,
+        provider_pid: Some(std::process::id()),
+    });
+    store.ingest(tool).unwrap();
+
+    let (cookie, _csrf) = authenticate(&server);
+    let snapshot = request(
+        server.address(),
+        "GET",
+        "/api/v1/snapshot",
+        &[("Cookie", &cookie)],
+        None,
+    );
+    assert_eq!(snapshot.status, 200);
+    let session = snapshot.body["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["providerSessionId"] == "live-external-session")
+        .unwrap();
+    assert_eq!(session["execState"], "tool_running");
+    assert_ne!(session["recoveryState"], "ended");
+
+    drop(server);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn pass_through_ack_snooze_and_websocket_snapshot_are_real() {
     let (root, store, waiters, server) = start("snapshot");
     let origin = server.origin();
@@ -622,7 +912,9 @@ fn pass_through_ack_snooze_and_websocket_snapshot_are_real() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let mut ws_request = format!("ws://{}/api/v1/ws?csrf={csrf}", server.address())
+        let ticket = websocket_ticket(&server, &cookie, &csrf);
+        let protocol = format!("actrealm.{ticket}");
+        let mut ws_request = format!("ws://{}/api/v1/ws", server.address())
             .into_client_request()
             .unwrap();
         ws_request
@@ -631,6 +923,10 @@ fn pass_through_ack_snooze_and_websocket_snapshot_are_real() {
         ws_request
             .headers_mut()
             .insert("Cookie", HeaderValue::from_str(&cookie).unwrap());
+        ws_request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_str(&protocol).unwrap(),
+        );
         let (mut websocket, response) = tokio_tungstenite::connect_async(ws_request).await.unwrap();
         assert_eq!(response.status(), 101);
         let frame = websocket.next().await.unwrap().unwrap();

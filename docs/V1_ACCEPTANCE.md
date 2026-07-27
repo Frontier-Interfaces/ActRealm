@@ -24,6 +24,57 @@ not weaken or replace the full plan.
   not transfer an already-running Codex Desktop Turn. Interrupt, steer,
   Coach, cloud accounts, and telemetry remain out of scope.
 
+## 2026-07-27 release-hardening gate
+
+This section is the current candidate gate and overrides stale test counts or
+candidate wording in historical milestone records below.
+
+Supported release-candidate scope:
+
+- [x] Apple Silicon only; macOS 26 native target and Xcode 26.6 CI.
+- [x] Rust 1.97.
+- [x] Local Claude Code and Codex sessions; direct control remains
+      reply-channel and version dependent.
+- [x] macOS and embedded Web clients support System, Simplified Chinese, and
+      English presentation without translating Provider/user content.
+- [x] Runtime remains local-only with no telemetry, cloud SDK, CDN, or outbound
+      update check.
+- [x] Intel, automatic updates, 48-hour soak, accessibility qualification,
+      Windows, and Gemini are explicitly outside this candidate.
+
+Completed hardening:
+
+- [x] Session execution and recovery/control truth are separated.
+- [x] UI snapshots, retention, Provider-log traversal, and usage aggregation
+      are bounded.
+- [x] Native task projection is incremental and independent of app focus.
+- [x] macOS and Web localization contracts pass.
+- [x] Stage Manager ownership and process identity are guarded across relaunch
+      and PID reuse.
+- [x] Web auth uses OS-random secrets, constant-time checks, strict
+      Origin/Cookie/CSRF validation, and single-use WebSocket tickets outside
+      URLs.
+- [x] Backups have source identity, private permissions, visible count/size,
+      and separate explicit deletion; no automatic deletion exists.
+- [x] CI Actions and tools are immutable/pinned; raw local evidence is removed
+      from the current tree.
+
+Remaining before commit or release:
+
+- [x] The full Task 10 common, performance, privacy, security, and resource
+      gates pass on the exact worktree.
+- [x] A final whole-branch review has no unresolved load-bearing finding.
+- [x] The exact packaged candidate is installed locally with its embedded
+      Helper and signature verified, without deleting existing user data.
+- [x] The user accepts the real Claude/Codex workflows and authorizes commit
+      and push to `agent/runtime-client-localization-hardening`.
+- [ ] Merge, tag, signing/notarization, and public release receive their own
+      later authorizations.
+
+The project does not require or claim a 48-hour soak for this candidate because
+that work was explicitly deferred. Historical unchecked 48-hour items remain
+historical records, not a hidden pass.
+
 ## Milestone gates
 
 ### M0 - provider control path

@@ -7,11 +7,13 @@ use actrealm_core::{
     PERMISSION_COMMIT_DELAY_MS,
 };
 use actrealm_providers::parse_hook;
+use rusqlite::trace::{TraceEvent, TraceEventCodes};
 use rusqlite::types::ValueRef;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, ToSql, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Number, Value};
-use std::collections::HashSet;
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io;
@@ -25,8 +27,11 @@ use uuid::Uuid;
 
 const SCHEMA_VERSION: i64 = 11;
 const SNAPSHOT_CACHE_MAX_AGE_MS: u64 = 2_000;
+const SQLITE_MAX_VARIABLE_NUMBER: usize = 32_766;
+const MAX_UI_SNAPSHOT_SESSION_IDS: usize = SQLITE_MAX_VARIABLE_NUMBER - 1;
 const MAX_TASK_TITLE_CHARS: usize = 64;
 const MAX_PLAN_STEPS: usize = 64;
+const MAX_ACTIVE_SUBAGENTS: usize = 64;
 const MAX_PLAN_STEP_CHARS: usize = 500;
 const MAX_PLAN_DETAIL_CHARS: usize = 1_500;
 const PROVIDER_TITLE_REFRESH_INTERVAL_MS: u64 = 2_000;
@@ -35,6 +40,47 @@ const CODEX_INTERNAL_PROMPT_PREFIXES: [&str; 2] = [
     "# Overview Generate 0 to 3 hyperpersonalized suggestions",
     "You are an expert at upholding safety and compliance standards",
 ];
+
+thread_local! {
+    static UI_SNAPSHOT_QUERY_COUNT: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+fn count_ui_snapshot_query(event: TraceEvent<'_>) {
+    if matches!(event, TraceEvent::Stmt(_, _)) {
+        UI_SNAPSHOT_QUERY_COUNT.with(|count| {
+            if let Some(value) = count.get() {
+                count.set(Some(value.saturating_add(1)));
+            }
+        });
+    }
+}
+
+struct UiSnapshotQueryTrace<'connection> {
+    connection: &'connection Connection,
+}
+
+impl<'connection> UiSnapshotQueryTrace<'connection> {
+    fn install(connection: &'connection Connection) -> Self {
+        UI_SNAPSHOT_QUERY_COUNT.with(|count| count.set(Some(0)));
+        connection.trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(count_ui_snapshot_query),
+        );
+        Self { connection }
+    }
+
+    fn query_count(&self) -> usize {
+        UI_SNAPSHOT_QUERY_COUNT.with(|count| count.get().unwrap_or_default())
+    }
+}
+
+impl Drop for UiSnapshotQueryTrace<'_> {
+    fn drop(&mut self) {
+        self.connection
+            .trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, None);
+        UI_SNAPSHOT_QUERY_COUNT.with(|count| count.set(None));
+    }
+}
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum StoreError {
@@ -424,6 +470,14 @@ enum StoreMessage {
     Snapshot {
         reply: mpsc::SyncSender<Result<StoreSnapshot, StoreError>>,
     },
+    UiSnapshot {
+        cutoff: u64,
+        reply: mpsc::SyncSender<Result<StoreSnapshot, StoreError>>,
+    },
+    UiSnapshotWithQueryCount {
+        cutoff: u64,
+        reply: mpsc::SyncSender<Result<(StoreSnapshot, usize), StoreError>>,
+    },
     ReadSetting {
         key: String,
         reply: mpsc::SyncSender<Result<Option<String>, StoreError>>,
@@ -440,6 +494,15 @@ enum StoreMessage {
     UpsertSessionUsage {
         records: Vec<SessionUsageRecord>,
         reply: mpsc::SyncSender<Result<(), StoreError>>,
+    },
+    BeginUsageCollectionGeneration {
+        reply: mpsc::SyncSender<Result<u64, StoreError>>,
+    },
+    ReplaceSessionUsage {
+        records: Vec<SessionUsageRecord>,
+        collected_at: u64,
+        generation: u64,
+        reply: mpsc::SyncSender<Result<bool, StoreError>>,
     },
     RecordMetric {
         event: MetricEvent,
@@ -647,6 +710,24 @@ impl RuntimeStore {
         receive(receiver)
     }
 
+    /// Reads the bounded Runtime projection used by the local UI.
+    pub fn ui_snapshot(&self, cutoff: u64) -> Result<StoreSnapshot, StoreError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send(StoreMessage::UiSnapshot { cutoff, reply })?;
+        receive(receiver)
+    }
+
+    /// Returns a bounded UI snapshot with its SQL statement count for regression tests.
+    #[doc(hidden)]
+    pub fn ui_snapshot_with_query_count(
+        &self,
+        cutoff: u64,
+    ) -> Result<(StoreSnapshot, usize), StoreError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send(StoreMessage::UiSnapshotWithQueryCount { cutoff, reply })?;
+        receive(receiver)
+    }
+
     pub fn read_setting(&self, key: impl Into<String>) -> Result<Option<String>, StoreError> {
         let (reply, receiver) = mpsc::sync_channel(1);
         self.send(StoreMessage::ReadSetting {
@@ -687,6 +768,45 @@ impl RuntimeStore {
         let (reply, receiver) = mpsc::sync_channel(1);
         self.send(StoreMessage::UpsertSessionUsage { records, reply })?;
         receive(receiver)
+    }
+
+    /// Begins a monotonic generation before a local usage collection starts.
+    /// A result can replace derived usage only while its generation is current.
+    pub fn begin_usage_collection_generation(&self) -> Result<u64, StoreError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send(StoreMessage::BeginUsageCollectionGeneration { reply })?;
+        receive(receiver)
+    }
+
+    /// Atomically replaces the local derived-usage view if `generation` is
+    /// still current. `captured_at` remains provider metadata, not ordering.
+    pub fn replace_session_usages_for_generation(
+        &self,
+        records: Vec<SessionUsageRecord>,
+        collected_at: u64,
+        generation: u64,
+    ) -> Result<bool, StoreError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send(StoreMessage::ReplaceSessionUsage {
+            records,
+            collected_at,
+            generation,
+            reply,
+        })?;
+        receive(receiver)
+    }
+
+    /// Atomically replaces the local derived-usage view with a newly started
+    /// generation. Prefer the generation methods when collection happens
+    /// outside the caller's immediate control flow.
+    pub fn replace_session_usages(
+        &self,
+        records: Vec<SessionUsageRecord>,
+        collected_at: u64,
+    ) -> Result<(), StoreError> {
+        let generation = self.begin_usage_collection_generation()?;
+        self.replace_session_usages_for_generation(records, collected_at, generation)
+            .map(|_| ())
     }
 
     pub fn record_metric(&self, event: MetricEvent, now: u64) -> Result<(), StoreError> {
@@ -752,17 +872,22 @@ fn writer_loop(
     receiver: mpsc::Receiver<StoreMessage>,
 ) {
     let mut last_provider_title_refresh_at = 0;
+    let mut latest_usage_collection_generation = 0_u64;
     let mut snapshot_cache: Option<(u64, StoreSnapshot)> = None;
+    let mut ui_snapshot_cache: Option<(u64, u64, StoreSnapshot)> = None;
     while let Ok(message) = receiver.recv() {
         if !matches!(
             &message,
             StoreMessage::Snapshot { .. }
+                | StoreMessage::UiSnapshot { .. }
+                | StoreMessage::UiSnapshotWithQueryCount { .. }
                 | StoreMessage::ReadSetting { .. }
                 | StoreMessage::Export { .. }
                 | StoreMessage::ExportMetrics { .. }
                 | StoreMessage::Shutdown
         ) {
             snapshot_cache = None;
+            ui_snapshot_cache = None;
         }
         match message {
             StoreMessage::Ingest { request, reply } => {
@@ -901,9 +1026,76 @@ fn writer_loop(
                             refresh_provider_titles(&mut connection, now)?;
                             last_provider_title_refresh_at = now;
                         }
-                        let snapshot = read_snapshot(&connection)?;
+                        let snapshot = read_snapshot(&connection, None)?;
                         snapshot_cache = Some((now, snapshot.clone()));
                         Ok(snapshot)
+                    })
+                };
+                let _ = reply.send(result);
+            }
+            StoreMessage::UiSnapshot { cutoff, reply } => {
+                let now = now_millis();
+                let cache_is_fresh =
+                    ui_snapshot_cache
+                        .as_ref()
+                        .is_some_and(|(built_at, cached_cutoff, _)| {
+                            cutoff >= *cached_cutoff
+                                && now.saturating_sub(*built_at) < SNAPSHOT_CACHE_MAX_AGE_MS
+                        });
+                let result = if cache_is_fresh {
+                    let mut snapshot = ui_snapshot_cache
+                        .as_ref()
+                        .map(|(_, _, snapshot)| snapshot.clone())
+                        .unwrap_or_default();
+                    filter_ui_snapshot_for_cutoff(&mut snapshot, cutoff);
+                    Ok(snapshot)
+                } else {
+                    reopen_due_snoozed(&mut connection, now).and_then(|_| {
+                        if now.saturating_sub(last_provider_title_refresh_at)
+                            >= PROVIDER_TITLE_REFRESH_INTERVAL_MS
+                        {
+                            refresh_provider_titles(&mut connection, now)?;
+                            last_provider_title_refresh_at = now;
+                        }
+                        let snapshot = read_ui_snapshot(&connection, cutoff)?;
+                        ui_snapshot_cache = Some((now, cutoff, snapshot.clone()));
+                        Ok(snapshot)
+                    })
+                };
+                let _ = reply.send(result);
+            }
+            StoreMessage::UiSnapshotWithQueryCount { cutoff, reply } => {
+                let now = now_millis();
+                let cache_is_fresh =
+                    ui_snapshot_cache
+                        .as_ref()
+                        .is_some_and(|(built_at, cached_cutoff, _)| {
+                            cutoff >= *cached_cutoff
+                                && now.saturating_sub(*built_at) < SNAPSHOT_CACHE_MAX_AGE_MS
+                        });
+                let result = if cache_is_fresh {
+                    let mut snapshot = ui_snapshot_cache
+                        .as_ref()
+                        .map(|(_, _, snapshot)| snapshot.clone())
+                        .unwrap_or_default();
+                    filter_ui_snapshot_for_cutoff(&mut snapshot, cutoff);
+                    Ok((snapshot, 0))
+                } else {
+                    reopen_due_snoozed(&mut connection, now).and_then(|_| {
+                        if now.saturating_sub(last_provider_title_refresh_at)
+                            >= PROVIDER_TITLE_REFRESH_INTERVAL_MS
+                        {
+                            refresh_provider_titles(&mut connection, now)?;
+                            last_provider_title_refresh_at = now;
+                        }
+                        let query_trace = UiSnapshotQueryTrace::install(&connection);
+                        let snapshot = read_ui_snapshot(&connection, cutoff);
+                        let query_count = query_trace.query_count();
+                        drop(query_trace);
+                        snapshot.map(|snapshot| {
+                            ui_snapshot_cache = Some((now, cutoff, snapshot.clone()));
+                            (snapshot, query_count)
+                        })
                     })
                 };
                 let _ = reply.send(result);
@@ -933,6 +1125,26 @@ fn writer_loop(
             }
             StoreMessage::UpsertSessionUsage { records, reply } => {
                 let _ = reply.send(upsert_session_usages(&mut connection, records));
+            }
+            StoreMessage::BeginUsageCollectionGeneration { reply } => {
+                let result = latest_usage_collection_generation
+                    .checked_add(1)
+                    .ok_or_else(|| StoreError::Storage("usage generation overflow".to_owned()))
+                    .inspect(|generation| latest_usage_collection_generation = *generation);
+                let _ = reply.send(result);
+            }
+            StoreMessage::ReplaceSessionUsage {
+                records,
+                collected_at,
+                generation,
+                reply,
+            } => {
+                let result = if generation == latest_usage_collection_generation {
+                    replace_session_usages(&mut connection, records, collected_at).map(|_| true)
+                } else {
+                    Ok(false)
+                };
+                let _ = reply.send(result);
             }
             StoreMessage::RecordMetric { event, now, reply } => {
                 let _ = reply.send(record_metric_transaction(&mut connection, event, now));
@@ -972,12 +1184,58 @@ fn upsert_session_usages(
         {
             continue;
         }
-        upsert_session_usage_row(&transaction, record)?;
+        legacy_upsert_session_usage_row(&transaction, record)?;
     }
     transaction.commit().map_err(storage_error)
 }
 
-fn upsert_session_usage_row(
+fn replace_session_usages(
+    connection: &mut Connection,
+    records: Vec<SessionUsageRecord>,
+    _collected_at: u64,
+) -> Result<(), StoreError> {
+    let transaction = connection.transaction().map_err(storage_error)?;
+    let mut observed = HashSet::new();
+    for record in records {
+        if is_ignored_provider_session(&transaction, &record.provider, &record.provider_session_id)?
+        {
+            continue;
+        }
+        let identity = (record.provider.clone(), record.provider_session_id.clone());
+        if replace_session_usage_row(&transaction, record)? > 0 {
+            observed.insert(identity);
+        }
+    }
+    let mut stale = transaction
+        .prepare(
+            "SELECT provider, provider_session_id
+             FROM session_usage",
+        )
+        .map_err(storage_error)?;
+    let stale_rows = stale
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    drop(stale);
+    for (provider, provider_session_id) in stale_rows {
+        if observed.contains(&(provider.clone(), provider_session_id.clone())) {
+            continue;
+        }
+        transaction
+            .execute(
+                "DELETE FROM session_usage
+                 WHERE provider = ?1 AND provider_session_id = ?2",
+                params![provider, provider_session_id],
+            )
+            .map_err(storage_error)?;
+    }
+    transaction.commit().map_err(storage_error)
+}
+
+fn legacy_upsert_session_usage_row(
     connection: &Connection,
     record: SessionUsageRecord,
 ) -> Result<(), StoreError> {
@@ -1046,6 +1304,80 @@ fn upsert_session_usage_row(
             ],
         )
         .map(|_| ())
+        .map_err(storage_error)
+}
+
+fn replace_session_usage_row(
+    connection: &Connection,
+    record: SessionUsageRecord,
+) -> Result<usize, StoreError> {
+    if record.provider_session_id.trim().is_empty() || record.provider_session_id.len() > 128 {
+        return Err(StoreError::Storage(
+            "usage session identifier is invalid".to_owned(),
+        ));
+    }
+    if record.model.as_ref().is_some_and(|model| {
+        model.trim().is_empty() || model.len() > 128 || model.chars().any(char::is_control)
+    }) {
+        return Err(StoreError::Storage(
+            "usage model identifier is invalid".to_owned(),
+        ));
+    }
+    connection
+        .execute(
+            "INSERT INTO session_usage(
+               provider, provider_session_id, model,
+               input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+               reasoning_tokens, token_total, last_turn_tokens, context_used_tokens,
+               context_window_tokens, context_used_percent, estimated_cost_usd_micros,
+               cost_kind, pricing_source, usage_source, usage_quality, captured_at
+             ) SELECT
+               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+               ?14, ?15, ?16, ?17, ?18, ?19
+             WHERE EXISTS (
+                SELECT 1 FROM sessions
+                WHERE provider = ?1 AND provider_session_id = ?2
+             )
+             ON CONFLICT(provider, provider_session_id) DO UPDATE SET
+               model = excluded.model,
+               input_tokens = excluded.input_tokens,
+               output_tokens = excluded.output_tokens,
+               cache_read_tokens = excluded.cache_read_tokens,
+               cache_creation_tokens = excluded.cache_creation_tokens,
+               reasoning_tokens = excluded.reasoning_tokens,
+               token_total = excluded.token_total,
+               last_turn_tokens = excluded.last_turn_tokens,
+               context_used_tokens = excluded.context_used_tokens,
+               context_window_tokens = excluded.context_window_tokens,
+               context_used_percent = excluded.context_used_percent,
+               estimated_cost_usd_micros = excluded.estimated_cost_usd_micros,
+               cost_kind = excluded.cost_kind,
+               pricing_source = excluded.pricing_source,
+               usage_source = excluded.usage_source,
+               usage_quality = excluded.usage_quality,
+               captured_at = excluded.captured_at",
+            params![
+                record.provider,
+                record.provider_session_id,
+                record.model,
+                record.input_tokens.map(to_i64),
+                record.output_tokens.map(to_i64),
+                record.cache_read_tokens.map(to_i64),
+                record.cache_creation_tokens.map(to_i64),
+                record.reasoning_tokens.map(to_i64),
+                record.token_total.map(to_i64),
+                record.last_turn_tokens.map(to_i64),
+                record.context_used_tokens.map(to_i64),
+                record.context_window_tokens.map(to_i64),
+                record.context_used_percent.map(i64::from),
+                record.estimated_cost_usd_micros.map(to_i64),
+                record.cost_kind,
+                record.pricing_source,
+                record.usage_source,
+                record.usage_quality,
+                to_i64(record.captured_at),
+            ],
+        )
         .map_err(storage_error)
 }
 
@@ -1198,12 +1530,70 @@ fn prune_events_transaction(
         return Ok(0);
     }
     let cutoff = now.saturating_sub(u64::from(retention_days) * 86_400_000);
-    connection
-        .execute(
-            "DELETE FROM events WHERE occurred_at < ?1",
+    let closed_expired_sessions = "
+        SELECT sessions.id, sessions.provider, sessions.provider_session_id
+        FROM sessions
+        WHERE sessions.last_event_at < ?1
+          AND sessions.exec_state IN ('idle', 'response_finished', 'failed')
+          AND NOT EXISTS (
+              SELECT 1 FROM attention_items
+              WHERE attention_items.session_id = sessions.id
+                AND attention_items.state IN ('open', 'committing', 'decision_sent', 'snoozed')
+          )";
+    let transaction = connection.transaction().map_err(storage_error)?;
+    let pruned_sessions = transaction
+        .query_row(
+            &format!("SELECT COUNT(*) FROM ({closed_expired_sessions})"),
             [to_i64(cutoff)],
+            |row| row.get::<_, i64>(0),
         )
-        .map_err(storage_error)
+        .map_err(storage_error)?;
+    for statement in [
+        format!(
+            "DELETE FROM commands
+             WHERE attention_id IN (
+                 SELECT id FROM attention_items
+                 WHERE session_id IN (SELECT id FROM ({closed_expired_sessions}))
+             )"
+        ),
+        format!(
+            "DELETE FROM attention_items
+             WHERE session_id IN (SELECT id FROM ({closed_expired_sessions}))"
+        ),
+        format!(
+            "DELETE FROM session_usage
+             WHERE EXISTS (
+                 SELECT 1 FROM ({closed_expired_sessions}) AS expired
+                 WHERE expired.provider = session_usage.provider
+                   AND expired.provider_session_id = session_usage.provider_session_id
+             )"
+        ),
+        format!("DELETE FROM events WHERE session_id IN (SELECT id FROM ({closed_expired_sessions}))"),
+        format!(
+            "DELETE FROM session_tasks WHERE session_id IN (SELECT id FROM ({closed_expired_sessions}))"
+        ),
+        format!(
+            "DELETE FROM session_plan_steps
+             WHERE session_id IN (SELECT id FROM ({closed_expired_sessions}))"
+        ),
+        format!(
+            "DELETE FROM session_subagents
+             WHERE session_id IN (SELECT id FROM ({closed_expired_sessions}))"
+        ),
+        format!("DELETE FROM turns WHERE session_id IN (SELECT id FROM ({closed_expired_sessions}))"),
+        format!("DELETE FROM sessions WHERE id IN (SELECT id FROM ({closed_expired_sessions}))"),
+    ] {
+        transaction
+            .execute(&statement, [to_i64(cutoff)])
+            .map_err(storage_error)?;
+    }
+    transaction.commit().map_err(storage_error)?;
+    if pruned_sessions > 0 {
+        // Retention is triggered only at Runtime startup or an authenticated settings update;
+        // never from the snapshot/WebSocket loop. SQLite requires this boundary after commit.
+        connection.execute_batch("VACUUM").map_err(storage_error)?;
+    }
+    Ok(usize::try_from(pruned_sessions).unwrap_or(usize::MAX))
 }
 
 fn export_database(connection: &Connection, now: u64) -> Result<Value, StoreError> {
@@ -1525,8 +1915,22 @@ fn initialize(connection: &mut Connection) -> Result<(), StoreError> {
             );
             CREATE INDEX IF NOT EXISTS events_session_time
               ON events(session_id, occurred_at);
+            CREATE INDEX IF NOT EXISTS sessions_last_event_at
+              ON sessions(last_event_at);
+            CREATE INDEX IF NOT EXISTS events_occurred_at
+              ON events(occurred_at);
             CREATE INDEX IF NOT EXISTS attention_state
               ON attention_items(state, created_at);
+            CREATE INDEX IF NOT EXISTS attention_session_blocker
+              ON attention_items(session_id, state, kind, created_at);
+            CREATE INDEX IF NOT EXISTS turns_session_ordinal
+              ON turns(session_id, ordinal DESC);
+            CREATE INDEX IF NOT EXISTS session_plan_steps_session_order
+              ON session_plan_steps(session_id, step_index);
+            CREATE INDEX IF NOT EXISTS session_tasks_session_order
+              ON session_tasks(session_id, created_at);
+            CREATE INDEX IF NOT EXISTS session_subagents_active_session_order
+              ON session_subagents(session_id, active, started_at);
             "#,
         )
         .map_err(storage_error)?;
@@ -1539,6 +1943,7 @@ fn initialize(connection: &mut Connection) -> Result<(), StoreError> {
     ensure_session_task_content_columns(connection)?;
     ensure_session_subagent_columns(connection)?;
     normalize_legacy_subagent_rows(connection)?;
+    normalize_orphaned_local_approval_sessions(connection, now_millis())?;
     suppress_existing_codex_internal_sessions(connection)?;
     connection
         .pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -1774,6 +2179,39 @@ fn normalize_legacy_subagent_rows(connection: &Connection) -> Result<(), StoreEr
             [],
         )
         .map_err(storage_error)?;
+    Ok(())
+}
+
+fn normalize_orphaned_local_approval_sessions(
+    connection: &mut Connection,
+    now: u64,
+) -> Result<(), StoreError> {
+    // Waiter continuations deliberately live only in memory. At startup there
+    // cannot be a live local reply channel, so a widget-owned waiting state
+    // without a blocking attention item is stale recovery metadata rather
+    // than an active approval. Native provider-owned observations remain
+    // untouched because their owner is `terminal` and their attention stays
+    // blocking until an explicit Provider transition resolves it.
+    let transaction = connection.transaction().map_err(storage_error)?;
+    transaction
+        .execute(
+            "UPDATE sessions
+             SET exec_state = 'waiting_for_event',
+                 approval_owner = NULL,
+                 activity = 'Runtime restarted and the old reply channel expired; waiting for a new Agent event',
+                 activity_since = ?1
+             WHERE exec_state = 'awaiting_approval'
+               AND approval_owner = 'widget'
+               AND NOT EXISTS (
+                 SELECT 1 FROM attention_items
+                 WHERE attention_items.session_id = sessions.id
+                   AND attention_items.kind IN ('approval', 'native_approval', 'question')
+                   AND attention_items.state IN ('open', 'committing', 'decision_sent', 'snoozed')
+               )",
+            [to_i64(now)],
+        )
+        .map_err(storage_error)?;
+    transaction.commit().map_err(storage_error)?;
     Ok(())
 }
 
@@ -3520,7 +3958,10 @@ fn should_refresh_provider_title(
     )
 }
 
-fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
+fn read_snapshot(
+    connection: &Connection,
+    cutoff: Option<u64>,
+) -> Result<StoreSnapshot, StoreError> {
     let mut sessions = {
         let mut statement = connection
             .prepare(
@@ -3563,11 +4004,19 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
                  LEFT JOIN session_usage AS usage
                    ON usage.provider = sessions.provider
                   AND usage.provider_session_id = sessions.provider_session_id
+                 WHERE ?1 IS NULL
+                    OR sessions.last_event_at >= ?1
+                    OR sessions.exec_state NOT IN ('idle', 'response_finished', 'failed')
+                    OR EXISTS (
+                        SELECT 1 FROM attention_items
+                        WHERE attention_items.session_id = sessions.id
+                          AND attention_items.state IN ('open', 'committing', 'decision_sent', 'snoozed')
+                    )
                  ORDER BY sessions.last_event_at DESC",
             )
             .map_err(storage_error)?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map([cutoff.map(to_i64)], |row| {
                 let provider = row.get::<_, String>(1)?;
                 let provider_session_id = row.get::<_, String>(2)?;
                 let term_app = row.get::<_, Option<String>>(18)?;
@@ -3661,21 +4110,32 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
             .map_err(storage_error)?;
         rows
     };
-    for session in &mut sessions {
-        session.plan_steps = read_plan_steps(connection, &session.id)?;
-        session.subagents = read_active_subagents(connection, &session.id)?;
-    }
+    read_plan_steps_batched(connection, &mut sessions)?;
+    read_active_subagents_batched(connection, &mut sessions)?;
     let attention = {
         let mut statement = connection
             .prepare(
                 "SELECT id, session_id, provider, project, request_id, kind,
                         title, detail, state, risk, risk_notes, command_preview,
                         expires_at, created_at, resolution
-                 FROM attention_items ORDER BY created_at DESC",
+                 FROM attention_items
+                 WHERE ?1 IS NULL
+                    OR state IN ('open', 'committing', 'decision_sent', 'snoozed')
+                    OR session_id IN (
+                        SELECT id FROM sessions
+                        WHERE last_event_at >= ?1
+                           OR exec_state NOT IN ('idle', 'response_finished', 'failed')
+                           OR EXISTS (
+                               SELECT 1 FROM attention_items AS blockers
+                               WHERE blockers.session_id = sessions.id
+                                 AND blockers.state IN ('open', 'committing', 'decision_sent', 'snoozed')
+                           )
+                    )
+                 ORDER BY created_at DESC",
             )
             .map_err(storage_error)?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map([cutoff.map(to_i64)], |row| {
                 let request: Option<String> = row.get(4)?;
                 Ok(AttentionRecord {
                     id: row.get(0)?,
@@ -3705,11 +4165,27 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
         let mut statement = connection
             .prepare(
                 "SELECT id, attention_id, request_id, action, state, created_at
-                 FROM commands ORDER BY created_at",
+                 FROM commands
+                 WHERE ?1 IS NULL
+                    OR attention_id IN (
+                        SELECT id FROM attention_items
+                        WHERE state IN ('open', 'committing', 'decision_sent', 'snoozed')
+                           OR session_id IN (
+                               SELECT id FROM sessions
+                               WHERE last_event_at >= ?1
+                                  OR exec_state NOT IN ('idle', 'response_finished', 'failed')
+                                  OR EXISTS (
+                                      SELECT 1 FROM attention_items AS blockers
+                                      WHERE blockers.session_id = sessions.id
+                                        AND blockers.state IN ('open', 'committing', 'decision_sent', 'snoozed')
+                                  )
+                           )
+                    )
+                 ORDER BY created_at",
             )
             .map_err(storage_error)?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map([cutoff.map(to_i64)], |row| {
                 let id: String = row.get(0)?;
                 let request: Option<String> = row.get(2)?;
                 Ok(CommandRecord {
@@ -3742,100 +4218,243 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
     })
 }
 
-fn read_plan_steps(
-    connection: &Connection,
-    session_id: &str,
-) -> Result<Vec<PlanStepRecord>, StoreError> {
-    let connector_steps = {
-        let mut statement = connection
-            .prepare(
-                "SELECT provider_turn_id || ':' || step_index, step, detail, status, source
-                 FROM session_plan_steps
-                 WHERE session_id = ?1
-                 ORDER BY step_index ASC LIMIT ?2",
+fn read_ui_snapshot(connection: &Connection, cutoff: u64) -> Result<StoreSnapshot, StoreError> {
+    read_snapshot(connection, Some(cutoff))
+}
+
+fn filter_ui_snapshot_for_cutoff(snapshot: &mut StoreSnapshot, cutoff: u64) {
+    let actionable_sessions = snapshot
+        .attention
+        .iter()
+        .filter(|attention| {
+            matches!(
+                attention.state.as_str(),
+                "open" | "committing" | "decision_sent" | "snoozed"
             )
-            .map_err(storage_error)?;
+        })
+        .map(|attention| attention.session_id.as_str())
+        .collect::<HashSet<_>>();
+    snapshot.sessions.retain(|session| {
+        session.last_event_at >= cutoff
+            || !matches!(
+                session.exec_state.as_str(),
+                "idle" | "response_finished" | "failed"
+            )
+            || actionable_sessions.contains(session.id.as_str())
+    });
+
+    let visible_sessions = snapshot
+        .sessions
+        .iter()
+        .map(|session| session.id.as_str())
+        .collect::<HashSet<_>>();
+    snapshot.attention.retain(|attention| {
+        matches!(
+            attention.state.as_str(),
+            "open" | "committing" | "decision_sent" | "snoozed"
+        ) || visible_sessions.contains(attention.session_id.as_str())
+    });
+
+    let visible_attention = snapshot
+        .attention
+        .iter()
+        .map(|attention| attention.id.as_str())
+        .collect::<HashSet<_>>();
+    snapshot
+        .commands
+        .retain(|command| visible_attention.contains(command.attention_id.as_str()));
+}
+
+fn read_plan_steps_batched(
+    connection: &Connection,
+    sessions: &mut [SessionRecord],
+) -> Result<(), StoreError> {
+    if sessions.is_empty() {
+        return Ok(());
+    }
+    let session_positions = session_positions(sessions);
+    let session_ids = sessions
+        .iter()
+        .map(|session| session.id.clone())
+        .collect::<Vec<_>>();
+    let max_steps = i64::try_from(MAX_PLAN_STEPS).unwrap_or(i64::MAX);
+
+    for range in ui_snapshot_batch_ranges(session_ids.len()) {
+        let batch_session_ids = &session_ids[range];
+        let placeholders = placeholders(batch_session_ids);
+        let query = format!(
+            "SELECT session_id, provider_turn_id || ':' || step_index, step, detail, status, source
+             FROM (
+               SELECT session_id, provider_turn_id, step_index, step, detail, status, source,
+                      ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY step_index ASC) AS position
+               FROM session_plan_steps
+               WHERE session_id IN ({placeholders})
+             )
+             WHERE position <= ?
+             ORDER BY session_id ASC, step_index ASC"
+        );
+        let mut statement = connection.prepare(&query).map_err(storage_error)?;
         let rows = statement
             .query_map(
-                params![
-                    session_id,
-                    i64::try_from(MAX_PLAN_STEPS).unwrap_or(i64::MAX)
-                ],
+                params_from_iter(session_query_params(batch_session_ids, &max_steps)),
                 |row| {
-                    Ok(PlanStepRecord {
-                        id: row.get(0)?,
-                        text: row.get(1)?,
-                        detail: row.get(2)?,
-                        status: row.get(3)?,
-                        source: row.get(4)?,
-                    })
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        PlanStepRecord {
+                            id: row.get(1)?,
+                            text: row.get(2)?,
+                            detail: row.get(3)?,
+                            status: row.get(4)?,
+                            source: row.get(5)?,
+                        },
+                    ))
                 },
             )
             .map_err(storage_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(storage_error)?;
-        rows
-    };
-    if !connector_steps.is_empty() {
-        return Ok(connector_steps);
+        for (session_id, step) in rows {
+            if let Some(&position) = session_positions.get(&session_id) {
+                sessions[position].plan_steps.push(step);
+            }
+        }
     }
 
-    let mut statement = connection
-        .prepare(
-            "SELECT task_id, COALESCE(subject, 'Untitled task'), description,
+    let sessions_with_connector_plan = sessions
+        .iter()
+        .filter(|session| !session.plan_steps.is_empty())
+        .map(|session| session.id.clone())
+        .collect::<HashSet<_>>();
+    for range in ui_snapshot_batch_ranges(session_ids.len()) {
+        let batch_session_ids = &session_ids[range];
+        let placeholders = placeholders(batch_session_ids);
+        let query = format!(
+            "SELECT session_id, task_id, COALESCE(subject, 'Untitled task'), description,
                     CASE completed WHEN 1 THEN 'completed' ELSE 'pending' END
-             FROM session_tasks
-             WHERE session_id = ?1
-             ORDER BY created_at ASC LIMIT ?2",
-        )
-        .map_err(storage_error)?;
-    let rows = statement
-        .query_map(
-            params![
-                session_id,
-                i64::try_from(MAX_PLAN_STEPS).unwrap_or(i64::MAX)
-            ],
-            |row| {
-                Ok(PlanStepRecord {
-                    id: row.get(0)?,
-                    text: row.get(1)?,
-                    detail: row.get(2)?,
-                    status: row.get(3)?,
-                    source: "claude_task".to_owned(),
-                })
-            },
-        )
-        .map_err(storage_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(storage_error)?;
-    Ok(rows)
+             FROM (
+               SELECT session_id, task_id, subject, description, completed,
+                      ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY created_at ASC) AS position
+               FROM session_tasks
+               WHERE session_id IN ({placeholders})
+             )
+             WHERE position <= ?
+             ORDER BY session_id ASC, position ASC"
+        );
+        let mut statement = connection.prepare(&query).map_err(storage_error)?;
+        let rows = statement
+            .query_map(
+                params_from_iter(session_query_params(batch_session_ids, &max_steps)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        PlanStepRecord {
+                            id: row.get(1)?,
+                            text: row.get(2)?,
+                            detail: row.get(3)?,
+                            status: row.get(4)?,
+                            source: "claude_task".to_owned(),
+                        },
+                    ))
+                },
+            )
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+        for (session_id, step) in rows {
+            if let Some(&position) = session_positions.get(&session_id) {
+                if !sessions_with_connector_plan.contains(&session_id) {
+                    sessions[position].plan_steps.push(step);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
-fn read_active_subagents(
+fn read_active_subagents_batched(
     connection: &Connection,
-    session_id: &str,
-) -> Result<Vec<SubagentRecord>, StoreError> {
-    let mut statement = connection
-        .prepare(
-            "SELECT agent_id, agent_type, status, source
-             FROM session_subagents
-             WHERE session_id = ?1 AND active = 1
-             ORDER BY started_at ASC LIMIT 64",
-        )
-        .map_err(storage_error)?;
-    let rows = statement
-        .query_map([session_id], |row| {
-            Ok(SubagentRecord {
-                id: row.get(0)?,
-                agent_type: row.get(1)?,
-                status: row.get(2)?,
-                source: row.get(3)?,
-            })
+    sessions: &mut [SessionRecord],
+) -> Result<(), StoreError> {
+    if sessions.is_empty() {
+        return Ok(());
+    }
+    let session_positions = session_positions(sessions);
+    let session_ids = sessions
+        .iter()
+        .map(|session| session.id.clone())
+        .collect::<Vec<_>>();
+    let max_subagents = i64::try_from(MAX_ACTIVE_SUBAGENTS).unwrap_or(i64::MAX);
+    for range in ui_snapshot_batch_ranges(session_ids.len()) {
+        let batch_session_ids = &session_ids[range];
+        let placeholders = placeholders(batch_session_ids);
+        let query = format!(
+            "SELECT session_id, agent_id, agent_type, status, source
+             FROM (
+               SELECT session_id, agent_id, agent_type, status, source,
+                      ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY started_at ASC) AS position
+               FROM session_subagents
+               WHERE active = 1 AND session_id IN ({placeholders})
+             )
+             WHERE position <= ?
+             ORDER BY session_id ASC, position ASC"
+        );
+        let mut statement = connection.prepare(&query).map_err(storage_error)?;
+        let rows = statement
+            .query_map(
+                params_from_iter(session_query_params(batch_session_ids, &max_subagents)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        SubagentRecord {
+                            id: row.get(1)?,
+                            agent_type: row.get(2)?,
+                            status: row.get(3)?,
+                            source: row.get(4)?,
+                        },
+                    ))
+                },
+            )
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+        for (session_id, subagent) in rows {
+            if let Some(&position) = session_positions.get(&session_id) {
+                sessions[position].subagents.push(subagent);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn session_positions(sessions: &[SessionRecord]) -> HashMap<String, usize> {
+    sessions
+        .iter()
+        .enumerate()
+        .map(|(position, session)| (session.id.clone(), position))
+        .collect()
+}
+
+fn placeholders(session_ids: &[String]) -> String {
+    vec!["?"; session_ids.len()].join(", ")
+}
+
+fn ui_snapshot_batch_ranges(session_count: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
+    (0..session_count)
+        .step_by(MAX_UI_SNAPSHOT_SESSION_IDS)
+        .map(move |start| {
+            let end = (start + MAX_UI_SNAPSHOT_SESSION_IDS).min(session_count);
+            start..end
         })
-        .map_err(storage_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(storage_error)?;
-    Ok(rows)
+}
+
+fn session_query_params<'a>(
+    session_ids: &'a [String],
+    limit: &'a i64,
+) -> impl Iterator<Item = &'a dyn ToSql> {
+    session_ids
+        .iter()
+        .map(|session_id| session_id as &dyn ToSql)
+        .chain(std::iter::once(limit as &dyn ToSql))
 }
 
 fn environment_label(surface: Option<&str>, app: Option<&str>) -> Option<String> {
@@ -5442,4 +6061,53 @@ fn now_millis() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        placeholders, session_query_params, ui_snapshot_batch_ranges, SQLITE_MAX_VARIABLE_NUMBER,
+    };
+    use rusqlite::{params_from_iter, Connection};
+
+    #[test]
+    fn ui_snapshot_batch_ranges_respect_sqlite_bind_limit() {
+        let total = SQLITE_MAX_VARIABLE_NUMBER * 2 + 1;
+        let batches = ui_snapshot_batch_ranges(total).collect::<Vec<_>>();
+
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].start, 0);
+        assert_eq!(batches[2].end, total);
+        assert!(batches.iter().all(|batch| {
+            batch.len() < SQLITE_MAX_VARIABLE_NUMBER && batch.end.saturating_sub(batch.start) > 0
+        }));
+    }
+
+    #[test]
+    fn ui_snapshot_batches_execute_at_sqlite_bind_limit_without_snapshot_payloads() {
+        let session_ids = (0..SQLITE_MAX_VARIABLE_NUMBER)
+            .map(|index| format!("session-{index}"))
+            .collect::<Vec<_>>();
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+            .unwrap();
+        let limit = 1_i64;
+
+        for range in ui_snapshot_batch_ranges(session_ids.len()) {
+            let batch_session_ids = &session_ids[range];
+            let query = format!(
+                "SELECT COUNT(*) FROM sessions WHERE id IN ({}) LIMIT ?",
+                placeholders(batch_session_ids)
+            );
+            let count = connection
+                .query_row(
+                    &query,
+                    params_from_iter(session_query_params(batch_session_ids, &limit)),
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0);
+        }
+    }
 }

@@ -338,7 +338,7 @@ private struct ProviderSetupCard: View {
         guard let command = provider.reviewCommand else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(command, forType: .string)
-        model.showToast("Codex 启动命令已复制；运行后输入 /hooks")
+        model.showToast(localized("Codex 启动命令已复制；运行后输入 /hooks", locale: locale))
     }
 
     private func openGuide() {

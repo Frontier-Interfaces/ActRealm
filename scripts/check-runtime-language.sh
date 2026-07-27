@@ -110,7 +110,7 @@ for index, item in enumerate(api_errors):
         raise SystemExit(f"error: English API error text contains Han characters: {code}")
 
 server_text = (root / "crates/server/src/server.rs").read_text(encoding="utf-8")
-server_production = server_text.split("#[cfg(test)]", 1)[0]
+server_production = server_text.split("\n#[cfg(test)]\nmod tests {", 1)[0]
 emitted_api_errors = set(
     re.findall(
         r'api_error(?:_detail)?\s*\(.{0,240}?"([A-Z][A-Z0-9_]+)"',

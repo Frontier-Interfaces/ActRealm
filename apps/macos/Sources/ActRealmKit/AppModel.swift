@@ -457,6 +457,7 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var uiSettings: UISettings = .defaults
     @Published public private(set) var displayCatalog: [DisplayField] = []
     @Published public private(set) var claudeQuotaBridge: ClaudeQuotaBridge?
+    @Published public private(set) var backupSummary: BackupSummary = .empty
     @Published public private(set) var isSetupBusy = false
     @Published public private(set) var isSettingsBusy = false
     @Published public private(set) var settingsSaveError: String?
@@ -466,7 +467,12 @@ public final class AppModel: ObservableObject {
     /// Persistent result shown in Settings. A main-window toast alone is not
     /// visible while the separate Settings scene is frontmost.
     @Published public private(set) var quotaRefreshMessage: String?
-    @Published public private(set) var eventUIP95Ms: UInt64?
+    /// Local event-to-native-presentation timing. Runtime transport p95
+    /// remains a Runtime concern and is never combined with this window.
+    @Published public private(set) var nativePresentationP95Ms: UInt64?
+    /// Factual task-card values are retained independently from quota, setup,
+    /// metrics and the one-second display clock.
+    @Published public private(set) var taskRenderSignatures: [TaskRenderSignature] = []
     /// Monotonic event observed by the AppKit shell to play the optional local
     /// arrival sound without moving platform UI code into ActRealmKit.
     @Published public private(set) var notificationPulse: UInt64 = 0
@@ -517,7 +523,7 @@ public final class AppModel: ObservableObject {
     /// out of every compact UI until a newer event makes them visible again.
     public var visibleAgentTasks: [LaneTask] {
         let cutoff = now.addingTimeInterval(-30 * 60)
-        return derived.agentTasks.filter { task in
+        return taskRenderSignatures.map(\.task).filter { task in
             guard !isTaskDismissed(task) else { return false }
             return task.status == .running || task.status == .waiting
                 || task.hasVisibleAttention || task.lastEventAt >= cutoff
@@ -554,7 +560,8 @@ public final class AppModel: ObservableObject {
     private var hasDeferredSnapshotProjection = false
     private var persistedUISettings: UISettings = .defaults
     private var renderedEventCount: UInt64 = 0
-    private var eventUILatenciesMs: [UInt64] = []
+    private var nativePresentationLatency = NativePresentationLatency()
+    private var taskRenderProjector = TaskRenderProjector()
     private var started = false
     private var wakeRecoveryTask: Task<Void, Never>?
 
@@ -657,11 +664,13 @@ public final class AppModel: ObservableObject {
         startTicker()
         if isDemo {
             derived = DemoData.derivedState(now: now)
+            publishTaskCards(derived.agentTasks)
             setupInfo = DemoData.setup
             uiSettings = DemoData.settings.settings
             persistedUISettings = DemoData.settings.settings
             displayCatalog = DemoData.settings.displayCatalog
             claudeQuotaBridge = DemoData.settings.claudeQuotaBridge
+            backupSummary = DemoData.settings.backups
             bridgeStatus = .listening
             lastSyncAt = now
             return
@@ -729,7 +738,10 @@ public final class AppModel: ObservableObject {
                 }
             }
             if let error {
-                runtimeActionMessage = error
+                runtimeActionMessage = AppLocalization.localizedRuntimeSupervisorText(
+                    error,
+                    language: appLanguage
+                )
                 isRestartingRuntime = false
                 return
             }
@@ -737,7 +749,10 @@ public final class AppModel: ObservableObject {
             for _ in 0..<60 {
                 if bridgeStatus.isListening { break }
                 if case .failed(let message) = supervisor.state {
-                    runtimeActionMessage = message
+                    runtimeActionMessage = AppLocalization.localizedRuntimeSupervisorText(
+                        message,
+                        language: appLanguage
+                    )
                     break
                 }
                 try? await Task.sleep(for: .milliseconds(200))
@@ -812,6 +827,7 @@ public final class AppModel: ObservableObject {
         settingsSaveNotice = nil
         if isDemo {
             derived = DemoData.derivedState(now: now)
+            publishTaskCards(derived.agentTasks)
         } else {
             apply(snapshot: latestSnapshot, emitArrivals: false)
         }
@@ -866,6 +882,7 @@ public final class AppModel: ObservableObject {
         persistedUISettings = response.settings
         displayCatalog = response.displayCatalog
         claudeQuotaBridge = response.claudeQuotaBridge
+        backupSummary = response.backups
         apply(snapshot: latestSnapshot, emitArrivals: false)
     }
 
@@ -948,6 +965,21 @@ public final class AppModel: ObservableObject {
         }
         await refreshSettings()
         showToast(l10n("本地运行数据已彻底清除，Hook 接入保持不变"))
+        return true
+    }
+
+    @discardableResult
+    public func clearConfigurationBackups(confirmation: String) async -> Bool {
+        guard confirmation == "DELETE BACKUPS" else {
+            showToast(l10n("请输入 DELETE BACKUPS；没有删除任何备份"))
+            return false
+        }
+        if let error = await client.clearBackups(confirmation: confirmation) {
+            showToast(l10nFormat("备份清除失败：%@", clientErrorMessage(error)))
+            return false
+        }
+        await refreshSettings()
+        showToast(l10n("ActRealm 配置备份已清除"))
         return true
     }
 
@@ -1057,12 +1089,21 @@ public final class AppModel: ObservableObject {
                 }
                 if self.isDemo, self.isWorkspaceAnimationActive {
                     self.derived = DemoData.derivedState(now: tick)
+                    self.publishTaskCards(self.derived.agentTasks)
                 }
             }
         }
     }
 
     // MARK: - Snapshot handling
+
+    private func publishTaskCards(_ tasks: [LaneTask]) {
+        let projection = taskRenderProjector.apply(tasks)
+        // Do not assign an equal array: @Published would otherwise notify the
+        // whole task feed for a quota/metrics/setup/clock-only refresh.
+        guard !projection.changedTaskIDs.isEmpty else { return }
+        taskRenderSignatures = projection.signatures
+    }
 
     func receive(snapshot: Snapshot) {
         let previous = latestSnapshot
@@ -1090,6 +1131,7 @@ public final class AppModel: ObservableObject {
         let complete = setupInfo == nil || setupInfo?.firstRun == true
             ? DerivedState.empty
             : DerivedState.derive(from: snapshot)
+        publishTaskCards(complete.agentTasks)
         // Reminder rules control presentation, not Runtime truth. An ignored
         // approval still keeps its task in the waiting state, matching Web.
         let next = DerivedState(
@@ -1158,15 +1200,9 @@ public final class AppModel: ObservableObject {
             let latestEventAt = snapshot.sessions.map(\.lastEventAt).max() ?? 0
             let currentMillis = UInt64(max(0, Date().timeIntervalSince1970 * 1000))
             if latestEventAt > 0, currentMillis >= latestEventAt {
-                let latency = currentMillis - latestEventAt
-                if latency <= 10_000 {
-                    eventUILatenciesMs.append(latency)
-                    if eventUILatenciesMs.count > 100 {
-                        eventUILatenciesMs.removeFirst(eventUILatenciesMs.count - 100)
-                    }
-                    let sorted = eventUILatenciesMs.sorted()
-                    let index = max(0, Int(ceil(Double(sorted.count) * 0.95)) - 1)
-                    eventUIP95Ms = sorted[index]
+                let eventAt = Date(timeIntervalSince1970: TimeInterval(latestEventAt) / 1_000)
+                if nativePresentationLatency.record(eventAt: eventAt, renderedAt: Date()) {
+                    nativePresentationP95Ms = nativePresentationLatency.p95Milliseconds
                 }
             }
             renderedEventCount = snapshot.stats.eventCount
@@ -1366,14 +1402,19 @@ public final class AppModel: ObservableObject {
         }
     }
 
-    private static func inferredToastPriority(for message: String) -> ToastPriority {
+    nonisolated static func inferredToastPriorityForTest(_ message: String) -> ToastPriority {
+        inferredToastPriority(for: message)
+    }
+
+    private nonisolated static func inferredToastPriority(for message: String) -> ToastPriority {
+        let normalized = message.lowercased()
         let errorMarkers = [
             "失败", "无法", "不能", "未连接", "没有可用", "没有找到", "未找到",
             "已过期", "请输入", "请回答", "请填写", "仍需在",
             "failed", "could not", "cannot", "disconnected", "unavailable",
             "not found", "expired", "enter ", "still need",
         ]
-        return errorMarkers.contains(where: message.contains) ? .error : .informational
+        return errorMarkers.contains(where: normalized.contains) ? .error : .informational
     }
 
     /// Applies one atomic edit and persists it immediately. The page calls this

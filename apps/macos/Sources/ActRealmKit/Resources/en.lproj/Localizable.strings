@@ -5,7 +5,8 @@
 "系统默认会根据 macOS 首选语言选择中文或英文。" = "System Default follows the preferred language in macOS.";
 
 "通用" = "General";
-"Agent" = "Agents";
+"Agent" = "Agent";
+"settings.tab.agents" = "Agents";
 "通知" = "Notifications";
 "主题" = "Appearance";
 "显示" = "Display";
@@ -72,7 +73,7 @@
 "Claude 额度" = "Claude quota";
 "Codex 信任必须在官方界面确认" = "Codex trust must be confirmed in the official interface";
 "Codex 同时存在 inline Hook；请先保留一种同层配置形式。" = "Codex also has an inline Hook. Keep only one configuration form at this level first.";
-"Codex 启动命令已复制；运行后输入 /hooks" = "Codex launch command copied. Enter /hooks after running it.";
+"Codex 启动命令已复制；运行后输入 /hooks" = "Codex launch command copied. Run it, then enter /hooks.";
 "Codex 增强活动" = "Enhanced Codex activity";
 "GIF 循环" = "Looping GIF";
 "HUD 倒计时" = "HUD countdown";
@@ -91,6 +92,19 @@
 "Runtime 正在启动" = "Runtime starting";
 "Runtime 状态与诊断" = "Runtime Status and Diagnostics";
 "Runtime 监控预览" = "Runtime monitor preview";
+"app 内没有打包 actrealm Helper，也未配置开发仓库路径" = "The app does not contain the ActRealm helper and no development repository path is configured";
+"cargo build --release -p actrealm failed" = "Could not build the local Runtime helper";
+"另一个 actrealm 实例已在运行（可先退出终端里的 serve）" = "Another ActRealm instance is already running. Stop the terminal serve process first.";
+"发现旧 LaunchAgent：serve --port 已不受当前 Runtime 支持，会反复退出" = "An outdated LaunchAgent was found. The current Runtime no longer supports serve --port, so it will repeatedly exit.";
+"已停止参数过期的 com.frontier.actrealm.runtime LaunchAgent" = "Stopped the outdated com.frontier.actrealm.runtime LaunchAgent";
+"runtime.error.stop_old" = "Could not stop the previous Runtime (PID %@)";
+"runtime.error.replace_abandoned" = "Could not safely replace the abandoned Runtime (PID %@)";
+"runtime.error.unrecognized_lock_stop" = "runtime.lock is held by unrecognized process PID %@ (%@), so ActRealm did not stop it";
+"runtime.error.unrecognized_lock_takeover" = "runtime.lock is held by unrecognized process PID %@ (%@), so ActRealm did not take control";
+"runtime.error.launch" = "Could not launch the ActRealm Runtime: %@";
+"runtime.error.exit_status" = "ActRealm Runtime exited with status %@";
+"runtime.error.restart_exhausted" = "%@; automatic recovery failed 5 times and has stopped retrying";
+"runtime.error.restart_scheduled" = "%@; automatically restarting in %@";
 "app-server 已连接；原生审批仍需在 Codex 处理" = "app-server connected; native approvals still need to be handled in Codex";
 "app-server 已连接；当前版本审批需原界面" = "app-server connected; this version requires approvals in the original interface";
 "· Provider 后续事件已确认继续" = "· A later Provider event confirmed continuation";
@@ -259,7 +273,7 @@
 "彻底清除运行数据" = "Erase all runtime data";
 "循环视频" = "Looping video";
 "必填" = "Required";
-"恢复状态" = "Restore state";
+"恢复状态" = "Recovery status";
 "恢复进入前状态的时机" = "When to restore the previous state";
 "恢复默认" = "Restore Defaults";
 "所选显示器当前工作区的应用" = "Apps in the selected display's current workspace";
@@ -341,6 +355,7 @@
 "未连接 Agent" = "Agent not connected";
 "本地数据" = "Local data";
 "本地数据已导出" = "Local data exported";
+"保存失败：%@" = "Could not save: %@";
 "本机 Session 同步" = "Local session sync";
 "本机 · 不发送遥测" = "Local · No telemetry";
 "本轮 Token" = "Turn tokens";
@@ -748,6 +763,8 @@
 "请求失败，请重试" = "The request failed. Try again.";
 "ANSWER_FAILED" = "The answer could not be sent to the Agent";
 "AUTH_UNAVAILABLE" = "Runtime authentication is unavailable";
+"BACKUP_CLEAR_FAILED" = "Configuration backups could not be cleared safely";
+"BACKUP_DELETE_CONFIRMATION_REQUIRED" = "Enter DELETE BACKUPS to clear configuration backups";
 "CLAUDE_BRIDGE_CHANGE_FAILED" = "The Claude quota bridge could not be updated";
 "CLAUDE_OAUTH_DISABLED" = "The official Claude OAuth quota endpoint is disabled";
 "CLAUDE_QUOTA_REFRESH_FAILED" = "Claude quota refresh failed";
@@ -803,3 +820,15 @@
 "RUNTIME_AUTH_FAILED" = "Runtime authentication failed";
 "RUNTIME_SESSION_MISSING" = "Runtime did not return a local session";
 "client.agent_focus.test.title" = "Agent Focus test";
+"%llu 个 · %@" = "%1$llu backups · %2$@";
+"ActRealm 配置备份已清除" = "ActRealm configuration backups cleared";
+"修改 Agent 配置前创建；不会自动删除" = "Created before Agent configuration changes; never deleted automatically";
+"只删除 ActRealm 所有的私有备份；发现符号链接或陌生文件会拒绝操作。" = "Only private backups owned by ActRealm are removed. Symlinks or unknown files make the operation fail safely.";
+"备份用于配置恢复。只有你明确确认后才会删除。" = "Backups support configuration recovery. They are deleted only after your explicit confirmation.";
+"备份清除失败：%@" = "Backup deletion failed: %@";
+"清除备份…" = "Clear Backups…";
+"清除配置备份" = "Clear Configuration Backups";
+"确认清除配置备份" = "Confirm Configuration Backup Deletion";
+"输入 DELETE BACKUPS；不会删除当前 Agent 配置" = "Enter DELETE BACKUPS. Current Agent configuration will not be deleted.";
+"请输入 DELETE BACKUPS；没有删除任何备份" = "Enter DELETE BACKUPS. No backups were removed.";
+"配置备份" = "Configuration Backups";

@@ -12,6 +12,7 @@ legacy_pattern="${old_prefix}([ _-]?${role})|act[ _-]?room|${role}[ _-]?workspac
 
 failed=0
 while IFS= read -r -d '' file; do
+  [[ -f "$file" ]] || continue
   if grep -I -H -n -i -E "$legacy_pattern" "$file"; then
     failed=1
   fi

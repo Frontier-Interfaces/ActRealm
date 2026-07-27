@@ -356,6 +356,328 @@ fn local_usage_snapshots_join_existing_sessions_without_prompt_content() {
     fs::remove_dir_all(root).unwrap();
 }
 
+fn usage_record(
+    provider_session_id: &str,
+    captured_at: u64,
+    token_total: u64,
+    estimated_cost_usd_micros: Option<u64>,
+    usage_quality: &str,
+) -> SessionUsageRecord {
+    SessionUsageRecord {
+        provider: "codex".to_owned(),
+        provider_session_id: provider_session_id.to_owned(),
+        model: Some("gpt-5.6-sol".to_owned()),
+        input_tokens: Some(token_total),
+        output_tokens: None,
+        cache_read_tokens: None,
+        cache_creation_tokens: None,
+        reasoning_tokens: None,
+        token_total: Some(token_total),
+        last_turn_tokens: Some(token_total),
+        context_used_tokens: Some(token_total),
+        context_window_tokens: Some(1_000),
+        context_used_percent: Some(10),
+        estimated_cost_usd_micros,
+        cost_kind: estimated_cost_usd_micros.map(|_| "computed".to_owned()),
+        pricing_source: estimated_cost_usd_micros.map(|_| "test_pricing".to_owned()),
+        usage_source: "codex_rollout".to_owned(),
+        usage_quality: usage_quality.to_owned(),
+        captured_at,
+    }
+}
+
+#[test]
+fn partial_usage_refresh_clears_persisted_complete_cost_and_unavailable_rows() {
+    let root = temp_root("usage-partial-invalidation");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({"hook_event_name":"SessionStart","session_id":"usage-partial"}),
+            1,
+        ))
+        .unwrap();
+    store
+        .upsert_session_usage(usage_record(
+            "usage-partial",
+            10,
+            1_000,
+            Some(9_999),
+            "official_local",
+        ))
+        .unwrap();
+    store
+        .replace_session_usages(
+            vec![usage_record("usage-partial", 11, 100, None, "partial")],
+            11,
+        )
+        .unwrap();
+    let partial = store.snapshot().unwrap().sessions.remove(0);
+    assert_eq!(partial.token_total, Some(100));
+    assert_eq!(partial.estimated_cost_usd_micros, None);
+    assert_eq!(partial.cost_kind, None);
+    assert_eq!(partial.pricing_source, None);
+    assert_eq!(partial.usage_quality.as_deref(), Some("partial"));
+
+    store.replace_session_usages(vec![], 12).unwrap();
+    let unavailable = store.snapshot().unwrap().sessions.remove(0);
+    assert_eq!(unavailable.usage_source, None);
+    assert_eq!(unavailable.usage_quality, None);
+    assert_eq!(unavailable.estimated_cost_usd_micros, None);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn usage_refresh_rejects_stale_results_and_cannot_recreate_retained_rows() {
+    let root = temp_root("usage-refresh-ordering");
+    let database = root.join("data.sqlite");
+    let store = RuntimeStore::open(&database).unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({"hook_event_name":"SessionStart","session_id":"usage-guard"}),
+            1,
+        ))
+        .unwrap();
+    let stale_generation = store.begin_usage_collection_generation().unwrap();
+    let current_generation = store.begin_usage_collection_generation().unwrap();
+    assert!(store
+        .replace_session_usages_for_generation(
+            vec![usage_record(
+                "usage-guard",
+                1_000,
+                1_000,
+                Some(1_000),
+                "official_local",
+            )],
+            1_000,
+            current_generation,
+        )
+        .unwrap());
+    assert!(!store
+        .replace_session_usages_for_generation(
+            vec![usage_record("usage-guard", 1_000, 99, None, "partial")],
+            1_000,
+            stale_generation,
+        )
+        .unwrap());
+    let guarded = store.snapshot().unwrap().sessions.remove(0);
+    assert_eq!(guarded.token_total, Some(1_000));
+    assert_eq!(guarded.estimated_cost_usd_micros, Some(1_000));
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let expired_at = now.saturating_sub(31 * 24 * 60 * 60 * 1_000);
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({"hook_event_name":"SessionStart","session_id":"retained-usage"}),
+            expired_at,
+        ))
+        .unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({"hook_event_name":"Stop","session_id":"retained-usage"}),
+            expired_at.saturating_add(1),
+        ))
+        .unwrap();
+    store.prune_events(30, now).unwrap();
+    let generation = store.begin_usage_collection_generation().unwrap();
+    assert!(store
+        .replace_session_usages_for_generation(
+            vec![usage_record(
+                "retained-usage",
+                now,
+                500,
+                Some(500),
+                "official_local",
+            )],
+            now,
+            generation,
+        )
+        .unwrap());
+    drop(store);
+
+    let connection = Connection::open(&database).unwrap();
+    let orphan_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM session_usage WHERE provider_session_id = 'retained-usage'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(orphan_count, 0);
+    drop(connection);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn usage_refresh_generation_orders_equal_millisecond_collections() {
+    let root = temp_root("usage-generation-ordering");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({"hook_event_name":"SessionStart","session_id":"generation-usage"}),
+            1,
+        ))
+        .unwrap();
+
+    let older = store.begin_usage_collection_generation().unwrap();
+    let newer = store.begin_usage_collection_generation().unwrap();
+    assert!(store
+        .replace_session_usages_for_generation(
+            vec![usage_record(
+                "generation-usage",
+                1_000,
+                200,
+                Some(200),
+                "complete"
+            )],
+            1_000,
+            newer,
+        )
+        .unwrap());
+    assert!(!store
+        .replace_session_usages_for_generation(
+            vec![usage_record(
+                "generation-usage",
+                1_000,
+                100,
+                None,
+                "partial"
+            )],
+            1_000,
+            older,
+        )
+        .unwrap());
+    let current = store.snapshot().unwrap().sessions.remove(0);
+    assert_eq!(current.token_total, Some(200));
+    assert_eq!(current.estimated_cost_usd_micros, Some(200));
+
+    let latest = store.begin_usage_collection_generation().unwrap();
+    assert!(store
+        .replace_session_usages_for_generation(
+            vec![usage_record("generation-usage", 1, 300, None, "partial")],
+            1_000,
+            latest,
+        )
+        .unwrap());
+    let latest_snapshot = store.snapshot().unwrap().sessions.remove(0);
+    assert_eq!(latest_snapshot.token_total, Some(300));
+    assert_eq!(latest_snapshot.estimated_cost_usd_micros, None);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn legacy_usage_upsert_preserves_nullable_values_and_allows_orphans() {
+    let root = temp_root("legacy-usage-upsert");
+    let database = root.join("data.sqlite");
+    let store = RuntimeStore::open(&database).unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({"hook_event_name":"SessionStart","session_id":"legacy-usage"}),
+            1,
+        ))
+        .unwrap();
+    store
+        .upsert_session_usage(usage_record(
+            "legacy-usage",
+            1_000,
+            1_000,
+            Some(1_000),
+            "official_local",
+        ))
+        .unwrap();
+    let mut partial = usage_record("legacy-usage", 999, 1, None, "partial");
+    partial.input_tokens = None;
+    partial.token_total = None;
+    partial.last_turn_tokens = None;
+    partial.context_used_tokens = None;
+    partial.context_window_tokens = None;
+    partial.context_used_percent = None;
+    store.upsert_session_usage(partial).unwrap();
+    store
+        .upsert_session_usage(usage_record("legacy-orphan", 1, 7, None, "partial"))
+        .unwrap();
+    drop(store);
+
+    let connection = Connection::open(&database).unwrap();
+    let (tokens, cost, source, quality, captured_at): (Option<i64>, Option<i64>, String, String, i64) =
+        connection
+            .query_row(
+                "SELECT token_total, estimated_cost_usd_micros, usage_source, usage_quality, captured_at
+                 FROM session_usage WHERE provider_session_id = 'legacy-usage'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+    assert_eq!(tokens, Some(1_000));
+    assert_eq!(cost, Some(1_000));
+    assert_eq!(source, "codex_rollout");
+    assert_eq!(quality, "partial");
+    assert_eq!(captured_at, 1_000);
+    let orphan_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM session_usage WHERE provider_session_id = 'legacy-orphan'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(orphan_count, 1);
+    drop(connection);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn atomic_usage_replacement_removes_orphan_when_no_row_is_affected() {
+    let root = temp_root("replacement-orphan-invalidation");
+    let database = root.join("data.sqlite");
+    let store = RuntimeStore::open(&database).unwrap();
+    store
+        .upsert_session_usage(usage_record(
+            "deleted-session",
+            1_000,
+            100,
+            Some(100),
+            "complete",
+        ))
+        .unwrap();
+    let generation = store.begin_usage_collection_generation().unwrap();
+    assert!(store
+        .replace_session_usages_for_generation(
+            vec![usage_record(
+                "deleted-session",
+                1_000,
+                200,
+                Some(200),
+                "complete"
+            )],
+            1_000,
+            generation,
+        )
+        .unwrap());
+    drop(store);
+
+    let connection = Connection::open(&database).unwrap();
+    let orphan_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM session_usage WHERE provider_session_id = 'deleted-session'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(orphan_count, 0);
+    drop(connection);
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn provider_titles_are_separate_from_the_live_task_and_follow_claude_updates() {
     let root = temp_root("provider-title");
@@ -1385,6 +1707,55 @@ fn restart_expires_every_approval_without_a_live_waiter() {
 }
 
 #[test]
+fn legacy_waiting_session_without_live_blocker_is_normalized_on_open() {
+    let root = temp_root("legacy-local-waiting");
+    let database = root.join("data.sqlite");
+    RuntimeStore::open(&database).unwrap();
+
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO sessions(
+                id, provider, provider_session_id, exec_state, approval_owner, started_at, last_event_at
+              ) VALUES
+                ('stale-local', 'claude', 'stale-local', 'awaiting_approval', 'widget', 1, 1),
+                ('native-observation', 'codex', 'native-observation', 'awaiting_approval', 'terminal', 1, 1);
+              INSERT INTO attention_items(
+                id, session_id, provider, kind, title, risk, risk_notes, dedupe_key, state, created_at
+              ) VALUES (
+                'native-attention', 'native-observation', 'codex', 'native_approval',
+                'Provider-native approval', 'unknown', '[]', 'native-observation', 'open', 1
+              );",
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = RuntimeStore::open(&database).unwrap();
+    let snapshot = reopened.snapshot().unwrap();
+    let stale = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.provider_session_id == "stale-local")
+        .unwrap();
+    assert_eq!(stale.exec_state, "waiting_for_event");
+    assert_eq!(stale.approval_owner, None);
+
+    let native = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.provider_session_id == "native-observation")
+        .unwrap();
+    assert_eq!(native.exec_state, "awaiting_approval");
+    assert_eq!(native.approval_owner.as_deref(), Some("terminal"));
+    assert!(snapshot.attention.iter().any(|item| {
+        item.session_id == native.id && item.kind == "native_approval" && item.state == "open"
+    }));
+
+    drop(reopened);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn stale_waiter_can_never_commit_a_persisted_decision() {
     let root = temp_root("stale-waiter");
     let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
@@ -1770,6 +2141,15 @@ fn claude_task_progress_uses_only_stable_task_ids_and_never_invents_a_percentage
     let created = store.snapshot().unwrap().sessions.remove(0);
     assert_eq!((created.plan_done, created.plan_total), (Some(0), Some(2)));
     assert_eq!(created.activity.as_deref(), Some("Plan progress 0/2"));
+    assert_eq!(
+        created
+            .plan_steps
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["task-1", "task-2"],
+        "batched snapshots must preserve every stable Claude task"
+    );
 
     store
         .ingest(event("TaskCompleted", Some("task-1"), 1_003))
@@ -2453,5 +2833,245 @@ fn codex_provider_owned_permission_never_opens_a_user_approval_item() {
         Some("provider")
     );
     drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn ui_snapshot_reads_only_recent_or_actionable_sessions() {
+    let root = temp_root("bounded-ui-snapshot");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let now = 1_784_130_000_000;
+    let cutoff = now - 30 * 60 * 1_000;
+
+    for index in 0..500 {
+        store
+            .ingest(request_at(
+                Provider::Claude,
+                "SessionStart",
+                &format!("expired-{index}"),
+                None,
+                None,
+                cutoff - 1,
+            ))
+            .unwrap();
+    }
+    store
+        .ingest(request_at(
+            Provider::Claude,
+            "UserPromptSubmit",
+            "recent",
+            Some("recent-turn"),
+            None,
+            now,
+        ))
+        .unwrap();
+    store
+        .ingest(request_at(
+            Provider::Claude,
+            "PermissionRequest",
+            "actionable-expired",
+            Some("actionable-turn"),
+            Some("cargo test"),
+            cutoff - 1,
+        ))
+        .unwrap();
+
+    let full_snapshot = store.snapshot().unwrap();
+    assert!(full_snapshot
+        .sessions
+        .iter()
+        .filter(|session| session.provider_session_id.starts_with("expired-"))
+        .all(|session| session.exec_state == "idle"));
+
+    let snapshot = store.ui_snapshot(cutoff).unwrap();
+    let session_ids = snapshot
+        .sessions
+        .iter()
+        .map(|session| session.provider_session_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        session_ids,
+        std::collections::HashSet::from(["recent", "actionable-expired"])
+    );
+
+    let export = store.export_json(now).unwrap();
+    assert_eq!(export["tables"]["sessions"].as_array().unwrap().len(), 502);
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn snapshot_batches_plan_steps_and_subagents() {
+    let root = temp_root("batched-ui-snapshot");
+    let database = root.join("data.sqlite");
+    RuntimeStore::open(&database).unwrap();
+
+    let mut connection = Connection::open(&database).unwrap();
+    let transaction = connection.transaction().unwrap();
+    for index in 0..500 {
+        let session_id = format!("visible-{index}");
+        transaction
+            .execute(
+                "INSERT INTO sessions(
+                    id, provider, provider_session_id, exec_state, started_at, last_event_at
+                 ) VALUES (?1, 'claude', ?1, 'thinking', 1, 1)",
+                [&session_id],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO session_plan_steps(
+                    session_id, provider_turn_id, step_index, step, detail, status, source, updated_at
+                 ) VALUES (?1, 'turn', 0, 'Run checks', NULL, 'pending', 'connector', 1)",
+                [&session_id],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO session_subagents(
+                    session_id, agent_id, agent_type, status, source, active, started_at
+                 ) VALUES (?1, 'child', 'Explore', 'running', 'hook', 1, 1)",
+                [&session_id],
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+    drop(connection);
+
+    let store = RuntimeStore::open(&database).unwrap();
+    let (snapshot, query_count) = store.ui_snapshot_with_query_count(0).unwrap();
+    assert_eq!(snapshot.sessions.len(), 500);
+    assert!(snapshot.sessions.iter().all(|session| {
+        session.plan_steps.len() == 1
+            && session.plan_steps[0].text == "Run checks"
+            && session.subagents.len() == 1
+            && session.subagents[0].id == "child"
+    }));
+    assert!(
+        query_count <= 8,
+        "UI snapshot issued {query_count} SQL statements for 500 sessions"
+    );
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn ui_snapshot_cache_does_not_cross_cutoffs() {
+    let root = temp_root("ui-snapshot-cache-cutoff");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(request_at(
+            Provider::Claude,
+            "SessionStart",
+            "cutoff-boundary",
+            None,
+            None,
+            1_000,
+        ))
+        .unwrap();
+
+    assert_eq!(store.ui_snapshot(1_000).unwrap().sessions.len(), 1);
+    assert!(store.ui_snapshot(1_001).unwrap().sessions.is_empty());
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn ui_snapshot_cache_reuses_moving_cutoffs_without_returning_expired_sessions() {
+    let root = temp_root("ui-snapshot-moving-cutoff-cache");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(request_at(
+            Provider::Claude,
+            "SessionStart",
+            "crosses-cutoff",
+            None,
+            None,
+            1_000,
+        ))
+        .unwrap();
+    store
+        .ingest(request_at(
+            Provider::Claude,
+            "SessionStart",
+            "stays-visible",
+            None,
+            None,
+            1_002,
+        ))
+        .unwrap();
+
+    let (first, first_query_count) = store.ui_snapshot_with_query_count(1_000).unwrap();
+    assert_eq!(first.sessions.len(), 2);
+    assert!(first_query_count > 0);
+
+    let (second, second_query_count) = store.ui_snapshot_with_query_count(1_001).unwrap();
+    assert_eq!(
+        second
+            .sessions
+            .iter()
+            .map(|session| session.provider_session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["stays-visible"]
+    );
+    assert_eq!(
+        second_query_count, 0,
+        "a moving cutoff inside the cache window should reuse the bounded snapshot"
+    );
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn ui_snapshot_query_measurement_is_independent_across_runtime_stores() {
+    let root = temp_root("ui-snapshot-query-counter-concurrency");
+    let databases = [root.join("first.sqlite"), root.join("second.sqlite")];
+    let stores = databases
+        .iter()
+        .map(|database| {
+            RuntimeStore::open(database).unwrap();
+            let mut connection = Connection::open(database).unwrap();
+            let transaction = connection.transaction().unwrap();
+            for index in 0..2_000 {
+                let session_id = format!("visible-{index}");
+                transaction
+                    .execute(
+                        "INSERT INTO sessions(
+                            id, provider, provider_session_id, exec_state, started_at, last_event_at
+                         ) VALUES (?1, 'claude', ?1, 'thinking', 1, 1)",
+                        [&session_id],
+                    )
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+            drop(connection);
+            RuntimeStore::open(database).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let barrier = Arc::new(Barrier::new(3));
+    let readers = stores
+        .iter()
+        .cloned()
+        .map(|store| {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                store.ui_snapshot_with_query_count(0).unwrap().1
+            })
+        })
+        .collect::<Vec<_>>();
+
+    barrier.wait();
+    let query_counts = readers
+        .into_iter()
+        .map(|reader| reader.join().unwrap())
+        .collect::<Vec<_>>();
+    assert!(query_counts.iter().all(|count| (1..=8).contains(count)));
+
+    drop(stores);
     fs::remove_dir_all(root).unwrap();
 }

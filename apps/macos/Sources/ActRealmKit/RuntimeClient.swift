@@ -340,6 +340,20 @@ public final class RuntimeClient: ObservableObject {
         }
     }
 
+    public func clearBackups(confirmation: String) async -> String? {
+        do {
+            _ = try await sendJSON(
+                "api/v1/backups/clear",
+                method: "POST",
+                body: ["confirmation": confirmation],
+                as: JSONValue.self
+            )
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
     public func recordMetric(_ event: String) async {
         _ = try? await sendJSON(
             "api/v1/metrics",
@@ -353,6 +367,10 @@ public final class RuntimeClient: ObservableObject {
 
     private struct BootstrapResponse: Decodable {
         let csrfToken: String
+    }
+
+    private struct WebSocketTicketResponse: Decodable {
+        let ticket: String
     }
 
     private struct APIError: Decodable {
@@ -393,27 +411,29 @@ public final class RuntimeClient: ObservableObject {
     private func streamLoop() async {
         var attempt = 0
         while !Task.isCancelled {
-            guard let baseURL, let cookie = sessionCookie, let csrfToken else { return }
-            guard var components = URLComponents(
-                url: baseURL.appendingPathComponent("api/v1/ws"),
-                resolvingAgainstBaseURL: false
-            ) else { return }
-            components.scheme = baseURL.scheme == "https" ? "wss" : "ws"
-            components.queryItems = [URLQueryItem(name: "csrf", value: csrfToken)]
-            guard let wsURL = components.url else { return }
-
-            var request = URLRequest(url: wsURL)
-            request.setValue("actrealm_session=\(cookie)", forHTTPHeaderField: "Cookie")
-            request.setValue(originValue(for: baseURL), forHTTPHeaderField: "Origin")
-            let task = session.webSocketTask(with: request)
-            webSocketTask = task
-            task.resume()
-            connectionState = .live
-            attempt = 0
-
+            guard let baseURL, let cookie = sessionCookie, csrfToken != nil else { return }
             do {
+                let ticket = try await sendEmpty(
+                    "api/v1/ws-ticket",
+                    method: "POST",
+                    as: WebSocketTicketResponse.self
+                ).ticket
+                guard let request = Self.webSocketRequest(
+                    baseURL: baseURL,
+                    cookie: cookie,
+                    ticket: ticket
+                ) else { return }
+                let task = session.webSocketTask(with: request)
+                webSocketTask = task
+                task.resume()
+                var receivedMessage = false
                 while !Task.isCancelled {
                     let message = try await task.receive()
+                    if !receivedMessage {
+                        receivedMessage = true
+                        connectionState = .live
+                        attempt = 0
+                    }
                     switch message {
                     case .string(let text): handleSocketText(text)
                     case .data(let data):
@@ -431,6 +451,29 @@ public final class RuntimeClient: ObservableObject {
             let delaySeconds = min(pow(2.0, Double(attempt)), 30)
             try? await Task.sleep(for: .seconds(delaySeconds))
         }
+    }
+
+    nonisolated static func webSocketRequest(
+        baseURL: URL,
+        cookie: String,
+        ticket: String
+    ) -> URLRequest? {
+        guard var components = URLComponents(
+            url: baseURL.appendingPathComponent("api/v1/ws"),
+            resolvingAgainstBaseURL: false
+        ) else { return nil }
+        components.scheme = baseURL.scheme == "https" ? "wss" : "ws"
+        components.query = nil
+        components.fragment = nil
+        guard let wsURL = components.url else { return nil }
+
+        var request = URLRequest(url: wsURL)
+        request.setValue("actrealm_session=\(cookie)", forHTTPHeaderField: "Cookie")
+        var origin = baseURL.absoluteString
+        if origin.hasSuffix("/") { origin.removeLast() }
+        request.setValue(origin, forHTTPHeaderField: "Origin")
+        request.setValue("actrealm.\(ticket)", forHTTPHeaderField: "Sec-WebSocket-Protocol")
+        return request
     }
 
     private func handleSocketText(_ text: String) {

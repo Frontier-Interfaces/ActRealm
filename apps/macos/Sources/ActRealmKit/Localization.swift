@@ -178,6 +178,74 @@ public enum AppLocalization {
         return localized("请求失败，请重试", language: language)
     }
 
+    /// Localizes ActRealm-owned Runtime supervisor diagnostics while leaving
+    /// paths, PIDs and provider/system output verbatim. The supervisor stores
+    /// operational facts independently from the currently selected UI locale.
+    public static func localizedRuntimeSupervisorText(
+        _ message: String,
+        language: AppLanguage
+    ) -> String {
+        guard AppLanguage.resolvedIdentifier(selection: language) == AppLanguage.english.rawValue
+        else { return message }
+
+        let direct = localized(message, language: language)
+        if direct != message { return direct }
+
+        if let pid = value(in: message, prefix: "无法停止旧 Runtime（PID ", suffix: "）") {
+            return formatted("runtime.error.stop_old", pid, language: language)
+        }
+        if let pid = value(in: message, prefix: "无法安全替换遗留 Runtime（PID ", suffix: "）") {
+            return formatted("runtime.error.replace_abandoned", pid, language: language)
+        }
+        if message.hasPrefix("failed to launch actrealm: ") {
+            return formatted(
+                "runtime.error.launch",
+                String(message.dropFirst("failed to launch actrealm: ".count)),
+                language: language
+            )
+        }
+        if let status = value(in: message, prefix: "actrealm 退出（状态码 ", suffix: "）") {
+            return formatted("runtime.error.exit_status", status, language: language)
+        }
+        if message.hasPrefix("runtime.lock 由未识别进程 PID "),
+           let held = message.range(of: " 持有（"),
+           let suffix = message.range(of: "），为避免误杀未自动")
+        {
+            let pidStart = message.index(message.startIndex, offsetBy: "runtime.lock 由未识别进程 PID ".count)
+            let pid = String(message[pidStart..<held.lowerBound])
+            let path = String(message[held.upperBound..<suffix.lowerBound])
+            let action = String(message[suffix.upperBound...])
+            let key = action == "停止"
+                ? "runtime.error.unrecognized_lock_stop"
+                : "runtime.error.unrecognized_lock_takeover"
+            return formatted(key, pid, path, language: language)
+        }
+        if message.hasSuffix("；自动恢复连续失败 5 次，已停止重试") {
+            let base = String(message.dropLast("；自动恢复连续失败 5 次，已停止重试".count))
+            return formatted(
+                "runtime.error.restart_exhausted",
+                localizedRuntimeSupervisorText(base, language: language),
+                language: language
+            )
+        }
+        if let marker = message.range(of: "；将在 "), message.hasSuffix(" 后自动重启") {
+            let failure = String(message[..<marker.lowerBound])
+            let delay = String(message[marker.upperBound...].dropLast(" 后自动重启".count))
+            return formatted(
+                "runtime.error.restart_scheduled",
+                localizedRuntimeSupervisorText(failure, language: language),
+                localizedProviderText(delay, language: language),
+                language: language
+            )
+        }
+        return message
+    }
+
+    private static func value(in text: String, prefix: String, suffix: String) -> String? {
+        guard text.hasPrefix(prefix), text.hasSuffix(suffix) else { return nil }
+        return String(text.dropFirst(prefix.count).dropLast(suffix.count))
+    }
+
     public static func localizedDisplayFieldLabel(
         id: String,
         fallback _: String,

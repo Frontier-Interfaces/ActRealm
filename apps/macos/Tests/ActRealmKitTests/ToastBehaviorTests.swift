@@ -34,6 +34,12 @@ import Testing
         #expect(!model.isSettingsVisible)
     }
 
+    @Test func englishErrorPriorityIsCaseInsensitiveAndExplicit() {
+        #expect(AppModel.inferredToastPriorityForTest("Could not save settings") == .error)
+        #expect(AppModel.inferredToastPriorityForTest("Enter DELETE") == .error)
+        #expect(AppModel.inferredToastPriorityForTest("Command copied") == .informational)
+    }
+
     private func isolatedDefaults() -> UserDefaults {
         let suite = "ToastBehaviorTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!

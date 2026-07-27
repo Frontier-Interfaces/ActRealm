@@ -130,7 +130,10 @@ public struct RuntimeMonitorView: View {
                 Text("发现旧的后台启动项")
                     .font(.system(size: 11.5, weight: .bold))
                     .foregroundStyle(DT.amberTextSoft)
-                Text(localized(warning, locale: locale))
+                Text(AppLocalization.localizedRuntimeSupervisorText(
+                    warning,
+                    language: model.appLanguage
+                ))
                     .font(DT.body(10.5))
                     .foregroundStyle(DT.textWeak)
             }
@@ -258,7 +261,10 @@ public struct RuntimeMonitorView: View {
     private var actionBar: some View {
         HStack(spacing: 10) {
             if let message = model.runtimeActionMessage {
-                Text(localized(message, locale: locale))
+                Text(AppLocalization.localizedRuntimeSupervisorText(
+                    message,
+                    language: model.appLanguage
+                ))
                     .font(DT.body(10.5))
                     .foregroundStyle(model.bridgeStatus.isListening ? DT.greenText : DT.redText)
                     .lineLimit(2)
@@ -379,7 +385,17 @@ public struct RuntimeMonitorView: View {
     private var logText: String {
         let stdout = model.runtimeDiagnostics.stdoutTail.trimmingCharacters(in: .whitespacesAndNewlines)
         let stderr = model.runtimeDiagnostics.stderrTail.trimmingCharacters(in: .whitespacesAndNewlines)
-        let combined = [stdout, stderr].filter { !$0.isEmpty }.joined(separator: "\n")
+        let combined = [stdout, stderr]
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map {
+                AppLocalization.localizedRuntimeSupervisorText(
+                    String($0),
+                    language: model.appLanguage
+                )
+            }
+            .joined(separator: "\n")
         return combined.isEmpty
             ? localized("等待 Runtime 输出…", locale: locale)
             : combined

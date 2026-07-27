@@ -8,6 +8,8 @@
   "errors": [
     { "code": "ANSWER_FAILED", "en": "The answer could not be sent to the Agent", "zh-Hans": "回答未能发送给 Agent" },
     { "code": "AUTH_UNAVAILABLE", "en": "Runtime authentication is unavailable", "zh-Hans": "Runtime 身份验证暂不可用" },
+    { "code": "BACKUP_CLEAR_FAILED", "en": "Configuration backups could not be cleared safely", "zh-Hans": "配置备份未能安全清除" },
+    { "code": "BACKUP_DELETE_CONFIRMATION_REQUIRED", "en": "Enter DELETE BACKUPS to clear configuration backups", "zh-Hans": "需要输入 DELETE BACKUPS 才能清除配置备份" },
     { "code": "CLAUDE_BRIDGE_CHANGE_FAILED", "en": "The Claude quota bridge could not be updated", "zh-Hans": "Claude 额度桥更新失败" },
     { "code": "CLAUDE_OAUTH_DISABLED", "en": "The official Claude OAuth quota endpoint is disabled", "zh-Hans": "Claude 官方 OAuth 额度接口未启用" },
     { "code": "CLAUDE_QUOTA_REFRESH_FAILED", "en": "Claude quota refresh failed", "zh-Hans": "Claude 额度刷新失败" },

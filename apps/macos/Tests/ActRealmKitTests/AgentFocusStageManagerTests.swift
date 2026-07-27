@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import ActRealmKit
 @testable import ActRealmUI
@@ -43,7 +44,7 @@ import Testing
         ))
     }
 
-    @Test func systemControllerAppliesPreferenceWithoutRestartingWindowManager() {
+    @Test @MainActor func systemControllerAppliesPreferenceWithoutRestartingWindowManager() async {
         final class State {
             var enabled = false
             var calls: [(String, [String])] = []
@@ -63,7 +64,7 @@ import Testing
             }
         }
 
-        #expect(controller.setEnabled(true))
+        #expect(await controller.setEnabled(true))
         #expect(state.calls.count == 2)
         #expect(state.calls.allSatisfy { $0.0 == "/usr/bin/defaults" })
         #expect(state.calls[0].1 == [
@@ -132,6 +133,7 @@ import Testing
         #expect(!lease.shouldRestore(for: .acceptance))
         #expect(!lease.shouldRestore(for: .actRealmReturn))
         #expect(!lease.shouldRestore(for: .focusDisabled))
+        #expect(!lease.shouldRestore(for: .relaunch))
     }
 
     @Test func failedEnableDoesNotCreateRestoreAuthority() {
@@ -146,5 +148,48 @@ import Testing
 
         #expect(!lease.didEnableStageManager)
         #expect(!lease.shouldRestore(for: .focusDisabled))
+    }
+
+    @Test func persistedLeaseRestoresAfterRelaunchOnlyWhenActRealmEnabledStageManager() throws {
+        var original = StageManagerLease()
+        original.begin(
+            allowed: true,
+            restoreTiming: .onReturnToActRealm,
+            originalState: false,
+            enableSucceeded: true
+        )
+
+        let persisted = try JSONEncoder().encode(original)
+        var relaunched = try JSONDecoder().decode(StageManagerLease.self, from: persisted)
+        #expect(relaunched.shouldRestore(for: .relaunch))
+        relaunched.finishRestore(succeeded: true)
+        #expect(!relaunched.didEnableStageManager)
+    }
+
+    @Test func failedRestoreKeepsLeaseForSafeRetry() {
+        var lease = StageManagerLease()
+        lease.begin(
+            allowed: true,
+            restoreTiming: .afterAcceptance,
+            originalState: false,
+            enableSucceeded: true
+        )
+
+        lease.finishRestore(succeeded: false)
+        #expect(lease.didEnableStageManager)
+        #expect(lease.shouldRestore(for: .relaunch))
+    }
+
+    @Test func keepEnabledClearsActRealmRestoreAuthority() {
+        var lease = StageManagerLease()
+        lease.begin(
+            allowed: true,
+            restoreTiming: .keepEnabled,
+            originalState: false,
+            enableSucceeded: true
+        )
+
+        lease.finishRestore(succeeded: true)
+        #expect(!lease.didEnableStageManager)
     }
 }

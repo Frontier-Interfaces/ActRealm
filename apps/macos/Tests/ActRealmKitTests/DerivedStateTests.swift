@@ -26,12 +26,15 @@ private func makeSession(
     provider: String = "claude",
     execState: String = "idle",
     title: String? = nil,
+    currentTool: String? = nil,
+    recoveryState: String? = nil,
     lastEventAt: UInt64 = 1000
 ) -> SessionRecord {
     SessionRecord(
         id: id, provider: provider, providerSessionId: id, project: "proj",
         title: title ?? "任务 \(id)", model: nil, execState: execState, approvalOwner: nil,
         activity: nil, activitySince: nil, planDone: nil, planTotal: nil,
+        currentTool: currentTool, recoveryState: recoveryState,
         lastEventAt: lastEventAt
     )
 }
@@ -471,6 +474,33 @@ private func makeSnapshot(
         #expect(task.status == .idle)
         #expect(task.openOutboxCount == 0)
         #expect(task.hasVisibleAttention)
+    }
+}
+
+@Suite struct ExecutionPresentationTests {
+    @Test func runningTaskAndRecoveryStatusNeverContradict() {
+        let task = LaneTask(
+            session: makeSession(
+                id: "running",
+                execState: "tool_running",
+                recoveryState: "ended"
+            ),
+            openAttention: []
+        )
+
+        #expect(task.status == .running)
+        #expect(task.recoveryPresentation != .ended)
+    }
+
+    @Test func missingToolNameIsOmittedInsteadOfRenderedAsUnknown() {
+        let task = LaneTask(
+            session: makeSession(id: "running", execState: "tool_running"),
+            openAttention: []
+        )
+
+        #expect(task.activityLabel == "运行中")
+        #expect(task.detailRows.contains(where: { $0.value == "Unknown" }) == false)
+        #expect(task.detailRows.contains(where: { $0.field == "tool" }) == false)
     }
 }
 
