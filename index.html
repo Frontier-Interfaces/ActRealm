@@ -1010,8 +1010,31 @@
       height: 20px;
     }
 
+    .footer-meta {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+    }
+
+    .footer-link {
+      color: #45454a;
+      font-weight: 700;
+      transition: color .2s ease;
+    }
+
+    .footer-link:hover {
+      color: #1677ff;
+    }
+
+    .footer-company {
+      margin-top: 22px;
+      color: #68686e;
+      font-size: 12px;
+      font-weight: 650;
+    }
+
     .footer-note {
-      margin-top: 24px;
+      margin-top: 10px;
       font-size: 12px;
       line-height: 1.75;
     }
@@ -1325,8 +1348,12 @@
           <img src="assets/actrealm-icon-192.png" alt="">
           <span>ActRealm</span>
         </div>
-        <div data-i18n="footer.tagline">Open-source agent operating layer for desktop · MIT License</div>
+        <div class="footer-meta">
+          <div data-i18n="footer.tagline">Open-source agent operating layer for desktop · MIT License</div>
+          <a class="footer-link" href="/support/" data-i18n="footer.support">Support</a>
+        </div>
       </div>
+      <p class="footer-company" data-i18n="footer.company">ActRealm is developed and operated by Frontier Interfaces Inc.</p>
       <p class="footer-note" data-i18n="footer.note">Capabilities labeled “In Development,” “Experimental,” or “Hardware Prototype” are not part of the current stable delivery. Stage Manager and Spaces are macOS system features. Apple, macOS, and Stage Manager are trademarks of Apple Inc.; this project is not affiliated with Apple Inc. Product interfaces and hardware images on this page illustrate the current build, experiments, and prototype direction.</p>
     </div>
   </footer>
@@ -1425,6 +1452,8 @@
         "opensource.copy": "当前源代码已经开放。M1 将重点完善审批闭环、任务状态、额度信息与上下文返回，从 macOS 上的 Claude Code 与 Codex 开始。欢迎试用当前构建、提交 issue，或为新的 Agent 工具编写适配器。",
         "opensource.note": "开源 · 从 GitHub 构建 · M1 提供打包安装",
         "footer.tagline": "桌面端的开源 Agent 操作层 · MIT License",
+        "footer.support": "支持",
+        "footer.company": "ActRealm 由 Frontier Interfaces Inc. 开发与运营。",
         "footer.note": "标注“开发中”“实验性方向”或“硬件原型”的能力不属于当前稳定交付。Stage Manager 与 Spaces 为 macOS 系统功能；Apple、macOS 与 Stage Manager 为 Apple Inc. 商标，本项目与 Apple Inc. 无关联。页面中的产品界面与硬件图片用于说明当前构建、实验和原型方向。"
       },
       html: {

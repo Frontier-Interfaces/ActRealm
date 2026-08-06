@@ -1,0 +1,1132 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ActRealm Support — Setup, product help, and issue reporting</title>
+  <meta name="description" content="Get help with ActRealm setup, product questions, bug reports, and private security concerns from Frontier Interfaces Inc.">
+  <meta name="theme-color" content="#ffffff">
+  <link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32.png">
+  <style>
+    :root {
+      --ink: #171719;
+      --secondary: #77777c;
+      --muted: #a0a0a6;
+      --line: #e3e3e7;
+      --paper: #ffffff;
+      --mist: #f5f5f7;
+      --panel: #eef0f4;
+      --black: #0b0b0f;
+      --cyan: #05a9bb;
+      --violet: #7258ee;
+      --green: #38b86a;
+      --blue: #1677ff;
+      --gradient: linear-gradient(100deg, #05a9bb 5%, #7258ee 95%);
+      --shadow: 0 24px 64px rgba(22, 26, 35, .14);
+      --shadow-soft: 0 12px 34px rgba(22, 26, 35, .09);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html {
+      scroll-behavior: smooth;
+      background: var(--paper);
+    }
+
+    body {
+      min-width: 320px;
+      color: var(--ink);
+      background: var(--paper);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display",
+        "SF Pro SC", "PingFang SC", "Helvetica Neue", Arial, sans-serif;
+      line-height: 1.55;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+    }
+
+    a {
+      color: inherit;
+      text-decoration: none;
+    }
+
+    button {
+      font: inherit;
+    }
+
+    .shell {
+      width: min(1040px, calc(100% - 96px));
+      margin: 0 auto;
+    }
+
+    .shell-wide {
+      width: min(1240px, calc(100% - 96px));
+      margin: 0 auto;
+    }
+
+    .eyebrow {
+      color: #8b8b91;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+
+    .gradient-line {
+      width: 360px;
+      max-width: 68vw;
+      height: 6px;
+      margin: 25px auto 0;
+      border-radius: 999px;
+      background: var(--gradient);
+    }
+
+    .reveal {
+      opacity: 0;
+      transform: translateY(20px);
+      transition: opacity .7s cubic-bezier(.2, .65, .25, 1),
+        transform .7s cubic-bezier(.2, .65, .25, 1);
+    }
+
+    .reveal.visible {
+      opacity: 1;
+      transform: none;
+    }
+
+    /* Navigation */
+    .nav {
+      position: sticky;
+      top: 0;
+      z-index: 30;
+      height: 64px;
+      border-bottom: 1px solid rgba(0, 0, 0, .08);
+      background: rgba(255, 255, 255, .88);
+      backdrop-filter: saturate(170%) blur(22px);
+      -webkit-backdrop-filter: saturate(170%) blur(22px);
+    }
+
+    .nav-inner {
+      display: grid;
+      grid-template-columns: 220px 1fr 280px;
+      align-items: center;
+      height: 64px;
+    }
+
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      width: max-content;
+      font-size: 16px;
+      font-weight: 700;
+    }
+
+    .brand img {
+      width: 24px;
+      height: 24px;
+      object-fit: contain;
+    }
+
+    .nav-links {
+      display: flex;
+      justify-content: center;
+      gap: 28px;
+      color: #85858a;
+      font-size: 12px;
+      font-weight: 520;
+      white-space: nowrap;
+    }
+
+    .nav-links a {
+      transition: color .2s ease;
+    }
+
+    .nav-links a:hover {
+      color: var(--ink);
+    }
+
+    .nav-tools {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 12px;
+    }
+
+    .lang-toggle {
+      min-width: 58px;
+      padding: 7px 13px;
+      border: 1px solid #d7d7dc;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, .9);
+      color: #68686e;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 650;
+      transition: color .2s ease, border-color .2s ease, background .2s ease;
+    }
+
+    .lang-toggle:hover {
+      border-color: #b8b8be;
+      background: #fff;
+      color: var(--ink);
+    }
+
+    .nav-action {
+      padding: 8px 20px;
+      border-radius: 999px;
+      background: var(--ink);
+      color: #fff;
+      font-size: 12px;
+      font-weight: 650;
+      transition: transform .2s ease, background .2s ease;
+    }
+
+    .nav-action:hover {
+      transform: translateY(-1px);
+      background: #303034;
+    }
+
+    /* Hero */
+    .hero {
+      padding: 90px 0 92px;
+      text-align: center;
+    }
+
+    .app-icon {
+      display: block;
+      width: 74px;
+      height: 74px;
+      margin: 24px auto 0;
+      object-fit: contain;
+      filter: drop-shadow(0 13px 18px rgba(40, 76, 175, .2));
+    }
+
+    .hero h1 {
+      max-width: 830px;
+      margin: 27px auto 0;
+      font-size: clamp(46px, 5.2vw, 68px);
+      font-weight: 730;
+      line-height: 1.07;
+      letter-spacing: -.048em;
+    }
+
+    .hero-copy {
+      max-width: 720px;
+      margin: 32px auto 0;
+      color: var(--secondary);
+      font-size: 18px;
+      line-height: 1.75;
+    }
+
+    .hero-actions {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 34px;
+      margin-top: 36px;
+    }
+
+    .primary-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 216px;
+      padding: 14px 26px;
+      border-radius: 999px;
+      background: var(--gradient);
+      box-shadow: 0 12px 30px rgba(50, 92, 198, .19);
+      color: #fff;
+      font-size: 15px;
+      font-weight: 700;
+      transition: transform .2s ease, filter .2s ease;
+    }
+
+    .primary-button:hover {
+      transform: translateY(-2px);
+      filter: saturate(1.12);
+    }
+
+    .text-link {
+      color: #1778e9;
+      font-size: 15px;
+      font-weight: 650;
+    }
+
+    .text-link:hover {
+      text-decoration: underline;
+    }
+
+    .identity-strip {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      margin-top: 68px;
+      overflow: hidden;
+      border: 1px solid #e0e0e4;
+      border-radius: 18px;
+      background: var(--mist);
+      text-align: left;
+    }
+
+    .identity-item {
+      min-height: 104px;
+      padding: 24px 26px;
+    }
+
+    .identity-item + .identity-item {
+      border-left: 1px solid #dedee3;
+    }
+
+    .identity-item small {
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 750;
+      letter-spacing: .11em;
+      text-transform: uppercase;
+    }
+
+    .identity-item strong,
+    .identity-item a {
+      display: block;
+      margin-top: 9px;
+      color: #3f4147;
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    .identity-item a:hover {
+      color: var(--blue);
+    }
+
+    /* Support paths */
+    .paths {
+      padding: 112px 0 124px;
+      scroll-margin-top: 64px;
+      background: var(--mist);
+    }
+
+    .section-heading {
+      max-width: 780px;
+    }
+
+    .section-heading h2 {
+      margin-top: 22px;
+      font-size: clamp(38px, 4vw, 52px);
+      line-height: 1.12;
+      letter-spacing: -.04em;
+    }
+
+    .section-heading p {
+      max-width: 680px;
+      margin-top: 24px;
+      color: var(--secondary);
+      font-size: 16px;
+      line-height: 1.75;
+    }
+
+    .path-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 20px;
+      margin-top: 54px;
+    }
+
+    .path-card {
+      display: flex;
+      min-height: 312px;
+      padding: 30px 28px;
+      flex-direction: column;
+      border: 1px solid #e0e0e4;
+      border-radius: 20px;
+      background: rgba(255, 255, 255, .92);
+      box-shadow: 0 7px 24px rgba(28, 32, 40, .04);
+      transition: transform .25s ease, box-shadow .25s ease, border-color .25s ease;
+    }
+
+    .path-card:hover {
+      transform: translateY(-4px);
+      border-color: #d3d3da;
+      box-shadow: var(--shadow-soft);
+    }
+
+    .path-number {
+      display: inline-flex;
+      width: 44px;
+      height: 28px;
+      align-items: center;
+      justify-content: center;
+      border-radius: 999px;
+      background: #ededf1;
+      color: #7d7d84;
+      font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+      font-size: 11px;
+      font-weight: 750;
+      letter-spacing: .05em;
+    }
+
+    .path-card:nth-child(2) .path-number {
+      background: rgba(5, 169, 187, .1);
+      color: #047c8a;
+    }
+
+    .path-card:nth-child(3) .path-number {
+      background: rgba(114, 88, 238, .1);
+      color: #624ac6;
+    }
+
+    .path-card h3 {
+      margin-top: 26px;
+      font-size: 22px;
+      letter-spacing: -.025em;
+    }
+
+    .path-card p {
+      margin-top: 13px;
+      color: var(--secondary);
+      font-size: 14px;
+      line-height: 1.72;
+    }
+
+    .card-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      width: max-content;
+      margin-top: auto;
+      padding-top: 28px;
+      color: var(--blue);
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    .card-link::after {
+      content: "→";
+      transition: transform .2s ease;
+    }
+
+    .card-link:hover::after {
+      transform: translateX(3px);
+    }
+
+    /* Contact */
+    .contact {
+      padding: 124px 0;
+      scroll-margin-top: 64px;
+    }
+
+    .contact-panel {
+      display: grid;
+      grid-template-columns: 1.15fr .85fr;
+      overflow: hidden;
+      border-radius: 26px;
+      background: #101015;
+      box-shadow: var(--shadow);
+      color: #fff;
+    }
+
+    .contact-main {
+      position: relative;
+      min-height: 480px;
+      padding: 58px 58px 54px;
+      overflow: hidden;
+    }
+
+    .contact-main::before {
+      position: absolute;
+      top: -170px;
+      right: -120px;
+      width: 390px;
+      height: 390px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(114, 88, 238, .45), rgba(5, 169, 187, .09) 46%, transparent 70%);
+      content: "";
+    }
+
+    .contact-main .eyebrow {
+      position: relative;
+      color: #8f919a;
+    }
+
+    .contact-main h2 {
+      position: relative;
+      max-width: 560px;
+      margin-top: 26px;
+      font-size: clamp(40px, 4.2vw, 58px);
+      line-height: 1.08;
+      letter-spacing: -.045em;
+    }
+
+    .contact-main p {
+      position: relative;
+      max-width: 530px;
+      margin-top: 24px;
+      color: #b7b8bf;
+      font-size: 15px;
+      line-height: 1.76;
+    }
+
+    .email-button {
+      position: relative;
+      display: inline-flex;
+      margin-top: 34px;
+      padding: 14px 24px;
+      align-items: center;
+      gap: 10px;
+      border-radius: 999px;
+      background: #fff;
+      color: #171719;
+      font-size: 14px;
+      font-weight: 750;
+      transition: transform .2s ease, background .2s ease;
+    }
+
+    .email-button:hover {
+      transform: translateY(-2px);
+      background: #f2f2f4;
+    }
+
+    .email-button::before {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+      content: "";
+    }
+
+    .message-guide {
+      padding: 58px 48px;
+      border-left: 1px solid rgba(255, 255, 255, .12);
+      background: rgba(255, 255, 255, .035);
+    }
+
+    .message-guide h3 {
+      color: #e5e5e9;
+      font-size: 16px;
+      letter-spacing: -.01em;
+    }
+
+    .guide-list {
+      display: grid;
+      gap: 18px;
+      margin-top: 28px;
+      list-style: none;
+    }
+
+    .guide-list li {
+      position: relative;
+      padding-left: 28px;
+      color: #a9abb2;
+      font-size: 13px;
+      line-height: 1.6;
+    }
+
+    .guide-list li::before {
+      position: absolute;
+      top: 3px;
+      left: 0;
+      display: inline-flex;
+      width: 18px;
+      height: 18px;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid #44464f;
+      border-radius: 50%;
+      color: #888b94;
+      content: "✓";
+      font-size: 10px;
+    }
+
+    .privacy-note {
+      margin-top: 30px;
+      padding-top: 24px;
+      border-top: 1px solid rgba(255, 255, 255, .1);
+      color: #7f818a;
+      font-size: 11px;
+      line-height: 1.7;
+    }
+
+    /* FAQ */
+    .faq {
+      padding: 112px 0 124px;
+      scroll-margin-top: 64px;
+      background: var(--mist);
+    }
+
+    .faq-layout {
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      gap: 90px;
+      align-items: start;
+    }
+
+    .faq-heading {
+      position: sticky;
+      top: 104px;
+    }
+
+    .faq-heading h2 {
+      margin-top: 20px;
+      font-size: 44px;
+      line-height: 1.12;
+      letter-spacing: -.04em;
+    }
+
+    .faq-heading p {
+      margin-top: 22px;
+      color: var(--secondary);
+      font-size: 14px;
+      line-height: 1.75;
+    }
+
+    .faq-list {
+      border-top: 1px solid #dcdce2;
+    }
+
+    details {
+      border-bottom: 1px solid #dcdce2;
+    }
+
+    summary {
+      display: flex;
+      min-height: 86px;
+      padding: 25px 8px 25px 0;
+      align-items: center;
+      justify-content: space-between;
+      gap: 30px;
+      cursor: pointer;
+      font-size: 16px;
+      font-weight: 700;
+      list-style: none;
+    }
+
+    summary::-webkit-details-marker {
+      display: none;
+    }
+
+    summary::after {
+      flex: 0 0 auto;
+      color: #8c8c92;
+      content: "+";
+      font-size: 23px;
+      font-weight: 350;
+      transition: transform .2s ease;
+    }
+
+    details[open] summary::after {
+      transform: rotate(45deg);
+    }
+
+    .answer {
+      max-width: 650px;
+      padding: 0 42px 28px 0;
+      color: var(--secondary);
+      font-size: 14px;
+      line-height: 1.8;
+    }
+
+    .answer a {
+      color: var(--blue);
+      font-weight: 650;
+    }
+
+    .answer a:hover {
+      text-decoration: underline;
+    }
+
+    /* Footer */
+    .footer {
+      padding: 38px 0 44px;
+      border-top: 1px solid var(--line);
+      background: #fafafa;
+      color: #929298;
+    }
+
+    .footer-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 36px;
+      font-size: 13px;
+    }
+
+    .footer-brand {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: #45454a;
+      font-weight: 750;
+    }
+
+    .footer-brand img {
+      width: 20px;
+      height: 20px;
+    }
+
+    .footer-links {
+      display: flex;
+      align-items: center;
+      gap: 22px;
+    }
+
+    .footer-links a {
+      color: #67676d;
+      font-weight: 650;
+      transition: color .2s ease;
+    }
+
+    .footer-links a:hover {
+      color: var(--blue);
+    }
+
+    .footer-company {
+      margin-top: 22px;
+      color: #68686e;
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    .footer-note {
+      margin-top: 10px;
+      font-size: 12px;
+      line-height: 1.75;
+    }
+
+    @media (max-width: 900px) {
+      .shell,
+      .shell-wide {
+        width: min(100% - 48px, 720px);
+      }
+
+      .nav-inner {
+        grid-template-columns: 1fr auto;
+      }
+
+      .nav-links {
+        display: none;
+      }
+
+      .path-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .path-card {
+        min-height: 250px;
+      }
+
+      .contact-panel,
+      .faq-layout {
+        grid-template-columns: 1fr;
+      }
+
+      .message-guide {
+        border-top: 1px solid rgba(255, 255, 255, .12);
+        border-left: 0;
+      }
+
+      .faq-layout {
+        gap: 48px;
+      }
+
+      .faq-heading {
+        position: static;
+      }
+    }
+
+    @media (max-width: 640px) {
+      .shell,
+      .shell-wide {
+        width: calc(100% - 36px);
+      }
+
+      .nav-action {
+        display: none;
+      }
+
+      .hero {
+        padding: 68px 0 72px;
+      }
+
+      .hero h1 {
+        font-size: 43px;
+      }
+
+      .hero-copy {
+        font-size: 16px;
+      }
+
+      .hero-actions {
+        flex-direction: column;
+        gap: 20px;
+      }
+
+      .identity-strip {
+        grid-template-columns: 1fr;
+      }
+
+      .identity-item + .identity-item {
+        border-top: 1px solid #dedee3;
+        border-left: 0;
+      }
+
+      .paths,
+      .contact,
+      .faq {
+        padding: 82px 0;
+      }
+
+      .section-heading h2,
+      .faq-heading h2 {
+        font-size: 38px;
+      }
+
+      .contact-main,
+      .message-guide {
+        padding: 40px 28px;
+      }
+
+      .contact-main {
+        min-height: 430px;
+      }
+
+      .contact-main h2 {
+        font-size: 42px;
+      }
+
+      .email-button {
+        width: 100%;
+        justify-content: center;
+        padding-right: 16px;
+        padding-left: 16px;
+        font-size: 13px;
+      }
+
+      summary {
+        font-size: 15px;
+      }
+
+      .footer-top {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .footer-links {
+        flex-wrap: wrap;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      .reveal {
+        opacity: 1;
+        transform: none;
+        transition: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <nav class="nav" aria-label="ActRealm support navigation" data-i18n-aria="nav.aria">
+    <div class="shell-wide nav-inner">
+      <a class="brand" href="/" aria-label="ActRealm home" data-i18n-aria="nav.homeAria">
+        <img src="/assets/actrealm-icon-192.png" alt="">
+        <span>ActRealm</span>
+      </a>
+      <div class="nav-links">
+        <a href="/" data-i18n="nav.home">Home</a>
+        <a href="#start" data-i18n="nav.start">Start here</a>
+        <a href="#contact" data-i18n="nav.contact">Contact</a>
+        <a href="#faq">FAQ</a>
+      </div>
+      <div class="nav-tools">
+        <button class="lang-toggle" id="language-toggle" type="button" aria-label="Switch to Chinese">中文</button>
+        <a class="nav-action" href="mailto:hello@getactrealm.com" data-i18n="nav.action">Email support</a>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+    <section class="hero" id="top">
+      <div class="shell">
+        <div class="eyebrow reveal">ACTREALM SUPPORT</div>
+        <img class="app-icon reveal" src="/assets/actrealm-icon-192.png" alt="ActRealm app icon" data-i18n-alt="hero.iconAlt">
+        <h1 class="reveal" data-i18n-html="hero.title">Get ActRealm running.<br>Keep agent work moving.</h1>
+        <div class="gradient-line reveal"></div>
+        <p class="hero-copy reveal" data-i18n="hero.copy">Find setup guidance, report a product issue, or contact us directly. Support for ActRealm is provided by Frontier Interfaces Inc.</p>
+        <div class="hero-actions reveal">
+          <a class="primary-button" href="mailto:hello@getactrealm.com" data-i18n="hero.primary">Email hello@getactrealm.com</a>
+          <a class="text-link" href="#start" data-i18n="hero.secondary">Browse support options ↓</a>
+        </div>
+
+        <div class="identity-strip reveal" aria-label="ActRealm support information" data-i18n-aria="identity.aria">
+          <div class="identity-item">
+            <small data-i18n="identity.channelLabel">Support channel</small>
+            <a href="mailto:hello@getactrealm.com">hello@getactrealm.com</a>
+          </div>
+          <div class="identity-item">
+            <small data-i18n="identity.companyLabel">Organization</small>
+            <strong>Frontier Interfaces Inc.</strong>
+          </div>
+          <div class="identity-item">
+            <small data-i18n="identity.productLabel">Product</small>
+            <strong data-i18n="identity.productValue">ActRealm for desktop</strong>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="paths" id="start">
+      <div class="shell">
+        <div class="section-heading">
+          <div class="eyebrow reveal" data-i18n="paths.eyebrow">START HERE</div>
+          <h2 class="reveal" data-i18n="paths.title">Choose the fastest path to an answer.</h2>
+          <p class="reveal" data-i18n="paths.copy">Use the product guides for setup, GitHub for reproducible product issues, and email when you need a direct or private conversation.</p>
+        </div>
+
+        <div class="path-grid">
+          <article class="path-card reveal">
+            <span class="path-number">01</span>
+            <h3 data-i18n="paths.guideTitle">Setup and product guides</h3>
+            <p data-i18n="paths.guideCopy">Start with installation, Provider connection, Runtime health, and recovery guidance for the current build.</p>
+            <a class="card-link" href="https://github.com/Frontier-Interfaces/ActRealm/blob/agent/v1-full/docs/USER_GUIDE_en.md" data-href-en="https://github.com/Frontier-Interfaces/ActRealm/blob/agent/v1-full/docs/USER_GUIDE_en.md" data-href-zh="https://github.com/Frontier-Interfaces/ActRealm/blob/agent/v1-full/docs/USER_GUIDE_zh-CN.md" target="_blank" rel="noreferrer" data-i18n="paths.guideLink">Read the user guide</a>
+          </article>
+
+          <article class="path-card reveal">
+            <span class="path-number">02</span>
+            <h3 data-i18n="paths.issueTitle">Report a product issue</h3>
+            <p data-i18n="paths.issueCopy">If the issue can be shared publicly, open a GitHub issue with clear reproduction steps and the behavior you expected.</p>
+            <a class="card-link" href="https://github.com/Frontier-Interfaces/ActRealm/issues" target="_blank" rel="noreferrer" data-i18n="paths.issueLink">Open GitHub Issues</a>
+          </article>
+
+          <article class="path-card reveal">
+            <span class="path-number">03</span>
+            <h3 data-i18n="paths.privateTitle">Direct or private support</h3>
+            <p data-i18n="paths.privateCopy">For general questions, details that should not be public, or a suspected security issue, contact us by email.</p>
+            <a class="card-link" href="mailto:hello@getactrealm.com" data-i18n="paths.privateLink">Email Frontier Interfaces</a>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="contact" id="contact">
+      <div class="shell-wide">
+        <div class="contact-panel reveal">
+          <div class="contact-main">
+            <div class="eyebrow" data-i18n="contact.eyebrow">CONTACT SUPPORT</div>
+            <h2 data-i18n="contact.title">Tell us where the work stopped.</h2>
+            <p data-i18n="contact.copy">Describe what you were trying to do, what happened, and what you expected. We use that context to understand the problem without asking you to expose private work.</p>
+            <a class="email-button" href="mailto:hello@getactrealm.com">hello@getactrealm.com</a>
+          </div>
+
+          <aside class="message-guide" aria-label="What to include in a support request" data-i18n-aria="contact.guideAria">
+            <h3 data-i18n="contact.guideTitle">Helpful details to include</h3>
+            <ul class="guide-list">
+              <li data-i18n="contact.guide1">ActRealm version or Git commit</li>
+              <li data-i18n="contact.guide2">macOS version and Mac model</li>
+              <li data-i18n="contact.guide3">What happened and what you expected</li>
+              <li data-i18n="contact.guide4">Short reproduction steps or a redacted screenshot</li>
+            </ul>
+            <p class="privacy-note" data-i18n="contact.privacy">Do not send passwords, API keys, authentication tokens, private source files, or complete agent transcripts.</p>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <section class="faq" id="faq">
+      <div class="shell faq-layout">
+        <div class="faq-heading reveal">
+          <div class="eyebrow">FAQ</div>
+          <h2 data-i18n="faq.title">A few useful answers before you write.</h2>
+          <p data-i18n="faq.copy">If these do not cover your situation, email us directly. A GitHub account is not required to contact support.</p>
+        </div>
+
+        <div class="faq-list reveal">
+          <details>
+            <summary data-i18n="faq.q1">What can I contact ActRealm Support about?</summary>
+            <div class="answer" data-i18n="faq.a1">You can contact us about installation, Provider setup, Runtime health, product behavior, bug reports, documentation, or other questions about using ActRealm.</div>
+          </details>
+          <details>
+            <summary data-i18n="faq.q2">Where should I start if ActRealm is not connecting?</summary>
+            <div class="answer" data-i18n-html="faq.a2">Start with the <a href="https://github.com/Frontier-Interfaces/ActRealm/blob/agent/v1-full/docs/USER_GUIDE_en.md" target="_blank" rel="noreferrer">current user guide</a> and its Runtime and Provider checks. If the issue remains, email the result of the relevant redacted health check.</div>
+          </details>
+          <details>
+            <summary data-i18n="faq.q3">How should I report a suspected security issue?</summary>
+            <div class="answer" data-i18n="faq.a3">Email hello@getactrealm.com privately. Do not open a public GitHub issue for suspected vulnerabilities, and do not include credentials, tokens, source files, or complete transcripts.</div>
+          </details>
+          <details>
+            <summary data-i18n="faq.q4">Do I need a GitHub account to get help?</summary>
+            <div class="answer" data-i18n="faq.a4">No. GitHub is available for public documentation and reproducible issues, but you can always contact Frontier Interfaces Inc. directly at hello@getactrealm.com.</div>
+          </details>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="shell-wide">
+      <div class="footer-top">
+        <a class="footer-brand" href="/">
+          <img src="/assets/actrealm-icon-192.png" alt="">
+          <span>ActRealm</span>
+        </a>
+        <div class="footer-links">
+          <a href="/" data-i18n="footer.home">Home</a>
+          <a href="https://github.com/Frontier-Interfaces/ActRealm/tree/agent/v1-full" target="_blank" rel="noreferrer">GitHub</a>
+          <a href="mailto:hello@getactrealm.com">hello@getactrealm.com</a>
+        </div>
+      </div>
+      <p class="footer-company" data-i18n="footer.company">ActRealm is developed and operated by Frontier Interfaces Inc.</p>
+      <p class="footer-note" data-i18n="footer.note">ActRealm is an independent product. Apple, macOS, Anthropic, Claude, OpenAI, and Codex are trademarks of their respective owners; Frontier Interfaces Inc. is not affiliated with those companies.</p>
+    </div>
+  </footer>
+
+  <script>
+    const translationNodes = {
+      text: [...document.querySelectorAll("[data-i18n]")],
+      html: [...document.querySelectorAll("[data-i18n-html]")],
+      aria: [...document.querySelectorAll("[data-i18n-aria]")],
+      alt: [...document.querySelectorAll("[data-i18n-alt]")]
+    };
+
+    const englishCopy = {
+      text: Object.fromEntries(translationNodes.text.map((element) => [element.dataset.i18n, element.textContent])),
+      html: Object.fromEntries(translationNodes.html.map((element) => [element.dataset.i18nHtml, element.innerHTML])),
+      aria: Object.fromEntries(translationNodes.aria.map((element) => [element.dataset.i18nAria, element.getAttribute("aria-label")])),
+      alt: Object.fromEntries(translationNodes.alt.map((element) => [element.dataset.i18nAlt, element.getAttribute("alt")]))
+    };
+
+    const chineseCopy = {
+      text: {
+        "nav.home": "首页",
+        "nav.start": "支持入口",
+        "nav.contact": "联系我们",
+        "nav.action": "邮件支持",
+        "hero.copy": "查看安装指引、报告产品问题，或直接联系我们。ActRealm 的产品支持由 Frontier Interfaces Inc. 提供。",
+        "hero.primary": "发送邮件至 hello@getactrealm.com",
+        "hero.secondary": "查看支持入口 ↓",
+        "identity.channelLabel": "支持邮箱",
+        "identity.companyLabel": "运营主体",
+        "identity.productLabel": "产品",
+        "identity.productValue": "桌面端 ActRealm",
+        "paths.eyebrow": "从这里开始",
+        "paths.title": "选择最快获得答案的方式。",
+        "paths.copy": "安装与使用问题先查看产品指南，可公开复现的问题提交到 GitHub，需要直接或私密沟通时请发送邮件。",
+        "paths.guideTitle": "安装与产品指南",
+        "paths.guideCopy": "从当前版本的安装、Provider 连接、Runtime 健康检查与恢复步骤开始排查。",
+        "paths.guideLink": "查看中文使用指南",
+        "paths.issueTitle": "报告产品问题",
+        "paths.issueCopy": "如果问题适合公开，请在 GitHub Issue 中提供清楚的复现步骤，并说明实际情况与预期情况。",
+        "paths.issueLink": "打开 GitHub Issues",
+        "paths.privateTitle": "直接或私密支持",
+        "paths.privateCopy": "一般问题、不适合公开的信息或疑似安全问题，请通过邮件直接联系我们。",
+        "paths.privateLink": "发送邮件给 Frontier Interfaces",
+        "contact.eyebrow": "联系支持",
+        "contact.title": "告诉我们工作停在了哪里。",
+        "contact.copy": "请说明你原本要完成什么、发生了什么，以及预期结果。这样我们可以理解问题，同时不要求你暴露私密工作内容。",
+        "contact.guideTitle": "建议提供的信息",
+        "contact.guide1": "ActRealm 版本或 Git commit",
+        "contact.guide2": "macOS 版本与 Mac 型号",
+        "contact.guide3": "实际发生的情况与预期结果",
+        "contact.guide4": "简短复现步骤或已脱敏截图",
+        "contact.privacy": "请勿发送密码、API Key、认证 Token、私有源文件或完整的 Agent 对话记录。",
+        "faq.title": "写邮件前，先看几个常见答案。",
+        "faq.copy": "如果这里没有覆盖你的情况，请直接发送邮件。联系支持不需要 GitHub 账号。",
+        "faq.q1": "哪些问题可以联系 ActRealm 支持？",
+        "faq.a1": "你可以就安装、Provider 设置、Runtime 健康状态、产品行为、Bug、文档或其他 ActRealm 使用问题联系我们。",
+        "faq.q2": "ActRealm 无法连接时，我应该先做什么？",
+        "faq.q3": "疑似安全问题应该如何报告？",
+        "faq.a3": "请通过 hello@getactrealm.com 私密联系。不要为疑似漏洞创建公开 GitHub Issue，也不要发送凭证、Token、源文件或完整对话记录。",
+        "faq.q4": "获得支持需要 GitHub 账号吗？",
+        "faq.a4": "不需要。GitHub 用于公开文档和可复现的问题，你始终可以通过 hello@getactrealm.com 直接联系 Frontier Interfaces Inc.。",
+        "footer.home": "首页",
+        "footer.company": "ActRealm 由 Frontier Interfaces Inc. 开发与运营。",
+        "footer.note": "ActRealm 是独立产品。Apple、macOS、Anthropic、Claude、OpenAI 与 Codex 是其各自所有者的商标；Frontier Interfaces Inc. 与这些公司不存在关联。"
+      },
+      html: {
+        "hero.title": "让 ActRealm 正常运行，<br>让 Agent 工作继续推进。",
+        "faq.a2": "请先查看<a href=\"https://github.com/Frontier-Interfaces/ActRealm/blob/agent/v1-full/docs/USER_GUIDE_zh-CN.md\" target=\"_blank\" rel=\"noreferrer\">当前中文使用指南</a>中的 Runtime 与 Provider 检查。如果问题仍然存在，请通过邮件发送相关健康检查的脱敏结果。"
+      },
+      aria: {
+        "nav.aria": "ActRealm 支持页面导航",
+        "nav.homeAria": "ActRealm 首页",
+        "identity.aria": "ActRealm 支持信息",
+        "contact.guideAria": "支持请求建议包含的信息"
+      },
+      alt: {
+        "hero.iconAlt": "ActRealm 应用图标"
+      }
+    };
+
+    const pageMetadata = {
+      en: {
+        title: "ActRealm Support — Setup, product help, and issue reporting",
+        description: "Get help with ActRealm setup, product questions, bug reports, and private security concerns from Frontier Interfaces Inc."
+      },
+      zh: {
+        title: "ActRealm 支持 — 安装、产品帮助与问题报告",
+        description: "获取 ActRealm 安装、产品问题、Bug 报告与私密安全问题支持。支持由 Frontier Interfaces Inc. 提供。"
+      }
+    };
+
+    const languageToggle = document.querySelector("#language-toggle");
+    const descriptionMeta = document.querySelector('meta[name="description"]');
+    const languageLinks = [...document.querySelectorAll("[data-href-en]")];
+    let currentLanguage = "en";
+
+    function applyLanguage(language) {
+      const isChinese = language === "zh";
+      const source = isChinese ? chineseCopy : englishCopy;
+
+      translationNodes.text.forEach((element) => {
+        const key = element.dataset.i18n;
+        element.textContent = source.text[key] ?? englishCopy.text[key];
+      });
+      translationNodes.html.forEach((element) => {
+        const key = element.dataset.i18nHtml;
+        element.innerHTML = source.html[key] ?? englishCopy.html[key];
+      });
+      translationNodes.aria.forEach((element) => {
+        const key = element.dataset.i18nAria;
+        element.setAttribute("aria-label", source.aria[key] ?? englishCopy.aria[key]);
+      });
+      translationNodes.alt.forEach((element) => {
+        const key = element.dataset.i18nAlt;
+        element.setAttribute("alt", source.alt[key] ?? englishCopy.alt[key]);
+      });
+      languageLinks.forEach((element) => {
+        element.setAttribute("href", isChinese ? element.dataset.hrefZh : element.dataset.hrefEn);
+      });
+
+      currentLanguage = language;
+      document.documentElement.lang = isChinese ? "zh-CN" : "en";
+      document.title = pageMetadata[language].title;
+      descriptionMeta.setAttribute("content", pageMetadata[language].description);
+      languageToggle.textContent = isChinese ? "EN" : "中文";
+      languageToggle.setAttribute("aria-label", isChinese ? "切换到英文" : "Switch to Chinese");
+    }
+
+    languageToggle.addEventListener("click", () => {
+      applyLanguage(currentLanguage === "en" ? "zh" : "en");
+    });
+
+    applyLanguage("en");
+
+    const items = document.querySelectorAll(".reveal");
+    if ("IntersectionObserver" in window && !window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      const observer = new IntersectionObserver((entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) {
+            entry.target.classList.add("visible");
+            observer.unobserve(entry.target);
+          }
+        });
+      }, { threshold: .08, rootMargin: "0px 0px -36px" });
+
+      items.forEach((item) => observer.observe(item));
+    } else {
+      items.forEach((item) => item.classList.add("visible"));
+    }
+  </script>
+</body>
+</html>
