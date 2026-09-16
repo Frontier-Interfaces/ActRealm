@@ -443,9 +443,16 @@ enum SnapshotProjectionPolicy {
 @MainActor
 public final class AppModel: ObservableObject {
     @Published public private(set) var derived: DerivedState = .empty
+    @Published public private(set) var tokenUsage: TokenUsageTotals = .empty
+    @Published public private(set) var tokenDecision: TokenUsageDecisionSummary = .empty
+    @Published public private(set) var tokenThresholdNotices: [TokenUsageBurnRate] = []
     @Published public private(set) var bridgeStatus: BridgeStatus = .starting
     @Published public private(set) var lastSyncAt: Date?
     @Published public private(set) var runtimeDiagnostics: RuntimeSupervisor.Diagnostics = .empty
+    @Published public private(set) var runtimeStatus: RuntimeStatusSnapshot?
+    @Published public private(set) var runtimeDoctorReport: RuntimeDoctorReport?
+    @Published public private(set) var controlPlaneDiagnosticsError: String?
+    @Published public private(set) var isRefreshingControlPlaneDiagnostics = false
     @Published public private(set) var isRestartingRuntime = false
     @Published public private(set) var runtimeActionMessage: String?
     @Published public private(set) var toastMessage: String?
@@ -453,6 +460,7 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var isHUDPreviewActive = false
     /// Ticks once per second so waiting timers and countdown rings advance.
     @Published public private(set) var now: Date = Date()
+    private var lastWorkspaceClockPublishAt = Date.distantPast
     @Published public private(set) var setupInfo: SetupInfo?
     @Published public private(set) var uiSettings: UISettings = .defaults
     @Published public private(set) var displayCatalog: [DisplayField] = []
@@ -462,6 +470,11 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var isSettingsBusy = false
     @Published public private(set) var settingsSaveError: String?
     @Published public private(set) var settingsSaveNotice: String?
+    @Published public private(set) var companionPairing: CompanionPairingResponse?
+    @Published public private(set) var companionConnections: [CompanionConnection] = []
+    @Published public private(set) var companionPairingError: String?
+    @Published public private(set) var isCompanionBusy = false
+    @Published public var companionAllowsControl = true
     @Published public private(set) var appLanguage: AppLanguage
     @Published public private(set) var isQuotaRefreshBusy = false
     /// Persistent result shown in Settings. A main-window toast alone is not
@@ -522,11 +535,9 @@ public final class AppModel: ObservableObject {
     /// Runtime sessions remain intact, while locally cleared task versions stay
     /// out of every compact UI until a newer event makes them visible again.
     public var visibleAgentTasks: [LaneTask] {
-        let cutoff = now.addingTimeInterval(-30 * 60)
         return taskRenderSignatures.map(\.task).filter { task in
             guard !isTaskDismissed(task) else { return false }
-            return task.status == .running || task.status == .waiting
-                || task.hasVisibleAttention || task.lastEventAt >= cutoff
+            return task.isVisibleInAgentTasks(at: now)
         }
     }
 
@@ -544,7 +555,7 @@ public final class AppModel: ObservableObject {
     private let themeDirectory: URL
     private var cancellables: Set<AnyCancellable> = []
     private var ticker: Task<Void, Never>?
-    private var dismissedTaskVersions: [String: UInt64]
+    @Published private var dismissedTaskVersions: [String: UInt64]
     private var toastTask: Task<Void, Never>?
     private var outboxHighlightTask: Task<Void, Never>?
     private var hudPreviewTask: Task<Void, Never>?
@@ -557,6 +568,10 @@ public final class AppModel: ObservableObject {
     private var foregroundQueue: [ForegroundQueuedArrival] = []
     private var lastSetupRefreshEventCount: UInt64 = 0
     private var latestSnapshot: Snapshot = .empty
+
+    public var runtimeCommands: [CommandRecord] {
+        latestSnapshot.commands
+    }
     private var hasDeferredSnapshotProjection = false
     private var persistedUISettings: UISettings = .defaults
     private var renderedEventCount: UInt64 = 0
@@ -673,6 +688,8 @@ public final class AppModel: ObservableObject {
             backupSummary = DemoData.settings.backups
             bridgeStatus = .listening
             lastSyncAt = now
+            runtimeStatus = .preview
+            runtimeDoctorReport = .preview
             return
         }
         let supervisor = self.supervisor
@@ -698,6 +715,37 @@ public final class AppModel: ObservableObject {
 
     public func refreshRuntimeDiagnostics() {
         supervisor.refreshDiagnostics()
+    }
+
+    public func refreshControlPlaneDiagnostics(includeDoctor: Bool) async {
+        supervisor.refreshDiagnostics()
+        if includeDoctor { isRefreshingControlPlaneDiagnostics = true }
+        defer {
+            if includeDoctor { isRefreshingControlPlaneDiagnostics = false }
+        }
+        guard !isDemo else {
+            controlPlaneDiagnosticsError = nil
+            return
+        }
+        do {
+            let status = try await client.fetchRuntimeStatus()
+            runtimeStatus = status
+            controlPlaneDiagnosticsError = status.isSupported
+                ? nil
+                : l10n("Runtime 分层诊断协议不兼容；任务控制仍按现有连接状态处理。")
+        } catch {
+            controlPlaneDiagnosticsError = clientErrorMessage(
+                (error as? RuntimeClientError)?.code ?? error.localizedDescription
+            )
+        }
+        guard includeDoctor else { return }
+        if let setup = await client.fetchSetup() {
+            setupInfo = setup
+        }
+        if let companions = await client.fetchCompanionConnections() {
+            companionConnections = companions
+        }
+        runtimeDoctorReport = await supervisor.doctorReport()
     }
 
     public func handleSystemWake() {
@@ -814,6 +862,48 @@ public final class AppModel: ObservableObject {
         acceptSettings(response)
     }
 
+    public func refreshCompanionConnections() async {
+        guard !isDemo else { return }
+        if let connections = await client.fetchCompanionConnections() {
+            companionConnections = connections
+            companionPairingError = nil
+        }
+    }
+
+    @discardableResult
+    public func createDisplayCompanionPairing() async -> Bool {
+        guard !isDemo, !isCompanionBusy else { return false }
+        isCompanionBusy = true
+        defer { isCompanionBusy = false }
+        let (pairing, error) = await client.createCompanionPairing(
+            allowControl: companionAllowsControl
+        )
+        guard let pairing else {
+            companionPairingError = clientErrorMessage(error)
+            return false
+        }
+        companionPairing = pairing
+        companionPairingError = nil
+        return true
+    }
+
+    public func clearCompanionPairing() {
+        companionPairing = nil
+        companionPairingError = nil
+    }
+
+    public func revokeCompanion(id: String) async {
+        guard !isDemo, !isCompanionBusy else { return }
+        isCompanionBusy = true
+        defer { isCompanionBusy = false }
+        if let error = await client.revokeCompanion(id: id) {
+            companionPairingError = clientErrorMessage(error)
+            return
+        }
+        companionPairingError = nil
+        await refreshCompanionConnections()
+    }
+
     /// Updates the local view immediately, then persists the complete Runtime
     /// settings object. A short debounce keeps segmented controls responsive
     /// while preserving the server's all-fields validation contract.
@@ -870,7 +960,11 @@ public final class AppModel: ObservableObject {
     }
 
     public func retrySettingsSave() {
-        guard !isDemo, !isSettingsBusy, let settings = failedUISettings else { return }
+        guard !isDemo, !isSettingsBusy else { return }
+        guard let settings = failedUISettings else {
+            Task { await refreshSettings() }
+            return
+        }
         uiSettings = settings
         settingsSaveError = nil
         apply(snapshot: latestSnapshot, emitArrivals: false)
@@ -915,27 +1009,14 @@ public final class AppModel: ObservableObject {
         isQuotaRefreshBusy = true
         defer { isQuotaRefreshBusy = false }
         quotaRefreshMessage = l10n("正在通过 Anthropic 官方接口更新…")
-        let previousCapture = Self.latestClaudeQuotaCapture(in: client.snapshot)
         if let error = await client.requestQuotaRefresh() {
             let message = l10nFormat("额度刷新失败：%@", clientErrorMessage(error))
             quotaRefreshMessage = message
             return
         }
-        for _ in 0..<12 {
-            if let currentCapture = Self.latestClaudeQuotaCapture(in: client.snapshot),
-               previousCapture.map({ currentCapture > $0 }) ?? true
-            {
-                let message = l10n("Claude 额度已主动更新")
-                quotaRefreshMessage = message
-                return
-            }
-            try? await Task.sleep(for: .seconds(1))
-            await client.refreshSnapshot()
-        }
-        let message = l10n(
-            "已请求刷新，但 Claude 暂未返回新额度；请启动 Claude Code CLI 并开始一次会话后重试"
-        )
-        quotaRefreshMessage = message
+        // The endpoint returns only after a successful upstream request and
+        // cache publication; a changed percentage is not required for success.
+        quotaRefreshMessage = l10n("Claude 额度已主动更新")
     }
 
     nonisolated static func latestClaudeQuotaCapture(in snapshot: Snapshot) -> UInt64? {
@@ -947,6 +1028,14 @@ public final class AppModel: ObservableObject {
 
     public func exportLocalData(metricsOnly: Bool) async -> Data? {
         let (data, error) = await client.exportData(metricsOnly: metricsOnly)
+        if data == nil {
+            showToast(l10nFormat("导出失败：%@", clientErrorMessage(error)))
+        }
+        return data
+    }
+
+    public func exportTokenUsage(csv: Bool) async -> Data? {
+        let (data, error) = await client.exportTokenUsage(csv: csv)
         if data == nil {
             showToast(l10nFormat("导出失败：%@", clientErrorMessage(error)))
         }
@@ -1079,8 +1168,22 @@ public final class AppModel: ObservableObject {
                 try? await Task.sleep(for: .seconds(1))
                 guard let self else { return }
                 let tick = Date()
-                if self.isWorkspaceAnimationActive {
+                let needsSecondPrecision = self.derived.pendingDecision != nil
+                    || self.foregroundDispatch != nil
+                    || self.hudArrivalDeadline != nil
+                let hasActiveWork = self.derived.agentTasks.contains {
+                    $0.status == .running || $0.status == .waiting
+                }
+                if self.isWorkspaceAnimationActive,
+                   WorkspaceClockPolicy.shouldPublish(
+                       lastPublishedAt: self.lastWorkspaceClockPublishAt,
+                       now: tick,
+                       needsSecondPrecision: needsSecondPrecision,
+                       hasActiveWork: hasActiveWork
+                   )
+                {
                     self.now = tick
+                    self.lastWorkspaceClockPublishAt = tick
                 }
                 self.advanceForegroundDispatch(at: tick)
                 if let deadline = self.hudArrivalDeadline, tick >= deadline {
@@ -1108,6 +1211,7 @@ public final class AppModel: ObservableObject {
     func receive(snapshot: Snapshot) {
         let previous = latestSnapshot
         latestSnapshot = snapshot
+        publishUsage(snapshot)
         guard SnapshotProjectionPolicy.shouldApply(
             previous: previous,
             next: snapshot,
@@ -1120,8 +1224,22 @@ public final class AppModel: ObservableObject {
         apply(snapshot: snapshot)
     }
 
+    private func publishUsage(_ snapshot: Snapshot) {
+        if tokenUsage != snapshot.tokenUsage {
+            tokenUsage = snapshot.tokenUsage
+        }
+        if tokenDecision != snapshot.tokenDecision {
+            tokenDecision = snapshot.tokenDecision
+        }
+        let nextTokenNotices = snapshot.tokenDecision.burnRates.filter(\.thresholdExceeded)
+        if tokenThresholdNotices != nextTokenNotices {
+            tokenThresholdNotices = nextTokenNotices
+        }
+    }
+
     private func apply(snapshot: Snapshot, emitArrivals: Bool = true) {
         latestSnapshot = snapshot
+        publishUsage(snapshot)
         let allowedAttentionIDs = Set(snapshot.attention.filter {
             uiSettings.notificationRules.mode(for: $0.kind) != .ignore
         }.map(\.id))
@@ -1186,7 +1304,9 @@ public final class AppModel: ObservableObject {
         if emitArrivals { seededNotifications = true }
 
         let previousOutbox = derived.openOutbox
-        derived = next
+        if derived != next {
+            derived = next
+        }
         selectedOutboxID = OutboxSelection.resolvedID(
             currentID: selectedOutboxID,
             previousEntries: previousOutbox,
@@ -1255,13 +1375,21 @@ public final class AppModel: ObservableObject {
         selectedOutboxID = id
     }
 
+
+    public func approvalActions(for entry: OutboxEntry, at date: Date? = nil) -> Set<String> {
+        guard let current = derived.openOutbox.first(where: {
+            $0.id == entry.id && $0.attention.requestId == entry.attention.requestId
+        }) else { return [] }
+        return current.approvalActions(at: date ?? now, connectionIsLive: canControlRuntime)
+    }
+
     public func approve(_ entry: OutboxEntry) {
-        guard canControlRuntime, entry.state == .open else { return }
+        guard approvalActions(for: entry, at: Date()).contains("approve") else { return }
         send(.approve, entry: entry)
     }
 
     public func deny(_ entry: OutboxEntry) {
-        guard canControlRuntime, entry.state == .open else { return }
+        guard approvalActions(for: entry, at: Date()).contains("deny") else { return }
         send(.deny, entry: entry)
     }
 
@@ -1271,7 +1399,9 @@ public final class AppModel: ObservableObject {
         send(.passThrough, entry: entry)
     }
 
-    /// "标记已处理 / 确认完成" for question, error, completion items.
+    /// Resolves ordinary attention. For an automatically hidden completion,
+    /// this only acknowledges the reminder; Runtime preserves the task until
+    /// its immutable `autoHideAt` deadline.
     public func acknowledge(_ entry: OutboxEntry) {
         guard canControlRuntime else { return }
         guard !isDemo else { return }
@@ -1327,46 +1457,22 @@ public final class AppModel: ObservableObject {
         expandedTaskId = task.session.id
     }
 
-    /// Matches the Web task-clear behavior: hand questions back to the Agent,
-    /// dismiss other related presentation items, then hide this session
-    /// version. Any later Runtime event makes it visible again.
-    public func dismissTask(_ task: LaneTask) {
-        Task { await clearTask(task) }
-    }
-
-    private func clearTask(_ task: LaneTask) async {
-        let related = derived.openOutbox.filter { $0.attention.sessionId == task.id }
-        var failed = 0
-        if !isDemo {
-            for entry in related {
-                if await client.dismissAttention(entry.attention) != nil { failed += 1 }
-            }
-        }
-        dismissedTaskVersions[task.id] = task.session.lastEventAt
-        defaults.set(
-            dismissedTaskVersions.mapValues { NSNumber(value: $0) },
-            forKey: Self.dismissedTasksKey
-        )
+    /// Delete the current card version, matching Display's event-watermark rule.
+    public func deleteTaskCard(_ task: LaneTask, at timestamp: UInt64? = nil) {
+        let nowMillis = timestamp ?? UInt64(max(0, Date().timeIntervalSince1970 * 1_000))
+        dismissedTaskVersions[task.id] = max(nowMillis, task.session.lastEventAt, task.session.turnStartedAt ?? 0)
+        defaults.set(dismissedTaskVersions.mapValues { NSNumber(value: $0) }, forKey: Self.dismissedTasksKey)
         if expandedTaskId == task.id { expandedTaskId = nil }
         if pinnedSessionId == task.id { pinnedSessionId = nil }
-        if failed > 0 {
-            showToast(l10nFormat(
-                "任务已清除；%lld 项仍需在 Outbox 或 Agent 原界面处理",
-                Int64(failed)
-            ))
-        } else if !related.isEmpty {
-            showToast(l10nFormat(
-                "任务已清除，并交还 %lld 项待处理事项",
-                Int64(related.count)
-            ))
-        } else {
-            showToast(l10n("已从列表移除；有新活动时会自动恢复"))
-        }
+        showToast(l10n("已删除任务 · 收到该会话的新事件后自动显示"))
     }
 
     public func isTaskDismissed(_ task: LaneTask) -> Bool {
-        guard let dismissedAt = dismissedTaskVersions[task.id] else { return false }
-        return dismissedAt >= task.session.lastEventAt
+        guard let removedAt = dismissedTaskVersions[task.id] else { return false }
+        let questionAt = latestSnapshot.attention.lazy
+            .filter { $0.sessionId == task.id && $0.kind == "question" }
+            .map(\.createdAt).max() ?? 0
+        return max(task.session.lastEventAt, task.session.turnStartedAt ?? 0, questionAt) <= removedAt
     }
 
     public func setSettingsVisible(_ visible: Bool) {
@@ -1919,9 +2025,14 @@ public final class AppModel: ObservableObject {
 
     private func send(_ action: AttentionAction, entry: OutboxEntry) {
         guard canControlRuntime, !isDemo else { return }
-        let requestId = entry.attention.requestId
         Task {
-            _ = await client.send(action: action, attentionId: entry.id, requestId: requestId)
+            if let error = await client.send(
+                action: action,
+                attentionId: entry.id,
+                requestId: entry.attention.requestId
+            ) {
+                showToast(l10nFormat("处理失败：%@", clientErrorMessage(error)))
+            }
         }
     }
 
@@ -1929,6 +2040,7 @@ public final class AppModel: ObservableObject {
         let subject = entry.taskTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
         let suffix = subject.flatMap { $0.isEmpty ? nil : "：\($0)" } ?? ""
         return switch entry.kind {
+        case .completion where entry.autoHideAt != nil: "已关闭完成提醒\(suffix)"
         case .completion: "已确认任务完成\(suffix)"
         case .error: "已标记问题解决\(suffix)"
         case .question: "已标记提问处理\(suffix)"
@@ -1941,6 +2053,8 @@ public final class AppModel: ObservableObject {
         let subject = trimmed?.isEmpty == false ? trimmed : nil
         let key: String
         switch entry.kind {
+        case .completion where entry.autoHideAt != nil:
+            key = subject == nil ? "已关闭完成提醒" : "已关闭完成提醒：%@"
         case .completion: key = subject == nil ? "已确认任务完成" : "已确认任务完成：%@"
         case .error: key = subject == nil ? "已标记问题解决" : "已标记问题解决：%@"
         case .question: key = subject == nil ? "已标记提问处理" : "已标记提问处理：%@"
@@ -1948,5 +2062,21 @@ public final class AppModel: ObservableObject {
         }
         guard let subject else { return l10n(key) }
         return l10nFormat(key, subject)
+    }
+}
+
+enum WorkspaceClockPolicy {
+    static let activeInterval: TimeInterval = 5
+    static let idleInterval: TimeInterval = 30
+
+    static func shouldPublish(
+        lastPublishedAt: Date,
+        now: Date,
+        needsSecondPrecision: Bool,
+        hasActiveWork: Bool
+    ) -> Bool {
+        let interval = hasActiveWork ? activeInterval : idleInterval
+        return needsSecondPrecision
+            || now.timeIntervalSince(lastPublishedAt) >= interval
     }
 }

@@ -2,6 +2,50 @@ import Combine
 import Darwin
 import Foundation
 
+public struct RuntimeDoctorReport: Codable, Equatable, Sendable {
+    public struct Check: Codable, Equatable, Identifiable, Sendable {
+        public let id: String
+        public let status: String
+        public let summary: String
+        public let detail: String
+        public let repairability: String
+        public let action: String?
+    }
+
+    public let schemaVersion: UInt16
+    public let generatedAtMs: UInt64
+    public let overall: String
+    public let checks: [Check]
+
+    public func check(_ id: String) -> Check? {
+        checks.first { $0.id == id }
+    }
+
+    public static let preview = RuntimeDoctorReport(
+        schemaVersion: 1,
+        generatedAtMs: 1_800_000_000_000,
+        overall: "pass",
+        checks: [
+            Check(
+                id: "claude.cli",
+                status: "pass",
+                summary: "claude CLI is available",
+                detail: "/usr/local/bin/claude · 2.1.226 (Claude Code)",
+                repairability: "not_applicable",
+                action: nil
+            ),
+            Check(
+                id: "codex.cli",
+                status: "pass",
+                summary: "codex CLI is available",
+                detail: "/usr/local/bin/codex · codex-cli 0.144.6",
+                repairability: "not_applicable",
+                action: nil
+            )
+        ]
+    )
+}
+
 /// Locates the `actrealm` Rust backend (bundled helper first, then a dev
 /// checkout), supervises it as a child process, and extracts the one-time
 /// bootstrap URL/token it prints on startup so a `RuntimeClient` can hand
@@ -407,6 +451,25 @@ public final class RuntimeSupervisor: ObservableObject {
             stderrTail: stderrTail,
             launchAgentWarning: Self.launchAgentWarning()
         )
+    }
+
+    public func doctorReport() async -> RuntimeDoctorReport? {
+        guard let helper = resolvedHelper(),
+              FileManager.default.isExecutableFile(atPath: helper.path)
+        else { return nil }
+        let result = await Self.runProcess(
+            executable: helper.path,
+            arguments: ["doctor", "--json"],
+            retainedBytes: 128 * 1024
+        )
+        guard result.status == 0 || !result.stdout.isEmpty else { return nil }
+        return Self.decodeDoctorReport(Data(result.stdout.utf8))
+    }
+
+    public nonisolated static func decodeDoctorReport(
+        _ data: Data
+    ) -> RuntimeDoctorReport? {
+        try? JSONDecoder().decode(RuntimeDoctorReport.self, from: data)
     }
 
     public nonisolated static func parseLockOwnerPID(_ text: String) -> Int32? {

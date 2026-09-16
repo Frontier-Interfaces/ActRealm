@@ -17,7 +17,8 @@ Native SwiftUI/AppKit client for the local `actrealm` Runtime.
 
 The client does not read SQLite or Provider configuration directly. Hooks,
 sanitization, approval state, persistence, and Provider replies remain owned by
-the Rust Runtime at the repository root.
+the Rust Runtime at the repository root. Local Companion clients use
+authenticated loopback routes; every action is revalidated by the Runtime.
 
 ## Development
 
@@ -55,10 +56,19 @@ apps/macos/Scripts/package-app.sh
 ```
 
 The result is written to `apps/macos/dist/ActRealm.app`. Build output, Xcode
-user state, snapshots, and packaged apps are ignored by Git.
+user state, snapshots, and packaged apps are ignored by Git. No cloud
+configuration or account is required.
 
-Local packaging uses an ad-hoc signature. Release packaging must provide a
-Developer ID identity and reject ad-hoc output:
+Local packaging automatically uses the first available Apple Development
+identity. This gives successive local builds a stable designated requirement,
+so macOS can remember a Keychain authorization instead of treating every
+ad-hoc build as unrelated code. If no development identity is installed, the
+script falls back to ad-hoc signing; set `ACTREALM_SIGN_IDENTITY=-` to request
+that fallback explicitly. Existing Keychain items can still require one final
+"Always Allow" confirmation after changing from ad-hoc to stable signing.
+
+Release packaging must explicitly provide a Developer ID Application identity;
+an Apple Development identity is rejected when release signing is required:
 
 ```bash
 ACTREALM_SIGN_IDENTITY="Developer ID Application: Example (TEAMID)" \
@@ -80,4 +90,4 @@ clean macOS 26 Apple Silicon account or VM.
 - `Sources/ActRealmUI/`: SwiftUI views and the AppKit Agent Focus executor;
 - `Sources/ActRealmApp/`: app, window, menu-bar, and lifecycle entry point;
 - `Sources/SnapshotTool/`: deterministic UI snapshot utility;
-- `Tests/ActRealmKitTests/`: model, decoding, scheduling, and bootstrap tests.
+- `Tests/ActRealmKitTests/`: model, decoding, scheduling, and bootstrap tests;

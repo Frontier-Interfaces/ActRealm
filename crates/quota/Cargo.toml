@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 actrealm-installer = { path = "../installer" }
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -1,9 +1,11 @@
 /target/
+/outputs/
 /.swiftpm/
 /.build/
 /apps/macos/.build/
 /apps/macos/.swiftpm/
 /apps/macos/dist/
+/apps/macos/dist-*/
 /apps/macos/snapshots/
 /apps/windows/**/bin/
 /apps/windows/**/obj/
@@ -13,6 +15,9 @@
 /.vscode/
 **/.DS_Store
 *.log
+firestore-debug.log
+ui-debug.log
+**/node_modules/
 
 # Raw local test evidence can contain paths, process data, prompts, or machine identifiers.
 /docs/reports/evidence/**

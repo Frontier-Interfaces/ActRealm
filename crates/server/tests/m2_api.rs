@@ -18,7 +18,11 @@ use uuid::Uuid;
 const INDEX_HTML: &str = include_str!("../../../web/index.html");
 const APP_CSS: &str = include_str!("../../../web/app.css");
 const I18N_JS: &str = include_str!("../../../web/i18n.js");
+const AGENT_STATE_JS: &str = include_str!("../../../web/agent-state.js");
+const AGENT_DETAIL_JS: &str = include_str!("../../../web/agent-detail.js");
 const APP_JS: &str = include_str!("../../../web/app.js");
+const RUNTIME_DIAGNOSTICS_SCHEMA: &str =
+    include_str!("../../../shared/contracts/runtime-diagnostics.schema.json");
 
 struct HttpResponse {
     status: u16,
@@ -430,7 +434,14 @@ fn embedded_ui_contract_is_bounded_honest_and_complete() {
     // This is a product-size budget, not a Runtime, HTTP, or WebView transport limit.
     // Revisit it deliberately with the architecture documentation as the UI evolves.
     const MAX_EMBEDDED_UI_ASSET_BYTES: usize = 128 * 1024;
-    for asset in [INDEX_HTML, APP_CSS, I18N_JS, APP_JS] {
+    for asset in [
+        INDEX_HTML,
+        APP_CSS,
+        I18N_JS,
+        AGENT_STATE_JS,
+        AGENT_DETAIL_JS,
+        APP_JS,
+    ] {
         assert!(
             asset.len() < MAX_EMBEDDED_UI_ASSET_BYTES,
             "embedded UI asset exceeds the 128 KiB engineering budget"
@@ -443,6 +454,10 @@ fn embedded_ui_contract_is_bounded_honest_and_complete() {
     assert!(INDEX_HTML.contains("额度"));
     assert!(INDEX_HTML.contains("OUTBOX"));
     assert!(INDEX_HTML.contains("AGENT TASKS"));
+    assert!(INDEX_HTML.contains("/agent-state.js"));
+    assert!(INDEX_HTML.contains("/agent-detail.js"));
+    assert!(AGENT_DETAIL_JS.contains("currentTarget"));
+    assert!(AGENT_DETAIL_JS.contains("renderSections"));
     assert!(INDEX_HTML.contains("通知与数据"));
     assert!(INDEX_HTML.contains("id=\"settings-save-feedback\""));
     assert!(INDEX_HTML.contains("id=\"settings-save-retry\""));
@@ -571,6 +586,7 @@ fn health_monitor_is_authenticated_and_restart_input_is_strict() {
     let public = request(address, "GET", "/api/v1/health", &[], None);
     assert_eq!(public.status, 200);
     assert_eq!(public.body["ok"], true);
+    assert_eq!(public.body["protocolVersion"], 6);
     assert!(Uuid::parse_str(public.body["instanceId"].as_str().unwrap()).is_ok());
     assert_eq!(
         request(address, "GET", "/api/v1/runtime/status", &[], None).status,
@@ -587,10 +603,61 @@ fn health_monitor_is_authenticated_and_restart_input_is_strict() {
     );
     assert_eq!(status.status, 200);
     assert_eq!(status.body["instanceId"], public.body["instanceId"]);
+    assert_eq!(status.body["schemaVersion"], 2);
+    assert_eq!(status.body["protocolVersion"], 6);
     assert_eq!(status.body["pid"], std::process::id());
     assert_eq!(status.body["api"]["status"], "ready");
     assert_eq!(status.body["storage"]["status"], "ready");
+    assert_eq!(status.body["storage"]["integrity"], "ok");
+    assert_eq!(
+        status.body["storage"]["schemaVersion"],
+        status.body["storage"]["expectedSchemaVersion"]
+    );
+    assert_eq!(
+        status.body["snapshot"]["revisionSource"],
+        "runtime:sqlite_event_count"
+    );
+    assert_eq!(status.body["collectors"]["review"]["status"], "parked");
+    assert_eq!(status.body["collectors"]["review"]["gitCheck"], "disabled");
+    assert_eq!(
+        status.body["collectors"]["review"]["pendingBaselines"],
+        Value::Null
+    );
+    assert_eq!(status.body["collectors"]["review"]["inProgress"], false);
+    assert_eq!(
+        status.body["collectors"]["token"]["source"],
+        "runtime:canonical_session_ledger"
+    );
+    assert_eq!(status.body["companion"]["protocolVersion"], 6);
+    assert_eq!(
+        status.body["conditional"]["claudeCowork"]["countsAsFault"],
+        false
+    );
+    assert!(status.body["conditional"]
+        .get("mobileRemoteApproval")
+        .is_none());
     assert_eq!(status.body["restart"]["count"], 0);
+    let schema: Value = serde_json::from_str(RUNTIME_DIAGNOSTICS_SCHEMA).unwrap();
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["properties"]["schemaVersion"]["const"], 2);
+    for forbidden in [
+        "prompt",
+        "command",
+        "path",
+        "token",
+        "credential",
+        "transcript",
+        "replyChannel",
+    ] {
+        assert!(schema["properties"].get(forbidden).is_none());
+    }
+    let encoded = status.body.to_string();
+    for private in ["bootstrap", "csrf", "cookie", "deviceCredential", "prompt"] {
+        assert!(
+            !encoded.contains(private),
+            "runtime diagnostics leaked {private}"
+        );
+    }
 
     let invalid = request(
         address,
@@ -781,6 +848,70 @@ fn running_execution_never_projects_recovery_as_ended() {
 }
 
 #[test]
+fn history_routes_separate_active_archive_and_delete_semantics() {
+    let (root, store, _waiters, server) = start("history-lifecycle");
+    let origin = server.origin();
+    let (cookie, csrf) = authenticate(&server);
+    let headers = auth_headers(&origin, &cookie, &csrf);
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"UserPromptSubmit",
+                "session_id":"history-session",
+                "cwd":"/tmp/real-project",
+                "turn_id":"history-turn",
+                "prompt":"验证历史生命周期"
+            }),
+            now_millis(),
+        ))
+        .unwrap();
+    let session_id = store.snapshot().unwrap().sessions[0].id.clone();
+    let archive_path = format!("/api/v1/sessions/{session_id}/archive");
+
+    let refused = request(server.address(), "POST", &archive_path, &headers, None);
+    assert_eq!(refused.status, 409);
+    assert_eq!(refused.body["error"]["code"], "TASK_STILL_ACTIVE");
+
+    store
+        .ingest(event(
+            Provider::Claude,
+            "Stop",
+            "history-session",
+            "history-turn",
+            None,
+        ))
+        .unwrap();
+    let archived = request(server.address(), "POST", &archive_path, &headers, None);
+    assert_eq!(archived.status, 200);
+    assert_eq!(archived.body["archived"], true);
+
+    let history = request(
+        server.address(),
+        "GET",
+        "/api/v1/history",
+        &[("Cookie", &cookie)],
+        None,
+    );
+    assert_eq!(history.status, 200);
+    assert_eq!(history.body["schemaVersion"], 1);
+    assert_eq!(history.body["tasks"][0]["id"], session_id);
+
+    let delete_path = format!("/api/v1/sessions/{session_id}/history");
+
+    let deleted = request(server.address(), "DELETE", &delete_path, &headers, None);
+    assert_eq!(deleted.status, 200);
+    assert_eq!(deleted.body["deleted"], true);
+    assert_eq!(deleted.body["gitChanged"], false);
+    assert_eq!(deleted.body["providerStopped"], false);
+    assert!(store.snapshot().unwrap().sessions.is_empty());
+
+    drop(server);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn pass_through_ack_snooze_and_websocket_snapshot_are_real() {
     let (root, store, waiters, server) = start("snapshot");
     let origin = server.origin();
@@ -948,12 +1079,21 @@ fn pass_through_ack_snooze_and_websocket_snapshot_are_real() {
         assert!(quota
             .iter()
             .all(|entry| entry["status"] == "unavailable" && entry.get("usedPct").is_none()));
-        let heartbeat = tokio::time::timeout(Duration::from_secs(1), websocket.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        let heartbeat: Value = serde_json::from_str(heartbeat.to_text().unwrap()).unwrap();
+        // Background collection can publish more snapshots before the first
+        // heartbeat. Bound the entire wait, not each intervening frame.
+        let heartbeat = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let frame = websocket.next().await.unwrap().unwrap();
+                let payload: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                if payload["type"] == "heartbeat" {
+                    break payload;
+                }
+                assert_eq!(payload["type"], "snapshot");
+                assert!(payload["snapshot"]["sessions"].is_array());
+            }
+        })
+        .await
+        .expect("WebSocket heartbeat must arrive within one second");
         assert_eq!(heartbeat["type"], "heartbeat");
         assert!(heartbeat["serverTime"].as_u64().is_some());
         websocket.close(None).await.unwrap();

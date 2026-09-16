@@ -1,14 +1,20 @@
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::symlink;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
+
+#[cfg(target_os = "macos")]
+use std::collections::HashMap;
+#[cfg(target_os = "macos")]
+use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(target_os = "macos")]
+use std::net::{SocketAddr, TcpStream};
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
 
 static TEST_ID: AtomicU64 = AtomicU64::new(0);
 static PROCESS_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -84,6 +90,7 @@ fn install_fake_provider(root: &TestDir, provider: &str) {
     symlink("/bin/echo", fake_bin.join(provider)).unwrap();
 }
 
+#[cfg(target_os = "macos")]
 fn install_fake_desktop_provider(root: &TestDir, provider: &str) -> PathBuf {
     let executable = match provider {
         "claude" => root.0.join("applications/Claude.app/Contents/MacOS/Claude"),
@@ -97,12 +104,14 @@ fn install_fake_desktop_provider(root: &TestDir, provider: &str) -> PathBuf {
     executable
 }
 
+#[cfg(target_os = "macos")]
 struct HttpResponse {
     status: u16,
     headers: HashMap<String, String>,
     body: Value,
 }
 
+#[cfg(target_os = "macos")]
 fn http(
     address: SocketAddr,
     method: &str,
@@ -227,6 +236,7 @@ fn cli_refuses_to_create_configuration_for_a_missing_provider() {
     assert!(!root.0.join("actrealm-home/bin/actrealm").exists());
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn desktop_apps_install_without_global_provider_clis() {
     let root = TestDir::new("desktop-only");
@@ -445,6 +455,7 @@ fn doctor_runtime_probe_round_trips_without_creating_a_provider_event() {
         .contains("without creating an Agent session"));
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn onboarding_api_uses_the_installer_and_requires_a_post_install_real_event() {
     let root = TestDir::new("onboarding-api");

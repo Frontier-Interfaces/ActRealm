@@ -73,7 +73,7 @@ struct AgentSetupView: View {
                     .foregroundStyle(DT.textSecondary)
             }
             Spacer()
-            Label("本机 · 不发送遥测", systemImage: "lock.shield")
+            Label("本机 Agent 数据不上传", systemImage: "lock.shield")
                 .font(.system(size: 10.5, weight: .semibold))
                 .foregroundStyle(DT.greenText)
                 .padding(.horizontal, 11)

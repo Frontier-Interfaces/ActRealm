@@ -6,6 +6,10 @@
   const ORIGINAL_ATTRIBUTES = new WeakMap();
 
   const LITERALS_EN = {
+  "删除任务": "Delete task",
+  "已删除任务 · 收到该会话的新事件后自动显示": "Task removed \u00b7 it will reappear after a new event",
+  "仅删除任务卡，不停止 Agent，也不删除原会话和 Token 记录": "Remove only the card; keep the Agent, conversation and usage history",
+  "无法保存任务显示设置": "Could not save task visibility settings",
   "语言": "Language",
   "界面语言": "App language",
   "跟随系统": "System Default",
@@ -64,6 +68,19 @@
   "Agent Focus · 在需要你判断时提醒并带回对应 Agent": "Agent Focus · Alerts you when a decision is needed and brings back the relevant Agent",
   "Agent 事件": "Agent events",
   "Agent 已完成本轮任务，需要你的确认": "The Agent has completed this turn and needs your confirmation",
+  "已完成任务": "Completed tasks",
+  "只对 Runtime 已确认完成的任务生效": "Applies only after the Runtime verifies completion",
+  "已完成任务隐藏方式": "Completed task hiding",
+  "确认后隐藏": "After confirmation",
+  "自动隐藏": "Automatically",
+  "完成后保留": "Keep after completion",
+  "运行、授权、提问和报错任务不会超时隐藏": "Running tasks and tasks awaiting approval, answers, or error handling are never hidden by timeout",
+  "“知道了”只关闭提醒；到达设定时间才隐藏任务": "Got it only closes the reminder; the task hides at its scheduled time",
+  "已完成任务自动隐藏时间": "Completed task auto-hide delay",
+  "5 分钟": "5 minutes",
+  "15 分钟": "15 minutes",
+  "30 分钟": "30 minutes",
+  "60 分钟": "60 minutes",
   "Agent 执行出错，或长时间没有进展": "The Agent encountered an error or has made no progress for a while",
   "Agent 接入": "Agent Setup",
   "Agent 提出了需要你回答的问题": "The Agent asked a question that needs your answer",
@@ -147,6 +164,11 @@
   "任务失败或需要检查": "Task failed or needs review",
   "任务完成": "Task complete",
   "任务摘要": "Task summary",
+  "项目未知": "Project unavailable",
+  "当前动作": "Current action",
+  "当前文件 / 目标": "Current file / target",
+  "语义类别与 Provider 工具名": "Semantic category and Provider tool name",
+  "仅使用 Provider 明确 path 字段的 basename": "Only a basename from an explicit Provider path field",
   "任务摘要 · 主标题不同时显示在第二行": "Task summary · Shown on the second line when different from the primary title",
   "任务需要处理": "Task needs attention",
   "优先打开具体任务；失败时打开 Agent 页面": "Open the specific task first; fall back to the Agent page if needed",
@@ -340,6 +362,11 @@
   "暂时没有额度数据": "No quota data yet",
   "更新时间未提供": "Update time unavailable",
   "最后事件": "Last event",
+  "计划事实": "Plan evidence",
+  "活动事实": "Activity evidence",
+  "目标事实": "Target evidence",
+  "完成事实": "Completion evidence",
+  "控制事实": "Control evidence",
   "最近检查": "Last checked",
   "最近没有新的活动": "No recent activity",
   "服务启动中": "Service starting",
@@ -420,6 +447,7 @@
   "确认允许运行这条命令？": "Allow this command to run?",
   "确认后归档本轮": "Archive this turn after confirmation",
   "确认完成": "Confirm Complete",
+  "知道了": "Got it",
   "确认彻底清除": "Confirm Erase Everything",
   "确认清除": "Confirm Clear",
   "移除": "Remove",
@@ -744,6 +772,10 @@
   "jump.unsupported": "Jump is not supported",
   "quota.window.months": "{count} months",
   "quota.window.weeks": "{count} weeks",
+  "quota.reason.cache_stale": "This is a historical quota value; waiting for a fresh Provider update.",
+  "quota.window.scoped": "{name} quota",
+  "quota.window.scoped_weeks": "{name} \u00b7 {count} weeks",
+  "quota.window.claude_weekly": "Weekly \u00b7 all models",
   "quota.window.days": "{count} days",
   "quota.window.hours": "{count} hours",
   "quota.window.minutes": "{count} minutes",
@@ -757,16 +789,25 @@
   "quota.reason.no_valid_window": "No verifiable quota window was found.",
   "quota.reason.codex_rollout_missing": "No Codex rollout file was found.",
   "quota.reason.codex_window_missing": "No verifiable quota window was found in the Codex rollout.",
+  "quota.reason.claude_refresh_failed": "Claude quota refresh failed. The last successfully captured values are shown.",
+  "quota.reason.codex_refresh_failed": "Codex quota refresh failed. The last successfully captured values are shown.",
   "额度更新结果：%@": "Quota update result: %@",
   "本机请求失败（HTTP %@）": "Local request failed (HTTP %@)",
   "请求失败（%@）": "Request failed (%@)",
   "请求失败，请重试": "The request failed. Try again.",
+  "归档": "Archive",
+  "归档不会停止 Provider；只有新 Turn 会让任务重新出现": "Archiving does not stop the Provider. Only a new Turn makes the task reappear.",
+  "运行中或等待处理的任务不能归档": "Running tasks and tasks awaiting attention cannot be archived",
+  "任务已归档；Provider 未停止，收到新 Turn 后会重新出现": "Task archived. The Provider was not stopped; a new Turn will make it active again.",
   "ANSWER_FAILED": "The answer could not be sent to the Agent",
   "AUTH_UNAVAILABLE": "Runtime authentication is unavailable",
   "BACKUP_CLEAR_FAILED": "Configuration backups could not be cleared safely",
   "BACKUP_DELETE_CONFIRMATION_REQUIRED": "Enter DELETE BACKUPS to clear configuration backups",
   "CLAUDE_BRIDGE_CHANGE_FAILED": "The Claude quota bridge could not be updated",
   "CLAUDE_OAUTH_DISABLED": "The official Claude OAuth quota endpoint is disabled",
+  "CLAUDE_SIGN_IN_REQUIRED": "Sign in to Claude Code once, then refresh. No conversation is needed.",
+  "CLAUDE_AUTH_REFRESH_FAILED": "Automatic Claude credential renewal failed. Check Claude Code sign-in or try again.",
+  "CLAUDE_QUOTA_RATE_LIMITED": "Claude is limiting quota requests. Automatic refresh will retry later.",
   "CLAUDE_QUOTA_REFRESH_FAILED": "Claude quota refresh failed",
   "CLEAR_FAILED": "Local data could not be cleared",
   "CODEX_REINSTALL_FAILED": "The Codex Hook could not be reinstalled",
@@ -780,9 +821,16 @@
   "INVALID_BOOTSTRAP": "The launch credential is invalid or expired",
   "INVALID_COMMAND_ID": "The command identifier is invalid",
   "INVALID_HOST": "The address is not a trusted local host",
+  "INVALID_HISTORY_LIMIT": "The history task limit is invalid",
   "INVALID_ORIGIN": "The request origin is not trusted",
   "INVALID_RESTART_TOKEN": "The Runtime restart credential is invalid",
   "INVALID_SETTINGS": "The settings are invalid",
+  "CHECKPOINT_NOT_FOUND": "The checkpoint was not found",
+  "CHECKPOINT_INVALID": "The checkpoint request is invalid",
+  "CHECKPOINT_GIT_FAILED": "The Git checkpoint could not be created or applied safely",
+  "CHECKPOINT_PREFLIGHT_FAILED": "Checkpoint recovery preflight did not pass",
+  "ARTIFACT_REVEAL_FAILED": "Finder could not reveal the file. Please try again",
+  "ARTIFACT_UNAVAILABLE": "The referenced file is unavailable or no longer belongs to this result",
   "JUMP_FAILED": "The original window was not found, or app-control permission is missing",
   "JUMP_UNSUPPORTED": "Jumping is not supported in the current environment",
   "MANAGED_CONNECTOR_UNSUPPORTED": "This session does not support a managed Connector",
@@ -801,6 +849,7 @@
   "RUNTIME_RESTART_TIMED_OUT": "Runtime restart timed out",
   "RUNTIME_RESTART_UNAVAILABLE": "This Runtime cannot restart automatically",
   "SESSION_NOT_FOUND": "The corresponding task was not found",
+  "TASK_STILL_ACTIVE": "This task is still running or awaiting attention and cannot be archived or deleted",
   "SETTINGS_READ_FAILED": "Local settings could not be read",
   "SETUP_CHANGE_FAILED": "Agent setup could not be updated",
   "SETUP_INSPECTION_FAILED": "Agent setup status could not be inspected",
@@ -1187,6 +1236,22 @@
     "en": "{count} months",
     "zh-Hans": "{count} 个月"
   },
+  "quota.window.claude_weekly": {
+    "en": "Weekly · all models",
+    "zh-Hans": "总周额度"
+  },
+  "quota.window.scoped_weeks": {
+    "en": "{name} · {count} weeks",
+    "zh-Hans": "{name} · {count} 周"
+  },
+  "quota.window.scoped": {
+    "en": "{name} quota",
+    "zh-Hans": "{name} 额度"
+  },
+  "quota.reason.cache_stale": {
+    "en": "This is a historical quota value; waiting for a fresh Provider update.",
+    "zh-Hans": "这是历史额度，正在等待 Provider 更新；不能作为当前剩余额度。"
+  },
   "quota.window.weeks": {
     "en": "{count} weeks",
     "zh-Hans": "{count} 周"
@@ -1242,12 +1307,72 @@
   "quota.reason.codex_window_missing": {
     "en": "No verifiable quota window was found in the Codex rollout.",
     "zh-Hans": "Codex rollout 中没有可验证的额度窗口。"
+  },
+  "quota.reason.claude_refresh_failed": {
+    "en": "Claude quota refresh failed. The last successfully captured values are shown.",
+    "zh-Hans": "Claude 额度刷新失败，当前显示的是上次成功获取的数据。"
+  },
+  "quota.reason.codex_refresh_failed": {
+    "en": "Codex quota refresh failed. The last successfully captured values are shown.",
+    "zh-Hans": "Codex 额度刷新失败，当前显示的是上次成功获取的数据。"
   }
 };
   const API_ERRORS = {
   "ANSWER_FAILED": {
     "en": "The answer could not be sent to the Agent",
     "zh-Hans": "回答未能发送给 Agent"
+  },
+  "AUTH_PERSIST_FAILED": {
+    "en": "Companion authorization could not be saved",
+    "zh-Hans": "伴生应用授权无法保存"
+  },
+  "COMPANION_NOT_FOUND": {
+    "en": "The Companion connection was not found",
+    "zh-Hans": "没有找到对应的伴生应用连接"
+  },
+  "COMPANION_SCOPE_REQUIRED": {
+    "en": "This Companion does not have the required permission",
+    "zh-Hans": "当前伴生应用没有这项操作权限"
+  },
+  "COMPANION_UNAUTHORIZED": {
+    "en": "The Companion connection is invalid or revoked",
+    "zh-Hans": "伴生应用连接无效或已撤销"
+  },
+  "CURRENT_TURN_REQUIRED": {
+    "en": "Current-turn mode is required for backward timeline paging",
+    "zh-Hans": "向前加载任务时间线时必须限定当前阶段"
+  },
+  "INVALID_CLIENT_NAME": {
+    "en": "The Companion name is invalid",
+    "zh-Hans": "伴生应用名称无效"
+  },
+  "INVALID_HISTORY_LIMIT": {
+    "en": "The history task limit is invalid",
+    "zh-Hans": "历史任务读取数量无效"
+  },
+  "INVALID_COMPANION_ID": {
+    "en": "The Companion identifier is invalid",
+    "zh-Hans": "伴生应用标识无效"
+  },
+  "INVALID_PAIRING_CODE": {
+    "en": "The pairing code is invalid or already used",
+    "zh-Hans": "配对码无效或已经使用"
+  },
+  "INVALID_SESSION_ID": {
+    "en": "The task identifier is invalid",
+    "zh-Hans": "任务标识无效"
+  },
+  "INVALID_TIMELINE_CURSOR": {
+    "en": "Use only one timeline cursor",
+    "zh-Hans": "任务时间线只能使用一个游标"
+  },
+  "PAIRING_EXPIRED": {
+    "en": "The pairing code has expired",
+    "zh-Hans": "配对码已经过期"
+  },
+  "PAIRING_UNAVAILABLE": {
+    "en": "No Companion pairing request is available",
+    "zh-Hans": "当前没有可用的伴生应用配对请求"
   },
   "AUTH_UNAVAILABLE": {
     "en": "Runtime authentication is unavailable",
@@ -1269,6 +1394,9 @@
     "en": "The official Claude OAuth quota endpoint is disabled",
     "zh-Hans": "Claude 官方 OAuth 额度接口未启用"
   },
+  "CLAUDE_SIGN_IN_REQUIRED": {"en": "Sign in to Claude Code once, then refresh. No conversation is needed.", "zh-Hans": "请先登录 Claude Code，再刷新额度；无需发送对话。"},
+  "CLAUDE_AUTH_REFRESH_FAILED": {"en": "Automatic Claude credential renewal failed. Check Claude Code sign-in or try again.", "zh-Hans": "Claude 凭据自动续期失败，请检查登录状态或重试。"},
+  "CLAUDE_QUOTA_RATE_LIMITED": {"en": "Claude is limiting quota requests. Automatic refresh will retry later.", "zh-Hans": "Claude 额度请求被限流，将稍后自动重试。"},
   "CLAUDE_QUOTA_REFRESH_FAILED": {
     "en": "Claude quota refresh failed",
     "zh-Hans": "Claude 额度刷新失败"
@@ -1332,6 +1460,30 @@
   "INVALID_SETTINGS": {
     "en": "The settings are invalid",
     "zh-Hans": "设置内容无效"
+  },
+  "CHECKPOINT_NOT_FOUND": {
+    "en": "The checkpoint was not found",
+    "zh-Hans": "没有找到对应 Checkpoint"
+  },
+  "CHECKPOINT_INVALID": {
+    "en": "The checkpoint request is invalid",
+    "zh-Hans": "Checkpoint 请求无效"
+  },
+  "CHECKPOINT_GIT_FAILED": {
+    "en": "The Git checkpoint could not be created or applied safely",
+    "zh-Hans": "无法安全创建或应用 Git Checkpoint"
+  },
+  "CHECKPOINT_PREFLIGHT_FAILED": {
+    "en": "Checkpoint recovery preflight did not pass",
+    "zh-Hans": "Checkpoint 恢复预检未通过"
+  },
+  "ARTIFACT_REVEAL_FAILED": {
+    "en": "Finder could not reveal the file. Please try again",
+    "zh-Hans": "访达未能定位该文件，请重试"
+  },
+  "ARTIFACT_UNAVAILABLE": {
+    "en": "The referenced file is unavailable or no longer belongs to this result",
+    "zh-Hans": "关联文件已不可用，或已不属于当前结果"
   },
   "JUMP_FAILED": {
     "en": "The original window was not found, or app-control permission is missing",
@@ -1404,6 +1556,10 @@
   "SESSION_NOT_FOUND": {
     "en": "The corresponding task was not found",
     "zh-Hans": "没有找到对应任务"
+  },
+  "TASK_STILL_ACTIVE": {
+    "en": "This task is still running or awaiting attention and cannot be archived or deleted",
+    "zh-Hans": "任务仍在运行或等待处理，不能归档或删除历史"
   },
   "SETTINGS_READ_FAILED": {
     "en": "Local settings could not be read",

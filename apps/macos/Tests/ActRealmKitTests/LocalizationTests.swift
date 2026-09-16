@@ -4,6 +4,44 @@ import Testing
 @testable import ActRealmUI
 
 @Suite struct LocalizationTests {
+    @Test func freshAndInvalidPreferencesFollowTheSystemByDefault() {
+        let suite = "ActRealmLanguageDefaults.\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        #expect(AppLocalization.selectedLanguage(defaults: defaults) == .system)
+        defaults.set("invalid-locale", forKey: AppLanguage.preferenceKey)
+        #expect(AppLocalization.selectedLanguage(defaults: defaults) == .system)
+        defaults.set("en", forKey: AppLanguage.preferenceKey)
+        #expect(AppLocalization.selectedLanguage(defaults: defaults) == .english)
+        #expect(AppLanguage.resolvedIdentifier(selection: .english, preferredLanguages: ["zh-Hans-CN"]) == "en")
+    }
+
+    @Test func usageSourcesAndCoverageTranslateBeforeTheyAreCombined() {
+        let sources: [String?] = [nil, "statusline", "claude_transcript_incremental", "codex_response_records",
+            "codex_rollout_session_local", "codex_rollout_incremental", "codex_rollout_during_indexing"]
+        for source in sources {
+            for quality: String? in [nil, "official", "official_local", "derived", "partial", "suspect"] {
+                let text = AppLocalization.localizedUsageDescription(source: source, quality: quality, language: .english)
+                #expect(!text.unicodeScalars.contains { (0x3400...0x9FFF).contains($0.value) })
+            }
+        }
+        #expect(AppLocalization.localizedUsageDescription(source: "codex_response_records", quality: "official_local", language: .english) == "Codex response records · Verified local records")
+        #expect(AppLocalization.localizedProviderText("命令包含组合语法", language: .english) == "Compound shell command")
+    }
+
+    @Test func englishPickersAndEventDatesDoNotLeakSystemChinese() {
+        for key in ["50K / 分钟", "100K / 分钟", "250K / 分钟", "500K / 分钟", "1M / 分钟", "万 / 亿"] {
+            let text = AppLocalization.localized(key, language: .english)
+            #expect(!text.unicodeScalars.contains { (0x3400...0x9FFF).contains($0.value) })
+        }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        calendar.locale = Locale(identifier: "zh-Hans-CN")
+        let text = ZhFormat.timestamp(Date(timeIntervalSince1970: 1_789_600_000), calendar: calendar, language: .english)
+        #expect(!text.unicodeScalars.contains { (0x3400...0x9FFF).contains($0.value) })
+        #expect(text.contains("2026"))
+    }
+
     @Test func systemLanguageResolvesChineseOrEnglish() {
         #expect(AppLanguage.resolvedIdentifier(
             selection: .system,
@@ -37,11 +75,23 @@ import Testing
             Int64(5),
             Int64(3),
             language: .english
-        ) == "5 tasks · 3 waiting")
+        ) == "Tasks: 5 · Waiting: 3")
         #expect(AppLocalization.localized("恢复状态", language: .english) == "Recovery status")
         #expect(AppLocalization.localized("settings.tab.agents", language: .english) == "Agents")
         #expect(AppLocalization.localized("Agent", language: .english) == "Agent")
+        #expect(AppLocalization.localized(
+            "历史数据部分可用",
+            language: .simplifiedChinese
+        ) == "历史数据部分可用")
+        #expect(AppLocalization.localized(
+            "历史数据部分可用",
+            language: .english
+        ) == "Partial history available")
     }
+
+
+
+
 
     @Test func runtimeSupervisorFailuresLocalizeDynamicArguments() {
         #expect(AppLocalization.localizedRuntimeSupervisorText(

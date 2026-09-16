@@ -151,6 +151,13 @@ pub(crate) fn attention_detail(attention: &AttentionRecord) -> Option<Value> {
 }
 
 pub(crate) fn attention_risks(attention: &AttentionRecord) -> Vec<Value> {
+    if !attention.risk_codes.is_empty() {
+        return attention
+            .risk_codes
+            .iter()
+            .map(|code| empty_message(code.as_str()))
+            .collect();
+    }
     attention
         .risk_notes
         .iter()
@@ -214,11 +221,35 @@ pub(crate) fn quota_window(entry: &QuotaEntry) -> Option<Value> {
     if entry.window == "extra_usage" {
         return Some(empty_message("quota.window.extra_usage"));
     }
+    if entry.provider == "claude" && entry.window == "7d" {
+        return Some(empty_message("quota.window.claude_weekly"));
+    }
+    if entry.provider == "claude"
+        && (entry.window.starts_with("scoped_") || entry.window.starts_with("7d_"))
+    {
+        if let Some(name) = entry.limit_name.as_deref() {
+            let name = name.split('·').next().unwrap_or(name).trim();
+            let mut args = string_arg("name", name);
+            if let Some(minutes) = entry
+                .window_minutes
+                .filter(|minutes| *minutes > 0 && minutes.is_multiple_of(10_080))
+            {
+                args.insert(
+                    "count".into(),
+                    Value::String((minutes / 10_080).to_string()),
+                );
+                return Some(message("quota.window.scoped_weeks", args));
+            }
+            return Some(message("quota.window.scoped", args));
+        }
+    }
     if entry.window == "week" {
         return Some(empty_message("quota.window.current_week"));
     }
     let minutes = entry.window_minutes?;
-    let (code, count) = if minutes.is_multiple_of(43_200) {
+    let (code, count) = if (40_320..=44_640).contains(&minutes) {
+        ("quota.window.months", 1)
+    } else if minutes.is_multiple_of(43_200) {
         ("quota.window.months", minutes / 43_200)
     } else if minutes.is_multiple_of(10_080) {
         ("quota.window.weeks", minutes / 10_080)
@@ -256,6 +287,21 @@ fn provider_name(provider: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use actrealm_core::{AttentionRiskCode, OperationCategory};
+
+    #[test]
+    fn claude_global_and_scoped_weekly_windows_have_distinct_labels() {
+        let global: QuotaEntry = serde_json::from_value(json!({"provider":"claude","window":"7d","windowMinutes":10080,"status":"available","source":"oauth_usage"})).unwrap();
+        let scoped: QuotaEntry = serde_json::from_value(json!({"provider":"claude","window":"scoped_fable","windowMinutes":10080,"limitName":"Fable","status":"available","source":"oauth_usage"})).unwrap();
+        assert_eq!(
+            quota_window(&global).unwrap()["code"],
+            "quota.window.claude_weekly"
+        );
+        let label = quota_window(&scoped).unwrap();
+        assert_eq!(label["code"], "quota.window.scoped_weeks");
+        assert_eq!(label["args"]["name"], "Fable");
+        assert_eq!(label["args"]["count"], "1");
+    }
 
     #[test]
     fn legacy_risk_copy_projects_to_stable_codes() {
@@ -274,10 +320,17 @@ mod tests {
                 "我不认识这个操作的影响".to_owned(),
                 "建议查看原窗口".to_owned(),
             ],
+            primary_category: None,
+            risk_codes: Vec::new(),
             command_preview: None,
             expires_at: None,
+            auto_hide_at: None,
+            reminder_acknowledged_at: None,
+            reminder_resolution: None,
+            retain_after_ack: false,
             created_at: 1,
             resolution: None,
+            remote_actionable: false,
         };
 
         let codes = attention_risks(&attention)
@@ -290,6 +343,46 @@ mod tests {
                 "attention.risk.unknown_impact",
                 "attention.risk.review_original"
             ]
+        );
+    }
+
+    #[test]
+    fn structured_risk_codes_are_used_without_legacy_text_inference() {
+        let attention = AttentionRecord {
+            id: "structured".to_owned(),
+            session_id: "session".to_owned(),
+            provider: "codex".to_owned(),
+            project: None,
+            request_id: None,
+            kind: "approval".to_owned(),
+            title: "Allow Bash?".to_owned(),
+            detail: None,
+            state: "open".to_owned(),
+            risk: "high".to_owned(),
+            risk_notes: vec!["unrecognized legacy copy".to_owned()],
+            primary_category: Some(OperationCategory::ShellRemove),
+            risk_codes: vec![
+                AttentionRiskCode::HighImpact,
+                AttentionRiskCode::Irreversible,
+            ],
+            command_preview: None,
+            expires_at: None,
+            auto_hide_at: None,
+            reminder_acknowledged_at: None,
+            reminder_resolution: None,
+            retain_after_ack: false,
+            created_at: 1,
+            resolution: None,
+            remote_actionable: false,
+        };
+
+        let codes = attention_risks(&attention)
+            .into_iter()
+            .filter_map(|message| message["code"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            codes,
+            ["attention.risk.high_impact", "attention.risk.irreversible"]
         );
     }
 }

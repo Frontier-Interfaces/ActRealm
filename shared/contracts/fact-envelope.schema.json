@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://getactrealm.com/contracts/fact-envelope.schema.json",
+  "title": "ActRealmSessionFacts",
+  "description": "Source, freshness, verification, absence, and control metadata for bounded Runtime session facts. Existing session fields remain the values.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "plan", "activity", "currentTarget", "completion", "control"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "plan": {"$ref": "#/$defs/factMetadata"},
+    "activity": {"$ref": "#/$defs/factMetadata"},
+    "currentTarget": {"$ref": "#/$defs/factMetadata"},
+    "completion": {"$ref": "#/$defs/factMetadata"},
+    "control": {"$ref": "#/$defs/factMetadata"}
+  },
+  "$defs": {
+    "sourceKind": {
+      "enum": ["authoritative", "observed", "derived", "unavailable"]
+    },
+    "freshness": {
+      "enum": ["live", "delayed", "stale", "expired"]
+    },
+    "verification": {
+      "enum": ["verified", "partial", "unverified", "not_applicable"]
+    },
+    "absenceReason": {
+      "enum": [
+        "provider_not_supplied",
+        "not_supported",
+        "capability_unconfirmed",
+        "no_current_turn",
+        "no_current_activity",
+        "no_current_tool",
+        "current_tool_has_no_target",
+        "task_not_completed",
+        "source_stale"
+      ]
+    },
+    "capability": {
+      "enum": ["direct", "return_to_provider", "observe_only", "unavailable"]
+    },
+    "factMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "sourceKind",
+        "sourceId",
+        "capturedAt",
+        "freshness",
+        "verification",
+        "absenceReason",
+        "capability"
+      ],
+      "properties": {
+        "schemaVersion": {"const": 1},
+        "sourceKind": {"$ref": "#/$defs/sourceKind"},
+        "sourceId": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 160,
+          "pattern": "^[a-z][a-z0-9._-]{0,31}:[A-Za-z0-9._/-]{1,127}$"
+        },
+        "capturedAt": {"type": ["integer", "null"], "minimum": 0},
+        "freshness": {"$ref": "#/$defs/freshness"},
+        "verification": {"$ref": "#/$defs/verification"},
+        "absenceReason": {
+          "anyOf": [
+            {"$ref": "#/$defs/absenceReason"},
+            {"type": "null"}
+          ]
+        },
+        "capability": {"$ref": "#/$defs/capability"}
+      }
+    }
+  }
+}

@@ -1,9 +1,13 @@
 #![cfg(unix)]
 
-use actrealm_core::{BridgeRequest, Decision, Provider, ReplyAction, TermContext};
+use actrealm_core::{
+    AttentionRiskCode, BridgeRequest, Decision, OperationCategory, Provider, ReplyAction,
+    TermContext,
+};
 use actrealm_runtime::{
-    ApprovalAction, AttentionAction, CommandState, EventSpool, InstanceError, RuntimeInstanceGuard,
-    RuntimeStore, SessionUsageRecord, SpoolError, StoreError, WaiterRegistry,
+    ApprovalAction, AttentionAction, CommandState, EventSpool, InstanceError, ReviewBaselineInput,
+    RuntimeInstanceGuard, RuntimeStore, SessionUsageDailyRecord, SessionUsageRecord, SpoolError,
+    StoreError, TaskCheckpointInput, WaiterRegistry,
 };
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -117,7 +121,7 @@ fn existing_v1_database_adds_task_titles_without_losing_sessions() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        11
+        38
     );
     let usage_columns = connection
         .prepare("PRAGMA table_info(session_usage)")
@@ -127,7 +131,274 @@ fn existing_v1_database_adds_task_titles_without_losing_sessions() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert!(usage_columns.iter().any(|column| column == "model"));
+    let session_columns = connection
+        .prepare("PRAGMA table_info(sessions)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(session_columns
+        .iter()
+        .any(|column| column == "current_target"));
+    assert!(session_columns
+        .iter()
+        .any(|column| column == "task_hidden_at"));
+    assert!(session_columns
+        .iter()
+        .any(|column| column == "task_hidden_reason"));
+    let event_columns = connection
+        .prepare("PRAGMA table_info(events)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(event_columns.iter().any(|column| column == "tool_target"));
+    let event_indexes = connection
+        .prepare("PRAGMA index_list(events)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(event_indexes
+        .iter()
+        .any(|index| index == "events_turn_occurred_at"));
+    let attention_columns = connection
+        .prepare("PRAGMA table_info(attention_items)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(attention_columns
+        .iter()
+        .any(|column| column == "remote_actionable"));
+    assert!(attention_columns
+        .iter()
+        .any(|column| column == "reminder_acknowledged_at"));
+    assert!(attention_columns
+        .iter()
+        .any(|column| column == "reminder_resolution"));
     drop(connection);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn review_baseline_queue_is_persistent_idempotent_and_records_late_first_tool() {
+    let root = temp_root("review-baseline");
+    fs::create_dir_all(&root).unwrap();
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"UserPromptSubmit",
+                "session_id":"review-baseline-session",
+                "turn_id":"review-baseline-turn",
+                "cwd":"/tmp/review-baseline"
+            }),
+            1_000,
+        ))
+        .unwrap();
+    let candidate = store.pending_review_baselines(4).unwrap().remove(0);
+    assert_eq!(candidate.first_tool_at, None);
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"PreToolUse",
+                "session_id":"review-baseline-session",
+                "turn_id":"review-baseline-turn",
+                "tool_name":"Read",
+                "tool_use_id":"review-tool"
+            }),
+            1_100,
+        ))
+        .unwrap();
+    let input = ReviewBaselineInput {
+        session_id: candidate.session_id.clone(),
+        turn_id: candidate.turn_id.clone(),
+        repository_root: PathBuf::from("/tmp/review-baseline"),
+        repository_identity: "a".repeat(64),
+        branch: Some("main".to_owned()),
+        head: Some("b".repeat(40)),
+        worktree_kind: "primary".to_owned(),
+        dirty: false,
+        changed_files: 0,
+        staged_files: 0,
+        unstaged_files: 0,
+        untracked_files: 0,
+        insertions: Some(0),
+        deletions: Some(0),
+        binary_files: Some(0),
+        turn_started_at: candidate.turn_started_at,
+        first_tool_at: candidate.first_tool_at,
+        captured_at: 1_200,
+    };
+    assert!(store.write_review_baseline(input.clone()).unwrap());
+    assert!(!store.write_review_baseline(input).unwrap());
+    assert!(store.pending_review_baselines(4).unwrap().is_empty());
+    let baseline = store.review_baseline(candidate.turn_id).unwrap().unwrap();
+    assert_eq!(baseline.first_tool_at, Some(1_100));
+    assert_eq!(baseline.captured_at, 1_200);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn review_baseline_rechecks_first_tool_when_event_arrives_after_capture() {
+    let root = temp_root("review-baseline-delayed-tool");
+    fs::create_dir_all(&root).unwrap();
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"UserPromptSubmit",
+                "session_id":"review-delayed-tool-session",
+                "turn_id":"review-delayed-tool-turn",
+                "cwd":"/tmp/review-delayed-tool"
+            }),
+            1_000,
+        ))
+        .unwrap();
+    let candidate = store.pending_review_baselines(4).unwrap().remove(0);
+    let input = ReviewBaselineInput {
+        session_id: candidate.session_id.clone(),
+        turn_id: candidate.turn_id.clone(),
+        repository_root: PathBuf::from("/tmp/review-delayed-tool"),
+        repository_identity: "a".repeat(64),
+        branch: Some("main".to_owned()),
+        head: Some("b".repeat(40)),
+        worktree_kind: "primary".to_owned(),
+        dirty: false,
+        changed_files: 0,
+        staged_files: 0,
+        unstaged_files: 0,
+        untracked_files: 0,
+        insertions: Some(0),
+        deletions: Some(0),
+        binary_files: Some(0),
+        turn_started_at: candidate.turn_started_at,
+        first_tool_at: candidate.first_tool_at,
+        captured_at: 1_200,
+    };
+    assert!(store.write_review_baseline(input).unwrap());
+    assert_eq!(
+        store
+            .review_baseline(&candidate.turn_id)
+            .unwrap()
+            .unwrap()
+            .first_tool_at,
+        None
+    );
+
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"PreToolUse",
+                "session_id":"review-delayed-tool-session",
+                "turn_id":"review-delayed-tool-turn",
+                "tool_name":"Read",
+                "tool_use_id":"review-delayed-tool"
+            }),
+            1_100,
+        ))
+        .unwrap();
+
+    let baseline = store.review_baseline(candidate.turn_id).unwrap().unwrap();
+    assert_eq!(baseline.first_tool_at, Some(1_100));
+    assert!(baseline.captured_at > baseline.first_tool_at.unwrap());
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn task_checkpoint_metadata_is_bounded_persistent_and_deletes_without_session_loss() {
+    let root = temp_root("task-checkpoint");
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("data.sqlite");
+    let store = RuntimeStore::open(&database).unwrap();
+    let ingested = store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"UserPromptSubmit",
+                "session_id":"checkpoint-session",
+                "turn_id":"checkpoint-turn",
+                "cwd":"/tmp/checkpoint-project"
+            }),
+            1_000,
+        ))
+        .unwrap();
+    let checkpoint_id = Uuid::now_v7().to_string();
+    let turn_id = store
+        .local_review_context(&ingested.session_id)
+        .unwrap()
+        .unwrap()
+        .turn_id
+        .unwrap();
+    let checkpoint = store
+        .create_task_checkpoint(TaskCheckpointInput {
+            id: checkpoint_id.clone(),
+            session_id: ingested.session_id.clone(),
+            turn_id,
+            label: Some("Before recovery".to_owned()),
+            kind: "metadata".to_owned(),
+            provider: "codex".to_owned(),
+            provider_session_id: "checkpoint-session".to_owned(),
+            provider_resume_capability: "unsupported".to_owned(),
+            repository_root: Some(PathBuf::from("/tmp/checkpoint-project")),
+            repository_identity: Some("a".repeat(64)),
+            branch: Some("main".to_owned()),
+            head: Some("b".repeat(40)),
+            worktree_kind: Some("primary".to_owned()),
+            dirty: Some(true),
+            changed_files: Some(2),
+            staged_files: Some(0),
+            unstaged_files: Some(1),
+            untracked_files: Some(1),
+            git_object_id: None,
+            git_ref: None,
+            patch_digest: None,
+            validation_json: "[]".to_owned(),
+            review_baseline_captured_at: Some(900),
+            created_at: 1_100,
+        })
+        .unwrap();
+    assert_eq!(checkpoint.id, checkpoint_id);
+    assert_eq!(checkpoint.label.as_deref(), Some("Before recovery"));
+    assert_eq!(
+        store.task_checkpoints(&ingested.session_id).unwrap().len(),
+        1
+    );
+    let export = store.export_json(1_200).unwrap();
+    assert_eq!(
+        export["tables"]["task_checkpoints"][0]["repository_root"],
+        "<redacted>"
+    );
+    assert_eq!(
+        export["tables"]["task_checkpoints"][0]["repository_identity"],
+        "<redacted>"
+    );
+    drop(store);
+
+    let reopened = RuntimeStore::open(&database).unwrap();
+    assert_eq!(
+        reopened
+            .task_checkpoint(&checkpoint_id)
+            .unwrap()
+            .unwrap()
+            .changed_files,
+        Some(2)
+    );
+    assert!(reopened.delete_task_checkpoint(&checkpoint_id).unwrap());
+    assert!(reopened.task_checkpoint(&checkpoint_id).unwrap().is_none());
+    assert_eq!(reopened.snapshot().unwrap().sessions.len(), 1);
+    drop(reopened);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -224,6 +495,59 @@ fn codex_internal_background_sessions_are_discarded_without_visibility_state() {
         .unwrap();
     assert!(safety.suppressed);
 
+    let metadata_free_session = "019f7eb9-3aa1-7d18-a1ad-a6be93b75058";
+    let mut metadata_free = codex_app_event(
+        "UserPromptSubmit",
+        metadata_free_session,
+        Some("# Overview Generate 0 to 3 hyperpersonalized suggestions for what to do next"),
+        2_500,
+    );
+    metadata_free.term = None;
+    metadata_free.raw["cwd"] = Value::String("/Users/test/project".to_owned());
+    let metadata_free = store.ingest(metadata_free).unwrap();
+    assert!(metadata_free.suppressed);
+
+    let executable_probe_session = "01a03d36-180a-7c12-b9e1-b0ac764daea7";
+    store
+        .ingest(codex_app_event(
+            "SessionStart",
+            executable_probe_session,
+            None,
+            2_600,
+        ))
+        .unwrap();
+    let executable_probe = store
+        .ingest(codex_app_event(
+            "UserPromptSubmit",
+            executable_probe_session,
+            Some("/opt/homebrew/bin/codex"),
+            2_601,
+        ))
+        .unwrap();
+    assert!(executable_probe.suppressed);
+
+    let hooks_command_session = "01a03d79-e01e-7aae-bcbf-d409133a39a8";
+    let hooks_command = store
+        .ingest(codex_app_event(
+            "UserPromptSubmit",
+            hooks_command_session,
+            Some("/hooks"),
+            2_700,
+        ))
+        .unwrap();
+    assert!(hooks_command.suppressed);
+
+    let markdown_hooks_session = "01a03d4c-7f7d-7541-8bf8-dfd182ae5f39";
+    let markdown_hooks = store
+        .ingest(codex_app_event(
+            "UserPromptSubmit",
+            markdown_hooks_session,
+            Some("`/hooks`"),
+            2_800,
+        ))
+        .unwrap();
+    assert!(markdown_hooks.suppressed);
+
     let real_session = "real-codex-app-root-session";
     let real = store
         .ingest(codex_app_event(
@@ -250,7 +574,7 @@ fn codex_internal_background_sessions_are_discarded_without_visibility_state() {
                 |row| row.get::<_, i64>(0)
             )
             .unwrap(),
-        2
+        6
     );
     assert_eq!(
         connection
@@ -266,11 +590,11 @@ fn codex_internal_background_sessions_are_discarded_without_visibility_state() {
         .execute(
             "INSERT INTO sessions(
                id, provider, provider_session_id, cwd, title,
-               term_bundle_id, term_surface, exec_state, started_at, last_event_at
+               exec_state, started_at, last_event_at
              ) VALUES (
-               'legacy-internal-id', 'codex', 'legacy-internal-session', '/',
+               'legacy-internal-id', 'codex', 'legacy-internal-session', '/Users/test/project',
                '# Overview Generate 0 to 3 hyperpersonalized suggestions for what to do next',
-               'com.openai.codex', 'codex_app', 'response_finished', 4000, 4100
+               'response_finished', 4000, 4100
              )",
             [],
         )
@@ -300,7 +624,7 @@ fn codex_internal_background_sessions_are_discarded_without_visibility_state() {
                 |row| row.get::<_, i64>(0)
             )
             .unwrap(),
-        3
+        7
     );
     drop(connection);
     fs::remove_dir_all(root).unwrap();
@@ -325,6 +649,9 @@ fn local_usage_snapshots_join_existing_sessions_without_prompt_content() {
         .upsert_session_usage(SessionUsageRecord {
             provider: "codex".to_owned(),
             provider_session_id: "usage-session".to_owned(),
+            project_id: None,
+            project_label: None,
+            parent_provider_session_id: None,
             model: Some("gpt-5.6-sol".to_owned()),
             input_tokens: Some(700),
             output_tokens: Some(100),
@@ -342,6 +669,7 @@ fn local_usage_snapshots_join_existing_sessions_without_prompt_content() {
             usage_source: "codex_rollout".to_owned(),
             usage_quality: "official_local".to_owned(),
             captured_at: 2,
+            daily_usage: Vec::new(),
         })
         .unwrap();
     let session = store.snapshot().unwrap().sessions.remove(0);
@@ -356,6 +684,174 @@ fn local_usage_snapshots_join_existing_sessions_without_prompt_content() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn model_switch_uses_current_turn_usage_and_new_hook_metadata_for_both_providers() {
+    for (provider, key, old, new) in [
+        (Provider::Codex, "codex", "gpt-5.6-sol", "gpt-6-astra"),
+        (
+            Provider::Claude,
+            "claude",
+            "claude-sonnet-4",
+            "claude-opus-4-6",
+        ),
+    ] {
+        let root = temp_root(&format!("model-switch-{key}"));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let event = |name: &str, turn: &str, model: &str, at| {
+            BridgeRequest::from_hook_at(
+                provider,
+                json!({
+                    "hook_event_name": name, "session_id": "model-switch-session", "turn_id": turn,
+                    "model": model, "prompt": "Continue model switch test", "tool_name": "Bash", "tool_input": {}
+                }),
+                at,
+            )
+        };
+        store
+            .ingest(event("UserPromptSubmit", "turn-1", old, 100))
+            .unwrap();
+        assert_eq!(
+            store.snapshot().unwrap().sessions[0].model.as_deref(),
+            Some(old)
+        );
+        let mut usage = usage_record("model-switch-session", 200, 100, Some(500), "derived");
+        usage.provider = key.to_owned();
+        usage.model = Some(new.to_owned());
+        store.upsert_session_usage(usage).unwrap();
+        store
+            .ingest(event("PreToolUse", "turn-1", old, 250))
+            .unwrap();
+        assert_eq!(
+            store.snapshot().unwrap().sessions[0].model.as_deref(),
+            Some(new)
+        );
+        store.ingest(event("Stop", "turn-1", old, 300)).unwrap();
+        assert_eq!(
+            store.snapshot().unwrap().sessions[0].model.as_deref(),
+            Some(new)
+        );
+        store
+            .ingest(event("UserPromptSubmit", "turn-2", "future-model", 400))
+            .unwrap();
+        // Old usage must not override a newer turn before its first usage sample.
+        assert_eq!(
+            store.snapshot().unwrap().sessions[0].model.as_deref(),
+            Some("future-model")
+        );
+        let mut usage = usage_record("model-switch-session", 450, 150, None, "derived");
+        usage.provider = key.to_owned();
+        usage.model = Some("future-model".to_owned());
+        store.upsert_session_usage(usage).unwrap();
+        assert_eq!(
+            store.snapshot().unwrap().sessions[0].model.as_deref(),
+            Some("future-model")
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn token_decision_attributes_ledger_and_uses_only_live_sample_deltas_for_burn_rate() {
+    let root = temp_root("token-decision");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"UserPromptSubmit",
+                "session_id":"decision-session",
+                "turn_id":"decision-turn",
+                "cwd":"/tmp/decision-project",
+                "prompt":"Measure this task without persisting the private prompt"
+            }),
+            now,
+        ))
+        .unwrap();
+    store
+        .upsert_session_usage(usage_record(
+            "decision-session",
+            now,
+            1_000,
+            None,
+            "official_local",
+        ))
+        .unwrap();
+    let project_id = format!("sha256:{}", "a".repeat(64));
+    let mut child = usage_record("child-history", now, 500, None, "derived");
+    child.project_id = Some(project_id.clone());
+    child.project_label = Some("decision-project".to_owned());
+    child.parent_provider_session_id = Some("decision-session".to_owned());
+    store.upsert_session_usage(child).unwrap();
+    let mut grandchild = usage_record("grandchild-history", now, 50, None, "derived");
+    grandchild.project_id = Some(project_id.clone());
+    grandchild.project_label = Some("decision-project".to_owned());
+    grandchild.parent_provider_session_id = Some("child-history".to_owned());
+    store.upsert_session_usage(grandchild).unwrap();
+    let mut project_history = usage_record("project-history", now, 250, None, "derived");
+    project_history.project_id = Some(project_id);
+    project_history.project_label = Some("decision-project".to_owned());
+    store.upsert_session_usage(project_history).unwrap();
+    store
+        .upsert_session_usage(usage_record(
+            "unassigned-history",
+            now,
+            100,
+            None,
+            "partial",
+        ))
+        .unwrap();
+    let collecting = store.token_usage_decision(now, Some(50_000)).unwrap();
+    assert_eq!(collecting.schema_version, 2);
+    assert_eq!(collecting.total_tokens, 1_900);
+    assert_eq!(collecting.attributed_tokens, 1_550);
+    assert_eq!(collecting.unattributed_tokens, 350);
+    assert_eq!(collecting.attribution_coverage_basis_points, 8_157);
+    assert_eq!(collecting.task_attributed_tokens, 1_550);
+    assert_eq!(collecting.task_unattributed_tokens, 350);
+    assert_eq!(collecting.task_attribution_coverage_basis_points, 8_157);
+    assert_eq!(collecting.project_attributed_tokens, 1_800);
+    assert_eq!(collecting.project_unattributed_tokens, 100);
+    assert_eq!(collecting.project_attribution_coverage_basis_points, 9_473);
+    assert_eq!(collecting.project_totals[0].project, "decision-project");
+    assert_eq!(collecting.project_totals[0].total, 1_800);
+    assert_eq!(collecting.project_totals[0].task_count, 1);
+    assert_eq!(collecting.project_totals[0].session_count, 4);
+    assert_eq!(collecting.task_totals[0].total, 1_550);
+    assert_eq!(collecting.burn_rates[0].state, "collecting");
+    assert!(!collecting.burn_rates[0].threshold_exceeded);
+
+    store
+        .upsert_session_usage(usage_record(
+            "decision-session",
+            now + 6_000,
+            7_000,
+            None,
+            "official_local",
+        ))
+        .unwrap();
+    let decision = store
+        .token_usage_decision(now + 6_000, Some(50_000))
+        .unwrap();
+    assert_eq!(decision.total_tokens, 7_900);
+    assert_eq!(decision.task_totals[0].total, 7_550);
+    assert_eq!(decision.project_totals[0].total, 7_800);
+    assert_eq!(decision.burn_rates[0].window_seconds, 6);
+    assert_eq!(decision.burn_rates[0].token_delta, 6_000);
+    assert_eq!(decision.burn_rates[0].tokens_per_minute, 60_000);
+    assert_eq!(decision.burn_rates[0].sample_count, 2);
+    assert_eq!(decision.burn_rates[0].state, "normal");
+    assert!(decision.burn_rates[0].threshold_exceeded);
+    let encoded = serde_json::to_string(&decision).unwrap();
+    assert!(!encoded.contains("/tmp/"));
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn usage_record(
     provider_session_id: &str,
     captured_at: u64,
@@ -366,6 +862,9 @@ fn usage_record(
     SessionUsageRecord {
         provider: "codex".to_owned(),
         provider_session_id: provider_session_id.to_owned(),
+        project_id: None,
+        project_label: None,
+        parent_provider_session_id: None,
         model: Some("gpt-5.6-sol".to_owned()),
         input_tokens: Some(token_total),
         output_tokens: None,
@@ -383,7 +882,654 @@ fn usage_record(
         usage_source: "codex_rollout".to_owned(),
         usage_quality: usage_quality.to_owned(),
         captured_at,
+        daily_usage: Vec::new(),
     }
+}
+
+#[test]
+fn token_usage_archive_counts_only_monotonic_session_deltas() {
+    let root = temp_root("token-usage-archive");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    store
+        .upsert_session_usage(usage_record("token-ledger", now, 100, None, "derived"))
+        .unwrap();
+    let mut observed_claude = usage_record("claude-observed", now, 0, None, "official");
+    observed_claude.provider = "claude".to_owned();
+    observed_claude.model = Some("claude-sonnet".to_owned());
+    observed_claude.token_total = None;
+    observed_claude.last_turn_tokens = None;
+    observed_claude.context_used_tokens = None;
+    store.upsert_session_usage(observed_claude).unwrap();
+    let first = store.snapshot().unwrap().token_usage;
+    assert_eq!((first.today, first.month, first.total), (100, 100, 100));
+    assert_eq!(first.recorded_from, Some(now));
+    assert_eq!(first.by_provider.len(), 2);
+    assert_eq!(first.by_provider[0].provider, "codex");
+    assert_eq!(first.by_provider[0].today, 100);
+    assert_eq!(first.by_provider[0].month, 100);
+    assert_eq!(first.by_provider[0].total, 100);
+    assert_eq!(first.by_provider[1].provider, "claude");
+    assert_eq!(first.by_provider[1].total, 0);
+    assert_eq!(first.active_days, 1);
+    assert_eq!(first.current_streak, 1);
+    assert_eq!(first.by_model.len(), 1);
+    assert_eq!(first.by_model[0].model, "gpt-5.6-sol");
+    assert_eq!(first.by_model[0].total, 100);
+    assert_eq!(first.recent_days.len(), 1);
+    assert_eq!(first.recent_days[0].total, 100);
+    assert_eq!(first.recent_days[0].by_provider[0].provider, "codex");
+    assert_eq!(first.recent_days[0].by_model[0].model, "gpt-5.6-sol");
+    assert_eq!(first.detail_recorded_from, Some(now));
+
+    store
+        .upsert_session_usage(usage_record("token-ledger", now + 1, 100, None, "derived"))
+        .unwrap();
+    store.replace_session_usages(vec![], now + 2).unwrap();
+    store
+        .upsert_session_usage(usage_record("token-ledger", now + 3, 20, None, "partial"))
+        .unwrap();
+    assert_eq!(store.snapshot().unwrap().token_usage.total, 100);
+
+    store
+        .upsert_session_usage(usage_record("token-ledger", now + 4, 175, None, "derived"))
+        .unwrap();
+    let final_totals = store.snapshot().unwrap().token_usage;
+    assert_eq!(
+        (final_totals.today, final_totals.month, final_totals.total),
+        (175, 175, 175)
+    );
+    assert_eq!(final_totals.captured_at, Some(now + 4));
+    assert_eq!(final_totals.recent_days[0].by_model[0].total, 175);
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn legacy_token_cursor_baselines_new_detail_fields_without_backfilling_history() {
+    let root = temp_root("token-detail-migration");
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("data.sqlite");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE token_usage_cursors (
+               provider TEXT NOT NULL,
+               provider_session_id TEXT NOT NULL,
+               token_total INTEGER NOT NULL,
+               captured_at INTEGER NOT NULL,
+               PRIMARY KEY(provider, provider_session_id)
+             );
+             CREATE TABLE token_usage_daily (
+               day TEXT NOT NULL,
+               provider TEXT NOT NULL,
+               token_total INTEGER NOT NULL DEFAULT 0,
+               captured_at INTEGER NOT NULL,
+               PRIMARY KEY(day, provider)
+             );
+             INSERT INTO token_usage_cursors VALUES ('codex', 'legacy', 100, 1000);",
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = RuntimeStore::open(&database).unwrap();
+    store
+        .upsert_session_usage(usage_record("legacy", 1_001, 100, None, "derived"))
+        .unwrap();
+    assert!(store.snapshot().unwrap().token_usage.recent_days.is_empty());
+
+    store
+        .upsert_session_usage(usage_record("legacy", 1_002, 150, None, "derived"))
+        .unwrap();
+    let totals = store.snapshot().unwrap().token_usage;
+    assert_eq!(totals.total, 50);
+    assert_eq!(totals.recent_days[0].by_model[0].total, 50);
+    assert_eq!(
+        totals.recent_days[0].by_model[0].estimated_cost_usd_micros,
+        None
+    );
+
+    drop(store);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let cursor_columns = connection
+        .prepare("PRAGMA table_info(token_usage_cursors)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    for expected in ["project_id", "project_label", "parent_provider_session_id"] {
+        assert!(cursor_columns.iter().any(|column| column == expected));
+    }
+    drop(connection);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn session_day_history_is_idempotent_and_drives_dashboard_breakdowns() {
+    let root = temp_root("token-session-day-history");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mut record = usage_record("daily-history", now, 150, Some(750), "derived");
+    record.daily_usage = vec![SessionUsageDailyRecord {
+        day: "2026-08-10".to_owned(),
+        model: Some("gpt-5.6-sol".to_owned()),
+        input_tokens: 100,
+        output_tokens: 20,
+        cache_read_tokens: 30,
+        cache_creation_tokens: 0,
+        reasoning_tokens: 5,
+        token_total: 150,
+        estimated_cost_usd_micros: Some(750),
+        cost_kind: Some("computed".to_owned()),
+        pricing_source: Some("openai_standard_2026-07-20".to_owned()),
+        message_count: 2,
+    }];
+    store.upsert_session_usage(record.clone()).unwrap();
+    store.upsert_session_usage(record).unwrap();
+
+    let totals = store.snapshot().unwrap().token_usage;
+    assert_eq!(totals.active_days, 1);
+    assert_eq!(totals.message_count, 2);
+    assert_eq!(totals.peak_day.as_deref(), Some("2026-08-10"));
+    assert_eq!(totals.peak_day_total, 150);
+    assert_eq!(totals.recent_days.len(), 1);
+    assert_eq!(totals.recent_days[0].estimated_cost_usd_micros, Some(750));
+    assert_eq!(totals.recent_days[0].message_count, 2);
+    assert_eq!(totals.recent_days[0].by_provider[0].message_count, 2);
+    assert_eq!(totals.recent_days[0].by_model[0].input_tokens, Some(100));
+    assert_eq!(totals.recent_days[0].by_model[0].reasoning_tokens, Some(5));
+    assert_eq!(totals.by_model[0].total, 150);
+
+    let mut corrected = usage_record("daily-history", now + 1, 90, Some(450), "derived");
+    corrected.daily_usage = vec![SessionUsageDailyRecord {
+        day: "2026-08-10".to_owned(),
+        model: Some("gpt-5.6-terra".to_owned()),
+        input_tokens: 60,
+        output_tokens: 10,
+        cache_read_tokens: 20,
+        cache_creation_tokens: 0,
+        reasoning_tokens: 3,
+        token_total: 90,
+        estimated_cost_usd_micros: Some(450),
+        cost_kind: Some("computed".to_owned()),
+        pricing_source: Some("openai_standard_2026-07-20".to_owned()),
+        message_count: 1,
+    }];
+    store.upsert_session_usage(corrected).unwrap();
+    let corrected_totals = store.snapshot().unwrap().token_usage;
+    assert_eq!(corrected_totals.total, 90);
+    assert_eq!(corrected_totals.message_count, 1);
+    assert_eq!(
+        corrected_totals.recent_days[0].estimated_cost_usd_micros,
+        Some(450)
+    );
+    assert_eq!(corrected_totals.recent_days[0].by_model.len(), 1);
+    assert_eq!(
+        corrected_totals.recent_days[0].by_model[0].model,
+        "gpt-5.6-terra"
+    );
+    assert_eq!(corrected_totals.by_model.len(), 1);
+
+    let mut unpriced = usage_record("unpriced-history", now + 2, 10, None, "derived");
+    unpriced.daily_usage = vec![SessionUsageDailyRecord {
+        day: "2026-08-10".to_owned(),
+        model: Some("future-model".to_owned()),
+        input_tokens: 8,
+        output_tokens: 2,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+        reasoning_tokens: 0,
+        token_total: 10,
+        estimated_cost_usd_micros: None,
+        cost_kind: None,
+        pricing_source: None,
+        message_count: 1,
+    }];
+    store.upsert_session_usage(unpriced).unwrap();
+    let partial_cost = store.snapshot().unwrap().token_usage;
+    assert_eq!(partial_cost.total, 100);
+    assert_eq!(partial_cost.priced_tokens, 90);
+    assert_eq!(partial_cost.unpriced_tokens, 10);
+    assert_eq!(partial_cost.estimated_cost_usd_micros, Some(450));
+    assert_eq!(partial_cost.recent_days[0].priced_tokens, 90);
+    assert_eq!(partial_cost.recent_days[0].unpriced_tokens, 10);
+    assert_eq!(
+        partial_cost.recent_days[0].estimated_cost_usd_micros,
+        Some(450)
+    );
+
+    let numeric_json = store.export_token_usage_json(now + 3).unwrap();
+    assert_eq!(numeric_json["scope"], "token_usage_numeric");
+    assert_eq!(numeric_json["dataQuality"], "not_evaluated");
+    assert_eq!(numeric_json["totals"]["tokenTotal"], 100);
+    assert_eq!(numeric_json["totals"]["pricedTokens"], 90);
+    assert_eq!(numeric_json["totals"]["unpricedTokens"], 10);
+    assert_eq!(numeric_json["totals"]["estimatedCostUsdMicros"], 450);
+    assert_eq!(numeric_json["totals"]["costStatus"], "partial");
+    assert_eq!(numeric_json["totals"]["agentExecutionTimeSeconds"], 0);
+    assert_eq!(
+        numeric_json["semantics"]["agentExecutionTime"],
+        "Runtime intervals in thinking, tool_running, or compacting states only; user waiting is excluded and concurrent Agents are summed."
+    );
+    assert_eq!(numeric_json["daily"].as_array().unwrap().len(), 2);
+    let encoded_numeric = serde_json::to_string(&numeric_json).unwrap();
+    for private_value in ["daily-history", "unpriced-history"] {
+        assert!(!encoded_numeric.contains(private_value));
+    }
+    for row in numeric_json["daily"].as_array().unwrap() {
+        let object = row.as_object().unwrap();
+        for private_field in [
+            "sessionId",
+            "prompt",
+            "path",
+            "command",
+            "toolContent",
+            "response",
+        ] {
+            assert!(!object.contains_key(private_field));
+        }
+    }
+
+    let numeric_csv = store.export_token_usage_csv(now + 3).unwrap();
+    assert!(numeric_csv.starts_with("day,provider,model,input_tokens"));
+    assert!(numeric_csv.contains("2026-08-10,codex,future-model,8,2"));
+    assert!(numeric_csv.contains("2026-08-10,codex,gpt-5.6-terra,60,10"));
+    assert!(!numeric_csv.contains("daily-history"));
+    assert!(!numeric_csv.contains("unpriced-history"));
+
+    let connection = Connection::open(root.join("data.sqlite")).unwrap();
+    let reconciled: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+               (SELECT SUM(token_total) FROM token_usage_daily),
+               (SELECT SUM(token_total) FROM token_usage_session_days),
+               (SELECT SUM(token_total) FROM token_usage_daily_models)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(reconciled, (100, 100, 100));
+    drop(connection);
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn historical_computed_cost_is_frozen_until_facts_or_provider_cost_changes() {
+    let root = temp_root("token-price-freeze");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let daily = |cost, kind: &str, source: &str| SessionUsageDailyRecord {
+        day: "2026-08-11".to_owned(),
+        model: Some("gpt-5.6-sol".to_owned()),
+        input_tokens: 80,
+        output_tokens: 20,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+        reasoning_tokens: 4,
+        token_total: 100,
+        estimated_cost_usd_micros: Some(cost),
+        cost_kind: Some(kind.to_owned()),
+        pricing_source: Some(source.to_owned()),
+        message_count: 1,
+    };
+
+    let mut original = usage_record("price-freeze", now, 100, Some(500), "derived");
+    original.daily_usage = vec![daily(500, "computed", "price_snapshot_v1")];
+    store.upsert_session_usage(original).unwrap();
+
+    let mut silently_repriced = usage_record("price-freeze", now + 1, 100, Some(900), "derived");
+    silently_repriced.daily_usage = vec![daily(900, "computed", "price_snapshot_v2")];
+    store.upsert_session_usage(silently_repriced).unwrap();
+    let frozen = store.snapshot().unwrap().token_usage;
+    assert_eq!(frozen.estimated_cost_usd_micros, Some(500));
+    assert_eq!(frozen.pricing_sources.len(), 1);
+    assert_eq!(frozen.pricing_sources[0].source, "price_snapshot_v1");
+
+    let mut provider_reported = usage_record("price-freeze", now + 2, 100, Some(700), "derived");
+    provider_reported.daily_usage =
+        vec![daily(700, "provider_estimate", "provider_transcript_cost")];
+    store.upsert_session_usage(provider_reported).unwrap();
+    let upgraded = store.snapshot().unwrap().token_usage;
+    assert_eq!(upgraded.estimated_cost_usd_micros, Some(700));
+    assert_eq!(upgraded.pricing_sources[0].cost_kind, "provider_estimate");
+    assert_eq!(
+        upgraded.pricing_sources[0].source,
+        "provider_transcript_cost"
+    );
+
+    let mut zero = usage_record("zero-price-source", now + 3, 0, Some(0), "derived");
+    zero.daily_usage = vec![SessionUsageDailyRecord {
+        day: "2026-08-11".to_owned(),
+        model: Some("claude-sonnet-5".to_owned()),
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+        reasoning_tokens: 0,
+        token_total: 0,
+        estimated_cost_usd_micros: Some(0),
+        cost_kind: Some("provider_estimate".to_owned()),
+        pricing_source: Some("zero_value_source".to_owned()),
+        message_count: 1,
+    }];
+    store.upsert_session_usage(zero).unwrap();
+    assert_eq!(
+        store.snapshot().unwrap().token_usage.pricing_sources.len(),
+        1
+    );
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn newly_known_catalog_price_fills_only_previously_unpriced_history() {
+    let root = temp_root("token-price-backfill");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let daily = |cost: Option<u64>, source: Option<&str>| SessionUsageDailyRecord {
+        day: "2026-08-12".to_owned(),
+        model: Some("claude-opus-5".to_owned()),
+        input_tokens: 80,
+        output_tokens: 20,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+        reasoning_tokens: 0,
+        token_total: 100,
+        estimated_cost_usd_micros: cost,
+        cost_kind: cost.map(|_| "computed".to_owned()),
+        pricing_source: source.map(ToOwned::to_owned),
+        message_count: 1,
+    };
+
+    let mut unknown = usage_record("price-backfill", now, 100, None, "derived");
+    unknown.daily_usage = vec![daily(None, None)];
+    store.upsert_session_usage(unknown).unwrap();
+    assert_eq!(store.snapshot().unwrap().token_usage.unpriced_tokens, 100);
+
+    let mut newly_priced = usage_record("price-backfill", now + 1, 100, Some(900), "derived");
+    newly_priced.daily_usage = vec![daily(Some(900), Some("models_dev_api_fixture"))];
+    store.upsert_session_usage(newly_priced).unwrap();
+
+    let backfilled = store.snapshot().unwrap().token_usage;
+    assert_eq!(backfilled.priced_tokens, 100);
+    assert_eq!(backfilled.unpriced_tokens, 0);
+    assert_eq!(backfilled.estimated_cost_usd_micros, Some(900));
+    assert_eq!(
+        backfilled.pricing_sources[0].source,
+        "models_dev_api_fixture"
+    );
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn legacy_daily_cost_migration_marks_the_original_source_as_unknown_and_frozen() {
+    let root = temp_root("token-price-source-migration");
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("data.sqlite");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE token_usage_session_days (
+               provider TEXT NOT NULL,
+               provider_session_id TEXT NOT NULL,
+               day TEXT NOT NULL,
+               model TEXT NOT NULL,
+               input_tokens INTEGER NOT NULL DEFAULT 0,
+               output_tokens INTEGER NOT NULL DEFAULT 0,
+               cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+               cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+               reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+               token_total INTEGER NOT NULL DEFAULT 0,
+               estimated_cost_usd_micros INTEGER,
+               message_count INTEGER NOT NULL DEFAULT 0,
+               captured_at INTEGER NOT NULL,
+               PRIMARY KEY(provider, provider_session_id, day, model)
+             );
+             INSERT INTO token_usage_session_days VALUES (
+               'codex', 'legacy-session', '2026-08-12', 'gpt-5.6-sol',
+               80, 20, 0, 0, 4, 100, 500, 1, 1000
+             );
+             PRAGMA user_version = 28;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = RuntimeStore::open(&database).unwrap();
+    let totals = store.snapshot().unwrap().token_usage;
+    assert_eq!(totals.estimated_cost_usd_micros, Some(500));
+    assert_eq!(totals.pricing_sources[0].cost_kind, "legacy_unclassified");
+    assert_eq!(totals.pricing_sources[0].source, "legacy_pre_v29");
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn token_audit_explains_suspect_days_and_excludes_them_from_peak_claims() {
+    let root = temp_root("token-audit-suspect-days");
+    let database = root.join("data.sqlite");
+    let store = RuntimeStore::open(&database).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mut record = usage_record("audit-days", now, 2_000_001_700, None, "derived");
+    record.daily_usage = (1..=7)
+        .map(|day| SessionUsageDailyRecord {
+            day: format!("2026-08-{day:02}"),
+            model: Some("future-model".to_owned()),
+            input_tokens: 80,
+            output_tokens: 20,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            reasoning_tokens: 0,
+            token_total: 100,
+            estimated_cost_usd_micros: None,
+            cost_kind: None,
+            pricing_source: None,
+            message_count: 1,
+        })
+        .chain(std::iter::once(SessionUsageDailyRecord {
+            day: "2026-08-08".to_owned(),
+            model: Some("future-model".to_owned()),
+            input_tokens: 2_000_000_000,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            reasoning_tokens: 0,
+            token_total: 2_000_000_000,
+            estimated_cost_usd_micros: None,
+            cost_kind: None,
+            pricing_source: None,
+            message_count: 1,
+        }))
+        .chain(std::iter::once(SessionUsageDailyRecord {
+            day: "2999-01-01".to_owned(),
+            model: Some("future-model".to_owned()),
+            input_tokens: 1_000,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            reasoning_tokens: 0,
+            token_total: 1_000,
+            estimated_cost_usd_micros: None,
+            cost_kind: None,
+            pricing_source: None,
+            message_count: 1,
+        }))
+        .collect();
+    store.upsert_session_usage(record).unwrap();
+
+    let audited = store.snapshot().unwrap().token_usage;
+    assert_eq!(audited.suspect_count, 2);
+    assert!(audited
+        .anomalies
+        .iter()
+        .any(|anomaly| anomaly.code == "extreme_daily_jump"));
+    assert!(audited.anomalies.iter().any(|anomaly| {
+        anomaly.code == "future_usage_day" && anomaly.day.as_deref() == Some("2999-01-01")
+    }));
+    assert_eq!(audited.peak_day.as_deref(), Some("2026-08-07"));
+    assert_eq!(audited.peak_day_total, 100);
+
+    drop(store);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE token_usage_daily SET token_total = token_total + 1
+             WHERE day = '2026-08-01'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let store = RuntimeStore::open(&database).unwrap();
+    let mismatched = store.snapshot().unwrap().token_usage;
+    assert!(mismatched
+        .anomalies
+        .iter()
+        .any(|anomaly| anomaly.code == "daily_projection_mismatch"));
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn agent_time_uses_observed_turn_activity_instead_of_wall_clock_age() {
+    let root = temp_root("token-agent-time");
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("data.sqlite");
+    RuntimeStore::open(&database).unwrap();
+
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO sessions(
+               id, provider, provider_session_id, exec_state, started_at, last_event_at
+             ) VALUES ('session', 'codex', 'provider-session', 'thinking', 1000, 61000);
+             INSERT INTO turns(
+               id, session_id, provider_turn_id, ordinal, state, started_at
+             ) VALUES ('turn', 'session', 'provider-turn', 1, 'running', 1000);
+             INSERT INTO events(
+               id, session_id, turn_id, provider, type, occurred_at, ingest_seq
+             ) VALUES ('event', 'session', 'turn', 'codex', 'tool_started', 61000, 1);",
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = RuntimeStore::open(&database).unwrap();
+    assert_eq!(
+        store.snapshot().unwrap().token_usage.active_time_seconds,
+        60
+    );
+    let period_totals = store.snapshot().unwrap().token_usage;
+    assert_eq!(period_totals.today_active_time_seconds, 0);
+    assert_eq!(period_totals.month_active_time_seconds, 0);
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn agent_execution_time_excludes_user_waiting_and_keeps_tool_time_continuous() {
+    let root = temp_root("agent-execution-time");
+    let database = root.join("data.sqlite");
+    let store = RuntimeStore::open(&database).unwrap();
+    for (event, tool, at) in [
+        ("UserPromptSubmit", None, 1_000),
+        ("PermissionRequest", Some("git push"), 11_000),
+        ("PermissionDenied", None, 51_000),
+        ("PreToolUse", Some("cargo test"), 61_000),
+        ("Stop", None, 71_000),
+    ] {
+        store
+            .ingest(request_at(
+                Provider::Claude,
+                event,
+                "execution-session",
+                Some("turn-1"),
+                tool,
+                at,
+            ))
+            .unwrap();
+    }
+
+    let totals = store.snapshot().unwrap().token_usage;
+    assert_eq!(totals.active_time_seconds, 70);
+    assert_eq!(totals.execution_time_seconds, 30);
+    assert!(totals.execution_time_seconds < totals.active_time_seconds);
+
+    drop(store);
+    let connection = Connection::open(&database).unwrap();
+    let intervals = connection
+        .prepare(
+            "SELECT started_at, ended_at FROM agent_execution_intervals
+             ORDER BY started_at",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(intervals, vec![(1_000, 11_000), (51_000, 71_000)]);
+    connection
+        .execute_batch(
+            "DROP TABLE agent_execution_intervals;
+             PRAGMA user_version = 29;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let migrated = RuntimeStore::open(&database).unwrap();
+    assert_eq!(
+        migrated
+            .snapshot()
+            .unwrap()
+            .token_usage
+            .execution_time_seconds,
+        30
+    );
+    drop(migrated);
+    let connection = Connection::open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        38
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_execution_intervals
+                 WHERE start_reason = 'historical_event_rebuild'
+                   AND end_reason = 'historical_boundary'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        2
+    );
+    drop(connection);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -575,6 +1721,56 @@ fn usage_refresh_generation_orders_equal_millisecond_collections() {
 }
 
 #[test]
+fn caught_up_generation_replaces_inflated_partial_daily_rows() {
+    let root = temp_root("usage-partial-generation-replacement");
+    let database = root.join("data.sqlite");
+    let store = RuntimeStore::open(&database).unwrap();
+    let daily = |day: &str, tokens: u64| SessionUsageDailyRecord {
+        day: day.to_owned(),
+        model: Some("gpt-5.6-sol".to_owned()),
+        input_tokens: tokens,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+        reasoning_tokens: 0,
+        token_total: tokens,
+        estimated_cost_usd_micros: None,
+        cost_kind: None,
+        pricing_source: None,
+        message_count: 1,
+    };
+    let mut inflated = usage_record("partial-rebuild", 1_000, 600, None, "partial");
+    inflated.daily_usage = vec![daily("2026-08-25", 100), daily("2026-08-26", 500)];
+    store.replace_session_usages(vec![inflated], 1_000).unwrap();
+    assert_eq!(store.snapshot().unwrap().token_usage.total, 600);
+
+    let mut corrected = usage_record("partial-rebuild", 2_000, 20, None, "partial");
+    corrected.daily_usage = vec![daily("2026-08-26", 20)];
+    let generation = store.begin_usage_collection_generation().unwrap();
+    assert!(store
+        .replace_session_usages_for_generation(vec![corrected], 2_000, generation)
+        .unwrap());
+    let totals = store.snapshot().unwrap().token_usage;
+    assert_eq!(totals.total, 20);
+    assert_eq!(totals.recent_days.len(), 1);
+    assert_eq!(totals.recent_days[0].day, "2026-08-26");
+
+    drop(store);
+    let connection = Connection::open(&database).unwrap();
+    let canonical: (i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(token_total), 0)
+             FROM token_usage_session_days",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(canonical, (1, 20));
+    drop(connection);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn legacy_usage_upsert_preserves_nullable_values_and_allows_orphans() {
     let root = temp_root("legacy-usage-upsert");
     let database = root.join("data.sqlite");
@@ -674,6 +1870,79 @@ fn atomic_usage_replacement_removes_orphan_when_no_row_is_affected() {
         )
         .unwrap();
     assert_eq!(orphan_count, 0);
+    drop(connection);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_usage_generation_rolls_back_canonical_ledger_and_projections_together() {
+    let root = temp_root("usage-generation-atomic-rollback");
+    let database = root.join("data.sqlite");
+    let store = RuntimeStore::open(&database).unwrap();
+    let mut baseline = usage_record("a-baseline", 1_000, 100, Some(500), "complete");
+    baseline.daily_usage = vec![SessionUsageDailyRecord {
+        day: "2026-08-17".to_owned(),
+        model: Some("gpt-5.6-sol".to_owned()),
+        input_tokens: 80,
+        output_tokens: 20,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+        reasoning_tokens: 4,
+        token_total: 100,
+        estimated_cost_usd_micros: Some(500),
+        cost_kind: Some("computed".to_owned()),
+        pricing_source: Some("test_pricing".to_owned()),
+        message_count: 1,
+    }];
+    store
+        .replace_session_usages(vec![baseline.clone()], 1_000)
+        .unwrap();
+
+    let mut corrected = baseline;
+    corrected.token_total = Some(200);
+    corrected.input_tokens = Some(200);
+    corrected.daily_usage[0].input_tokens = 160;
+    corrected.daily_usage[0].output_tokens = 40;
+    corrected.daily_usage[0].token_total = 200;
+    let mut invalid = usage_record("z-invalid", 2_000, 50, None, "complete");
+    invalid.daily_usage = vec![SessionUsageDailyRecord {
+        day: "not-a-day".to_owned(),
+        model: Some("gpt-5.6-sol".to_owned()),
+        input_tokens: 50,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+        reasoning_tokens: 0,
+        token_total: 50,
+        estimated_cost_usd_micros: None,
+        cost_kind: None,
+        pricing_source: None,
+        message_count: 1,
+    }];
+    let generation = store.begin_usage_collection_generation().unwrap();
+    assert!(store
+        .replace_session_usages_for_generation(vec![corrected, invalid], 2_000, generation,)
+        .is_err());
+    drop(store);
+
+    let connection = Connection::open(&database).unwrap();
+    for table in [
+        "token_usage_session_days",
+        "token_usage_daily",
+        "token_usage_daily_models",
+    ] {
+        assert_eq!(
+            connection
+                .query_row(
+                    &format!("SELECT SUM(token_total) FROM {table}"),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            100,
+            "{table} must remain on the previous committed generation"
+        );
+    }
     drop(connection);
     fs::remove_dir_all(root).unwrap();
 }
@@ -790,6 +2059,39 @@ fn current_task_title_is_a_bounded_prompt_summary_with_live_activity_time() {
     assert_eq!(session.activity_since, Some(9_000));
     assert_eq!(session.turn_started_at, Some(9_000));
     assert_eq!(session.turn_ended_at, None);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn delegated_task_title_projects_only_the_user_request_without_internal_ids() {
+    let root = temp_root("delegated-task-title");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let private_thread = "private-source-thread-must-not-project";
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"UserPromptSubmit",
+                "session_id":"delegated-title-session",
+                "cwd":"/tmp/delegated-project",
+                "prompt":format!(
+                    "<codex_delegation><source_thread_id>{private_thread}</source_thread_id><input>Review H2.4 and README.md. Then finish.</input></codex_delegation><environment_context>private host context</environment_context>"
+                )
+            }),
+            10_000,
+        ))
+        .unwrap();
+
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(
+        snapshot.sessions[0].title.as_deref(),
+        Some("Review H2.4 and README.md.")
+    );
+    let encoded = serde_json::to_string(&snapshot).unwrap();
+    assert!(!encoded.contains(private_thread));
+    assert!(!encoded.contains("codex_delegation"));
+    assert!(!encoded.contains("environment_context"));
     drop(store);
     fs::remove_dir_all(root).unwrap();
 }
@@ -1127,6 +2429,71 @@ fn delayed_commit_undo_and_provider_confirmation_are_honest() {
 }
 
 #[test]
+fn provider_specific_undo_delay_can_commit_immediately_or_remain_undoable() {
+    let root = temp_root("provider-undo-delay");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+
+    let immediate = request_at(
+        Provider::Claude,
+        "PermissionRequest",
+        "immediate-session",
+        Some("turn-1"),
+        Some("git push origin main"),
+        1_000,
+    );
+    let immediate_request = immediate.request_id.unwrap();
+    store.ingest(immediate).unwrap();
+    let immediate_command = Uuid::now_v7();
+    let claim = store
+        .claim_approval_with_delay(
+            immediate_command,
+            immediate_request,
+            ApprovalAction::Approve,
+            2_000,
+            0,
+        )
+        .unwrap();
+    assert_eq!(claim.commit_due_at, Some(2_000));
+    assert_eq!(
+        store.commit(immediate_command, 2_000, true).unwrap().state,
+        CommandState::DecisionSent
+    );
+    assert_eq!(
+        store.undo(immediate_command, 2_000),
+        Err(StoreError::NotUndoable)
+    );
+
+    let delayed = request_at(
+        Provider::Codex,
+        "PermissionRequest",
+        "delayed-session",
+        Some("turn-1"),
+        Some("sudo true"),
+        3_000,
+    );
+    let delayed_request = delayed.request_id.unwrap();
+    store.ingest(delayed).unwrap();
+    let delayed_command = Uuid::now_v7();
+    let claim = store
+        .claim_approval_with_delay(
+            delayed_command,
+            delayed_request,
+            ApprovalAction::Deny,
+            4_000,
+            3_000,
+        )
+        .unwrap();
+    assert_eq!(claim.commit_due_at, Some(7_000));
+    assert_eq!(
+        store.undo(delayed_command, 6_999).unwrap(),
+        CommandState::Undone
+    );
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn tool_completion_before_stop_confirms_only_an_allow() {
     let root = temp_root("confirmation");
     let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
@@ -1304,6 +2671,68 @@ fn managed_codex_approval_replaces_observation_only_native_attention() {
     }));
     drop(store);
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn repeated_native_approval_and_usage_polling_do_not_advance_session_event_time() {
+    for provider in [Provider::Codex, Provider::Claude] {
+        let root = temp_root("native-approval-event-time");
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        store
+            .ingest(request_at(
+                provider,
+                "UserPromptSubmit",
+                "event-time",
+                Some("turn-1"),
+                None,
+                1_000,
+            ))
+            .unwrap();
+        store
+            .sync_native_approval(provider, "event-time", true, true, 1_100)
+            .unwrap();
+        let waiting = store.snapshot().unwrap();
+        for at in [1_200, 1_300] {
+            store
+                .sync_native_approval(provider, "event-time", true, true, at)
+                .unwrap();
+            store
+                .sync_provider_execution(provider, "event-time", true, at)
+                .unwrap();
+            let mut usage = usage_record("event-time", at, at, None, "derived");
+            usage.provider = provider.to_string();
+            store.upsert_session_usage(usage).unwrap();
+            let polled = store.snapshot().unwrap();
+            assert_eq!(polled.sessions[0].last_event_at, 1_100);
+            assert_eq!(
+                polled.sessions[0].activity_since,
+                waiting.sessions[0].activity_since
+            );
+            assert_eq!(polled.attention[0].id, waiting.attention[0].id);
+            assert_eq!(polled.sessions[0].token_total, Some(at));
+        }
+        store
+            .sync_native_approval(provider, "event-time", false, true, 1_400)
+            .unwrap();
+        assert_eq!(store.snapshot().unwrap().sessions[0].last_event_at, 1_400);
+        store
+            .sync_native_approval(provider, "event-time", false, true, 1_500)
+            .unwrap();
+        assert_eq!(store.snapshot().unwrap().sessions[0].last_event_at, 1_400);
+        store
+            .ingest(request_at(
+                provider,
+                "PreToolUse",
+                "event-time",
+                Some("turn-1"),
+                Some("Read"),
+                1_600,
+            ))
+            .unwrap();
+        assert_eq!(store.snapshot().unwrap().sessions[0].last_event_at, 1_600);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]
@@ -1880,6 +3309,14 @@ fn previews_are_redacted_and_risk_never_uses_history_to_downgrade() {
         .unwrap();
     let attention = store.snapshot().unwrap().attention.remove(0);
     assert_eq!(attention.risk, "high");
+    assert_eq!(attention.primary_category, Some(OperationCategory::GitPush));
+    assert_eq!(
+        attention.risk_codes,
+        [
+            AttentionRiskCode::HighImpact,
+            AttentionRiskCode::Irreversible
+        ]
+    );
     let preview = attention.command_preview.unwrap();
     assert!(preview.contains("<redacted>"));
     assert!(!preview.contains("super-secret"));
@@ -2042,6 +3479,86 @@ fn different_commands_in_the_same_turn_are_not_false_duplicates() {
     registry
         .pass_through(second.request_id.unwrap(), "test")
         .unwrap();
+}
+
+#[test]
+fn provider_retry_identity_deduplicates_only_events_with_a_strong_stable_id() {
+    let root = temp_root("stable-provider-event");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let event = json!({
+        "hook_event_name":"PreToolUse",
+        "session_id":"stable-event-session",
+        "prompt_id":"prompt-1",
+        "tool_use_id":"tool-use-1",
+        "tool_name":"Bash",
+        "tool_input":{"command":"cargo test"}
+    });
+    assert!(
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                event.clone(),
+                1_000,
+            ))
+            .unwrap()
+            .inserted
+    );
+    assert!(
+        !store
+            .ingest(BridgeRequest::from_hook_at(Provider::Claude, event, 2_000,))
+            .unwrap()
+            .inserted
+    );
+
+    let distinct = json!({
+        "hook_event_name":"PreToolUse",
+        "session_id":"stable-event-session",
+        "prompt_id":"prompt-1",
+        "tool_use_id":"tool-use-2",
+        "tool_name":"Bash",
+        "tool_input":{"command":"cargo test"}
+    });
+    assert!(
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                distinct,
+                3_000,
+            ))
+            .unwrap()
+            .inserted
+    );
+
+    let without_stable_id = json!({
+        "hook_event_name":"PermissionRequest",
+        "session_id":"stable-event-session",
+        "prompt_id":"prompt-1",
+        "tool_name":"Bash",
+        "tool_input":{"command":"cargo test"}
+    });
+    assert!(
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                without_stable_id.clone(),
+                4_000,
+            ))
+            .unwrap()
+            .inserted
+    );
+    assert!(
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                without_stable_id,
+                5_000,
+            ))
+            .unwrap()
+            .inserted
+    );
+    assert_eq!(store.snapshot().unwrap().event_count, 4);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -2516,6 +4033,68 @@ fn new_activity_resolves_stale_completion_and_error_without_hiding_running_state
 }
 
 #[test]
+fn a_tool_start_reopens_an_automatically_continued_codex_turn() {
+    let root = temp_root("tool-reopens-completed-turn");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+
+    for (at, event, tool_name) in [
+        (1_000, "UserPromptSubmit", None),
+        (1_100, "PreToolUse", Some("Write")),
+        (1_150, "PostToolUse", Some("Write")),
+        (1_200, "Stop", None),
+    ] {
+        let mut raw = json!({
+            "hook_event_name": event,
+            "session_id": "automatic-continuation",
+            "turn_id": "turn-1",
+            "cwd": "/tmp/example-project"
+        });
+        if let Some(tool_name) = tool_name {
+            raw["tool_name"] = Value::String(tool_name.to_owned());
+            raw["tool_input"] = json!({ "file_path": "/tmp/example-project/file.rs" });
+        }
+        store
+            .ingest(BridgeRequest::from_hook_at(Provider::Codex, raw, at))
+            .unwrap();
+    }
+
+    let stopped = store.snapshot().unwrap();
+    assert_eq!(stopped.sessions[0].exec_state, "response_finished");
+    assert!(stopped.sessions[0].turn_ended_at.is_some());
+    assert!(stopped
+        .attention
+        .iter()
+        .any(|item| item.kind == "completion" && item.state == "open"));
+
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "automatic-continuation",
+                "turn_id": "turn-1",
+                "cwd": "/tmp/example-project",
+                "tool_name": "Bash",
+                "tool_input": { "command": "cargo test" }
+            }),
+            1_300,
+        ))
+        .unwrap();
+
+    let resumed = store.snapshot().unwrap();
+    assert_eq!(resumed.sessions[0].exec_state, "tool_running");
+    assert!(resumed.sessions[0].turn_ended_at.is_none());
+    assert!(resumed.attention.iter().any(|item| {
+        item.kind == "completion"
+            && item.state == "resolved"
+            && item.resolution.as_deref() == Some("superseded_by_activity")
+    }));
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn provider_handled_approval_resolves_attention_and_session_waiting_state() {
     let root = temp_root("provider-handled-approval");
     let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
@@ -2679,6 +4258,112 @@ fn successful_turn_without_write_tools_still_creates_completion_attention() {
         .unwrap();
     assert_eq!(completion.state, "open");
     assert_eq!(completion.title, "Task completed; waiting for confirmation");
+    assert_eq!(completion.auto_hide_at, None);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn auto_hide_policy_assigns_a_runtime_owned_completion_deadline() {
+    let root = temp_root("completion-auto-hide-deadline");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    store
+        .write_ui_settings(
+            r#"{"completionTaskHideMode":"afterDelay","completionAutoHideMinutes":30}"#,
+            now,
+        )
+        .unwrap();
+    store
+        .ingest(request_at(
+            Provider::Codex,
+            "UserPromptSubmit",
+            "auto-hide-session",
+            Some("turn-1"),
+            None,
+            now.saturating_add(1),
+        ))
+        .unwrap();
+    store
+        .ingest(request_at(
+            Provider::Codex,
+            "Stop",
+            "auto-hide-session",
+            Some("turn-1"),
+            None,
+            now.saturating_add(2),
+        ))
+        .unwrap();
+
+    let snapshot = store.snapshot().unwrap();
+    let completion = snapshot
+        .attention
+        .iter()
+        .find(|item| item.kind == "completion")
+        .unwrap();
+    assert_eq!(completion.state, "open");
+    assert_eq!(
+        completion.auto_hide_at,
+        Some(now.saturating_add(2 + 30 * 60 * 1000))
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn hidden_completed_task_reappears_only_after_new_meaningful_activity() {
+    let root = temp_root("completion-visibility-reactivation");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(request_at(
+            Provider::Codex,
+            "UserPromptSubmit",
+            "reactivated-session",
+            Some("turn-1"),
+            None,
+            90_000,
+        ))
+        .unwrap();
+    store
+        .ingest(request_at(
+            Provider::Codex,
+            "Stop",
+            "reactivated-session",
+            Some("turn-1"),
+            None,
+            90_001,
+        ))
+        .unwrap();
+    let completion = store
+        .snapshot()
+        .unwrap()
+        .attention
+        .into_iter()
+        .find(|item| item.kind == "completion")
+        .unwrap();
+    store
+        .act_on_attention(Uuid::now_v7(), &completion.id, AttentionAction::Ack, 90_002)
+        .unwrap();
+    assert!(store.ui_snapshot(0).unwrap().sessions.is_empty());
+    assert_eq!(store.snapshot().unwrap().sessions.len(), 1);
+
+    store
+        .ingest(request_at(
+            Provider::Codex,
+            "UserPromptSubmit",
+            "reactivated-session",
+            Some("turn-2"),
+            None,
+            90_003,
+        ))
+        .unwrap();
+    let reactivated = store.ui_snapshot(0).unwrap();
+    assert_eq!(reactivated.sessions.len(), 1);
+    assert_eq!(reactivated.sessions[0].exec_state, "thinking");
+
     drop(store);
     fs::remove_dir_all(root).unwrap();
 }
@@ -2808,6 +4493,188 @@ fn codex_plan_updates_persist_real_steps_and_progress() {
 }
 
 #[test]
+fn codex_update_plan_hook_persists_the_allowlisted_nested_plan() {
+    let root = temp_root("codex-hook-plan");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "hook-plan-session",
+                "turn_id": "hook-plan-turn",
+                "tool_name": "update_plan",
+                "tool_use_id": "plan-call",
+                "tool_input": {
+                    "explanation": "bounded explanation",
+                    "plan": [
+                        {"step": "Inspect", "status": "completed"},
+                        {"step": "Implement", "status": "in_progress"},
+                        {"step": "Verify", "status": "pending"}
+                    ]
+                }
+            }),
+            71_500,
+        ))
+        .unwrap();
+
+    let snapshot = store.snapshot().unwrap();
+    let session = &snapshot.sessions[0];
+    assert_eq!((session.plan_done, session.plan_total), (Some(1), Some(3)));
+    assert_eq!(session.plan_steps[1].text, "Implement");
+    assert_eq!(session.plan_steps[1].status, "in_progress");
+
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name": "Stop",
+                "session_id": "hook-plan-session",
+                "turn_id": "hook-plan-turn"
+            }),
+            71_600,
+        ))
+        .unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "hook-plan-session",
+                "turn_id": "hook-plan-turn",
+                "tool_name": "update_plan",
+                "tool_use_id": "plan-call-after-stop",
+                "tool_input": {
+                    "plan": [
+                        {"step": "Inspect", "status": "completed"},
+                        {"step": "Implement", "status": "completed"},
+                        {"step": "Verify", "status": "in_progress"}
+                    ]
+                }
+            }),
+            71_700,
+        ))
+        .unwrap();
+
+    let after_stop = store.snapshot().unwrap();
+    let session = &after_stop.sessions[0];
+    assert_eq!(session.exec_state, "response_finished");
+    assert_eq!((session.plan_done, session.plan_total), (Some(2), Some(3)));
+    assert_eq!(session.plan_steps[1].status, "completed");
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_new_codex_turn_does_not_inherit_the_previous_turn_plan() {
+    let root = temp_root("codex-turn-scoped-plan");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "turn-scoped-plan-session",
+                "turn_id": "turn-1"
+            }),
+            80_000,
+        ))
+        .unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "turn-scoped-plan-session",
+                "turn_id": "turn-1",
+                "tool_name": "update_plan",
+                "tool_input": {
+                    "plan": [
+                        {"step":"Old task", "status":"in_progress"},
+                        {"step":"Old verification", "status":"pending"}
+                    ]
+                }
+            }),
+            80_010,
+        ))
+        .unwrap();
+    assert_eq!(store.snapshot().unwrap().sessions[0].plan_total, Some(2));
+
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name": "Stop",
+                "session_id": "turn-scoped-plan-session",
+                "turn_id": "turn-1"
+            }),
+            80_020,
+        ))
+        .unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "turn-scoped-plan-session",
+                "turn_id": "turn-2"
+            }),
+            80_030,
+        ))
+        .unwrap();
+
+    let current = store.snapshot().unwrap().sessions.remove(0);
+    assert_eq!((current.plan_done, current.plan_total), (None, None));
+    assert!(current.plan_steps.is_empty());
+    let workflow = store
+        .latest_current_local_timeline(current.id, 100)
+        .unwrap()
+        .unwrap();
+    assert_eq!(workflow.events.len(), 1);
+    assert_eq!(
+        workflow.events[0].kind,
+        actrealm_runtime::TimelineEventKind::TurnStarted
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn workflow_projects_safe_semantic_tool_categories() {
+    let root = temp_root("workflow-tool-category");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    for (at, event) in [(81_000, "PreToolUse"), (81_010, "PostToolUse")] {
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Codex,
+                json!({
+                    "hook_event_name": event,
+                    "session_id": "category-session",
+                    "turn_id": "category-turn",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "cargo test --workspace --offline"}
+                }),
+                at,
+            ))
+            .unwrap();
+    }
+    let workflow = store
+        .latest_current_local_timeline(store.snapshot().unwrap().sessions[0].id.clone(), 10)
+        .unwrap()
+        .unwrap();
+    assert_eq!(workflow.events.len(), 2);
+    assert!(workflow
+        .events
+        .iter()
+        .all(|event| event.tool_category.as_deref() == Some("test")));
+    assert!(!serde_json::to_string(&workflow)
+        .unwrap()
+        .contains("cargo test"));
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn codex_provider_owned_permission_never_opens_a_user_approval_item() {
     let root = temp_root("provider-owned-pretool");
     let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
@@ -2868,6 +4735,34 @@ fn ui_snapshot_reads_only_recent_or_actionable_sessions() {
     store
         .ingest(request_at(
             Provider::Claude,
+            "UserPromptSubmit",
+            "old-but-active",
+            Some("active-turn"),
+            None,
+            cutoff - 10_000,
+        ))
+        .unwrap();
+    for (session, stop_at) in [
+        ("recently-inactive", cutoff + 1),
+        ("expired-inactive", cutoff - 1),
+    ] {
+        store
+            .ingest(request_at(
+                Provider::Claude,
+                "UserPromptSubmit",
+                session,
+                Some("terminal-turn"),
+                None,
+                cutoff - 20_000,
+            ))
+            .unwrap();
+        assert!(store
+            .sync_provider_execution(Provider::Claude, session, false, stop_at)
+            .unwrap());
+    }
+    store
+        .ingest(request_at(
+            Provider::Claude,
             "PermissionRequest",
             "actionable-expired",
             Some("actionable-turn"),
@@ -2880,7 +4775,12 @@ fn ui_snapshot_reads_only_recent_or_actionable_sessions() {
     assert!(full_snapshot
         .sessions
         .iter()
-        .filter(|session| session.provider_session_id.starts_with("expired-"))
+        .filter(|session| {
+            session
+                .provider_session_id
+                .strip_prefix("expired-")
+                .is_some_and(|suffix| suffix.parse::<usize>().is_ok())
+        })
         .all(|session| session.exec_state == "idle"));
 
     let snapshot = store.ui_snapshot(cutoff).unwrap();
@@ -2891,11 +4791,123 @@ fn ui_snapshot_reads_only_recent_or_actionable_sessions() {
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(
         session_ids,
-        std::collections::HashSet::from(["recent", "actionable-expired"])
+        std::collections::HashSet::from([
+            "recent",
+            "old-but-active",
+            "recently-inactive",
+            "actionable-expired"
+        ])
     );
 
     let export = store.export_json(now).unwrap();
-    assert_eq!(export["tables"]["sessions"].as_array().unwrap().len(), 502);
+    assert_eq!(export["tables"]["sessions"].as_array().unwrap().len(), 505);
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn provider_connector_execution_state_reactivates_and_finishes_a_session() {
+    let root = temp_root("provider-execution-sync");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(request_at(
+            Provider::Codex,
+            "SessionStart",
+            "connector-thread",
+            None,
+            None,
+            1_000,
+        ))
+        .unwrap();
+
+    assert!(store
+        .sync_provider_execution(Provider::Codex, "connector-thread", true, 2_000)
+        .unwrap());
+    let active = store.snapshot().unwrap();
+    assert_eq!(active.sessions[0].exec_state, "thinking");
+    assert_eq!(active.sessions[0].activity_since, Some(2_000));
+
+    assert!(store
+        .sync_provider_execution(Provider::Codex, "connector-thread", false, 3_000)
+        .unwrap());
+    let inactive = store.snapshot().unwrap();
+    assert_eq!(inactive.sessions[0].exec_state, "response_finished");
+    assert_eq!(inactive.sessions[0].activity_since, Some(3_000));
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn codex_compaction_session_start_preserves_the_active_turn() {
+    let root = temp_root("codex-compaction-session-start");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(request_at(
+            Provider::Codex,
+            "UserPromptSubmit",
+            "compacting-thread",
+            Some("turn-1"),
+            None,
+            1_000,
+        ))
+        .unwrap();
+
+    let mut compact = request_at(
+        Provider::Codex,
+        "SessionStart",
+        "compacting-thread",
+        Some("turn-1"),
+        None,
+        2_000,
+    );
+    compact.raw["source"] = Value::String("compact".to_owned());
+    store.ingest(compact).unwrap();
+
+    let active = store.snapshot().unwrap();
+    assert_eq!(active.sessions[0].exec_state, "thinking");
+    assert_eq!(active.sessions[0].activity.as_deref(), Some("Thinking"));
+
+    store
+        .ingest(request_at(
+            Provider::Codex,
+            "PreToolUse",
+            "compacting-thread",
+            Some("turn-1"),
+            Some("cargo test"),
+            2_100,
+        ))
+        .unwrap();
+    let mut compact_during_tool = request_at(
+        Provider::Codex,
+        "SessionStart",
+        "compacting-thread",
+        Some("turn-1"),
+        None,
+        2_200,
+    );
+    compact_during_tool.raw["source"] = Value::String("compact".to_owned());
+    store.ingest(compact_during_tool).unwrap();
+    assert_eq!(
+        store.snapshot().unwrap().sessions[0].exec_state,
+        "tool_running"
+    );
+
+    store
+        .ingest(request_at(
+            Provider::Codex,
+            "Stop",
+            "compacting-thread",
+            Some("turn-1"),
+            None,
+            3_000,
+        ))
+        .unwrap();
+    assert_eq!(
+        store.snapshot().unwrap().sessions[0].exec_state,
+        "response_finished"
+    );
 
     drop(store);
     fs::remove_dir_all(root).unwrap();
@@ -2970,6 +4982,14 @@ fn snapshot_batches_plan_steps_and_subagents() {
             .unwrap();
         transaction
             .execute(
+                "INSERT INTO turns(
+                    id, session_id, provider_turn_id, ordinal, state, started_at
+                 ) VALUES (?1 || '-turn', ?1, 'turn', 1, 'running', 1)",
+                [&session_id],
+            )
+            .unwrap();
+        transaction
+            .execute(
                 "INSERT INTO session_plan_steps(
                     session_id, provider_turn_id, step_index, step, detail, status, source, updated_at
                  ) VALUES (?1, 'turn', 0, 'Run checks', NULL, 'pending', 'connector', 1)",
@@ -2998,7 +5018,7 @@ fn snapshot_batches_plan_steps_and_subagents() {
             && session.subagents[0].id == "child"
     }));
     assert!(
-        query_count <= 8,
+        query_count <= 10,
         "UI snapshot issued {query_count} SQL statements for 500 sessions"
     );
 
@@ -3072,6 +5092,40 @@ fn ui_snapshot_cache_reuses_moving_cutoffs_without_returning_expired_sessions() 
 }
 
 #[test]
+fn unchanged_usage_refresh_keeps_the_ui_snapshot_cache_hot() {
+    let root = temp_root("unchanged-usage-snapshot-cache");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({"hook_event_name":"SessionStart","session_id":"stable-usage"}),
+            1,
+        ))
+        .unwrap();
+    let record = usage_record("stable-usage", 2_000, 100, Some(250), "derived");
+    let first_generation = store.begin_usage_collection_generation().unwrap();
+    assert!(store
+        .replace_session_usages_for_generation(vec![record.clone()], 2_000, first_generation,)
+        .unwrap());
+    let (_, first_query_count) = store.ui_snapshot_with_query_count(0).unwrap();
+    assert!(first_query_count > 0);
+
+    let second_generation = store.begin_usage_collection_generation().unwrap();
+    assert!(store
+        .replace_session_usages_for_generation(vec![record], 2_001, second_generation)
+        .unwrap());
+    let (snapshot, second_query_count) = store.ui_snapshot_with_query_count(0).unwrap();
+    assert_eq!(snapshot.token_usage.total, 100);
+    assert_eq!(
+        second_query_count, 0,
+        "an unchanged one-second usage poll must not rebuild the SQLite snapshot"
+    );
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn ui_snapshot_query_measurement_is_independent_across_runtime_stores() {
     let root = temp_root("ui-snapshot-query-counter-concurrency");
     let databases = [root.join("first.sqlite"), root.join("second.sqlite")];
@@ -3115,8 +5169,220 @@ fn ui_snapshot_query_measurement_is_independent_across_runtime_stores() {
         .into_iter()
         .map(|reader| reader.join().unwrap())
         .collect::<Vec<_>>();
-    assert!(query_counts.iter().all(|count| (1..=8).contains(count)));
+    assert!(query_counts.iter().all(|count| (1..=10).contains(count)));
 
     drop(stores);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn provider_result_excerpts_are_transient_and_clear_on_the_next_turn() {
+    for provider in [Provider::Codex, Provider::Claude] {
+        let root = temp_root("transient-result");
+        let path = root.join("data.sqlite");
+        let store = RuntimeStore::open(&path).unwrap();
+        let start = store
+            .ingest(request_at(
+                provider,
+                "UserPromptSubmit",
+                "result-session",
+                Some("t1"),
+                None,
+                100,
+            ))
+            .unwrap();
+        let stop = BridgeRequest::from_hook_at(
+            provider,
+            json!({
+                "hook_event_name":"Stop", "session_id":"result-session", "turn_id":"t1",
+                "last_assistant_message":"独立结果标记：计算结果为 15129。"
+            }),
+            200,
+        );
+        store.ingest(stop.clone()).unwrap();
+        assert!(store
+            .session_result(&start.session_id, 100, 250)
+            .unwrap()
+            .summary
+            .contains("15129"));
+        assert!(!store
+            .export_json(250)
+            .unwrap()
+            .to_string()
+            .contains("独立结果标记"));
+        let spool = EventSpool::new(root.join("spool"));
+        spool.append(&stop).unwrap();
+        spool
+            .drain(|r| {
+                assert!(r.raw.get("last_assistant_message").is_none());
+                true
+            })
+            .unwrap();
+        store
+            .ingest(request_at(
+                provider,
+                "UserPromptSubmit",
+                "result-session",
+                Some("t2"),
+                None,
+                300,
+            ))
+            .unwrap();
+        assert!(store.session_result(&start.session_id, 300, 350).is_none());
+        drop(store);
+        let store = RuntimeStore::open(&path).unwrap();
+        assert!(store.session_result(&start.session_id, 0, 400).is_none());
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn codex_rollout_terminal_events_repair_only_the_matching_current_turn() {
+    let root = temp_root("rollout-terminal");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(request_at(
+            Provider::Codex,
+            "UserPromptSubmit",
+            "thread",
+            Some("turn-1"),
+            None,
+            1000,
+        ))
+        .unwrap();
+    assert!(!store
+        .observe_codex_turn_end("thread", "older-turn", "StopFailure", 2000)
+        .unwrap());
+    assert!(!store
+        .observe_codex_turn_end("thread", "turn-1", "StopFailure", 999)
+        .unwrap());
+    assert!(store
+        .observe_codex_turn_end("thread", "turn-1", "StopFailure", 2000)
+        .unwrap());
+    let failed = &store.snapshot().unwrap().sessions[0];
+    assert_eq!(failed.exec_state, "failed");
+    assert_eq!(failed.turn_ended_at, Some(2000));
+    assert!(!store
+        .observe_codex_turn_end("thread", "turn-1", "StopFailure", 2000)
+        .unwrap());
+    store
+        .ingest(request_at(
+            Provider::Codex,
+            "UserPromptSubmit",
+            "thread",
+            Some("turn-2"),
+            None,
+            3000,
+        ))
+        .unwrap();
+    assert!(!store
+        .observe_codex_turn_end("thread", "turn-1", "Stop", 4000)
+        .unwrap());
+    assert_eq!(store.snapshot().unwrap().sessions[0].exec_state, "thinking");
+    assert!(store
+        .observe_codex_turn_end("thread", "turn-2", "Stop", 4000)
+        .unwrap());
+    assert_eq!(
+        store.snapshot().unwrap().sessions[0].exec_state,
+        "response_finished"
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn missing_execution_evidence_never_completes_work_or_overwrites_a_new_event() {
+    let root = temp_root("unconfirmed-execution");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(request_at(
+            Provider::Codex,
+            "UserPromptSubmit",
+            "thread",
+            Some("turn-1"),
+            None,
+            1000,
+        ))
+        .unwrap();
+    let id = store.snapshot().unwrap().sessions[0].id.clone();
+    assert!(!store.mark_execution_unconfirmed(&id, 999).unwrap());
+    assert!(store.mark_execution_unconfirmed(&id, 1000).unwrap());
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.sessions[0].exec_state, "waiting_for_event");
+    assert_eq!(snapshot.sessions[0].turn_ended_at, None);
+    assert!(!snapshot
+        .attention
+        .iter()
+        .any(|item| item.kind == "completion"));
+    store
+        .ingest(request_at(
+            Provider::Codex,
+            "PreToolUse",
+            "thread",
+            Some("turn-1"),
+            Some("Read"),
+            2000,
+        ))
+        .unwrap();
+    assert!(!store.mark_execution_unconfirmed(&id, 1000).unwrap());
+    assert_eq!(
+        store.snapshot().unwrap().sessions[0].exec_state,
+        "tool_running"
+    );
+    store
+        .ingest(request_at(
+            Provider::Codex,
+            "PermissionRequest",
+            "thread",
+            Some("turn-1"),
+            Some("Bash"),
+            3000,
+        ))
+        .unwrap();
+    assert!(!store.mark_execution_unconfirmed(&id, 3000).unwrap());
+    assert_eq!(
+        store.snapshot().unwrap().sessions[0].exec_state,
+        "awaiting_approval"
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn codex_internal_memory_maintenance_is_not_a_user_task() {
+    let root = temp_root("internal-memory");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let internal = store.ingest(BridgeRequest::from_hook_at(Provider::Codex, json!({
+        "hook_event_name": "UserPromptSubmit", "session_id": "internal",
+        "prompt": "## Memory Writing Agent: Phase 2 (Consolidation)\nYou are a Memory Writing Agent."
+    }), 1000)).unwrap();
+    assert!(internal.suppressed);
+    assert!(
+        store
+            .ingest(request_at(
+                Provider::Codex,
+                "PreToolUse",
+                "internal",
+                None,
+                Some("Read"),
+                1100
+            ))
+            .unwrap()
+            .suppressed
+    );
+    let user = store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name": "UserPromptSubmit", "session_id": "user",
+                "prompt": "Review the memory writing code and fix its cache."
+            }),
+            1200,
+        ))
+        .unwrap();
+    assert!(!user.suppressed);
+    assert_eq!(store.snapshot().unwrap().sessions.len(), 1);
+    drop(store);
     fs::remove_dir_all(root).unwrap();
 }

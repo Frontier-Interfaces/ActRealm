@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "providers": {
+    "claude": {
+      "plan": {
+        "status": "supported",
+        "source": "hook:TaskCreated/TaskCompleted"
+      },
+      "subagents": {
+        "status": "supported",
+        "source": "hook:SubagentStart/SubagentStop"
+      },
+      "approvals": {
+        "status": "supported",
+        "source": "hook:PermissionRequest"
+      },
+      "transcriptSlice": {
+        "status": "supported",
+        "source": "hook:transcript_path/claude_jsonl_v1"
+      },
+      "toolLifecycle": {
+        "status": "supported",
+        "source": "hook:PreToolUse/PostToolUse/PostToolUseFailure"
+      },
+      "currentTarget": {
+        "status": "supported",
+        "source": "hook:tool_input/allowlisted_basename"
+      }
+    },
+    "codex": {
+      "plan": {
+        "status": "supported",
+        "source": "connector:turn/plan/updated"
+      },
+      "subagents": {
+        "status": "unknown"
+      },
+      "approvals": {
+        "status": "supported",
+        "source": "hook:PermissionRequest"
+      },
+      "transcriptSlice": {
+        "status": "unsupported"
+      },
+      "toolLifecycle": {
+        "status": "supported",
+        "source": "hook:PreToolUse/PostToolUse/PostToolUseFailure"
+      },
+      "currentTarget": {
+        "status": "supported",
+        "source": "hook:tool_input/allowlisted_basename"
+      }
+    },
+    "gemini": {
+      "plan": {
+        "status": "unsupported"
+      },
+      "subagents": {
+        "status": "unsupported"
+      },
+      "approvals": {
+        "status": "unsupported"
+      },
+      "transcriptSlice": {
+        "status": "unsupported"
+      },
+      "toolLifecycle": {
+        "status": "unsupported"
+      },
+      "currentTarget": {
+        "status": "unsupported"
+      }
+    }
+  }
+}

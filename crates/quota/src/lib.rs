@@ -8,19 +8,21 @@ use std::env;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(target_os = "macos")]
-use std::sync::{Mutex, OnceLock};
-use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
+
+mod claude_auth;
 use thiserror::Error;
 
 const CACHE_SCHEMA_VERSION: u32 = 1;
 const CLAUDE_SOURCE: &str = "statusline";
 const CLAUDE_OAUTH_SOURCE: &str = "oauth_usage";
 const CODEX_SOURCE: &str = "rollout_experimental";
+pub const CODEX_APP_SERVER_SOURCE: &str = "codex_app_server";
+const CLAUDE_CACHE_FRESHNESS_MS: u64 = 15 * 60 * 1_000;
 const MAX_CLOCK_SKEW_MS: u64 = 5 * 60 * 1_000;
 const MAX_STATUSLINE_BYTES: u64 = 256 * 1_024;
 const MAX_ROLLOUT_TAIL_BYTES: u64 = 2 * 1_024 * 1_024;
@@ -31,9 +33,7 @@ const MAX_OAUTH_RESPONSE_BYTES: usize = 256 * 1_024;
 const OAUTH_RETRY_AFTER_MS: u64 = 60 * 1_000;
 const OAUTH_REFRESH_SKEW_MS: u64 = 4 * 60 * 1_000;
 const OAUTH_REFRESH_COOLDOWN_MS: u64 = 60 * 1_000;
-const OAUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(12);
-#[cfg(target_os = "macos")]
-const KEYCHAIN_SERVICE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const OAUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(20);
 #[cfg(target_os = "macos")]
 const MAX_KEYCHAIN_DUMP_BYTES: usize = 4 * 1024 * 1024;
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -66,6 +66,10 @@ pub struct QuotaEntry {
     pub remaining_pct: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resets_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_captured_at: Option<u64>,
     pub source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_minutes: Option<u64>,
@@ -86,6 +90,20 @@ pub struct QuotaEntry {
 }
 
 impl QuotaEntry {
+    /// Preserves the last validated values while making it explicit that the
+    /// provider refresh failed. Callers must never present an old percentage
+    /// as current after an authentication or transport failure.
+    pub fn mark_stale(mut self, reason_code: &str, reason: impl Into<String>) -> Self {
+        if self.used_pct.is_none() && self.remaining_pct.is_none() {
+            return self;
+        }
+        self.status = "stale".to_owned();
+        self.reason_code = Some(reason_code.to_owned());
+        self.reason = Some(reason.into());
+        self.reason_args.clear();
+        self
+    }
+
     fn available(
         provider: &str,
         window: impl Into<String>,
@@ -120,6 +138,8 @@ impl QuotaEntry {
             used_pct: Some(used_pct),
             remaining_pct: Some(100.0 - used_pct),
             resets_at,
+            reset_source: resets_at.map(|_| source.to_owned()),
+            reset_captured_at: resets_at.map(|_| captured_at),
             source: source.to_owned(),
             window_minutes: None,
             limit_id: None,
@@ -146,6 +166,8 @@ impl QuotaEntry {
             used_pct: None,
             remaining_pct: None,
             resets_at: None,
+            reset_source: None,
+            reset_captured_at: None,
             source: source.to_owned(),
             window_minutes: None,
             limit_id: None,
@@ -174,6 +196,16 @@ impl QuotaEntry {
         self.limit_id = limit_id;
         self.limit_name = limit_name;
         self.plan_type = plan_type;
+        self
+    }
+
+    fn with_reset_metadata(
+        mut self,
+        reset_source: Option<String>,
+        reset_captured_at: Option<u64>,
+    ) -> Self {
+        self.reset_source = self.resets_at.and(reset_source);
+        self.reset_captured_at = self.resets_at.and(reset_captured_at);
         self
     }
 }
@@ -243,7 +275,7 @@ impl QuotaCollector {
                 "temporarily rate limited".to_owned(),
             ));
         }
-        if self.oauth_credential.is_none() {
+        if should_reload_oauth_credential(self.oauth_credential.as_ref()) {
             self.oauth_credential = read_oauth_credential();
         }
         // Claude Desktop/Code may be signed in while no readable credential
@@ -270,6 +302,7 @@ impl QuotaCollector {
         let response = match fetch_oauth_usage(&access_token) {
             Ok(response) => response,
             Err(OAuthFetchError::Unauthorized) => {
+                self.oauth_credential = None;
                 self.refresh_oauth_credential_from_provider(now_ms);
                 let updated_token = self
                     .oauth_credential
@@ -296,7 +329,10 @@ impl QuotaCollector {
             &entries,
             now_ms,
         )?;
-        Ok(entries)
+        // Return the merged cache projection as well. A fresh OAuth response
+        // can omit reset timestamps even while an unexpired official
+        // StatusLine reset remains valid for the same window.
+        Ok(self.collect_claude(now_ms))
     }
 
     fn refresh_oauth_credential_from_provider(&mut self, now_ms: u64) {
@@ -305,7 +341,8 @@ impl QuotaCollector {
             return;
         }
         self.oauth_refresh_after = now_ms.saturating_add(OAUTH_REFRESH_COOLDOWN_MS);
-        let _ = refresh_oauth_via_claude_cli();
+        let previous = self.oauth_credential.clone();
+        let _ = refresh_oauth_via_claude_cli(&self.paths.actrealm_home, previous.as_ref(), now_ms);
         self.oauth_credential = read_oauth_credential();
     }
 
@@ -395,15 +432,33 @@ impl QuotaCollector {
                     && (0.0..=100.0).contains(&window.used_pct)
             })
             .map(|window| {
-                QuotaEntry::available_optional(
+                let source = window
+                    .used_pct_source
+                    .as_deref()
+                    .unwrap_or(cache.source.as_str());
+                let captured_at = window.used_pct_captured_at.unwrap_or(cache.captured_at);
+                let identity = window.window.clone();
+                let reset_passed = window
+                    .resets_at
+                    .is_some_and(|reset| reset <= now_ms / 1_000);
+                let entry = QuotaEntry::available_optional(
                     "claude",
                     window.window,
                     window.used_pct,
                     window.resets_at,
-                    &cache.source,
-                    cache.captured_at,
+                    source,
+                    captured_at,
                 )
-                .with_metadata(window.window_minutes, None, window.label, None)
+                .with_metadata(window.window_minutes, Some(identity), window.label, None)
+                .with_reset_metadata(window.reset_source, window.reset_captured_at);
+                if now_ms.saturating_sub(captured_at) > CLAUDE_CACHE_FRESHNESS_MS || reset_passed {
+                    entry.mark_stale(
+                        "quota.reason.cache_stale",
+                        "This is a historical quota value; waiting for a fresh Provider update.",
+                    )
+                } else {
+                    entry
+                }
             })
             .collect::<Vec<_>>();
         if entries.is_empty() {
@@ -472,6 +527,10 @@ fn unavailable_windows(
         .collect()
 }
 
+fn should_reload_oauth_credential(_credential: Option<&OAuthCredential>) -> bool {
+    true
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CacheDocument {
@@ -491,7 +550,15 @@ struct CacheWindow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     window_minutes: Option<u64>,
     used_pct: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    used_pct_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    used_pct_captured_at: Option<u64>,
     resets_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reset_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reset_captured_at: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -537,8 +604,6 @@ struct OAuthLimit {
     group: Option<String>,
     percent: Option<f64>,
     resets_at: Option<String>,
-    #[serde(default)]
-    is_active: bool,
     scope: Option<OAuthScope>,
 }
 
@@ -581,48 +646,26 @@ struct KeychainLocator {
 }
 
 #[cfg(target_os = "macos")]
-#[derive(Default)]
-struct KeychainLookupCache {
-    locator: Option<KeychainLocator>,
-    services: Vec<String>,
-    services_discovered_at: Option<Instant>,
-}
-
-#[cfg(target_os = "macos")]
-fn keychain_lookup_cache() -> &'static Mutex<KeychainLookupCache> {
-    static CACHE: OnceLock<Mutex<KeychainLookupCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(KeychainLookupCache::default()))
-}
-
-#[cfg(target_os = "macos")]
 fn read_known_keychain_oauth_credential() -> Option<OAuthCredential> {
-    let cached = keychain_lookup_cache()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .locator
-        .clone();
-    if let Some(locator) = cached {
-        if let Some(credential) = read_keychain_locator(&locator) {
-            return Some(credential);
-        }
-        keychain_lookup_cache()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .locator = None;
-    }
+    // The non-profile service represents the currently selected account.
+    // Never reuse a profile locator across polls: an older profile credential
+    // can remain valid after the user switches accounts.
     try_keychain_service("Claude Code-credentials")
 }
 
 #[cfg(target_os = "macos")]
 fn read_discovered_keychain_oauth_credential() -> Option<OAuthCredential> {
-    for service in discovered_keychain_services() {
-        if service != "Claude Code-credentials" {
-            if let Some(credential) = try_keychain_service(&service) {
-                return Some(credential);
-            }
-        }
-    }
-    None
+    let services = discovered_keychain_services();
+    selected_profile_keychain_service(&services).and_then(try_keychain_service)
+}
+
+#[cfg(target_os = "macos")]
+fn selected_profile_keychain_service(services: &[String]) -> Option<&str> {
+    let mut profiles = services
+        .iter()
+        .filter(|service| service.as_str() != "Claude Code-credentials");
+    let selected = profiles.next()?;
+    profiles.next().is_none().then_some(selected.as_str())
 }
 
 #[cfg(target_os = "macos")]
@@ -641,10 +684,6 @@ fn try_keychain_service(service: &str) -> Option<OAuthCredential> {
             account,
         };
         if let Some(credential) = read_keychain_locator(&locator) {
-            keychain_lookup_cache()
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .locator = Some(locator);
             return Some(credential);
         }
     }
@@ -658,40 +697,61 @@ fn read_keychain_locator(locator: &KeychainLocator) -> Option<OAuthCredential> {
     if let Some(account) = locator.account.as_deref() {
         command.args(["-a", account]);
     }
-    let output = command.arg("-w").output().ok()?;
-    output
-        .status
-        .success()
-        .then(|| parse_oauth_credential(&output.stdout))
-        .flatten()
+    let output = bounded_command_output(
+        command.arg("-w"),
+        MAX_CREDENTIAL_BYTES as usize,
+        Duration::from_secs(3),
+    )?;
+    parse_oauth_credential(&output)
 }
 
 #[cfg(target_os = "macos")]
 fn discovered_keychain_services() -> Vec<String> {
-    {
-        let cache = keychain_lookup_cache()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if cache
-            .services_discovered_at
-            .is_some_and(|discovered| discovered.elapsed() < KEYCHAIN_SERVICE_CACHE_TTL)
-        {
-            return cache.services.clone();
+    // Account switching can leave the previous profile credential valid, so
+    // the bounded service-name scan is deliberately fresh on every quota poll.
+    bounded_command_output(
+        Command::new("/usr/bin/security").args(["dump-keychain"]),
+        MAX_KEYCHAIN_DUMP_BYTES,
+        Duration::from_secs(3),
+    )
+    .map(|output| parse_keychain_service_names(&output))
+    .unwrap_or_default()
+}
+
+fn bounded_command_output(
+    command: &mut Command,
+    limit: usize,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    let mut child = command
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.take(limit as u64 + 1).read_to_end(&mut bytes).ok()?;
+        (bytes.len() <= limit).then_some(bytes)
+    });
+    let start = Instant::now();
+    let success = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(25)),
+            _ => {
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                let _ = child.wait();
+                break false;
+            }
         }
-    }
-    let services = Command::new("/usr/bin/security")
-        .args(["dump-keychain"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success() && output.stdout.len() <= MAX_KEYCHAIN_DUMP_BYTES)
-        .map(|output| parse_keychain_service_names(&output.stdout))
-        .unwrap_or_default();
-    let mut cache = keychain_lookup_cache()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    cache.services = services.clone();
-    cache.services_discovered_at = Some(Instant::now());
-    services
+    };
+    // An exited command may have left a helper holding its stdout pipe.
+    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    let bytes = reader.join().ok().flatten();
+    success.then_some(bytes).flatten()
 }
 
 #[cfg(target_os = "macos")]
@@ -789,43 +849,47 @@ fn normalize_epoch_millis(value: u64) -> u64 {
     }
 }
 
-fn refresh_oauth_via_claude_cli() -> bool {
-    provider_cli_candidates(HookProvider::Claude)
+fn refresh_oauth_via_claude_cli(
+    home: &Path,
+    previous: Option<&OAuthCredential>,
+    now_ms: u64,
+) -> bool {
+    let Some(executable) = provider_cli_candidates(HookProvider::Claude)
         .into_iter()
-        .any(|candidate| run_claude_auth_status(&candidate, OAUTH_REFRESH_TIMEOUT))
+        .find(|candidate| candidate.is_file())
+    else {
+        return false;
+    };
+    // `auth status` is useful only as a logged-out gate, never as renewal.
+    // Do not launch an interactive probe every minute for a signed-out user.
+    if previous.is_none() && !claude_auth::signed_in(&executable) {
+        return false;
+    }
+    claude_auth::refresh(
+        &executable,
+        &home.join("run/claude-quota-probe"),
+        OAUTH_REFRESH_TIMEOUT,
+        || {
+            read_oauth_credential()
+                .is_some_and(|current| credential_renewed(previous, &current, now_ms))
+        },
+    )
+    .unwrap_or(false)
 }
 
-fn run_claude_auth_status(executable: &Path, timeout: Duration) -> bool {
-    let mut child = match Command::new(executable)
-        .args(["auth", "status", "--json"])
-        .env("BROWSER", "true")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return false,
-    };
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
-            Ok(None) if started.elapsed() < timeout => {
-                thread::sleep(Duration::from_millis(50));
-            }
-            Ok(None) | Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            }
-        }
-    }
+fn credential_renewed(
+    previous: Option<&OAuthCredential>,
+    current: &OAuthCredential,
+    now_ms: u64,
+) -> bool {
+    !current.should_refresh(now_ms)
+        && previous.is_none_or(|old| old.access_token != current.access_token)
 }
 
 fn fetch_oauth_usage(token: &str) -> Result<OAuthUsageResponse, OAuthFetchError> {
     let mut child = Command::new("/usr/bin/curl")
         .args([
+            "-q",
             "--silent",
             "--show-error",
             "--max-time",
@@ -860,6 +924,11 @@ fn fetch_oauth_usage(token: &str) -> Result<OAuthUsageResponse, OAuthFetchError>
     let output = child
         .wait_with_output()
         .map_err(|error| OAuthFetchError::Other(error.to_string()))?;
+    if !output.status.success() {
+        return Err(OAuthFetchError::Other(
+            "network request failed or timed out".to_owned(),
+        ));
+    }
     if output.stdout.len() > MAX_OAUTH_RESPONSE_BYTES.saturating_add(8) {
         return Err(OAuthFetchError::Other(
             "response exceeded size limit".to_owned(),
@@ -919,9 +988,8 @@ fn oauth_entries(response: OAuthUsageResponse, now_ms: u64) -> Vec<QuotaEntry> {
     );
     let mut seen_models = Vec::<String>::new();
     for limit in response.limits {
-        if !limit.is_active {
-            continue;
-        }
+        // is_active is not a validity flag. A nonbinding weekly scope still
+        // carries current usage (including zero) and must replace old cache.
         let Some(percent) = limit.percent.filter(|value| value.is_finite()) else {
             continue;
         };
@@ -1087,7 +1155,7 @@ fn write_claude_cache(
     entries: &[QuotaEntry],
     now_ms: u64,
 ) -> Result<(), QuotaError> {
-    let windows = entries
+    let incoming = entries
         .iter()
         .filter_map(|entry| {
             Some(CacheWindow {
@@ -1095,10 +1163,15 @@ fn write_claude_cache(
                 label: entry.limit_name.clone(),
                 window_minutes: entry.window_minutes,
                 used_pct: entry.used_pct?,
+                used_pct_source: Some(entry.source.clone()),
+                used_pct_captured_at: entry.captured_at.or(Some(now_ms)),
                 resets_at: entry.resets_at,
+                reset_source: entry.reset_source.clone(),
+                reset_captured_at: entry.reset_captured_at,
             })
         })
         .collect::<Vec<_>>();
+    let windows = merge_claude_windows(cache_path, incoming, now_ms);
     let document = CacheDocument {
         schema_version: CACHE_SCHEMA_VERSION,
         provider: "claude".to_owned(),
@@ -1109,6 +1182,92 @@ fn write_claude_cache(
     let mut bytes = serde_json::to_vec_pretty(&document)?;
     bytes.push(b'\n');
     atomic_write(cache_path, &bytes, 0o600)
+}
+
+fn merge_claude_windows(
+    cache_path: &Path,
+    mut incoming: Vec<CacheWindow>,
+    now_ms: u64,
+) -> Vec<CacheWindow> {
+    let existing = read_bounded(cache_path, MAX_STATUSLINE_BYTES)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<CacheDocument>(&bytes).ok())
+        .filter(|cache| {
+            cache.schema_version == CACHE_SCHEMA_VERSION
+                && cache.provider == "claude"
+                && matches!(cache.source.as_str(), CLAUDE_SOURCE | CLAUDE_OAUTH_SOURCE)
+                && cache.captured_at <= now_ms.saturating_add(MAX_CLOCK_SKEW_MS)
+        });
+    let Some(existing) = existing else {
+        return incoming;
+    };
+    for mut previous in existing.windows {
+        normalize_legacy_cache_window(&mut previous, &existing.source, existing.captured_at);
+        if let Some(current) = incoming
+            .iter_mut()
+            .find(|current| current.window == previous.window)
+        {
+            merge_reset_field(current, &previous, now_ms);
+        } else {
+            // A StatusLine payload usually contains only core windows, while
+            // OAuth can also expose scoped-model and Extra Usage buckets.
+            // Preserve those independently captured percentages instead of
+            // making one source erase another source's unrelated windows.
+            incoming.push(previous);
+        }
+    }
+    incoming
+}
+
+fn normalize_legacy_cache_window(window: &mut CacheWindow, source: &str, captured_at: u64) {
+    if window.used_pct_source.is_none() {
+        window.used_pct_source = Some(source.to_owned());
+    }
+    if window.used_pct_captured_at.is_none() {
+        window.used_pct_captured_at = Some(captured_at);
+    }
+    if window.resets_at.is_some() && window.reset_source.is_none() {
+        window.reset_source = Some(source.to_owned());
+    }
+    if window.resets_at.is_some() && window.reset_captured_at.is_none() {
+        window.reset_captured_at = Some(captured_at);
+    }
+}
+
+fn merge_reset_field(current: &mut CacheWindow, previous: &CacheWindow, now_ms: u64) {
+    let now_seconds = now_ms / 1_000;
+    let previous_valid = previous.resets_at.is_some_and(|value| value > now_seconds);
+    let current_valid = current.resets_at.is_some_and(|value| value > now_seconds);
+    if !previous_valid {
+        if !current_valid {
+            current.resets_at = None;
+            current.reset_source = None;
+            current.reset_captured_at = None;
+        }
+        return;
+    }
+    let previous_source = previous.reset_source.as_deref().unwrap_or("");
+    let current_source = current.reset_source.as_deref().unwrap_or("");
+    let previous_priority = reset_source_priority(previous_source);
+    let current_priority = reset_source_priority(current_source);
+    let previous_is_preferred = !current_valid
+        || previous_priority > current_priority
+        || (previous_priority == current_priority
+            && previous.reset_captured_at.unwrap_or(0) > current.reset_captured_at.unwrap_or(0));
+    if previous_is_preferred {
+        current.resets_at = previous.resets_at;
+        current.reset_source = previous.reset_source.clone();
+        current.reset_captured_at = previous.reset_captured_at;
+    }
+}
+
+fn reset_source_priority(source: &str) -> u8 {
+    match source {
+        CLAUDE_SOURCE => 3,
+        CLAUDE_OAUTH_SOURCE => 2,
+        "local_estimate" => 1,
+        _ => 0,
+    }
 }
 
 pub fn capture_claude_statusline(
@@ -1149,24 +1308,17 @@ pub fn capture_claude_statusline(
                 .and_then(Value::as_u64)
                 .or_else(|| canonical_window_minutes(&name)),
             used_pct,
+            used_pct_source: Some(CLAUDE_SOURCE.to_owned()),
+            used_pct_captured_at: Some(now_ms),
             resets_at: Some(resets_at),
+            reset_source: Some(CLAUDE_SOURCE.to_owned()),
+            reset_captured_at: Some(now_ms),
         });
     }
     if windows.is_empty() {
         return Ok(Vec::new());
     }
-    let cache = CacheDocument {
-        schema_version: CACHE_SCHEMA_VERSION,
-        provider: "claude".to_owned(),
-        source: CLAUDE_SOURCE.to_owned(),
-        captured_at: now_ms,
-        windows,
-    };
-    let mut bytes = serde_json::to_vec_pretty(&cache)?;
-    bytes.push(b'\n');
-    atomic_write(cache_path, &bytes, 0o600)?;
-    Ok(cache
-        .windows
+    let entries = windows
         .into_iter()
         .map(|window| {
             let CacheWindow {
@@ -1175,6 +1327,7 @@ pub fn capture_claude_statusline(
                 window_minutes,
                 used_pct,
                 resets_at,
+                ..
             } = window;
             QuotaEntry::available_optional(
                 "claude",
@@ -1186,7 +1339,9 @@ pub fn capture_claude_statusline(
             )
             .with_metadata(window_minutes, None, label, None)
         })
-        .collect())
+        .collect::<Vec<_>>();
+    write_claude_cache(cache_path, CLAUDE_SOURCE, &entries, now_ms)?;
+    Ok(entries)
 }
 
 pub fn statusline_text(entries: &[QuotaEntry]) -> String {
@@ -1273,6 +1428,95 @@ struct CodexWindow {
     used_percent: f64,
     window_minutes: u64,
     resets_at: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAppServerWindow {
+    used_percent: f64,
+    window_duration_mins: Option<u64>,
+    resets_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAppServerSnapshot {
+    limit_id: Option<String>,
+    limit_name: Option<String>,
+    plan_type: Option<String>,
+    primary: Option<CodexAppServerWindow>,
+    secondary: Option<CodexAppServerWindow>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAppServerResponse {
+    rate_limits: CodexAppServerSnapshot,
+    #[serde(default)]
+    rate_limits_by_limit_id: Option<BTreeMap<String, CodexAppServerSnapshot>>,
+}
+
+/// Converts the official Codex app-server account snapshot into ActRealm's
+/// privacy-bounded quota contract. The response contains account-level
+/// percentages and reset timestamps only; no task needs to be started.
+pub fn codex_app_server_entries(value: &Value, captured_at: u64) -> Vec<QuotaEntry> {
+    let Ok(response) = serde_json::from_value::<CodexAppServerResponse>(value.clone()) else {
+        return Vec::new();
+    };
+    let snapshots = response
+        .rate_limits_by_limit_id
+        .filter(|snapshots| !snapshots.is_empty())
+        .map(|snapshots| snapshots.into_iter().collect::<Vec<_>>())
+        .unwrap_or_else(|| {
+            vec![(
+                response
+                    .rate_limits
+                    .limit_id
+                    .clone()
+                    .unwrap_or_else(|| "codex".to_owned()),
+                response.rate_limits,
+            )]
+        });
+    snapshots
+        .into_iter()
+        .flat_map(|(fallback_limit_id, snapshot)| {
+            let limit_id = snapshot
+                .limit_id
+                .as_deref()
+                .and_then(bounded_label)
+                .or_else(|| bounded_label(&fallback_limit_id));
+            let limit_name = snapshot.limit_name.as_deref().and_then(bounded_label);
+            let plan_type = snapshot.plan_type.as_deref().and_then(bounded_label);
+            [snapshot.primary, snapshot.secondary]
+                .into_iter()
+                .flatten()
+                .filter_map(move |window| {
+                    let minutes = window.window_duration_mins?;
+                    if !window.used_percent.is_finite()
+                        || !(0.0..=100.0).contains(&window.used_percent)
+                        || minutes == 0
+                    {
+                        return None;
+                    }
+                    Some(
+                        QuotaEntry::available_optional(
+                            "codex",
+                            format!("{minutes}m"),
+                            window.used_percent,
+                            window.resets_at.filter(|value| *value > 0),
+                            CODEX_APP_SERVER_SOURCE,
+                            captured_at,
+                        )
+                        .with_metadata(
+                            Some(minutes),
+                            limit_id.clone(),
+                            limit_name.clone(),
+                            plan_type.clone(),
+                        ),
+                    )
+                })
+        })
+        .collect()
 }
 
 fn read_codex_limits(path: &Path, captured_at: u64) -> Result<Vec<QuotaEntry>, QuotaError> {
@@ -1527,7 +1771,7 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    fn root(name: &str) -> PathBuf {
+    pub(super) fn root(name: &str) -> PathBuf {
         let path = PathBuf::from("/tmp").join(format!(
             "actrealm-quota-{name}-{}-{}",
             std::process::id(),
@@ -1536,6 +1780,38 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn claude_scopes_survive_cache_reload_and_expire_at_their_own_timestamp() {
+        let root = root("scoped-freshness");
+        let paths = QuotaPaths {
+            actrealm_home: root.clone(),
+            codex_sessions: root.join("none"),
+        };
+        let response: OAuthUsageResponse = serde_json::from_value(serde_json::json!({
+            "seven_day":{"utilization":20,"resets_at":null},
+            "limits":[{"kind":"weekly_scoped","group":"weekly","percent":30,"is_active":true,"scope":{"model":{"display_name":"Fable"}}}]
+        })).unwrap();
+        let entries = oauth_entries(response, 1_000);
+        write_claude_cache(&paths.claude_cache(), CLAUDE_OAUTH_SOURCE, &entries, 1_000).unwrap();
+        let collector = QuotaCollector::new(paths);
+        let current = collector.collect_claude(2_000);
+        let scoped = current.iter().find(|e| e.window == "scoped_fable").unwrap();
+        assert_eq!(scoped.limit_name.as_deref(), Some("Fable"));
+        assert_eq!(scoped.limit_id.as_deref(), Some("scoped_fable"));
+        assert_eq!(scoped.status, "available");
+        let old = collector.collect_claude(1_001 + CLAUDE_CACHE_FRESHNESS_MS);
+        assert!(old.iter().all(|e| e.status == "stale"));
+        assert!(old.iter().all(|e| e.captured_at == Some(1_000)));
+        assert_eq!(
+            old.iter()
+                .find(|e| e.window == "scoped_fable")
+                .unwrap()
+                .remaining_pct,
+            Some(70.0)
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1584,6 +1860,99 @@ mod tests {
     }
 
     #[test]
+    fn stale_quota_preserves_last_validated_values_and_labels_the_failure() {
+        let entry = QuotaEntry::available("claude", "5h", 25.0, 200, "oauth_usage", 100)
+            .mark_stale("quota.reason.claude_refresh_failed", "refresh failed");
+        assert_eq!(entry.status, "stale");
+        assert_eq!(entry.used_pct, Some(25.0));
+        assert_eq!(entry.remaining_pct, Some(75.0));
+        assert_eq!(entry.captured_at, Some(100));
+        assert_eq!(
+            entry.reason_code.as_deref(),
+            Some("quota.reason.claude_refresh_failed")
+        );
+    }
+
+    #[test]
+    fn oauth_null_reset_preserves_unexpired_official_statusline_reset() {
+        let root = root("merge-reset");
+        let cache = root.join("cache/claude-rl.json");
+        capture_claude_statusline(
+            br#"{"rate_limits":{"five_hour":{"used_percentage":25,"resets_at":500}}}"#,
+            &cache,
+            1_000,
+        )
+        .unwrap();
+        let oauth = vec![QuotaEntry::available_optional(
+            "claude",
+            "5h",
+            40.0,
+            None,
+            CLAUDE_OAUTH_SOURCE,
+            2_000,
+        )];
+        write_claude_cache(&cache, CLAUDE_OAUTH_SOURCE, &oauth, 2_000).unwrap();
+
+        let collected = QuotaCollector::new(QuotaPaths {
+            actrealm_home: root.clone(),
+            codex_sessions: root.join("none"),
+        })
+        .collect_claude(2_000);
+        assert_eq!(collected[0].used_pct, Some(40.0));
+        assert_eq!(collected[0].source, CLAUDE_OAUTH_SOURCE);
+        assert_eq!(collected[0].resets_at, Some(500));
+        assert_eq!(collected[0].reset_source.as_deref(), Some(CLAUDE_SOURCE));
+        assert_eq!(collected[0].reset_captured_at, Some(1_000));
+    }
+
+    #[test]
+    fn expired_reset_is_not_carried_into_a_new_provider_snapshot() {
+        let root = root("expired-reset");
+        let cache = root.join("cache/claude-rl.json");
+        capture_claude_statusline(
+            br#"{"rate_limits":{"five_hour":{"used_percentage":25,"resets_at":2}}}"#,
+            &cache,
+            1_000,
+        )
+        .unwrap();
+        let oauth = vec![QuotaEntry::available_optional(
+            "claude",
+            "5h",
+            40.0,
+            None,
+            CLAUDE_OAUTH_SOURCE,
+            3_000,
+        )];
+        write_claude_cache(&cache, CLAUDE_OAUTH_SOURCE, &oauth, 3_000).unwrap();
+
+        let collected = QuotaCollector::new(QuotaPaths {
+            actrealm_home: root.clone(),
+            codex_sessions: root.join("none"),
+        })
+        .collect_claude(3_000);
+        assert_eq!(collected[0].resets_at, None);
+        assert_eq!(collected[0].reset_source, None);
+    }
+
+    #[test]
+    fn stale_marker_does_not_claim_last_values_when_none_exist() {
+        let entry = QuotaEntry::unavailable(
+            "claude",
+            "5h",
+            "oauth_usage",
+            "quota.reason.cache_missing",
+            "cache missing",
+        )
+        .mark_stale("quota.reason.claude_refresh_failed", "refresh failed");
+        assert_eq!(entry.status, "unavailable");
+        assert_eq!(
+            entry.reason_code.as_deref(),
+            Some("quota.reason.cache_missing")
+        );
+        assert_eq!(entry.reason.as_deref(), Some("cache missing"));
+    }
+
+    #[test]
     fn old_claude_cache_preserves_last_value_but_incompatible_data_stays_unavailable() {
         let stale_root = root("stale");
         let paths = QuotaPaths {
@@ -1597,7 +1966,7 @@ mod tests {
         )
         .unwrap();
         let last_known = QuotaCollector::new(paths.clone()).collect_claude(86_400_000);
-        assert_eq!(last_known[0].status, "available");
+        assert_eq!(last_known[0].status, "stale");
         assert_eq!(last_known[0].used_pct, Some(50.0));
         assert_eq!(last_known[0].remaining_pct, Some(50.0));
         assert_eq!(last_known[0].resets_at, Some(1_784_140_000));
@@ -1685,6 +2054,70 @@ mod tests {
             Some("quota.reason.codex_window_missing")
         );
         assert_eq!(incompatible[0].used_pct, None);
+    }
+
+    #[test]
+    fn codex_app_server_snapshot_refreshes_without_a_rollout() {
+        let entries = codex_app_server_entries(
+            &serde_json::json!({
+                "rateLimits": {
+                    "limitId": "codex",
+                    "limitName": "Codex",
+                    "planType": "plus",
+                    "primary": {
+                        "usedPercent": 12,
+                        "windowDurationMins": 300,
+                        "resetsAt": 1_784_140_000
+                    },
+                    "secondary": {
+                        "usedPercent": 44,
+                        "windowDurationMins": 43_800,
+                        "resetsAt": 1_788_219_474
+                    }
+                },
+                "rateLimitsByLimitId": null
+            }),
+            1_785_744_057_000,
+        );
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].source, CODEX_APP_SERVER_SOURCE);
+        assert_eq!(entries[0].remaining_pct, Some(88.0));
+        assert_eq!(entries[1].window_minutes, Some(43_800));
+        assert_eq!(entries[1].resets_at, Some(1_788_219_474));
+    }
+
+    #[test]
+    fn codex_app_server_prefers_named_multi_bucket_limits() {
+        let entries = codex_app_server_entries(
+            &serde_json::json!({
+                "rateLimits": {},
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "limitId": "codex",
+                        "primary": {
+                            "usedPercent": 25,
+                            "windowDurationMins": 300,
+                            "resetsAt": null
+                        }
+                    },
+                    "codex_bengalfox": {
+                        "limitId": "codex_bengalfox",
+                        "secondary": {
+                            "usedPercent": 0,
+                            "windowDurationMins": 10080,
+                            "resetsAt": 1_787_213_254
+                        }
+                    }
+                }
+            }),
+            42,
+        );
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].limit_id.as_deref(), Some("codex"));
+        assert_eq!(entries[0].resets_at, None);
+        assert_eq!(entries[0].captured_at, Some(42));
+        assert_eq!(entries[1].window, "10080m");
+        assert_eq!(entries[1].limit_id.as_deref(), Some("codex_bengalfox"));
     }
 
     #[test]
@@ -1821,14 +2254,14 @@ mod tests {
                  "scope":{"model":{"display_name":"Fable"}}},
                 {"kind":"weekly_scoped","group":"weekly","percent":1,
                  "resets_at":null,"is_active":false,
-                 "scope":{"model":{"display_name":"Old model"}}}
+                 "scope":{"model":{"display_name":"Other model"}}}
               ],
               "extra_usage":{"is_enabled":true,"utilization":12.5}
             }"#,
         )
         .unwrap();
         let entries = oauth_entries(response, 123);
-        assert_eq!(entries.len(), 4);
+        assert_eq!(entries.len(), 5);
         assert_eq!(entries[0].window, "5h");
         assert!(entries[0].resets_at.is_some());
         assert_eq!(entries[1].window, "7d");
@@ -1839,9 +2272,68 @@ mod tests {
             .unwrap();
         assert_eq!(fable.used_pct, Some(97.0));
         assert_eq!(fable.window_minutes, Some(10_080));
-        assert!(entries
+        let other = entries
             .iter()
-            .all(|entry| entry.limit_name.as_deref() != Some("Old model")));
+            .find(|entry| entry.limit_name.as_deref() == Some("Other model"))
+            .unwrap();
+        assert_eq!(other.used_pct, Some(1.0));
+        assert_eq!(other.resets_at, None);
+    }
+
+    #[test]
+    fn nonbinding_fable_zero_replaces_stale_cache_and_survives_statusline_merge() {
+        let root = root("fable-nonbinding-refresh");
+        let paths = QuotaPaths {
+            actrealm_home: root.clone(),
+            codex_sessions: root.join("none"),
+        };
+        let cache = paths.claude_cache();
+        let now = 1_789_563_200_000;
+        let old = QuotaEntry::available_optional(
+            "claude",
+            "scoped_fable",
+            29.0,
+            None,
+            CLAUDE_OAUTH_SOURCE,
+            now - 14 * 24 * 60 * 60 * 1_000,
+        )
+        .with_metadata(Some(10_080), None, Some("Fable".into()), None);
+        write_claude_cache(
+            &cache,
+            CLAUDE_OAUTH_SOURCE,
+            &[old],
+            now - 14 * 24 * 60 * 60 * 1_000,
+        )
+        .unwrap();
+        let response: OAuthUsageResponse = serde_json::from_value(serde_json::json!({
+            "five_hour":{"utilization":0,"resets_at":null},
+            "seven_day":{"utilization":0,"resets_at":null},
+            "limits":[{"kind":"weekly_scoped","group":"weekly","percent":0,
+                "is_active":false,"resets_at":"2026-09-23T04:00:00Z",
+                "scope":{"model":{"id":null,"display_name":"Fable"}}}]
+        }))
+        .unwrap();
+        let entries = oauth_entries(response, now);
+        write_claude_cache(&cache, CLAUDE_OAUTH_SOURCE, &entries, now).unwrap();
+        capture_claude_statusline(
+            br#"{"rate_limits":{"five_hour":{"used_percentage":1,"resets_at":1790000000}}}"#,
+            &cache,
+            now + 1_000,
+        )
+        .unwrap();
+        let collector = QuotaCollector::new(paths);
+        let snapshot = collector.collect_claude(now + 2_000);
+        let fable = snapshot
+            .iter()
+            .find(|entry| entry.window == "scoped_fable")
+            .unwrap();
+        assert_eq!(fable.status, "available");
+        assert_eq!(fable.used_pct, Some(0.0));
+        assert_eq!(fable.remaining_pct, Some(100.0));
+        assert_eq!(fable.captured_at, Some(now));
+        assert_eq!(fable.resets_at, Some(1_790_136_000));
+        assert_eq!(fable.source, CLAUDE_OAUTH_SOURCE);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1890,6 +2382,15 @@ mod tests {
         assert_eq!(seconds.expires_at_ms, Some(1_900_000_000_000));
     }
 
+    #[test]
+    fn every_poll_rediscovers_the_current_claude_credential() {
+        let credential = OAuthCredential {
+            access_token: "still-valid-old-account".to_owned(),
+            expires_at_ms: Some(u64::MAX),
+        };
+        assert!(should_reload_oauth_credential(Some(&credential)));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn keychain_service_discovery_is_deduplicated_and_bounded_to_claude() {
@@ -1910,15 +2411,33 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn claude_auth_status_runner_requires_a_successful_process() {
-        assert!(run_claude_auth_status(
-            Path::new("/usr/bin/true"),
-            Duration::from_secs(1)
-        ));
-        assert!(!run_claude_auth_status(
-            Path::new("/usr/bin/false"),
-            Duration::from_secs(1)
-        ));
+    fn multiple_valid_profile_services_fail_closed_instead_of_guessing() {
+        let services = vec![
+            "Claude Code-credentials-profile-a".to_owned(),
+            "Claude Code-credentials-profile-b".to_owned(),
+        ];
+        assert_eq!(selected_profile_keychain_service(&services), None);
+    }
+
+    #[test]
+    fn renewal_requires_a_changed_nonexpired_credential() {
+        let old = OAuthCredential {
+            access_token: "old".into(),
+            expires_at_ms: Some(1_000),
+        };
+        let fresh = OAuthCredential {
+            access_token: "new".into(),
+            expires_at_ms: Some(1_000_000),
+        };
+        assert!(credential_renewed(Some(&old), &fresh, 2_000));
+        assert!(!credential_renewed(Some(&fresh), &fresh, 2_000));
+        assert!(!credential_renewed(None, &old, 2_000));
+        assert!(credential_renewed(None, &fresh, 2_000));
+        assert!(parse_oauth_credential(
+            br#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}"#
+        )
+        .is_none());
     }
 }

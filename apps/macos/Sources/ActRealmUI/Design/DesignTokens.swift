@@ -169,10 +169,10 @@ enum DT {
 
     // MARK: Type
 
-    static func sectionTitle() -> Font { .system(size: 12, weight: .heavy) }
-    static func cardTitle(_ size: CGFloat = 12.5) -> Font { .system(size: size, weight: .bold) }
-    static func body(_ size: CGFloat = 11) -> Font { .system(size: size) }
-    static func micro(_ size: CGFloat = 9.5, weight: Font.Weight = .regular) -> Font {
+    static func sectionTitle() -> Font { .system(size: 12.5, weight: .heavy) }
+    static func cardTitle(_ size: CGFloat = 13) -> Font { .system(size: size, weight: .bold) }
+    static func body(_ size: CGFloat = 11.5) -> Font { .system(size: size) }
+    static func micro(_ size: CGFloat = 10, weight: Font.Weight = .regular) -> Font {
         .system(size: size, weight: weight)
     }
     static func mono(_ size: CGFloat = 12, weight: Font.Weight = .regular) -> Font {

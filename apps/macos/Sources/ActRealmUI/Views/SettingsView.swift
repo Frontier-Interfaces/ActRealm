@@ -14,10 +14,12 @@ public enum SettingsSection: String, CaseIterable, Hashable, Identifiable, Senda
 
     public var id: Self { self }
 
+    static var visibleCases: [Self] { allCases }
+
     var title: String {
         switch self {
         case .general: "通用"
-        case .agents: "Agent"
+        case .agents: "settings.tab.agents"
         case .notifications: "通知"
         case .theme: "主题"
         case .display: "显示"
@@ -32,7 +34,9 @@ public struct SettingsView: View {
     @Environment(\.snapshotRendering) private var snapshotRendering
     @State private var selection: SettingsSection
 
-    public init(initialSection: SettingsSection = .general) {
+    public init(
+        initialSection: SettingsSection = .general
+    ) {
         _selection = State(initialValue: initialSection)
     }
 
@@ -41,7 +45,7 @@ public struct SettingsView: View {
             if snapshotRendering {
                 snapshotSidebar
             } else {
-                List(SettingsSection.allCases, selection: $selection) { section in
+                List(SettingsSection.visibleCases, selection: $selection) { section in
                     Text(LocalizedStringKey(section.title))
                         .tag(section)
                 }
@@ -55,7 +59,10 @@ public struct SettingsView: View {
                 .id(selection)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(width: 920, height: 660)
+        .frame(
+            width: 920,
+            height: 660
+        )
         .background(Color(nsColor: .windowBackgroundColor))
         .overlay(alignment: .bottom) {
             VStack(spacing: 8) {
@@ -85,12 +92,15 @@ public struct SettingsView: View {
             model.refreshRuntimeDiagnostics()
             await model.refreshSettings()
             await model.refreshSetup()
+            if ProductScope.companionManagementEnabled {
+                await model.refreshCompanionConnections()
+            }
         }
     }
 
     private var snapshotSidebar: some View {
         VStack(alignment: .leading, spacing: 4) {
-            ForEach(SettingsSection.allCases) { section in
+            ForEach(SettingsSection.visibleCases) { section in
                 Text(LocalizedStringKey(section.title))
                     .font(.system(size: 12.5, weight: section == selection ? .semibold : .regular))
                     .foregroundStyle(section == selection ? Color.accentColor : Color.primary)
@@ -233,7 +243,7 @@ private struct GeneralSettingsPage: View {
                 } header: {
                     Text("语言")
                 } footer: {
-                    Text("系统默认会根据 macOS 首选语言选择中文或英文。")
+                    Text("默认跟随系统；界面立即切换，macOS 系统菜单在重启 ActRealm 后更新。")
                 }
 
                 Section {
@@ -342,7 +352,7 @@ private struct AgentSettingsPage: View {
     var body: some View {
         VStack(spacing: 0) {
             SettingsPageHeader(
-                title: "Agent",
+                title: "settings.tab.agents",
                 subtitle: "管理 Claude Code、Codex 及可选的本机数据来源。"
             )
             Form {
@@ -379,14 +389,14 @@ private struct AgentSettingsPage: View {
                             Task { await model.changeClaudeQuotaBridge(action: action) }
                         }
                     )) {
-                        SettingsLabel("Claude 额度", detail: bridgeStatusText)
+                        SettingsLabel("Claude 状态栏额度补充（可选）", detail: bridgeStatusText)
                     }
                     .disabled(model.isSettingsBusy || model.claudeQuotaBridge?.status == "config_malformed")
 
                     HStack {
                         SettingsLabel(
                             "主动更新额度",
-                            detail: "额度长时间不变或电脑唤醒后可立即请求；若凭证不可用，请先启动 Claude Code CLI 并开始一次会话"
+                            detail: "每分钟自动更新，启动和唤醒后立即恢复；凭据到期自动续期，无需发送对话。立即更新会等待实际结果"
                         )
                         Spacer(minLength: 12)
                         Button(
@@ -427,6 +437,137 @@ private struct AgentSettingsPage: View {
                             "Codex 增强活动",
                             detail: "关闭后仍保留审批与必要生命周期事件"
                         )
+                    }
+                }
+
+                Section {
+                    Picker(
+                        selection: Binding(
+                            get: { model.uiSettings.completionTaskHideMode },
+                            set: { mode in
+                                model.updateUISettings {
+                                    $0.completionTaskHideMode = mode
+                                }
+                            }
+                        ),
+                        label: SettingsLabel(
+                            "隐藏方式",
+                            detail: "任务必须先由 Runtime 明确认定完成"
+                        )
+                    ) {
+                        Text("确认后隐藏").tag(CompletionTaskHideMode.afterConfirmation)
+                        Text("自动隐藏").tag(CompletionTaskHideMode.afterDelay)
+                    }
+                    .pickerStyle(.segmented)
+
+                    if model.uiSettings.completionTaskHideMode == .afterDelay {
+                        Picker(
+                            selection: Binding(
+                                get: { model.uiSettings.completionAutoHideMinutes },
+                                set: { minutes in
+                                    model.updateUISettings {
+                                        $0.completionAutoHideMinutes = minutes
+                                    }
+                                }
+                            ),
+                            label: SettingsLabel(
+                                "完成后保留",
+                                detail: "“知道了”只关闭提醒，任务仍在设定时间自动隐藏"
+                            )
+                        ) {
+                            Text("5 分钟").tag(UInt32(5))
+                            Text("15 分钟").tag(UInt32(15))
+                            Text("30 分钟").tag(UInt32(30))
+                            Text("60 分钟").tag(UInt32(60))
+                        }
+                    }
+                } header: {
+                    Text("已完成任务")
+                } footer: {
+                    Text("正在运行、等待授权、等待回答和报错任务不会因为没有新事件而自动隐藏。隐藏不会删除会话、事件或 Token 统计。")
+                }
+
+                if ProductScope.companionManagementEnabled {
+                    Section {
+                        Toggle(isOn: $model.companionAllowsControl) {
+                        SettingsLabel(
+                            "允许处理 Agent 请求",
+                            detail: "仅为这次新配对授予审批、拒绝、交回原 Agent 和问题回答能力"
+                        )
+                    }
+                        .disabled(model.isCompanionBusy)
+
+                    HStack {
+                        SettingsLabel(
+                            "Display Companion",
+                            detail: "通过本机加密令牌读取任务状态；不共享 ActRealm Cookie 或数据库"
+                        )
+                        Spacer(minLength: 12)
+                        Button("生成配对码", systemImage: "link.badge.plus") {
+                            Task {
+                                if await model.createDisplayCompanionPairing(),
+                                   let code = model.companionPairing?.enrollmentCode
+                                {
+                                    NSPasteboard.general.clearContents()
+                                    NSPasteboard.general.setString(code, forType: .string)
+                                    model.showToast(AppLocalization.localized(
+                                        "显示器伴生应用配对码已复制"
+                                    ))
+                                }
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!model.bridgeStatus.isListening || model.isCompanionBusy)
+                    }
+
+                    if let pairing = model.companionPairing {
+                        VStack(alignment: .leading, spacing: 7) {
+                            HStack {
+                                Text(pairing.enrollmentCode)
+                                    .font(.system(.caption, design: .monospaced).weight(.semibold))
+                                    .lineLimit(1)
+                                    .textSelection(.enabled)
+                                Spacer()
+                                Button("复制") {
+                                    NSPasteboard.general.clearContents()
+                                    NSPasteboard.general.setString(
+                                        pairing.enrollmentCode,
+                                        forType: .string
+                                    )
+                                }
+                            }
+                            Text("5 分钟内粘贴到显示器伴生应用的 Agent 页面；配对码只能使用一次。")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    ForEach(model.companionConnections) { connection in
+                        HStack {
+                            SettingsLabel(
+                                connection.clientName,
+                                detail: connection.scopes.contains("attention.respond")
+                                    ? "任务状态、跳转与受控处理"
+                                    : "只读任务状态与跳转"
+                            )
+                            Spacer(minLength: 12)
+                            Button("撤销", role: .destructive) {
+                                Task { await model.revokeCompanion(id: connection.id) }
+                            }
+                            .disabled(model.isCompanionBusy)
+                        }
+                    }
+
+                    if let error = model.companionPairingError {
+                        Label(error, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .textSelection(.enabled)
+                    }
+                    } header: {
+                        Text("本机伴生应用")
+                    } footer: {
+                        Text("撤销后对应伴生应用会立即失去访问权限；每次操作仍由 Runtime 重新校验请求和通道。")
                     }
                 }
             }
@@ -536,7 +677,7 @@ private struct NotificationSettingsPage: View {
         VStack(spacing: 0) {
             SettingsPageHeader(
                 title: "通知",
-                subtitle: "选择哪些事件需要出现在 Outbox 中，提醒你处理。"
+                subtitle: "管理本机 Agent 的待处理事项与通知。"
             )
             Form {
                 Section {
@@ -569,6 +710,7 @@ private struct NotificationSettingsPage: View {
                 } footer: {
                     Text("关闭某项后，此类事件仍会保留在任务记录中，但不会出现在 Outbox。")
                 }
+
 
                 Section("声音") {
                     Toggle(isOn: Binding(
@@ -783,6 +925,7 @@ private struct NotificationSettingsPage: View {
         )
     }
 
+
     private func hudField(_ label: String, field: HUDDisplayField) -> some View {
         Toggle(isOn: Binding(
             get: { model.hudSettings.fields.contains(field) },
@@ -850,13 +993,17 @@ private struct ThemeSettingsPage: View {
                                 model.resetThemeBackground()
                             }
                         }
-                        Button("选择图片 / GIF / 视频…", action: chooseBackground)
+                        Button(ProductScope.animatedThemeMediaEnabled
+                            ? "选择图片 / GIF / 视频…"
+                            : "选择图片…", action: chooseBackground)
                             .buttonStyle(.borderedProminent)
                     }
                 } header: {
                     Text("背景图片")
                 } footer: {
-                    Text("支持静态图片、GIF、MP4、MOV 等 macOS 可读取格式。GIF 与视频会静音自动循环；文件只保存在本机。")
+                    Text(ProductScope.animatedThemeMediaEnabled
+                        ? "支持静态图片、GIF、MP4、MOV 等 macOS 可读取格式。GIF 与视频会静音自动循环；文件只保存在本机。"
+                        : "只使用本机静态图片；动画与视频背景在当前候选中暂停。")
                 }
 
                 Section {
@@ -944,7 +1091,9 @@ private struct ThemeSettingsPage: View {
         let panel = NSOpenPanel()
         panel.title = localized("选择 ActRealm 背景", locale: locale)
         panel.prompt = localized("使用背景", locale: locale)
-        panel.allowedContentTypes = [.image, .movie]
+        panel.allowedContentTypes = ProductScope.animatedThemeMediaEnabled
+            ? [.image, .movie]
+            : [.image]
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
@@ -1126,7 +1275,7 @@ private struct TaskCardFieldGuide: View {
             HStack(spacing: 6) {
                 guideChip("Token")
                 guideChip("上下文")
-                guideChip("估算价格")
+                guideChip("API 等价值")
             }
             Divider()
             Label("点击任务后展开详细信息与开发者信息", systemImage: "chevron.down")
@@ -1169,7 +1318,7 @@ private struct DisplaySettingsPage: View {
         VStack(spacing: 0) {
             SettingsPageHeader(
                 title: "显示",
-                subtitle: "控制任务卡和额度卡的信息密度；只显示 Runtime 允许的安全字段。"
+                subtitle: "控制任务卡、Token 用量和额度卡的信息密度；只显示 Runtime 允许的安全字段。"
             )
             Form {
                 Section {
@@ -1190,12 +1339,201 @@ private struct DisplaySettingsPage: View {
                         Text("单行").tag(QuotaDisplayMode.singleLine)
                     }
                     .pickerStyle(.segmented)
+
                 } header: {
                     Text("额度显示")
                 } footer: {
                     Text("默认使用完整模式。三种模式都会随额度栏宽度自适应，且不改变额度数据与刷新规则。")
                 }
 
+                    Section {
+                    Picker(
+                        selection: Binding(
+                            get: { model.uiSettings.tokenUsageDisplayMode },
+                            set: { mode in
+                                model.updateUISettings { $0.tokenUsageDisplayMode = mode }
+                            }
+                        ),
+                        label: SettingsLabel(
+                            "累计 Token",
+                            detail: "完整显示入口摘要；紧凑只保留核心数字；点击可打开独立 Token 仪表板"
+                        )
+                    ) {
+                        Text("完整").tag(TokenUsageDisplayMode.full)
+                        Text("紧凑").tag(TokenUsageDisplayMode.compact)
+                        Text("隐藏").tag(TokenUsageDisplayMode.hidden)
+                    }
+                    .pickerStyle(.segmented)
+
+                    if ProductScope.advancedTokenAnalyticsEnabled {
+                        Toggle(isOn: Binding(
+                        get: { model.uiSettings.tokenUsageComponentsVisible },
+                        set: { visible in
+                            model.updateUISettings {
+                                $0.tokenUsageComponentsVisible = visible
+                            }
+                        }
+                    )) {
+                        SettingsLabel(
+                            "Token 组成",
+                            detail: "在独立仪表板显示未命中输入、缓存读取、缓存写入、输出与命中率"
+                        )
+                    }
+
+                    Toggle(isOn: Binding(
+                        get: { model.uiSettings.tokenUsageHeatmapVisible },
+                        set: { visible in
+                            model.updateUISettings { $0.tokenUsageHeatmapVisible = visible }
+                        }
+                    )) {
+                        SettingsLabel(
+                            "Token 活跃度",
+                            detail: "显示逐日 Token / API 等价值热力图与悬停详情"
+                        )
+                    }
+
+                    Toggle(isOn: Binding(
+                        get: { model.uiSettings.tokenUsageCostVisible },
+                        set: { visible in
+                            model.updateUISettings { $0.tokenUsageCostVisible = visible }
+                        }
+                    )) {
+                        SettingsLabel(
+                            "估算 API 费用",
+                            detail: "显示价格快照能够覆盖的 API 等价估算；未知不会显示为 0"
+                        )
+                    }
+
+                    Toggle(isOn: Binding(
+                        get: { model.uiSettings.tokenUsageExecutionTimeVisible },
+                        set: { visible in
+                            model.updateUISettings {
+                                $0.tokenUsageExecutionTimeVisible = visible
+                            }
+                        }
+                    )) {
+                        SettingsLabel(
+                            "Agent 执行时间",
+                            detail: "仅统计思考、工具运行与上下文压缩区间；排除等待，并发任务相加"
+                        )
+                    }
+
+                    Toggle(isOn: Binding(
+                        get: { model.uiSettings.tokenUsageObservedTimeVisible },
+                        set: { visible in
+                            model.updateUISettings {
+                                $0.tokenUsageObservedTimeVisible = visible
+                            }
+                        }
+                    )) {
+                        SettingsLabel(
+                            "任务观测时间",
+                            detail: "按日、月、累计显示 Turn 开始到最后事件的区间（包含等待）"
+                        )
+                    }
+
+                    Toggle(isOn: Binding(
+                        get: { model.uiSettings.tokenUsageTaskProjectVisible },
+                        set: { visible in
+                            model.updateUISettings {
+                                $0.tokenUsageTaskProjectVisible = visible
+                            }
+                        }
+                    )) {
+                        SettingsLabel(
+                            "任务与项目归因",
+                            detail: "项目来自脱敏会话元数据；任务使用可验证会话与父子关系，分别保留未识别数量"
+                        )
+                    }
+
+                    Toggle(isOn: Binding(
+                        get: { model.uiSettings.tokenUsageBurnRateVisible },
+                        set: { visible in
+                            model.updateUISettings {
+                                $0.tokenUsageBurnRateVisible = visible
+                            }
+                        }
+                    )) {
+                        SettingsLabel(
+                            "当前燃烧速度",
+                            detail: "使用真实 5 分钟滑动窗口；只比较数值，不判断是否浪费"
+                        )
+                    }
+
+                    Toggle(isOn: Binding(
+                        get: { model.uiSettings.tokenUsageAnomalyVisible },
+                        set: { visible in
+                            model.updateUISettings {
+                                $0.tokenUsageAnomalyVisible = visible
+                            }
+                        }
+                    )) {
+                        SettingsLabel(
+                            "用量异常与数据质量",
+                            detail: "显示数值突增、账本一致性和价格覆盖问题"
+                        )
+                    }
+
+                    Toggle(isOn: Binding(
+                        get: { model.uiSettings.tokenThresholdNotificationsEnabled },
+                        set: { enabled in
+                            model.updateUISettings {
+                                $0.tokenThresholdNotificationsEnabled = enabled
+                            }
+                        }
+                    )) {
+                        SettingsLabel(
+                            "燃烧速度提醒",
+                            detail: "仅对实时任务触发；历史回补和首次基线不会通知"
+                        )
+                    }
+
+                    if model.uiSettings.tokenThresholdNotificationsEnabled {
+                        Picker(
+                            selection: Binding(
+                                get: { model.uiSettings.tokenThresholdTokensPerMinute },
+                                set: { threshold in
+                                    model.updateUISettings {
+                                        $0.tokenThresholdTokensPerMinute = threshold
+                                    }
+                                }
+                            ),
+                            label: SettingsLabel(
+                                "提醒阈值",
+                                detail: "本机 Token / 分钟；不与官方套餐额度换算"
+                            )
+                        ) {
+                            Text("50K / 分钟").tag(UInt64(50_000))
+                            Text("100K / 分钟").tag(UInt64(100_000))
+                            Text("250K / 分钟").tag(UInt64(250_000))
+                            Text("500K / 分钟").tag(UInt64(500_000))
+                            Text("1M / 分钟").tag(UInt64(1_000_000))
+                        }
+                    }
+
+                    Picker(
+                        selection: Binding(
+                            get: { model.uiSettings.tokenUsageUnitStyle },
+                            set: { style in
+                                model.updateUISettings { $0.tokenUsageUnitStyle = style }
+                            }
+                        ),
+                        label: SettingsLabel(
+                            "Token 简写",
+                            detail: "自动模式会在中文界面使用万/亿，英文界面使用 K/M/B"
+                        )
+                    ) {
+                        Text("自动").tag(TokenUsageUnitStyle.automatic)
+                        Text("K / M / B").tag(TokenUsageUnitStyle.western)
+                        Text("万 / 亿").tag(TokenUsageUnitStyle.eastAsian)
+                    }
+                        .pickerStyle(.segmented)
+                    }
+                    } header: {
+                        Text("Token 用量")
+                    } footer: {
+                        Text("Codex 与 Claude 使用同一套本机统计。只有 Agent 提供真实 Token 数据后才显示数值；不会用额度百分比推算。")
+                    }
                 Section("显示档位") {
                     Picker("任务卡", selection: Binding(
                         get: { activePreset },
@@ -1208,7 +1546,8 @@ private struct DisplaySettingsPage: View {
                     .pickerStyle(.segmented)
                 }
 
-                Section {
+                if ProductScope.developerDisplayCustomizationEnabled {
+                    Section {
                     Toggle(isOn: Binding(
                         get: { model.uiSettings.displayProfile == "custom" },
                         set: { enabled in setCustom(enabled) }
@@ -1273,10 +1612,11 @@ private struct DisplaySettingsPage: View {
                             }
                         }
                     }
-                } header: {
-                    Text("任务卡字段")
-                } footer: {
-                    Text("三个预设提供固定字段组合；简洁模式默认显示 7 项关键信息。开启“自定义字段”后可按显示位置逐项调整。原始提示、命令和文件内容不会因此显示。")
+                    } header: {
+                        Text("任务卡字段")
+                    } footer: {
+                        Text("三个预设提供固定字段组合；简洁模式默认显示 7 项折叠信息，并保留展开后的任务流程与工作流。开启“自定义字段”后可按显示位置逐项调整。原始提示、命令和文件内容不会因此显示。")
+                    }
                 }
             }
             .formStyle(.grouped)
@@ -1330,6 +1670,13 @@ private struct DisplaySettingsPage: View {
     }
 }
 
+private enum DataExportKind {
+    case allData
+    case metrics
+    case tokenJSON
+    case tokenCSV
+}
+
 private struct DataSettingsPage: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.locale) private var locale
@@ -1343,7 +1690,7 @@ private struct DataSettingsPage: View {
         VStack(spacing: 0) {
             SettingsPageHeader(
                 title: "数据",
-                subtitle: "管理本机保留、导出和使用统计；ActRealm 不发送遥测。"
+                subtitle: "管理本机数据、导出与保留期限。"
             )
             Form {
                 Section("本地数据") {
@@ -1359,21 +1706,33 @@ private struct DataSettingsPage: View {
                         SettingsLabel("事件保留", detail: "超过保留期的本机事件会自动清理")
                     }
 
-                    HStack {
-                        Button("导出全部数据…") { Task { await export(metricsOnly: false) } }
-                            .disabled(exporting || model.isDemo)
-                        Button("导出使用统计…") { Task { await export(metricsOnly: true) } }
-                            .disabled(exporting || model.isDemo)
-                        Spacer()
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Button("导出全部数据…") { Task { await export(.allData) } }
+                            Button("导出使用统计…") { Task { await export(.metrics) } }
+                            Spacer()
+                        }
+                        HStack {
+                            Button("导出 Token JSON…") { Task { await export(.tokenJSON) } }
+                            Button("导出 Token CSV…") { Task { await export(.tokenCSV) } }
+                            Spacer()
+                        }
+                        Text("Token 数值导出不包含任务 ID、Prompt、路径、命令、工具内容或回复")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
+                    .disabled(exporting || model.isDemo)
                 }
 
-                Section {
-                    metricsGrid
-                } header: {
-                    Text("使用统计")
-                } footer: {
-                    Text("统计只在这台 Mac 上累计。")
+
+                if ProductScope.localUsageStatsEnabled {
+                    Section {
+                        metricsGrid
+                    } header: {
+                        Text("使用统计")
+                    } footer: {
+                        Text("统计只在这台 Mac 上累计。")
+                    }
                 }
 
                 Section {
@@ -1442,7 +1801,8 @@ private struct DataSettingsPage: View {
                             Spacer()
                             Button("确认清除", role: .destructive) {
                                 Task {
-                                    if await model.clearLocalData(confirmation: clearConfirmation) {
+                                    let cleared = await model.clearLocalData(confirmation: clearConfirmation)
+                                    if cleared {
                                         showingClearConfirmation = false
                                         clearConfirmation = ""
                                     }
@@ -1463,7 +1823,9 @@ private struct DataSettingsPage: View {
                 } header: {
                     Text("清除数据")
                 } footer: {
-                    Text("此操作不可撤销。")
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("此操作不可撤销。")
+                    }
                 }
             }
             .formStyle(.grouped)
@@ -1527,18 +1889,46 @@ private struct DataSettingsPage: View {
     }
 
     @MainActor
-    private func export(metricsOnly: Bool) async {
+    private func export(_ kind: DataExportKind) async {
         guard !exporting else { return }
         exporting = true
         defer { exporting = false }
-        guard let data = await model.exportLocalData(metricsOnly: metricsOnly) else { return }
+        let data: Data?
+        switch kind {
+        case .allData:
+            data = await model.exportLocalData(metricsOnly: false)
+        case .metrics:
+            data = await model.exportLocalData(metricsOnly: true)
+        case .tokenJSON:
+            data = await model.exportTokenUsage(csv: false)
+        case .tokenCSV:
+            data = await model.exportTokenUsage(csv: true)
+        }
+        guard let data else { return }
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = metricsOnly ? "actrealm-metrics.json" : "actrealm-export.json"
-        panel.allowedContentTypes = [.json]
+        switch kind {
+        case .allData:
+            panel.nameFieldStringValue = "actrealm-export.json"
+            panel.allowedContentTypes = [.json]
+        case .metrics:
+            panel.nameFieldStringValue = "actrealm-metrics.json"
+            panel.allowedContentTypes = [.json]
+        case .tokenJSON:
+            panel.nameFieldStringValue = "actrealm-token-usage.json"
+            panel.allowedContentTypes = [.json]
+        case .tokenCSV:
+            panel.nameFieldStringValue = "actrealm-token-usage.csv"
+            panel.allowedContentTypes = [.commaSeparatedText]
+        }
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
             try data.write(to: url, options: .atomic)
-            model.showToast(localized(metricsOnly ? "统计已导出" : "本地数据已导出", locale: locale))
+            let message = switch kind {
+            case .allData: "本地数据已导出"
+            case .metrics: "统计已导出"
+            case .tokenJSON, .tokenCSV: "Token 数值已导出"
+            }
+            model.showToast(localized(message, locale: locale))
         } catch {
             model.showToast(
                 localizedFormat("保存失败：%@", locale: locale, error.localizedDescription),

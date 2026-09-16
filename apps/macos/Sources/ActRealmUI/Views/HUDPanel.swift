@@ -371,7 +371,9 @@ public struct HUDCapsuleView: View {
 
                 Text(localized(
                     entry.kind == .approval
-                        ? "可直接允许或拒绝 · 事项保留在待处理列表"
+                        ? (model.approvalActions(for: entry).isEmpty
+                            ? "请在原窗口处理 · 事项保留在待处理列表"
+                            : "可按所示按钮处理 · 事项保留在待处理列表")
                         : "事项已进入待处理列表",
                     locale: model.interfaceLocale
                 ))
@@ -574,35 +576,42 @@ public struct HUDCapsuleView: View {
                     state: entry.state,
                     submission: decisionSubmission
                 ) {
-                    Button {
-                        submit(.deny, entry: entry)
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 13, weight: .bold))
-                            .foregroundStyle(DT.redText)
-                            .frame(width: 40, height: 40)
-                            .background(Circle().fill(DT.redBg))
-                            .overlay(Circle().strokeBorder(DT.redStroke, lineWidth: 1))
-                            .contentShape(Circle())
+                    let actions = model.approvalActions(for: entry)
+                    if actions.contains("deny") {
+                        Button { submit(.deny, entry: entry) } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundStyle(DT.redText)
+                                .frame(width: 40, height: 40)
+                                .background(Circle().fill(DT.redBg))
+                                .overlay(Circle().strokeBorder(DT.redStroke, lineWidth: 1))
+                                .contentShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .help(localized("拒绝", locale: locale))
                     }
-                    .buttonStyle(.plain)
-                    .contentShape(Circle())
-                    .help(localized("拒绝", locale: locale))
-
-                    Button {
-                        submit(.approve, entry: entry)
-                    } label: {
-                        Image(systemName: "checkmark")
-                            .font(.system(size: 13, weight: .bold))
-                            .foregroundStyle(.white)
-                            .frame(width: 40, height: 40)
-                            .background(Circle().fill(DT.primaryGradient))
-                            .contentShape(Circle())
+                    if actions.contains("approve") {
+                        Button { submit(.approve, entry: entry) } label: {
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundStyle(.white)
+                                .frame(width: 40, height: 40)
+                                .background(Circle().fill(DT.primaryGradient))
+                                .contentShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .shadow(color: DT.blue.opacity(0.4), radius: 8, y: 4)
+                        .help(localized("允许（提交前可撤回）", locale: locale))
                     }
-                    .buttonStyle(.plain)
-                    .contentShape(Circle())
-                    .shadow(color: DT.blue.opacity(0.4), radius: 8, y: 4)
-                    .help(localized("允许（3 秒内可撤回）", locale: locale))
+                    if actions.isEmpty {
+                        Button { Task { await model.jump(to: entry) } } label: {
+                            Image(systemName: "arrow.up.forward.app")
+                                .font(.system(size: 13, weight: .bold))
+                                .frame(width: 40, height: 40)
+                        }
+                        .buttonStyle(.plain)
+                        .help(localized("去原窗口核对", locale: locale))
+                    }
                 } else {
                     decisionSubmissionStatus(entry)
                 }
@@ -617,10 +626,14 @@ public struct HUDCapsuleView: View {
             submission: decisionSubmission
         ) else { return }
 
+        if action == .approve || action == .deny {
+            guard model.approvalActions(for: entry, at: Date()).contains(action.rawValue) else { return }
+        }
         decisionSubmission = HUDDecisionSubmission(attentionID: entry.id, action: action)
         switch action {
         case .approve: model.approve(entry)
         case .deny: model.deny(entry)
+        case .passThrough: model.passThrough(entry)
         default: return
         }
 
@@ -680,6 +693,9 @@ public struct HUDCapsuleView: View {
 
     private func detailParts(_ entry: OutboxEntry) -> [String] {
         var parts: [String] = []
+        if entry.kind == .approval {
+            parts.append(localized(entry.risk.badgeText, locale: locale))
+        }
         if model.hudSettings.fields.contains(.provider), entry.provider != nil {
             parts.append(providerName(entry))
         }

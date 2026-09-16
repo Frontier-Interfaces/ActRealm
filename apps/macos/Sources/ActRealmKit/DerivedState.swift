@@ -79,10 +79,10 @@ public enum RiskLevel: String, Sendable {
         }
     }
 
-    /// High-caution approvals hide the direct Allow button: the primary
-    /// action becomes "去原窗口核对" and Allow requires double confirmation.
+    /// Emphasize the warning independently of the Runtime's reply capabilities.
+    /// Risk classification never grants or removes an approval action.
     public var needsVerification: Bool {
-        self == .high || self == .unknown
+        self != .low
     }
 }
 
@@ -146,8 +146,24 @@ public struct OutboxEntry: Identifiable, Equatable, Sendable {
     public let taskTitle: String?
     public let createdAt: Date
     public let expiresAt: Date?
+    public let autoHideAt: Date?
 
     public var id: String { attention.id }
+    public var reminderAcknowledged: Bool { attention.reminderAcknowledgedAt != nil }
+
+    /// Match Display: capabilities come from the live Runtime reply channel,
+    /// not the tool name, command preview or risk label. An explicit empty
+    /// list overrides legacy remoteActionable; unknown actions never expand it.
+    public func approvalActions(at now: Date, connectionIsLive: Bool) -> Set<String> {
+        guard connectionIsLive, kind == .approval, state == .open,
+              attention.requestId != nil, let expiresAt, expiresAt > now
+        else { return [] }
+        if let declared = attention.allowedActions {
+            return Set(declared).intersection(["approve", "deny"])
+        }
+        if attention.remoteActionable == true { return ["approve", "deny"] }
+        return ["deny"]
+    }
 
     /// "Codex · actrealm" source line.
     public var sourceLine: String {
@@ -291,6 +307,7 @@ public struct OutboxEntry: Identifiable, Equatable, Sendable {
         }
         self.createdAt = ZhFormat.date(fromMillis: attention.createdAt)
         self.expiresAt = attention.expiresAt.map(ZhFormat.date(fromMillis:))
+        self.autoHideAt = attention.autoHideAt.map(ZhFormat.date(fromMillis:))
     }
 }
 
@@ -373,14 +390,31 @@ public struct LaneTask: Identifiable, Equatable, Sendable {
     public let oldestOpenOutboxAt: Date?
     public let firstOpenOutboxId: String?
     public let primaryAttentionKind: OutboxKind?
+    public let pendingInteractionState: String?
+    public let awaitingCompletionConfirmation: Bool
+    public let completionAcknowledged: Bool
+    /// Product ordering: error/blocked, direct approval, Provider-native
+    /// approval, question, running, completed, idle.
+    public let taskPriorityRank: Int
 
     public var id: String { session.id }
 
     public var title: String {
         if let title = session.providerTitle, !title.isEmpty { return title }
         if let title = session.title, !title.isEmpty { return title }
-        if let project = session.project, !project.isEmpty { return project }
+        if let project = session.project, !project.isEmpty {
+            return "\(providerFallbackName) · \(project)"
+        }
         return "未命名任务"
+    }
+
+    private var providerFallbackName: String {
+        switch session.provider {
+        case "codex": "Codex"
+        case "claude": "Claude"
+        case "gemini": "Gemini"
+        default: "Agent"
+        }
     }
 
     public var projectName: String? { session.project }
@@ -397,16 +431,88 @@ public struct LaneTask: Identifiable, Equatable, Sendable {
     /// provide them. A placeholder would turn missing Provider state into a
     /// claim about the Provider.
     public var detailRows: [TaskDetailRow] {
-        guard let currentTool = session.currentTool?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !currentTool.isEmpty
-        else { return [] }
-        return [TaskDetailRow(field: "tool", value: currentTool)]
+        var rows: [TaskDetailRow] = []
+        if let currentTool = session.currentTool?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !currentTool.isEmpty {
+            rows.append(TaskDetailRow(field: "tool", value: currentTool))
+        }
+        if let currentTarget = session.currentTarget?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !currentTarget.isEmpty {
+            rows.append(TaskDetailRow(field: "target", value: currentTarget))
+        }
+        return rows
     }
+    public func localizedState(language: AppLanguage) -> String {
+        let key: String
+        if status == .failed { key = "失败" }
+        else if pendingInteractionState == "committing" { key = "正在提交决定" }
+        else if pendingInteractionState == "decision_sent" { key = "等待 Agent 确认" }
+        else if awaitingCompletionConfirmation { key = "完成待确认" }
+        else if executionIsUnconfirmed { key = "等待新事件" }
+        else {
+            switch status {
+            case .waiting: key = "等你处理"
+            case .running: key = "运行中"
+            case .failed: key = "失败"
+            case .done: key = completionAcknowledged ? "已确认完成" : "本轮已完成"
+            case .idle: key = "空闲"
+            }
+        }
+        return AppLocalization.localized(key, language: language)
+    }
+
+    public func localizedCurrentAction(language: AppLanguage) -> String {
+        let key: String
+        if status == .failed { key = "任务失败" }
+        else if pendingInteractionState == "committing" { key = "正在提交决定" }
+        else if pendingInteractionState == "decision_sent" { key = "已处理，等待 Agent 确认" }
+        else if awaitingCompletionConfirmation { key = "完成待确认" }
+        else if status == .waiting {
+            switch primaryAttentionKind {
+            case .approval: key = "等待批准"
+            case .nativeApproval: key = "等待原界面批准"
+            case .question: key = "等待回答"
+            case .completion: key = "完成待确认"
+            default: key = "等待处理"
+            }
+        } else if executionIsUnconfirmed { key = "等待新事件" }
+        else if status == .done { key = completionAcknowledged ? "已确认完成" : "本轮已完成" }
+        else {
+            switch session.execState {
+            case "thinking": key = "正在思考"
+            case "compacting": key = "正在整理上下文"
+            case "tool_running":
+                return TaskActivityPresentation.action(category: session.currentToolCategory,
+                    tool: session.currentTool, running: true, language: language)
+            default: key = "等待任务事件"
+            }
+        }
+        return AppLocalization.localized(key, language: language)
+    }
+
     public var activitySince: Date? { session.activitySince.map(ZhFormat.date(fromMillis:)) }
     public var lastEventAt: Date { ZhFormat.date(fromMillis: session.lastEventAt) }
+
+    /// Active and waiting work never ages out. Once a task is inactive it
+    /// leaves the compact Agent list immediately unless a current Attention
+    /// item still needs to remain associated with it.
+    public func isVisibleInAgentTasks(at _: Date) -> Bool {
+        status == .running || status == .waiting || hasVisibleAttention
+    }
+
     public var inputTokens: UInt64? { session.inputTokens }
     public var outputTokens: UInt64? { session.outputTokens }
     public var totalTokens: UInt64? { session.totalTokens }
+    /// Per-task evidence remains useful while unrelated historical indexing is partial.
+    public var usageIsProvisional: Bool {
+        !["official", "official_local", "derived"].contains(session.usageQuality ?? "")
+    }
+
+    public var executionIsUnconfirmed: Bool {
+        if session.execState == "waiting_for_event" { return true }
+        return ["thinking", "tool_running", "compacting"].contains(session.execState)
+            && ["lost_control", "waiting_for_event", "ended"].contains(session.recoveryState ?? "")
+    }
     public var contextWindowTokens: UInt64? { session.contextWindowTokens }
     public var usageCapturedAt: Date? {
         session.usageCapturedAt.map(ZhFormat.date(fromMillis:))
@@ -461,27 +567,77 @@ public struct LaneTask: Identifiable, Equatable, Sendable {
         self.session = session
         self.openOutboxCount = openAttention.count
         self.hasVisibleAttention = !(visibleAttention ?? openAttention).isEmpty
-        self.oldestOpenOutboxAt = openAttention.map(\.createdAt).min().map(ZhFormat.date(fromMillis:))
-        self.firstOpenOutboxId = openAttention
-            .min(by: { $0.createdAt < $1.createdAt })?.id
-        self.primaryAttentionKind = openAttention
-            .min(by: { $0.createdAt < $1.createdAt })
-            .map { OutboxKind(record: $0.kind) }
+        func attentionRank(_ item: AttentionRecord) -> Int {
+            switch item.kind {
+            case "error": 0
+            case "approval": 1
+            case "native_approval": 2
+            case "question", "elicitation": 3
+            case "completion": 4
+            default: 5
+            }
+        }
+        let primary = openAttention.min {
+            let left = attentionRank($0), right = attentionRank($1)
+            return left == right ? $0.createdAt < $1.createdAt : left < right
+        }
+        self.oldestOpenOutboxAt = primary.map(\.createdAt).map(ZhFormat.date(fromMillis:))
+        self.firstOpenOutboxId = primary?.id
+        self.primaryAttentionKind = primary.map {
+            OutboxKind(record: $0.kind == "elicitation" ? "question" : $0.kind)
+        }
+        let interactions = openAttention.filter {
+            ["approval", "native_approval", "question", "elicitation"].contains($0.kind)
+        }
+        self.pendingInteractionState = interactions.contains(where: { $0.state == "open" }) ? nil
+            : interactions.contains(where: { $0.state == "committing" }) ? "committing"
+            : interactions.contains(where: { $0.state == "decision_sent" }) ? "decision_sent" : nil
+        self.awaitingCompletionConfirmation = ["idle", "response_finished"].contains(session.execState)
+            && interactions.isEmpty
+            && !openAttention.contains { $0.kind == "error" }
+            && openAttention.contains { $0.kind == "completion" && $0.reminderAcknowledgedAt == nil }
+        self.completionAcknowledged = (visibleAttention ?? openAttention).contains {
+            $0.kind == "completion" && $0.reminderAcknowledgedAt != nil
+                && $0.createdAt >= (session.turnStartedAt ?? 0)
+        }
 
-        let waitingKinds: Set<String> = ["approval", "native_approval", "question"]
+        let waitingKinds: Set<String> = ["approval", "native_approval", "question", "elicitation"]
         let hasBlockingAttention = openAttention.contains { waitingKinds.contains($0.kind) }
         let hasCompletionAttention = openAttention.contains { $0.kind == "completion" }
+        if session.execState == "failed" || openAttention.contains(where: { $0.kind == "error" }) {
+            self.status = .failed
+        } else {
         switch session.execState {
         case "awaiting_approval":
             self.status = .waiting
         case "thinking", "tool_running", "compacting":
-            self.status = hasBlockingAttention ? .waiting : .running
+            self.status = hasBlockingAttention ? .waiting : (
+                ["lost_control", "waiting_for_event", "ended"].contains(session.recoveryState ?? "") ? .idle : .running
+            )
         case "failed":
             self.status = .failed
         case "response_finished":
             self.status = (hasBlockingAttention || hasCompletionAttention) ? .waiting : .done
         default:
             self.status = (hasBlockingAttention || hasCompletionAttention) ? .waiting : .idle
+        }
+        }
+        if session.execState == "failed" || openAttention.contains(where: { $0.kind == "error" }) {
+            self.taskPriorityRank = 0
+        } else if openAttention.contains(where: { $0.kind == "approval" }) {
+            self.taskPriorityRank = 1
+        } else if openAttention.contains(where: { $0.kind == "native_approval" }) {
+            self.taskPriorityRank = 2
+        } else if openAttention.contains(where: { $0.kind == "question" }) {
+            self.taskPriorityRank = 3
+        } else if self.status == .waiting {
+            self.taskPriorityRank = 3
+        } else if self.status == .running {
+            self.taskPriorityRank = 4
+        } else if hasCompletionAttention || self.status == .done {
+            self.taskPriorityRank = 5
+        } else {
+            self.taskPriorityRank = 6
         }
     }
 }
@@ -662,11 +818,25 @@ public struct QuotaSlot: Identifiable, Equatable, Sendable {
     public let titleMessage: RuntimeMessage?
     public let reasonMessage: RuntimeMessage?
     public let source: String
+    public let resetSource: String?
+    public let resetCapturedAt: Date?
     public let planType: String?
+    public let isSpark: Bool
     public let windowMinutes: UInt64?
     public let availability: Availability
 
     public var id: String { slot.rawValue }
+
+    public var providerDisplayName: String {
+        if isSpark { return "Codex Spark" }
+        return slot.provider == .claude ? "Claude" : "Codex"
+    }
+
+    public var displayPlanType: String? {
+        guard let planType else { return nil }
+        let trimmed = planType.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
 
     /// Remaining < 20% → 紧张; nil when no trustworthy number exists.
     public var isTight: Bool {
@@ -697,7 +867,10 @@ public struct QuotaSlot: Identifiable, Equatable, Sendable {
         self.titleMessage = entry.windowMessage
         self.reasonMessage = entry.reasonMessage
         self.source = entry.source
+        self.resetSource = entry.resetSource
+        self.resetCapturedAt = entry.resetCapturedAt.map(ZhFormat.date(fromMillis:))
         self.planType = entry.planType
+        self.isSpark = Self.isSparkEntry(entry)
         self.windowMinutes = entry.windowMinutes
         let remaining = entry.remainingPct ?? entry.usedPct.map { 100 - $0 }
         // Quota reset timestamps are epoch seconds; capture/event timestamps
@@ -711,7 +884,7 @@ public struct QuotaSlot: Identifiable, Equatable, Sendable {
                 resetsAt: resetsAt,
                 capturedAt: capturedAt
             )
-        case "stale":
+        case "stale" where remaining != nil:
             self.availability = .stale(
                 remainingPct: remaining.map { max(0, min(100, $0)) },
                 resetsAt: resetsAt,
@@ -722,9 +895,19 @@ public struct QuotaSlot: Identifiable, Equatable, Sendable {
         }
     }
 
+    static func isSparkEntry(_ entry: QuotaEntry) -> Bool {
+        entry.quotaKind == "spark"
+    }
+
+    static func isProPlan(_ planType: String?) -> Bool {
+        planType?.trimmingCharacters(in: .whitespacesAndNewlines)
+            .caseInsensitiveCompare("pro") == .orderedSame
+    }
+
     private static func windowTitle(_ entry: QuotaEntry) -> String {
         if let name = entry.limitName, !name.isEmpty { return name }
         if let minutes = entry.windowMinutes, minutes > 0 {
+            if (40_320 ... 44_640).contains(minutes) { return "1 month" }
             if minutes.isMultiple(of: 43_200) { return "\(minutes / 43_200) months" }
             if minutes.isMultiple(of: 10_080) { return "\(minutes / 10_080) weeks" }
             if minutes.isMultiple(of: 1_440) { return "\(minutes / 1_440) days" }
@@ -786,7 +969,9 @@ public struct DerivedState: Equatable, Sendable {
     }
 
     public var highRiskOpenCount: Int {
-        openOutbox.filter { $0.kind == .approval && $0.risk.needsVerification }.count
+        openOutbox.filter {
+            $0.kind == .approval && ($0.risk == .high || $0.risk == .unknown)
+        }.count
     }
 
     public var longestWait: TimeInterval? {
@@ -801,12 +986,27 @@ public struct DerivedState: Equatable, Sendable {
         lanes.reduce(0) { $0 + $1.tasks.filter { $0.status == .done }.count }
     }
 
-    /// Interaction-model task feed: one newest-first list across providers.
+    /// Interaction-model task feed shared by the main window and menu bar.
+    /// Routine tool events do not reorder running turns because their stable
+    /// turn start, not their latest event, is the within-group key.
     public var agentTasks: [LaneTask] {
         lanes
             .flatMap(\.tasks)
             .sorted {
-                if $0.lastEventAt != $1.lastEventAt { return $0.lastEventAt > $1.lastEventAt }
+                if $0.taskPriorityRank != $1.taskPriorityRank {
+                    return $0.taskPriorityRank < $1.taskPriorityRank
+                }
+                if $0.status == .waiting || $1.status == .waiting {
+                    let lhsWait = $0.oldestOpenOutboxAt ?? $0.lastEventAt
+                    let rhsWait = $1.oldestOpenOutboxAt ?? $1.lastEventAt
+                    if lhsWait != rhsWait { return lhsWait < rhsWait }
+                } else if $0.status == .running && $1.status == .running {
+                    let lhsStart = $0.turnStartedAt ?? .distantPast
+                    let rhsStart = $1.turnStartedAt ?? .distantPast
+                    if lhsStart != rhsStart { return lhsStart > rhsStart }
+                } else if $0.lastEventAt != $1.lastEventAt {
+                    return $0.lastEventAt > $1.lastEventAt
+                }
                 return $0.id < $1.id
             }
     }
@@ -832,7 +1032,10 @@ public struct DerivedState: Equatable, Sendable {
         // oldest waiting first inside a rank (spec §2.5).
         let visibleStates: Set<String> = ["open", "committing", "decision_sent", "snoozed"]
         let outbox = snapshot.attention
-            .filter { visibleStates.contains($0.state) }
+            .filter {
+                visibleStates.contains($0.state)
+                    && !($0.kind == "completion" && $0.reminderAcknowledgedAt != nil)
+            }
             .map {
                 let session = sessionsById[$0.sessionId]
                 return OutboxEntry(
@@ -859,14 +1062,20 @@ public struct DerivedState: Equatable, Sendable {
         // Pending Attention grouped per session for lane badges.
         var openAttentionBySession: [String: [AttentionRecord]] = [:]
         for item in snapshot.attention
-        where ["open", "committing", "decision_sent"].contains(item.state) {
+        where ["open", "committing", "decision_sent"].contains(item.state)
+            && !(item.kind == "completion" && item.reminderAcknowledgedAt != nil) {
             openAttentionBySession[item.sessionId, default: []].append(item)
         }
 
         // Render every validated Runtime window. M14 may add scoped model and
         // extra-usage windows, so the native client must not collapse them to
         // the three pre-M14 placeholders.
-        let quotaSlots = snapshot.quota.enumerated()
+        let codexIsPro = snapshot.quota.contains {
+            $0.provider == "codex" && QuotaSlot.isProPlan($0.planType)
+        }
+        let quotaSlots = snapshot.quota
+            .filter { !QuotaSlot.isSparkEntry($0) || codexIsPro }
+            .enumerated()
             .map { QuotaSlot(entry: $0.element, index: $0.offset) }
 
         // Claude and Codex lanes remain visible before their first task. Any
@@ -978,5 +1187,103 @@ public struct DerivedState: Equatable, Sendable {
             quotaSlots: quotaSlots,
             pendingDecision: pending
         )
+    }
+}
+
+public enum TaskFactPresentation {
+    public static func summary(
+        _ fact: RuntimeFactMetadata,
+        language: AppLanguage,
+        now: Date = Date()
+    ) -> String {
+        let english = AppLanguage.resolvedIdentifier(selection: language)
+            == AppLanguage.english.rawValue
+        var parts = [sourceLabel(fact, english: english)]
+        parts.append(freshnessLabel(fact.freshness, english: english))
+        parts.append(verificationLabel(fact.verification, english: english))
+        if let absenceReason = fact.absenceReason {
+            parts.append(absenceLabel(absenceReason, english: english))
+        }
+        if fact.capability == .direct {
+            parts.append(english ? "Direct action" : "可直接处理")
+        } else if fact.capability == .returnToProvider {
+            parts.append(english ? "Return to Provider" : "返回原应用")
+        }
+        if let capturedAt = fact.capturedAt {
+            let captured = ZhFormat.date(fromMillis: capturedAt)
+            parts.append(ZhFormat.relativeAgo(
+                max(0, now.timeIntervalSince(captured)),
+                language: language
+            ))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private static func sourceLabel(_ fact: RuntimeFactMetadata, english: Bool) -> String {
+        guard let source = fact.sourceId else {
+            return english ? "No source" : "无可用来源"
+        }
+        if source.hasPrefix("connector:") {
+            return english ? "Provider connector" : "Provider Connector"
+        }
+        if source.hasPrefix("hook:") {
+            return english ? "Provider hook" : "Provider Hook"
+        }
+        if source.hasPrefix("provider:") {
+            return english ? "Provider event" : "Provider 事件"
+        }
+        if source.hasPrefix("runtime:") {
+            return "Runtime"
+        }
+        return english ? "Bounded source" : "受限来源"
+    }
+
+    private static func freshnessLabel(_ value: RuntimeFactFreshness, english: Bool) -> String {
+        switch value {
+        case .live: english ? "Live" : "实时"
+        case .delayed: english ? "Delayed" : "延迟"
+        case .stale: english ? "Stale" : "已过期"
+        case .expired: english ? "Expired" : "已失效"
+        }
+    }
+
+    private static func verificationLabel(
+        _ value: RuntimeFactVerification,
+        english: Bool
+    ) -> String {
+        switch value {
+        case .verified: english ? "Verified" : "已验证"
+        case .partial: english ? "Partial" : "部分验证"
+        case .unverified: english ? "Unverified" : "无法验证"
+        case .notApplicable: english ? "Not applicable" : "不适用"
+        }
+    }
+
+    private static func absenceLabel(
+        _ value: RuntimeFactAbsenceReason,
+        english: Bool
+    ) -> String {
+        switch value {
+        case .providerNotSupplied:
+            english ? "Provider did not supply it" : "Provider 未提供"
+        case .notSupported:
+            english ? "Provider does not support it" : "Provider 不支持"
+        case .capabilityUnconfirmed:
+            english ? "Capability is unconfirmed" : "能力尚未确认"
+        case .noCurrentTurn:
+            english ? "No current turn" : "当前 Turn 已结束"
+        case .noCurrentActivity:
+            english ? "No current activity" : "暂无当前活动"
+        case .noCurrentTool:
+            english ? "No current tool" : "当前阶段没有工具"
+        case .currentToolHasNoTarget:
+            english ? "Current tool has no file target" : "当前工具没有文件目标"
+        case .taskNotCompleted:
+            english ? "Task is not completed" : "任务尚未完成"
+        case .sourceStale:
+            english ? "Source is stale" : "来源已过期"
+        case .unknown:
+            english ? "Reason unavailable" : "原因不可用"
+        }
     }
 }

@@ -8,6 +8,7 @@ public enum MainWindowPage: Sendable, Hashable {
     case foregroundScheduling
 }
 
+
 struct WorkspaceColumnWidths: Equatable {
     let outbox: CGFloat
     let tasks: CGFloat
@@ -43,7 +44,9 @@ enum WorkspaceColumnLayout {
 /// The native title bar is transparent: macOS keeps ownership of the window
 /// controls while the app header shares the same uninterrupted background.
 public struct MainWindowView: View {
-    public init(initialPage: MainWindowPage = .actRealmWorkspace) {
+    public init(
+        initialPage: MainWindowPage = .actRealmWorkspace
+    ) {
         _page = State(initialValue: initialPage)
     }
 
@@ -58,7 +61,8 @@ public struct MainWindowView: View {
                 openWorkspace: { switchPage(to: .actRealmWorkspace) },
                 openSetup: { switchPage(to: .agentSetup) },
                 openScheduling: { switchPage(to: .foregroundScheduling) },
-                openSettings: { openWindow(id: "settings") }
+                openSettings: { openWindow(id: "settings") },
+                openTokenUsage: { openWindow(id: "token-dashboard") }
             )
 
             Group {
@@ -68,13 +72,12 @@ public struct MainWindowView: View {
                             containerWidth: proxy.size.width,
                             language: model.appLanguage
                         )
-
                         HStack(spacing: WorkspaceColumnLayout.gap) {
                             OutboxSection()
                                 .frame(width: columns.outbox)
-                            AgentTasksSection(
-                                onOpenSetup: { switchPage(to: .agentSetup) }
-                            )
+                            AgentTasksSection(onOpenSetup: {
+                                switchPage(to: .agentSetup)
+                            })
                                 .frame(width: columns.tasks)
                             QuotaSection()
                                 .frame(width: columns.quota)
@@ -151,6 +154,7 @@ public struct MainWindowView: View {
         guard page != destination else { return }
         page = destination
     }
+
 }
 
 private struct IntegratedWindowHeader: View {
@@ -161,6 +165,7 @@ private struct IntegratedWindowHeader: View {
     let openSetup: () -> Void
     let openScheduling: () -> Void
     let openSettings: () -> Void
+    let openTokenUsage: () -> Void
 
     var body: some View {
         HStack(spacing: 10) {
@@ -183,6 +188,17 @@ private struct IntegratedWindowHeader: View {
                 .buttonStyle(.plain)
                 .help(localized("返回 ActRealm 工作区", locale: locale))
             }
+
+            Button(action: openTokenUsage) {
+                Label("Token 用量", systemImage: "chart.xyaxis.line")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(DT.blueText)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(DT.blueBg, in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .help(localized("打开 Token 仪表板", locale: locale))
 
             SchedulingNavigationButton(
                 selected: page == .foregroundScheduling,

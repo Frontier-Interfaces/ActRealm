@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
@@ -56,6 +57,149 @@ impl FromStr for Provider {
 #[derive(Debug, Error)]
 #[error("unsupported provider: {0}")]
 pub struct ParseProviderError(String);
+
+pub const PROVIDER_CAPABILITY_SCHEMA_VERSION: u16 = 1;
+const PROVIDER_CAPABILITIES_JSON: &str =
+    include_str!("../../../shared/contracts/provider-capabilities.json");
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderCapabilityStatus {
+    Supported,
+    Unsupported,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl ProviderCapabilityStatus {
+    pub const fn can_claim_support(self) -> bool {
+        matches!(self, Self::Supported)
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderCapabilityFact {
+    #[serde(default)]
+    pub status: ProviderCapabilityStatus,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderCapabilitySet {
+    #[serde(default)]
+    pub plan: ProviderCapabilityFact,
+    #[serde(default)]
+    pub subagents: ProviderCapabilityFact,
+    #[serde(default)]
+    pub approvals: ProviderCapabilityFact,
+    #[serde(default)]
+    pub transcript_slice: ProviderCapabilityFact,
+    #[serde(default)]
+    pub tool_lifecycle: ProviderCapabilityFact,
+    #[serde(default)]
+    pub current_target: ProviderCapabilityFact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderCapabilityFeature {
+    Plan,
+    Subagents,
+    Approvals,
+    TranscriptSlice,
+    ToolLifecycle,
+    CurrentTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderCapabilityMatrix {
+    pub schema_version: u16,
+    pub providers: BTreeMap<String, ProviderCapabilitySet>,
+}
+
+impl Default for ProviderCapabilityMatrix {
+    fn default() -> Self {
+        Self {
+            schema_version: PROVIDER_CAPABILITY_SCHEMA_VERSION,
+            providers: BTreeMap::new(),
+        }
+    }
+}
+
+impl ProviderCapabilityMatrix {
+    /// Missing providers, missing features, and unknown future status values
+    /// all remain unknown so callers cannot accidentally claim support.
+    pub fn capability(
+        &self,
+        provider: &str,
+        feature: ProviderCapabilityFeature,
+    ) -> ProviderCapabilityFact {
+        let Some(capabilities) = self.providers.get(provider) else {
+            return ProviderCapabilityFact::default();
+        };
+        match feature {
+            ProviderCapabilityFeature::Plan => capabilities.plan.clone(),
+            ProviderCapabilityFeature::Subagents => capabilities.subagents.clone(),
+            ProviderCapabilityFeature::Approvals => capabilities.approvals.clone(),
+            ProviderCapabilityFeature::TranscriptSlice => capabilities.transcript_slice.clone(),
+            ProviderCapabilityFeature::ToolLifecycle => capabilities.tool_lifecycle.clone(),
+            ProviderCapabilityFeature::CurrentTarget => capabilities.current_target.clone(),
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        self.schema_version == PROVIDER_CAPABILITY_SCHEMA_VERSION
+            && self.providers.len() <= 32
+            && self.providers.iter().all(|(provider, capabilities)| {
+                valid_capability_provider(provider)
+                    && [
+                        &capabilities.plan,
+                        &capabilities.subagents,
+                        &capabilities.approvals,
+                        &capabilities.transcript_slice,
+                        &capabilities.tool_lifecycle,
+                        &capabilities.current_target,
+                    ]
+                    .into_iter()
+                    .all(valid_capability_fact)
+            })
+    }
+}
+
+/// The bundled matrix is parsed once. A malformed or unsupported contract
+/// safely degrades to an empty matrix, whose every lookup is `unknown`.
+pub fn provider_capability_matrix() -> &'static ProviderCapabilityMatrix {
+    static MATRIX: OnceLock<ProviderCapabilityMatrix> = OnceLock::new();
+    MATRIX.get_or_init(|| {
+        serde_json::from_str::<ProviderCapabilityMatrix>(PROVIDER_CAPABILITIES_JSON)
+            .ok()
+            .filter(ProviderCapabilityMatrix::is_valid)
+            .unwrap_or_default()
+    })
+}
+
+fn valid_capability_provider(provider: &str) -> bool {
+    !provider.is_empty()
+        && provider.len() <= 64
+        && provider.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        })
+}
+
+fn valid_capability_fact(fact: &ProviderCapabilityFact) -> bool {
+    match fact.status {
+        ProviderCapabilityStatus::Supported => fact.source.as_deref().is_some_and(|source| {
+            !source.is_empty() && source.len() <= 160 && !source.chars().any(char::is_control)
+        }),
+        ProviderCapabilityStatus::Unsupported | ProviderCapabilityStatus::Unknown => {
+            fact.source.is_none()
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -119,6 +263,125 @@ pub enum BlockingRequestKind {
     ClaudeQuestion,
     ClaudeElicitation,
     CodexUserInput,
+}
+
+/// A capability explicitly granted by the trusted Runtime request adapter.
+/// Missing and unknown future request types remain remote-inert by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteActionCapability {
+    Approval,
+}
+
+/// A privacy-safe, explicitly enumerated description of the operation being
+/// requested. Unknown future tools must map to `ShellUnknown`; categories do
+/// not grant remote-action capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OperationCategory {
+    #[serde(rename = "creds.access")]
+    CredentialsAccess,
+    #[serde(rename = "vcs.internal")]
+    VersionControlInternal,
+    #[serde(rename = "net.fetch_exec")]
+    NetworkFetchAndExecute,
+    #[serde(rename = "shell.remove")]
+    ShellRemove,
+    #[serde(rename = "pkg.install")]
+    PackageInstall,
+    #[serde(rename = "git.push")]
+    GitPush,
+    #[serde(rename = "file.delete")]
+    FileDelete,
+    #[serde(rename = "file.edit")]
+    FileEdit,
+    #[serde(rename = "file.create")]
+    FileCreate,
+    #[serde(rename = "proc.spawn")]
+    ProcessSpawn,
+    #[serde(rename = "net.fetch")]
+    NetworkFetch,
+    #[serde(rename = "git.readonly")]
+    GitReadOnly,
+    #[serde(rename = "shell.readonly")]
+    ShellReadOnly,
+    #[serde(rename = "shell.unknown")]
+    ShellUnknown,
+}
+
+impl OperationCategory {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CredentialsAccess => "creds.access",
+            Self::VersionControlInternal => "vcs.internal",
+            Self::NetworkFetchAndExecute => "net.fetch_exec",
+            Self::ShellRemove => "shell.remove",
+            Self::PackageInstall => "pkg.install",
+            Self::GitPush => "git.push",
+            Self::FileDelete => "file.delete",
+            Self::FileEdit => "file.edit",
+            Self::FileCreate => "file.create",
+            Self::ProcessSpawn => "proc.spawn",
+            Self::NetworkFetch => "net.fetch",
+            Self::GitReadOnly => "git.readonly",
+            Self::ShellReadOnly => "shell.readonly",
+            Self::ShellUnknown => "shell.unknown",
+        }
+    }
+
+    pub fn from_code(value: &str) -> Option<Self> {
+        match value {
+            "creds.access" => Some(Self::CredentialsAccess),
+            "vcs.internal" => Some(Self::VersionControlInternal),
+            "net.fetch_exec" => Some(Self::NetworkFetchAndExecute),
+            "shell.remove" => Some(Self::ShellRemove),
+            "pkg.install" => Some(Self::PackageInstall),
+            "git.push" => Some(Self::GitPush),
+            "file.delete" => Some(Self::FileDelete),
+            "file.edit" => Some(Self::FileEdit),
+            "file.create" => Some(Self::FileCreate),
+            "proc.spawn" => Some(Self::ProcessSpawn),
+            "net.fetch" => Some(Self::NetworkFetch),
+            "git.readonly" => Some(Self::GitReadOnly),
+            "shell.readonly" => Some(Self::ShellReadOnly),
+            "shell.unknown" => Some(Self::ShellUnknown),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttentionRiskCode {
+    #[serde(rename = "attention.risk.high_impact")]
+    HighImpact,
+    #[serde(rename = "attention.risk.irreversible")]
+    Irreversible,
+    #[serde(rename = "attention.risk.compound_syntax")]
+    CompoundSyntax,
+    #[serde(rename = "attention.risk.read_only_intent")]
+    ReadOnlyIntent,
+    #[serde(rename = "attention.risk.undo_window")]
+    UndoWindow,
+    #[serde(rename = "attention.risk.side_effects")]
+    SideEffects,
+    #[serde(rename = "attention.risk.unknown_impact")]
+    UnknownImpact,
+    #[serde(rename = "attention.risk.review_original")]
+    ReviewOriginal,
+}
+
+impl AttentionRiskCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HighImpact => "attention.risk.high_impact",
+            Self::Irreversible => "attention.risk.irreversible",
+            Self::CompoundSyntax => "attention.risk.compound_syntax",
+            Self::ReadOnlyIntent => "attention.risk.read_only_intent",
+            Self::UndoWindow => "attention.risk.undo_window",
+            Self::SideEffects => "attention.risk.side_effects",
+            Self::UnknownImpact => "attention.risk.unknown_impact",
+            Self::ReviewOriginal => "attention.risk.review_original",
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,6 +635,8 @@ pub struct BridgeRequest {
     pub provider_handles_approval: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocking_kind: Option<BlockingRequestKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_action_capability: Option<RemoteActionCapability>,
     pub term: Option<TermContext>,
     pub raw: Value,
 }
@@ -421,6 +686,12 @@ impl BridgeRequest {
         };
         let needs_reply = blocking_kind.is_some();
         let request_id = needs_reply.then(Uuid::now_v7);
+        let remote_action_capability = remote_action_capability(
+            provider,
+            event_name,
+            blocking_kind,
+            raw.get("tool_name").and_then(Value::as_str),
+        );
 
         Self {
             v: PROTOCOL_VERSION,
@@ -438,6 +709,7 @@ impl BridgeRequest {
             needs_reply,
             provider_handles_approval,
             blocking_kind,
+            remote_action_capability,
             term: terminal_context(),
             raw,
         }
@@ -487,6 +759,7 @@ impl BridgeRequest {
             needs_reply: true,
             provider_handles_approval: false,
             blocking_kind: Some(BlockingRequestKind::Permission),
+            remote_action_capability: None,
             term: None,
             raw: serde_json::json!({
                 "hook_event_name": DOCTOR_PROBE_EVENT,
@@ -528,6 +801,7 @@ impl BridgeRequest {
             needs_reply: true,
             provider_handles_approval: false,
             blocking_kind: Some(BlockingRequestKind::CodexUserInput),
+            remote_action_capability: None,
             term: None,
             raw,
         })
@@ -587,6 +861,7 @@ impl BridgeRequest {
             needs_reply: true,
             provider_handles_approval: false,
             blocking_kind: Some(BlockingRequestKind::Permission),
+            remote_action_capability: Some(RemoteActionCapability::Approval),
             term: None,
             raw,
         })
@@ -743,6 +1018,35 @@ pub fn codex_provider_handles_approval(raw: &Value) -> bool {
     )
 }
 
+/// Grants remote handling only to Provider request shapes that have been
+/// reviewed as real, request-keyed reply channels. The allowlist is kept here
+/// in the trusted adapter so a future tool that happens to emit
+/// `PermissionRequest` remains local-only until explicitly reviewed.
+fn remote_action_capability(
+    provider: Provider,
+    event_name: Option<&str>,
+    blocking_kind: Option<BlockingRequestKind>,
+    tool_name: Option<&str>,
+) -> Option<RemoteActionCapability> {
+    if event_name != Some("PermissionRequest")
+        || blocking_kind != Some(BlockingRequestKind::Permission)
+    {
+        return None;
+    }
+    let reviewed = match provider {
+        Provider::Claude => matches!(tool_name, Some("Bash" | "Write" | "Edit" | "WebFetch")),
+        // Managed Codex app-server approvals are authorized by
+        // `codex_approval_at`'s closed method match. These names cover only
+        // the separately captured external Hook compatibility path.
+        Provider::Codex => matches!(
+            tool_name,
+            Some("Bash" | "Write" | "Edit" | "WebFetch" | "exec_command" | "apply_patch")
+        ),
+        Provider::Gemini => false,
+    };
+    reviewed.then_some(RemoteActionCapability::Approval)
+}
+
 fn terminal_context() -> Option<TermContext> {
     let app = std::env::var("TERM_PROGRAM")
         .ok()
@@ -867,10 +1171,129 @@ mod tests {
     use super::*;
 
     #[test]
+    fn provider_capability_contract_matches_current_verified_sources() {
+        let matrix = provider_capability_matrix();
+        assert_eq!(
+            matrix.capability("claude", ProviderCapabilityFeature::Plan),
+            ProviderCapabilityFact {
+                status: ProviderCapabilityStatus::Supported,
+                source: Some("hook:TaskCreated/TaskCompleted".to_owned()),
+            }
+        );
+        assert_eq!(
+            matrix.capability("claude", ProviderCapabilityFeature::Subagents),
+            ProviderCapabilityFact {
+                status: ProviderCapabilityStatus::Supported,
+                source: Some("hook:SubagentStart/SubagentStop".to_owned()),
+            }
+        );
+        assert_eq!(
+            matrix
+                .capability("codex", ProviderCapabilityFeature::Subagents)
+                .status,
+            ProviderCapabilityStatus::Unknown,
+            "unverified connector item shapes must not claim support"
+        );
+        assert_eq!(
+            matrix
+                .capability("gemini", ProviderCapabilityFeature::Approvals)
+                .status,
+            ProviderCapabilityStatus::Unsupported
+        );
+        assert_eq!(
+            matrix.capability("claude", ProviderCapabilityFeature::TranscriptSlice),
+            ProviderCapabilityFact {
+                status: ProviderCapabilityStatus::Supported,
+                source: Some("hook:transcript_path/claude_jsonl_v1".to_owned()),
+            }
+        );
+        assert_eq!(
+            matrix
+                .capability("codex", ProviderCapabilityFeature::ToolLifecycle)
+                .status,
+            ProviderCapabilityStatus::Supported
+        );
+        assert_eq!(
+            matrix
+                .capability("claude", ProviderCapabilityFeature::CurrentTarget)
+                .status,
+            ProviderCapabilityStatus::Supported
+        );
+        assert_eq!(
+            matrix
+                .capability("future-provider", ProviderCapabilityFeature::Plan)
+                .status,
+            ProviderCapabilityStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn provider_capability_unknown_values_and_missing_fields_default_deny() {
+        let future = serde_json::from_value::<ProviderCapabilityFact>(serde_json::json!({
+            "status": "future-capability-state"
+        }))
+        .unwrap();
+        assert_eq!(future.status, ProviderCapabilityStatus::Unknown);
+        assert!(!future.status.can_claim_support());
+
+        let missing = serde_json::from_value::<ProviderCapabilitySet>(serde_json::json!({}))
+            .expect("missing facts are deliberately compatible");
+        assert_eq!(missing.plan.status, ProviderCapabilityStatus::Unknown);
+        assert_eq!(
+            missing.transcript_slice.status,
+            ProviderCapabilityStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn provider_capability_supported_fact_requires_a_bounded_source() {
+        let matrix = serde_json::from_value::<ProviderCapabilityMatrix>(serde_json::json!({
+            "schemaVersion": PROVIDER_CAPABILITY_SCHEMA_VERSION,
+            "providers": {
+                "claude": {
+                    "plan": {"status": "supported"}
+                }
+            }
+        }))
+        .unwrap();
+        assert!(
+            !matrix.is_valid(),
+            "a support claim without factual provenance must be rejected"
+        );
+    }
+
+    #[test]
+    fn operation_categories_and_risk_codes_use_stable_wire_values() {
+        assert_eq!(
+            serde_json::to_value(OperationCategory::NetworkFetchAndExecute).unwrap(),
+            serde_json::json!("net.fetch_exec")
+        );
+        assert_eq!(
+            serde_json::to_value(AttentionRiskCode::HighImpact).unwrap(),
+            serde_json::json!("attention.risk.high_impact")
+        );
+        assert_eq!(
+            OperationCategory::from_code("future.category"),
+            None,
+            "unknown future categories must remain default-deny"
+        );
+    }
+
+    #[test]
     fn detects_supported_hook_reply_requests_as_blocking() {
         let permission = BridgeRequest::from_hook(
             Provider::Claude,
-            serde_json::json!({"hook_event_name": "PermissionRequest"}),
+            serde_json::json!({
+                "hook_event_name": "PermissionRequest",
+                "tool_name": "Bash"
+            }),
+        );
+        let unknown_permission = BridgeRequest::from_hook(
+            Provider::Claude,
+            serde_json::json!({
+                "hook_event_name": "PermissionRequest",
+                "tool_name": "FutureAutonomousTool"
+            }),
         );
         let stop = BridgeRequest::from_hook(
             Provider::Claude,
@@ -898,6 +1321,12 @@ mod tests {
 
         assert!(permission.needs_reply);
         assert_eq!(
+            permission.remote_action_capability,
+            Some(RemoteActionCapability::Approval)
+        );
+        assert!(unknown_permission.needs_reply);
+        assert_eq!(unknown_permission.remote_action_capability, None);
+        assert_eq!(
             question.blocking_kind,
             Some(BlockingRequestKind::ClaudeQuestion)
         );
@@ -906,7 +1335,9 @@ mod tests {
             Some(BlockingRequestKind::ClaudeElicitation)
         );
         assert!(!codex_question.needs_reply);
+        assert_eq!(codex_question.remote_action_capability, None);
         assert!(!stop.needs_reply);
+        assert_eq!(stop.remote_action_capability, None);
     }
 
     #[test]
@@ -944,6 +1375,7 @@ mod tests {
             assert!(!request.needs_reply);
             assert_eq!(request.request_id, None);
             assert_eq!(request.blocking_kind, None);
+            assert_eq!(request.remote_action_capability, None);
         }
 
         let user = BridgeRequest::from_hook_at(
@@ -951,6 +1383,7 @@ mod tests {
             serde_json::json!({
                 "hook_event_name":"PermissionRequest",
                 "session_id":"user",
+                "tool_name":"Bash",
                 "approvals_reviewer":"user",
                 "permission_mode":"default"
             }),
@@ -959,6 +1392,10 @@ mod tests {
         assert!(!user.provider_handles_approval);
         assert!(user.needs_reply);
         assert_eq!(user.blocking_kind, Some(BlockingRequestKind::Permission));
+        assert_eq!(
+            user.remote_action_capability,
+            Some(RemoteActionCapability::Approval)
+        );
     }
 
     #[test]
@@ -977,6 +1414,7 @@ mod tests {
         assert!(!request.needs_reply);
         assert_eq!(request.blocking_kind, None);
         assert_eq!(request.request_id, None);
+        assert_eq!(request.remote_action_capability, None);
         assert!(!request.provider_handles_approval);
     }
 
@@ -1002,6 +1440,7 @@ mod tests {
         assert!(!request.needs_reply);
         assert_eq!(request.request_id, None);
         assert_eq!(request.blocking_kind, None);
+        assert_eq!(request.remote_action_capability, None);
         assert!(!request.provider_handles_approval);
     }
 
@@ -1023,6 +1462,10 @@ mod tests {
         assert!(request.needs_reply);
         assert_eq!(request.role, "managed");
         assert_eq!(request.blocking_kind, Some(BlockingRequestKind::Permission));
+        assert_eq!(
+            request.remote_action_capability,
+            Some(RemoteActionCapability::Approval)
+        );
         assert_eq!(
             request.raw["_codex_server_request_method"],
             "item/commandExecution/requestApproval"

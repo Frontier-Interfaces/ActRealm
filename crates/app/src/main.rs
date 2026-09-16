@@ -164,6 +164,8 @@ struct ServeLaunch {
     open: bool,
     api_bind: SocketAddr,
     bootstrap_token: Option<String>,
+    session_token: Option<String>,
+    csrf_token: Option<String>,
     restart_count: u32,
     restart_state_path: Option<PathBuf>,
 }
@@ -183,6 +185,10 @@ struct RestartState {
     api_enabled: bool,
     api_bind: SocketAddr,
     bootstrap_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    csrf_token: Option<String>,
     restart_count: u32,
 }
 
@@ -1127,6 +1133,10 @@ fn parse_approval_mode(value: &str) -> Result<ApprovalMode> {
     }
 }
 
+fn valid_restart_secret(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn load_serve_launch(
     socket: Option<PathBuf>,
     approval: ApprovalMode,
@@ -1141,6 +1151,8 @@ fn load_serve_launch(
             open,
             api_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             bootstrap_token: None,
+            session_token: None,
+            csrf_token: None,
             restart_count: 0,
             restart_state_path: None,
         });
@@ -1169,6 +1181,11 @@ fn load_serve_launch(
     let state: RestartState =
         serde_json::from_slice(&payload).context("failed to parse restart state")?;
     let now = now_millis();
+    let preserved_auth_valid = match (&state.session_token, &state.csrf_token) {
+        (None, None) => true,
+        (Some(session), Some(csrf)) => valid_restart_secret(session) && valid_restart_secret(csrf),
+        _ => false,
+    };
     if state.schema_version != 1
         || !state.api_enabled
         || now.saturating_sub(state.created_at) > RESTART_STATE_TTL_MS
@@ -1176,6 +1193,7 @@ fn load_serve_launch(
         || !state.api_bind.ip().is_loopback()
         || state.api_bind.port() == 0
         || Uuid::parse_str(&state.bootstrap_token).is_err()
+        || !preserved_auth_valid
     {
         anyhow::bail!("restart state is invalid or expired");
     }
@@ -1186,6 +1204,8 @@ fn load_serve_launch(
         open: false,
         api_bind: state.api_bind,
         bootstrap_token: Some(state.bootstrap_token),
+        session_token: state.session_token,
+        csrf_token: state.csrf_token,
         restart_count: state.restart_count,
         restart_state_path: Some(state_path),
     })
@@ -1196,6 +1216,8 @@ fn write_restart_state(
     launch: &ServeLaunch,
     bootstrap_token: &str,
     api_bind: SocketAddr,
+    session_token: Option<String>,
+    csrf_token: Option<String>,
 ) -> Result<PathBuf> {
     let directory = paths
         .lock
@@ -1210,6 +1232,8 @@ fn write_restart_state(
         api_enabled: launch.api_enabled,
         api_bind,
         bootstrap_token: bootstrap_token.to_owned(),
+        session_token,
+        csrf_token,
         restart_count: launch.restart_count.saturating_add(1),
     };
     let mut file = OpenOptions::new()
@@ -1276,11 +1300,14 @@ fn serve(launch: ServeLaunch) -> Result<ServeOutcome> {
                 ApiServerConfig {
                     bind: launch.api_bind,
                     bootstrap_token: launch.bootstrap_token.clone(),
+                    initial_session_token: launch.session_token.clone(),
+                    initial_csrf_token: launch.csrf_token.clone(),
                     runtime_started_at,
                     restart_count: launch.restart_count,
                     commit_delay: commit_delay(),
                     enable_codex_connector: true,
                     enable_claude_oauth_quota: true,
+                    enable_live_usage_pricing: true,
                     runtime_restart: Some(RuntimeRestartHandle::new(
                         restart_sender,
                         socket_path.clone(),
@@ -1337,13 +1364,22 @@ fn serve(launch: ServeLaunch) -> Result<ServeOutcome> {
         let Some(stream) = listener.incoming().next() else {
             break;
         };
-        if let Ok(request) = restart_receiver.try_recv() {
+        let mut accepted_restart = None;
+        while let Ok(request) = restart_receiver.try_recv() {
+            if request.try_accept() {
+                accepted_restart = Some(request);
+                break;
+            }
+        }
+        if let Some(request) = accepted_restart {
             drop(stream);
             let state_path = match write_restart_state(
                 &paths,
                 &launch,
                 &request.bootstrap_token,
                 request.api_bind,
+                request.session_token.clone(),
+                request.csrf_token.clone(),
             ) {
                 Ok(path) => path,
                 Err(error) => {
@@ -1821,6 +1857,8 @@ mod tests {
             api_enabled: true,
             api_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 43121),
             bootstrap_token: Uuid::now_v7().to_string(),
+            session_token: Some("a".repeat(64)),
+            csrf_token: Some("b".repeat(64)),
             restart_count: 3,
         };
         let mut file = OpenOptions::new()
@@ -1863,6 +1901,14 @@ mod tests {
         assert_eq!(launch.api_bind.port(), 43121);
         assert_eq!(launch.restart_count, 3);
         assert!(launch.bootstrap_token.is_some());
+        assert_eq!(
+            launch.session_token.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            launch.csrf_token.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
         assert_eq!(launch.restart_state_path.as_deref(), Some(path.as_path()));
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
@@ -1902,6 +1948,8 @@ mod tests {
             open: false,
             api_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 43121),
             bootstrap_token: None,
+            session_token: None,
+            csrf_token: None,
             restart_count: 0,
             restart_state_path: None,
         };
@@ -1910,6 +1958,8 @@ mod tests {
             &launch,
             &Uuid::now_v7().to_string(),
             launch.api_bind,
+            None,
+            None,
         )
         .unwrap();
         let parent_mode = fs::metadata(&root).unwrap().permissions().mode() & 0o777;

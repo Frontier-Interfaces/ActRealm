@@ -171,6 +171,7 @@ for locale in ("en", "zh-Hans"):
         )
 
 web_text = (root / "web/app.js").read_text(encoding="utf-8")
+web_agent_detail_text = (root / "web/agent-detail.js").read_text(encoding="utf-8")
 try:
     web_registry = web_text.split("const RUNTIME_MESSAGES_ZH = {", 1)[1].split(
         "\n};", 1
@@ -255,8 +256,10 @@ if not display_fields_match:
     raise SystemExit("error: Runtime task-card display-field registry was not found")
 display_field_ids = set(re.findall(r'"([^"]+)"', display_fields_match.group(1)))
 try:
-    web_display_registry = web_text.split("const DISPLAY_FIELDS_ZH = {", 1)[1].split(
-        "\n};", 1
+    web_display_registry = web_agent_detail_text.split(
+        "const displayFieldsZh = Object.freeze({", 1
+    )[1].split(
+        "\n  });", 1
     )[0]
 except IndexError as error:
     raise SystemExit("error: Web display-field registry was not found") from error
