@@ -2,10 +2,10 @@
 
 Last reviewed: 2026-09-17
 
-## 2026-09-17 English follow-up — build 122
+## 2026-09-17 English follow-up — build 123
 
-Build 122 fills missing Data settings, pricing-source and quota tooltip
-translations, fixes singular quota labels, and extends the native localization
+Build 123 fills missing Data settings, pricing-source and quota tooltip
+translations, fixes singular quota and task-count labels, and extends the native localization
 guard to custom view labels. The installed candidate was inspected in English;
 404 Rust and 211 Swift tests and the required local gates passed. Follow system
 remains the default, while explicit language choices stay local.

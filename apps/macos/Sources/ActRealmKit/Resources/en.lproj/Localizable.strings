@@ -1561,9 +1561,9 @@
 "来源：本机事实账本" = "Source: local factual ledger";
 "按项目" = "By project";
 "还没有可归因的项目用量" = "No attributable project usage yet";
-"%lld 个任务" = "%lld tasks";
-"%lld 个任务 · %lld 个会话" = "%lld tasks · %lld sessions";
-"%lld 个历史会话" = "%lld historical sessions";
+"%lld 个任务" = "Tasks: %lld";
+"%lld 个任务 · %lld 个会话" = "Tasks: %lld · Sessions: %lld";
+"%lld 个历史会话" = "Historical sessions: %lld";
 "按任务" = "By task";
 "还没有可归因的任务用量" = "No attributable task usage yet";
 "当前燃烧速度" = "Current burn rate";

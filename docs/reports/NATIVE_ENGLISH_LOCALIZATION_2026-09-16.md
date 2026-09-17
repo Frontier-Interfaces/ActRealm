@@ -75,3 +75,19 @@ The public review is [PR #10](https://github.com/Frontier-Interfaces/ActRealm/pu
 against `agent/v1-full`; current CI and the final installed commit are recorded
 in that PR's validation section. This local inspection does not qualify a
 public release or the deferred long-sleep credential-recovery scenarios.
+
+### Final count copy and CI observation
+
+Build 123 also uses `Tasks: 1 · Sessions: 1` style labels in project attribution,
+avoiding incorrect English plurals when only one task or session is present.
+The installed build 122 Token dashboard was checked for the translated
+`Pricing sources` label and English date axes before this final copy change.
+
+The initial GitHub run stalled in
+`claude_auth::tests::blocked_login_prompt_is_bounded_and_never_accepted` and was
+cancelled when the next commit started. The next GitHub run passed the Rust and
+Swift suites. The unchanged short-deadline login test also passed 100 consecutive
+local attempts. Local sampling of a separate slow renewal fixture showed launch
+delay, not the original CI hang; the cause of that hang is not established.
+No test was ignored, no timeout was relaxed in the delivered source, and no
+speculative Runtime change was made. Preserve this observation if it recurs.
