@@ -150,8 +150,14 @@ public enum AppLocalization {
         guard let message else {
             return localizedProviderText(fallback, language: language)
         }
-        let template = localized(message.code, language: language)
-        guard template != message.code else {
+        let singularQuotaWindows: Set<String> = [
+            "quota.window.months", "quota.window.weeks", "quota.window.days",
+            "quota.window.hours", "quota.window.minutes", "quota.window.scoped_weeks",
+        ]
+        let key = message.args["count"] == "1" && singularQuotaWindows.contains(message.code)
+            ? "\(message.code).one" : message.code
+        let template = localized(key, language: language)
+        guard template != key else {
             return localizedProviderText(fallback, language: language)
         }
         return message.args.reduce(template) { result, pair in

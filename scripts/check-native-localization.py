@@ -9,7 +9,11 @@ sources = root / "apps/macos/Sources"
 catalog = sources / "ActRealmKit/Resources/en.lproj/Localizable.strings"
 entries = dict(re.findall(r'^"((?:[^"\\]|\\.)*)"\s*=\s*"((?:[^"\\]|\\.)*)";', catalog.read_text(), re.M))
 han = re.compile(r"[\u3400-\u9fff]")
-literal = re.compile(r'\b(?:Text|Button|Label|Toggle|Section|Picker|TextField|Menu|Window|navigationTitle|help|alert|LocalizedStringKey)\(\s*"((?:[^"\\]|\\.)*)"', re.S)
+literal = re.compile(r'\b(?:Text|Button|Label|Toggle|Section|Picker|TextField|Menu|Window|navigationTitle|help|alert|LocalizedStringKey|SettingsLabel)\(\s*"((?:[^"\\]|\\.)*)"', re.S)
+# App-owned view wrappers pass their copy through named arguments or metric's
+# second argument, so checking only SwiftUI initializers misses visible text.
+view_argument = re.compile(r'\b(?:title|subtitle|label|detail):\s*"((?:[^"\\]|\\.)*)"', re.S)
+metric_label = re.compile(r'\bmetric\([^\n]*,\s*"((?:[^"\\]|\\.)*)"\s*\)')
 errors = []
 entry_line = re.compile(r'^"(?:[^"\\]|\\.)*"\s*=\s*"(?:[^"\\]|\\.)*";\s*$')
 for locale in ("en", "zh-Hans"):
@@ -31,7 +35,11 @@ for path in sorted(sources.rglob("*.swift")):
     if "SnapshotTool" in path.parts:
         continue
     text = path.read_text()
-    for match in literal.finditer(text):
+    matches = list(literal.finditer(text))
+    if "ActRealmUI" in path.parts:
+        matches.extend(view_argument.finditer(text))
+        matches.extend(metric_label.finditer(text))
+    for match in matches:
         key = match[1]
         if han.search(key) and "\\(" not in key and key not in entries:
             line = text.count("\n", 0, match.start()) + 1

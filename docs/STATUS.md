@@ -1,6 +1,20 @@
 # ActRealm current status
 
-Last reviewed: 2026-09-16
+Last reviewed: 2026-09-17
+
+## 2026-09-17 English follow-up — build 122
+
+Build 122 fills missing Data settings, pricing-source and quota tooltip
+translations, fixes singular quota labels, and extends the native localization
+guard to custom view labels. The installed candidate was inspected in English;
+404 Rust and 211 Swift tests and the required local gates passed. Follow system
+remains the default, while explicit language choices stay local.
+
+The public candidate is under review in
+[PR #10](https://github.com/Frontier-Interfaces/ActRealm/pull/10), targeting
+`agent/v1-full`. CI status is tracked in the PR. Earlier uncommitted/local-only
+notes below describe the state at those milestones; the candidate source is
+now included in this PR. No merge or public release is implied.
 
 ## 2026-09-16 System-default language and English UI — build 121
 

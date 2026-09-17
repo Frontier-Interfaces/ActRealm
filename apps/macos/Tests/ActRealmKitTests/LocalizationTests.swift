@@ -4,6 +4,21 @@ import Testing
 @testable import ActRealmUI
 
 @Suite struct LocalizationTests {
+    @Test func quotaWindowsUseSingularAndPluralEnglishWithoutChangingNames() {
+        for unit in ["month", "week", "day", "hour", "minute"] {
+            for count in ["1", "2"] {
+                let message = RuntimeMessage(code: "quota.window.\(unit)s", args: ["count": count])
+                #expect(AppLocalization.localizedRuntimeMessage(message, fallback: "unused", language: .english)
+                    == "\(count) \(unit)\(count == "1" ? "" : "s")")
+            }
+        }
+        let scoped = RuntimeMessage(code: "quota.window.scoped_weeks", args: ["count": "1", "name": "Fable"])
+        #expect(AppLocalization.localizedRuntimeMessage(scoped, fallback: "unused", language: .english) == "Fable · 1 week")
+        #expect(AppLocalization.localizedRuntimeMessage(scoped, fallback: "unused", language: .simplifiedChinese) == "Fable · 1 周")
+        let unknown = RuntimeMessage(code: "provider.custom", args: ["count": "1"])
+        #expect(AppLocalization.localizedRuntimeMessage(unknown, fallback: "Provider title", language: .english) == "Provider title")
+    }
+
     @Test func freshAndInvalidPreferencesFollowTheSystemByDefault() {
         let suite = "ActRealmLanguageDefaults.\(UUID())"
         let defaults = UserDefaults(suiteName: suite)!

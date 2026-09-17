@@ -1220,7 +1220,7 @@
 "设备身份在密钥注册期间发生变化。" = "The device identity changed while registering the key.";
 "允许处理 Agent 请求" = "Allow Agent request actions";
 "仅为这次新配对授予审批、拒绝、交回原 Agent 和问题回答能力" = "Allow this new pairing to approve, deny, hand back requests, and answer questions";
-"通过本机加密令牌读取任务状态；不共享 ActRealm Cookie 或数据库" = "Reads Task status through an encrypted local token; no ActRealm Cookie or database is shared";
+"通过本机加密令牌读取任务状态；不共享 ActRealm Cookie 或数据库" = "Uses a local access token. It does not receive the ActRealm session cookie or database.";
 "生成配对码" = "Create Pairing Code";
 "显示器伴生应用配对码已复制" = "Display Companion pairing code copied";
 "5 分钟内粘贴到显示器伴生应用的 Agent 页面；配对码只能使用一次。" = "Paste this into the display Companion Agent page within five minutes. The code can be used only once.";
@@ -1933,3 +1933,15 @@
 "1M / 分钟" = "1M / min";
 
 "万 / 亿" = "Chinese units";
+
+/* Singular quota windows for native presentation. */
+"quota.window.months.one" = "{count} month";
+"quota.window.weeks.one" = "{count} week";
+"quota.window.days.one" = "{count} day";
+"quota.window.hours.one" = "{count} hour";
+"quota.window.minutes.one" = "{count} minute";
+"quota.window.scoped_weeks.one" = "{name} · {count} week";
+
+"ActRealm 修改 Agent 配置前创建；不会自动删除" = "Created before ActRealm changes agent settings; kept until you delete them";
+"原生呈现 p95" = "UI latency (p95)";
+"价格依据" = "Pricing sources";

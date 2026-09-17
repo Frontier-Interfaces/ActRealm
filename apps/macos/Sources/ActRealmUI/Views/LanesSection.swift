@@ -3057,7 +3057,9 @@ struct QuotaSection: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(model.isQuotaRefreshBusy || !model.canControlRuntime)
-                .help(Text(model.quotaRefreshMessage ?? "更新 Claude 额度"))
+                .help(Text(model.quotaRefreshMessage ?? AppLocalization.localized(
+                    "更新 Claude 额度", language: model.appLanguage
+                )))
                 .accessibilityLabel(Text("更新 Claude 额度"))
             }
             if let message = model.quotaRefreshMessage {

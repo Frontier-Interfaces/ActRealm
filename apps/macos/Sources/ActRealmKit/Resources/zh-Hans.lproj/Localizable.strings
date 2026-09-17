@@ -1292,3 +1292,15 @@
 "1M / 分钟" = "1M / 分钟";
 
 "万 / 亿" = "万 / 亿";
+
+/* Singular quota windows for native presentation. */
+"quota.window.months.one" = "{count} 个月";
+"quota.window.weeks.one" = "{count} 周";
+"quota.window.days.one" = "{count} 天";
+"quota.window.hours.one" = "{count} 小时";
+"quota.window.minutes.one" = "{count} 分钟";
+"quota.window.scoped_weeks.one" = "{name} · {count} 周";
+
+"ActRealm 修改 Agent 配置前创建；不会自动删除" = "ActRealm 修改 Agent 配置前创建；不会自动删除";
+"原生呈现 p95" = "原生呈现 p95";
+"价格依据" = "价格依据";

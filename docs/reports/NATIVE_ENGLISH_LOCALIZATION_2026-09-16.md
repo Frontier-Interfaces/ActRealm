@@ -48,3 +48,30 @@ lockfile before publication.
 Validation results and installed-app observations are appended in the local
 artifact copy after completion. Real long-sleep/expired-Claude-credential
 recovery and public release qualification remain outside this English UI pass.
+
+## 2026-09-17 follow-up — build 122
+
+Live inspection of build 121 found missing English text in Data settings and
+an untranslated quota refresh tooltip. The follow-up fills those entries plus
+the Token dashboard pricing-source label, corrects singular quota windows such
+as `Fable · 1 week`, and clarifies the local Companion access-token description.
+The localization guard now also checks app-owned view wrapper arguments and
+metric labels, which previously escaped the static SwiftUI literal scan.
+
+The updated source passed 404 Rust tests (3 explicitly ignored), 211 Swift
+tests, formatting, Clippy with warnings denied, the release build, dependency
+audit with warnings denied, language/workflow contracts and resource parsing.
+
+The build 122 candidate was installed and inspected locally on September 17.
+The live main window showed singular weekly limits and the translated refresh
+label. Data settings showed English backup help and UI latency labels with no
+clipping in the inspected window. Settings and native menus opened in English,
+and the local Runtime reconnected. Existing task titles and questions remained
+in their original language. A regression test covers absent/invalid language
+preferences falling back to System and explicit English overriding Chinese
+system preferences.
+
+The public review is [PR #10](https://github.com/Frontier-Interfaces/ActRealm/pull/10)
+against `agent/v1-full`; current CI and the final installed commit are recorded
+in that PR's validation section. This local inspection does not qualify a
+public release or the deferred long-sleep credential-recovery scenarios.

@@ -908,11 +908,13 @@ public struct QuotaSlot: Identifiable, Equatable, Sendable {
         if let name = entry.limitName, !name.isEmpty { return name }
         if let minutes = entry.windowMinutes, minutes > 0 {
             if (40_320 ... 44_640).contains(minutes) { return "1 month" }
-            if minutes.isMultiple(of: 43_200) { return "\(minutes / 43_200) months" }
-            if minutes.isMultiple(of: 10_080) { return "\(minutes / 10_080) weeks" }
-            if minutes.isMultiple(of: 1_440) { return "\(minutes / 1_440) days" }
-            if minutes.isMultiple(of: 60) { return "\(minutes / 60) hours" }
-            return "\(minutes) minutes"
+            for (unitMinutes, unit) in [(UInt64(43_200), "month"), (10_080, "week"),
+                                        (1_440, "day"), (60, "hour"), (1, "minute")] {
+                if minutes.isMultiple(of: unitMinutes) {
+                    let count = minutes / unitMinutes
+                    return "\(count) \(unit)\(count == 1 ? "" : "s")"
+                }
+            }
         }
         switch entry.window {
         case "5h": return "5 hours"
