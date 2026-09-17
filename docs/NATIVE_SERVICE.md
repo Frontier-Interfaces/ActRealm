@@ -23,7 +23,7 @@ restrictions remain effective.
 
 The apps use the private `~/.actrealm/run/native-clients.sock` socket. Both ends
 verify the same user and the kernel-supplied audit token, then validate the
-live peer's code signature. Runtime accepts only these signing identifiers
+live peer's code signature and Hardened Runtime flag. Runtime accepts only these signing identifiers
 from its own developer team:
 
 - `com.frontierinterfaces.actrealm`

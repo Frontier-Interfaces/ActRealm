@@ -255,6 +255,7 @@ enum LocalRuntimeService {
         guard SecStaticCodeCreateWithPath(url as CFURL, [], &code) == errSecSuccess, let code,
               SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), try requirement(team: team)) == errSecSuccess
         else { throw LocalRuntimeServiceError.untrusted }
+        try verifyHardened(code)
     }
 
     private static func verifyPeer(fd: Int32, team: String) throws {
@@ -271,6 +272,18 @@ enum LocalRuntimeService {
         guard SecCodeCopyGuestWithAttributes(nil, attributes, [], &code) == errSecSuccess, let code,
               SecCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), try requirement(team: team)) == errSecSuccess
         else { throw LocalRuntimeServiceError.untrusted }
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode else {
+            throw LocalRuntimeServiceError.untrusted
+        }
+        try verifyHardened(staticCode)
+    }
+
+    private static func verifyHardened(_ code: SecStaticCode) throws {
+        var information: CFDictionary?
+        guard SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
+              let flags = (information as? [String: Any])?[kSecCodeInfoFlags as String] as? NSNumber,
+              flags.uint32Value & 0x10000 != 0 else { throw LocalRuntimeServiceError.untrusted }
     }
 }
 

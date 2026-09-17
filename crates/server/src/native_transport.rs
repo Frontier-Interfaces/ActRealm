@@ -218,6 +218,7 @@ pub mod signing {
         ) -> Ref;
         fn CFDictionarySetValue(dictionary: Ref, key: Ref, value: Ref);
         fn CFDictionaryGetValue(dictionary: Ref, key: Ref) -> Ref;
+        fn CFNumberGetValue(number: Ref, kind: isize, value: *mut c_void) -> bool;
         static kCFTypeDictionaryKeyCallBacks: u8;
         static kCFTypeDictionaryValueCallBacks: u8;
     }
@@ -238,6 +239,7 @@ pub mod signing {
         fn SecRequirementCreateWithString(text: Ref, flags: u32, requirement: *mut Ref) -> i32;
         static kSecGuestAttributeAudit: Ref;
         static kSecCodeInfoTeamIdentifier: Ref;
+        static kSecCodeInfoFlags: Ref;
     }
     const UTF8: u32 = 0x08000100;
     fn denied() -> io::Error {
@@ -268,6 +270,28 @@ pub mod signing {
         if unsafe { SecCodeCheckValidity(code, 1 << 4, requirement.0) } != 0 {
             return Err(denied());
         }
+        let mut static_code = ptr::null();
+        if unsafe { SecCodeCopyStaticCode(code, 0, &mut static_code) } != 0 {
+            return Err(denied());
+        }
+        let static_code = Owned(static_code);
+        require_hardened(static_code.0)?;
+        Ok(())
+    }
+    fn require_hardened(code: Ref) -> io::Result<()> {
+        let mut info = ptr::null();
+        if unsafe { SecCodeCopySigningInformation(code, 1 << 1, &mut info) } != 0 {
+            return Err(denied());
+        }
+        let info = Owned(info);
+        let number = unsafe { CFDictionaryGetValue(info.0, kSecCodeInfoFlags) };
+        let mut flags: u32 = 0;
+        if number.is_null()
+            || !unsafe { CFNumberGetValue(number, 3, (&raw mut flags).cast()) }
+            || flags & 0x10000 == 0
+        {
+            return Err(denied());
+        }
         Ok(())
     }
     pub fn validate_binary(path: &std::path::Path, team: &str, identifier: &str) -> io::Result<()> {
@@ -284,6 +308,9 @@ pub mod signing {
         let requirement = requirement(team, identifier)?;
         if unsafe { SecStaticCodeCheckValidity(code.0, 1 << 4, requirement.0) } != 0 {
             return Err(denied());
+        }
+        if identifier == RUNTIME_IDENTIFIER {
+            require_hardened(code.0)?;
         }
         Ok(())
     }
