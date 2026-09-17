@@ -33,6 +33,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+mod service;
+
 const PROVIDER_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
@@ -48,8 +50,16 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Ensure or inspect the independent local native Runtime service.
+    Service {
+        #[arg(value_enum)]
+        action: service::Action,
+    },
     /// Run the local runtime and control panel.
     Serve {
+        /// Launched by the per-user service; never print bootstrap credentials.
+        #[arg(long, hide = true)]
+        service: bool,
         #[arg(long, value_enum, default_value_t = ApprovalMode::Widget)]
         approval: ApprovalMode,
         #[arg(long)]
@@ -197,16 +207,18 @@ const RESTART_STATE_TTL_MS: u64 = 30_000;
 
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Service { action } => service::run(action),
         Command::Serve {
+            service,
             approval,
             socket,
             open,
             restart_state,
         } => {
             let launch = load_serve_launch(socket, approval, open, restart_state)?;
-            match serve(launch)? {
+            match serve(launch, service)? {
                 ServeOutcome::Stopped => Ok(()),
-                ServeOutcome::Restart(state_path) => replace_runtime_process(&state_path),
+                ServeOutcome::Restart(state_path) => replace_runtime_process(&state_path, service),
             }
         }
         Command::Hook { provider, socket } => {
@@ -1247,18 +1259,19 @@ fn write_restart_state(
     Ok(state_path)
 }
 
-fn replace_runtime_process(state_path: &Path) -> Result<()> {
+fn replace_runtime_process(state_path: &Path, service: bool) -> Result<()> {
     let executable = std::env::current_exe().context("failed to locate Runtime executable")?;
-    let error = std::process::Command::new(executable)
-        .arg("serve")
-        .arg("--restart-state")
-        .arg(state_path)
-        .exec();
+    let mut command = std::process::Command::new(executable);
+    command.arg("serve").arg("--restart-state").arg(state_path);
+    if service {
+        command.arg("--service");
+    }
+    let error = command.exec();
     let _ = fs::remove_file(state_path);
     Err(error).context("failed to replace Runtime process")
 }
 
-fn serve(launch: ServeLaunch) -> Result<ServeOutcome> {
+fn serve(launch: ServeLaunch, service: bool) -> Result<ServeOutcome> {
     let socket_path = launch.socket_path.clone();
     let approval = launch.approval;
     let open = launch.open;
@@ -1298,6 +1311,7 @@ fn serve(launch: ServeLaunch) -> Result<ServeOutcome> {
                 store.clone(),
                 waiters.clone(),
                 ApiServerConfig {
+                    enable_native_clients: true,
                     bind: launch.api_bind,
                     bootstrap_token: launch.bootstrap_token.clone(),
                     initial_session_token: launch.session_token.clone(),
@@ -1326,11 +1340,13 @@ fn serve(launch: ServeLaunch) -> Result<ServeOutcome> {
     }
     let mut runtime_output = io::stdout().lock();
     if let Some(api) = api.as_ref() {
-        let _ = writeln!(
-            runtime_output,
-            "ActRealm control panel: {}",
-            api.bootstrap_url()
-        );
+        if !service {
+            let _ = writeln!(
+                runtime_output,
+                "ActRealm control panel: {}",
+                api.bootstrap_url()
+            );
+        }
         if open {
             let _ = std::process::Command::new("open")
                 .arg(api.bootstrap_url())

@@ -5,7 +5,7 @@ Native SwiftUI/AppKit client for the local `actrealm` Runtime.
 ## Responsibilities
 
 - render Attention, tasks, quota, settings, menu-bar, and HUD surfaces;
-- supervise the bundled Runtime helper and connect through its authenticated
+- ensure the independent per-user Runtime service and connect through its authenticated
   loopback API and WebSocket;
 - execute macOS-only Agent Focus through `NSWorkspace` and AppKit, including
   pointer acceptance and bounded Stage Manager state restoration;
@@ -91,3 +91,7 @@ clean macOS 26 Apple Silicon account or VM.
 - `Sources/ActRealmApp/`: app, window, menu-bar, and lifecycle entry point;
 - `Sources/SnapshotTool/`: deterministic UI snapshot utility;
 - `Tests/ActRealmKitTests/`: model, decoding, scheduling, and bootstrap tests;
+
+Native client registration now uses the private signed-peer channel described in
+[Independent native service](../../docs/NATIVE_SERVICE.md). Closing ActRealm
+disconnects its UI only. The pairing management UI has been removed.

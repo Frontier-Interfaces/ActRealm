@@ -21,6 +21,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+axum-server = { version = "=0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
+rcgen = { version = "=0.14.8", default-features = false, features = ["crypto", "ring"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 
 [dev-dependencies]
 futures-util = "0.3"

@@ -1945,3 +1945,19 @@
 "ActRealm 修改 Agent 配置前创建；不会自动删除" = "Created before ActRealm changes agent settings; kept until you delete them";
 "原生呈现 p95" = "UI latency (p95)";
 "价格依据" = "Pricing sources";
+
+/* Independent local service. */
+"诊断仅覆盖本机 Runtime、Agent 接入和本机客户端。" = "Diagnostics cover the local Runtime, Agent connections and local clients.";
+"本机客户端" = "Local clients";
+"无客户端访问记录" = "No client access records";
+"协议 v%lld · %lld 条访问记录 · %@" = "Protocol v%lld · %lld access records · %@";
+"由本机应用自动连接；停用后需主动启用" = "Local apps connect automatically; disabled access must be enabled explicitly";
+"只在本机按需读取；不会发送到其他本机应用" = "Read locally on demand; not sent to other local apps";
+
+/* Native service connection failures. */
+"本机 Runtime 不可用，请重新连接。" = "Local Runtime is unavailable. Reconnect to try again.";
+"无法验证本机应用或 Runtime 的签名。" = "The app or Runtime signature could not be verified.";
+"本机 Agent 访问已停用，请在当前应用中主动启用。" = "Local Agent access is disabled. Enable it in this app to reconnect.";
+"本机 Runtime 版本需要更新。" = "The local Runtime needs an update.";
+"旧版 Runtime 仍在运行，请退出旧版应用后更新服务。" = "An older Runtime is running. Quit the older app before updating the service.";
+"无法启动本机 Runtime，请检查后台项目设置和诊断日志。" = "Could not start the local Runtime. Check background-item settings and diagnostics.";

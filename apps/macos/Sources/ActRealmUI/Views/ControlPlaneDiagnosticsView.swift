@@ -119,7 +119,7 @@ struct ControlPlaneDiagnosticsView: View {
                     .font(.system(size: 10.5, weight: .semibold))
                     .foregroundStyle(DT.textPrimary)
                 Text(localized(
-                    "诊断仅覆盖本机 Runtime、Agent 接入和伴生应用。",
+                    "诊断仅覆盖本机 Runtime、Agent 接入和本机客户端。",
                     locale: locale
                 ))
                     .font(DT.body(9.5))
@@ -326,7 +326,7 @@ struct ControlPlaneDiagnosticsView: View {
 
     private var protocolText: String {
         guard let status = model.runtimeStatus else { return "尚无数据" }
-        return "API v\(status.schemaVersion) · Companion v\(status.protocolVersion ?? 0)"
+        return "API v\(status.schemaVersion) · Runtime v\(status.protocolVersion ?? 0)"
     }
 
     private var instanceText: String {
@@ -468,27 +468,27 @@ struct ControlPlaneDiagnosticsView: View {
         guard let companion = model.runtimeStatus?.companion else {
             return unavailableLayer(
                 id: "companion",
-                title: "Companion",
+                title: "本机客户端",
                 symbol: "display.2"
             )
         }
         let good = companion.status == "ready"
         let scopes = companion.scopes.isEmpty
-            ? localized("无已配对客户端", locale: locale)
+            ? localized("无客户端访问记录", locale: locale)
             : companion.scopes.joined(separator: ", ")
         return DiagnosticLayerPresentation(
             id: "companion",
-            title: "Companion",
+            title: "本机客户端",
             status: good ? "正常" : "不可用",
             detail: localizedFormat(
-                "协议 v%lld · %lld 个客户端 · %@",
+                "协议 v%lld · %lld 条访问记录 · %@",
                 locale: locale,
                 Int64(companion.protocolVersion),
                 Int64(companion.registrations),
                 scopes
             ),
             metadata: "source: runtime:companion-auth (token hash only)",
-            recovery: "在设置中配对或撤销",
+            recovery: "由本机应用自动连接；停用后需主动启用",
             symbol: "display.2",
             tone: good ? .good : .bad
         )

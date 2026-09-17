@@ -586,7 +586,7 @@ fn health_monitor_is_authenticated_and_restart_input_is_strict() {
     let public = request(address, "GET", "/api/v1/health", &[], None);
     assert_eq!(public.status, 200);
     assert_eq!(public.body["ok"], true);
-    assert_eq!(public.body["protocolVersion"], 6);
+    assert_eq!(public.body["protocolVersion"], 7);
     assert!(Uuid::parse_str(public.body["instanceId"].as_str().unwrap()).is_ok());
     assert_eq!(
         request(address, "GET", "/api/v1/runtime/status", &[], None).status,
@@ -604,7 +604,7 @@ fn health_monitor_is_authenticated_and_restart_input_is_strict() {
     assert_eq!(status.status, 200);
     assert_eq!(status.body["instanceId"], public.body["instanceId"]);
     assert_eq!(status.body["schemaVersion"], 2);
-    assert_eq!(status.body["protocolVersion"], 6);
+    assert_eq!(status.body["protocolVersion"], 7);
     assert_eq!(status.body["pid"], std::process::id());
     assert_eq!(status.body["api"]["status"], "ready");
     assert_eq!(status.body["storage"]["status"], "ready");
@@ -628,7 +628,7 @@ fn health_monitor_is_authenticated_and_restart_input_is_strict() {
         status.body["collectors"]["token"]["source"],
         "runtime:canonical_session_ledger"
     );
-    assert_eq!(status.body["companion"]["protocolVersion"], 6);
+    assert_eq!(status.body["companion"]["protocolVersion"], 7);
     assert_eq!(
         status.body["conditional"]["claudeCowork"]["countsAsFault"],
         false

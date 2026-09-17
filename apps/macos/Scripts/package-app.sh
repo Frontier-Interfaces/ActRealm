@@ -149,7 +149,7 @@ if [[ "$SIGN_IDENTITY" == "Developer ID Application:"* ]]; then
   SIGN_ARGS+=(--timestamp)
 fi
 echo "==> Codesigning ($SIGN_IDENTITY)"
-codesign "${SIGN_ARGS[@]}" "$APP/Contents/Helpers/actrealm"
+codesign "${SIGN_ARGS[@]}" --identifier com.frontierinterfaces.actrealm.runtime "$APP/Contents/Helpers/actrealm"
 codesign "${SIGN_ARGS[@]}" --entitlements "$ENTITLEMENTS" "$APP/Contents/MacOS/ActRealm"
 codesign "${SIGN_ARGS[@]}" --entitlements "$ENTITLEMENTS" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"

@@ -477,12 +477,13 @@ public final class RuntimeClient: ObservableObject {
     @Published public private(set) var connectionState: ConnectionState = .idle
     @Published public private(set) var snapshot: Snapshot = .empty
 
-    private let session: URLSession
+    private var session: URLSession
     private var baseURL: URL?
     private var sessionCookie: String?
     private var csrfToken: String?
     private var webSocketTask: URLSessionWebSocketTask?
     private var streamTask: Task<Void, Never>?
+    private var connectionGeneration = 0
 
     public init() {
         let configuration = URLSessionConfiguration.ephemeral
@@ -494,18 +495,42 @@ public final class RuntimeClient: ObservableObject {
 
     public func connect(baseURL: URL, token: String) async {
         disconnect()
+        let generation = connectionGeneration
         self.baseURL = baseURL
         connectionState = .connecting
         do {
             try await bootstrap(baseURL: baseURL, token: token)
             try await refreshSnapshotThrowing()
+            guard generation == connectionGeneration else { return }
             startStreaming()
         } catch {
-            connectionState = .error(error.localizedDescription)
+            if generation == connectionGeneration { connectionState = .error(error.localizedDescription) }
         }
     }
 
+    public func connect(credentials: LocalRuntimeCredentials) async {
+        disconnect()
+        let generation = connectionGeneration
+        guard credentials.isSupported, let baseURL = credentials.baseURL, let cookie = credentials.sessionToken,
+              let csrf = credentials.csrfToken, LocalRuntimeService.isSecret(cookie), LocalRuntimeService.isSecret(csrf) else {
+            connectionState = .error(LocalRuntimeServiceError.incompatible.localizedDescription)
+            return
+        }
+        self.session.invalidateAndCancel()
+        self.session = LocalRuntimeService.makeSession(credentials: credentials)
+        self.baseURL = baseURL
+        sessionCookie = cookie
+        csrfToken = csrf
+        connectionState = .connecting
+        do {
+            try await refreshSnapshotThrowing()
+            guard generation == connectionGeneration else { return }
+            startStreaming()
+        } catch { if generation == connectionGeneration { connectionState = .error(error.localizedDescription) } }
+    }
+
     public func disconnect() {
+        connectionGeneration += 1
         streamTask?.cancel()
         streamTask = nil
         webSocketTask?.cancel(with: .goingAway, reason: nil)
@@ -579,7 +604,10 @@ public final class RuntimeClient: ObservableObject {
     }
 
     private func refreshSnapshotThrowing() async throws {
-        snapshot = try await get("api/v1/snapshot", as: Snapshot.self)
+        let generation = connectionGeneration
+        let next = try await get("api/v1/snapshot", as: Snapshot.self)
+        guard generation == connectionGeneration else { throw CancellationError() }
+        snapshot = next
     }
 
     // MARK: - Attention and sessions
@@ -1045,6 +1073,7 @@ public final class RuntimeClient: ObservableObject {
     }
 
     private func streamLoop() async {
+        let generation = connectionGeneration
         var attempt = 0
         while !Task.isCancelled {
             guard let baseURL, let cookie = sessionCookie, csrfToken != nil else { return }
@@ -1065,6 +1094,7 @@ public final class RuntimeClient: ObservableObject {
                 var receivedMessage = false
                 while !Task.isCancelled {
                     let message = try await task.receive()
+                    guard !Task.isCancelled, generation == connectionGeneration else { return }
                     if !receivedMessage {
                         receivedMessage = true
                         connectionState = .live

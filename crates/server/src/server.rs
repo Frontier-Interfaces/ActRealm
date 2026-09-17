@@ -57,6 +57,11 @@ use crate::codex_questions::{
     self, Observation, QuestionBatch, QuestionRegistry, QuestionScanner, ReplyRoute,
 };
 use crate::status_messages;
+#[cfg(test)]
+#[path = "native_client_tests.rs"]
+mod native_client_tests;
+#[path = "native_clients.rs"]
+mod native_clients;
 
 const SESSION_COOKIE: &str = "actrealm_session";
 const CSRF_HEADER: &str = "x-actrealm-csrf";
@@ -68,7 +73,7 @@ const COMPANION_SCHEMA_VERSION: u32 = 1;
 const COMPANION_SCOPE_SNAPSHOT: &str = "snapshot.read";
 const COMPANION_SCOPE_JUMP: &str = "session.jump";
 const COMPANION_SCOPE_RESPOND: &str = "attention.respond";
-const PUBLIC_PROTOCOL_VERSION: u32 = 6;
+const PUBLIC_PROTOCOL_VERSION: u32 = 7;
 const RUNTIME_GIT_COMMIT: &str = match option_env!("ACTREALM_GIT_COMMIT") {
     Some(commit) => commit,
     None => "unknown",
@@ -216,6 +221,7 @@ struct SessionFacts {
 
 #[derive(Debug, Clone)]
 pub struct ApiServerConfig {
+    pub enable_native_clients: bool,
     pub bind: SocketAddr,
     pub bootstrap_token: Option<String>,
     pub initial_session_token: Option<String>,
@@ -236,6 +242,7 @@ pub struct ApiServerConfig {
 impl Default for ApiServerConfig {
     fn default() -> Self {
         Self {
+            enable_native_clients: false,
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             bootstrap_token: None,
             initial_session_token: None,
@@ -402,6 +409,7 @@ pub enum ApiServerError {
 }
 
 pub struct ApiServer {
+    native_listener: Option<crate::native_transport::NativeListener>,
     address: SocketAddr,
     bootstrap_token: String,
     shutdown: Option<oneshot::Sender<()>>,
@@ -502,6 +510,7 @@ impl ApiServer {
                 session_token: initial_session_token,
                 csrf_token: initial_csrf_token,
                 websocket_tickets: Vec::new(),
+                native_sessions: Vec::new(),
             })),
             companions: Arc::new(Mutex::new(companion_state)),
             expected_host: address.to_string(),
@@ -551,6 +560,29 @@ impl ApiServer {
             codex,
             runtime_restart: config.runtime_restart,
         };
+        let mut native_tls = None;
+        let native_listener = if config.enable_native_clients {
+            let tls = crate::native_tls::NativeTls::new().map_err(ApiServerError::Io)?;
+            let path = state
+                .data_paths
+                .companion_discovery
+                .with_file_name("native-clients.sock");
+            let mut native_state = state.clone();
+            native_state.expected_host = tls.address.to_string();
+            native_state.expected_origin = format!("https://{}", tls.address);
+            let mut registrar = native_clients::Registrar::new(native_state.clone())
+                .map_err(|error| ApiServerError::Setup(error.to_string()))?;
+            registrar.certificate_sha256 = Some(tls.certificate_sha256.clone());
+            native_tls = Some((tls, router(native_state)));
+            Some(
+                crate::native_transport::NativeListener::start(path, move |identity, request| {
+                    registrar.connect(identity, request)
+                })
+                .map_err(ApiServerError::Io)?,
+            )
+        } else {
+            None
+        };
         let quota_scheduler_state = state.clone();
         let usage_scheduler_state = state.clone();
         let usage_worker_failures = state.usage_worker_failures.clone();
@@ -564,6 +596,11 @@ impl ApiServer {
                     .build();
                 let Ok(runtime) = runtime else { return };
                 runtime.block_on(async move {
+                    let tls_handle = axum_server::Handle::new();
+                    let tls_task = native_tls.map(|(tls, router)| {
+                        let handle = tls_handle.clone();
+                        tokio::spawn(async move { tls.serve(router, handle).await })
+                    });
                     let quota_scheduler = tokio::spawn(quota_refresh_loop(quota_scheduler_state));
                     let Ok(listener) = tokio::net::TcpListener::from_std(listener) else {
                         quota_scheduler.abort();
@@ -574,6 +611,10 @@ impl ApiServer {
                             let _ = shutdown_receiver.await;
                         })
                         .await;
+                    tls_handle.shutdown();
+                    if let Some(task) = tls_task {
+                        let _ = task.await;
+                    }
                     quota_scheduler.abort();
                 });
             })
@@ -591,6 +632,7 @@ impl ApiServer {
             }
         };
         Ok(Self {
+            native_listener,
             address,
             bootstrap_token,
             shutdown: Some(shutdown),
@@ -626,6 +668,7 @@ impl ApiServer {
 
 impl Drop for ApiServer {
     fn drop(&mut self) {
+        self.native_listener.take();
         self.shutdown_flag.store(true, Ordering::Release);
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
@@ -872,11 +915,26 @@ struct DataPaths {
     companion_discovery: PathBuf,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeSessionKind {
+    Full,
+    SetupReadOnly,
+    SetupReadWrite,
+}
+
+struct NativeSession {
+    token: String,
+    csrf: String,
+    kind: NativeSessionKind,
+    companion_id: Option<String>,
+}
+
 struct AuthState {
     bootstrap_token: Option<String>,
     session_token: Option<String>,
     csrf_token: Option<String>,
     websocket_tickets: Vec<(String, Instant)>,
+    native_sessions: Vec<NativeSession>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2551,6 +2609,7 @@ fn router(state: AppState) -> Router {
         .route("/assets/claude.png", get(claude_icon))
         .route("/assets/codex.png", get(codex_icon))
         .route("/api/v1/health", get(health))
+        .route("/api/v1/native/session", get(native_session_health))
         .route("/api/v1/runtime/status", get(runtime_status))
         .route("/api/v1/runtime/restart", post(restart_runtime))
         .route("/api/v1/bootstrap", post(bootstrap))
@@ -2901,7 +2960,7 @@ fn static_binary_response(content_type: &'static str, body: &'static [u8]) -> Re
 }
 
 async fn setup(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !authorized(&state, &headers) {
+    if !authorized_setup(&state, &headers, false) {
         return api_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED");
     }
     setup_value(&state)
@@ -5795,7 +5854,7 @@ async fn change_setup(
     headers: HeaderMap,
     Json(request): Json<SetupChangeRequest>,
 ) -> Response {
-    if !authorized_mutation(&state, &headers) {
+    if !authorized_setup(&state, &headers, true) {
         return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_MUTATION");
     }
     let provider = match request.provider.as_str() {
@@ -9041,24 +9100,92 @@ fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
     auth.session_token
         .as_deref()
         .is_some_and(|token| constant_time_eq(token, cookie))
+        || auth.native_sessions.iter().any(|session| {
+            session.kind == NativeSessionKind::Full && constant_time_eq(&session.token, cookie)
+        })
 }
 
 fn authorized_mutation(state: &AppState, headers: &HeaderMap) -> bool {
-    authorized(state, headers)
-        && valid_same_origin(state, headers)
-        && headers
-            .get(CSRF_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| valid_csrf_value(state, value))
-}
-
-fn valid_csrf_value(state: &AppState, value: &str) -> bool {
+    if !valid_same_origin(state, headers) {
+        return false;
+    }
+    let Some(cookie) = headers
+        .get(COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| cookie_value(value, SESSION_COOKIE))
+    else {
+        return false;
+    };
+    let Some(csrf) = headers
+        .get(CSRF_HEADER)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
     let Ok(auth) = state.auth.lock() else {
         return false;
     };
-    auth.csrf_token
+    (auth
+        .session_token
         .as_deref()
-        .is_some_and(|token| constant_time_eq(token, value))
+        .is_some_and(|token| constant_time_eq(token, cookie))
+        && auth
+            .csrf_token
+            .as_deref()
+            .is_some_and(|token| constant_time_eq(token, csrf)))
+        || auth.native_sessions.iter().any(|session| {
+            session.kind == NativeSessionKind::Full
+                && constant_time_eq(&session.token, cookie)
+                && constant_time_eq(&session.csrf, csrf)
+        })
+}
+
+fn authorized_setup(state: &AppState, headers: &HeaderMap, mutation: bool) -> bool {
+    if if mutation {
+        authorized_mutation(state, headers)
+    } else {
+        authorized(state, headers)
+    } {
+        return true;
+    }
+    if !valid_host(state, headers) || (mutation && !valid_same_origin(state, headers)) {
+        return false;
+    }
+    let Some(cookie) = headers
+        .get(COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| cookie_value(v, SESSION_COOKIE))
+    else {
+        return false;
+    };
+    let csrf = headers.get(CSRF_HEADER).and_then(|v| v.to_str().ok());
+    let Ok(auth) = state.auth.lock() else {
+        return false;
+    };
+    let Ok(companions) = state.companions.lock() else {
+        return false;
+    };
+    auth.native_sessions.iter().any(|session| {
+        constant_time_eq(&session.token, cookie)
+            && companions.registrations.iter().any(|entry| {
+                Some(&entry.id) == session.companion_id.as_ref()
+                    && (!mutation
+                        || entry
+                            .scopes
+                            .iter()
+                            .any(|scope| scope == COMPANION_SCOPE_RESPOND))
+            })
+            && (!mutation
+                || (session.kind == NativeSessionKind::SetupReadWrite
+                    && csrf.is_some_and(|value| constant_time_eq(&session.csrf, value))))
+    })
+}
+
+async fn native_session_health(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized_setup(&state, &headers, false) {
+        return api_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED");
+    }
+    Json(json!({"ok": true, "protocolVersion": PUBLIC_PROTOCOL_VERSION, "instanceId": state.instance_id})).into_response()
 }
 
 fn websocket_protocol(headers: &HeaderMap) -> Option<String> {
@@ -9998,7 +10125,7 @@ done
         ));
     }
 
-    fn test_state(store: RuntimeStore, root: &FilePath) -> AppState {
+    pub(super) fn test_state(store: RuntimeStore, root: &FilePath) -> AppState {
         let paths = InstallPaths {
             actrealm_home: root.join("actrealm-home"),
             claude_settings: root.join("home/.claude/settings.json"),
@@ -10026,6 +10153,7 @@ done
                 session_token: None,
                 csrf_token: None,
                 websocket_tickets: Vec::new(),
+                native_sessions: Vec::new(),
             })),
             companions: Arc::new(Mutex::new(CompanionState::default())),
             expected_host: "127.0.0.1:43111".to_owned(),

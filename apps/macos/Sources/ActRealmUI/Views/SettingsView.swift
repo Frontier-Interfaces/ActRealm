@@ -92,9 +92,6 @@ public struct SettingsView: View {
             model.refreshRuntimeDiagnostics()
             await model.refreshSettings()
             await model.refreshSetup()
-            if ProductScope.companionManagementEnabled {
-                await model.refreshCompanionConnections()
-            }
         }
     }
 
@@ -487,89 +484,7 @@ private struct AgentSettingsPage: View {
                     Text("正在运行、等待授权、等待回答和报错任务不会因为没有新事件而自动隐藏。隐藏不会删除会话、事件或 Token 统计。")
                 }
 
-                if ProductScope.companionManagementEnabled {
-                    Section {
-                        Toggle(isOn: $model.companionAllowsControl) {
-                        SettingsLabel(
-                            "允许处理 Agent 请求",
-                            detail: "仅为这次新配对授予审批、拒绝、交回原 Agent 和问题回答能力"
-                        )
-                    }
-                        .disabled(model.isCompanionBusy)
 
-                    HStack {
-                        SettingsLabel(
-                            "Display Companion",
-                            detail: "通过本机加密令牌读取任务状态；不共享 ActRealm Cookie 或数据库"
-                        )
-                        Spacer(minLength: 12)
-                        Button("生成配对码", systemImage: "link.badge.plus") {
-                            Task {
-                                if await model.createDisplayCompanionPairing(),
-                                   let code = model.companionPairing?.enrollmentCode
-                                {
-                                    NSPasteboard.general.clearContents()
-                                    NSPasteboard.general.setString(code, forType: .string)
-                                    model.showToast(AppLocalization.localized(
-                                        "显示器伴生应用配对码已复制"
-                                    ))
-                                }
-                            }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(!model.bridgeStatus.isListening || model.isCompanionBusy)
-                    }
-
-                    if let pairing = model.companionPairing {
-                        VStack(alignment: .leading, spacing: 7) {
-                            HStack {
-                                Text(pairing.enrollmentCode)
-                                    .font(.system(.caption, design: .monospaced).weight(.semibold))
-                                    .lineLimit(1)
-                                    .textSelection(.enabled)
-                                Spacer()
-                                Button("复制") {
-                                    NSPasteboard.general.clearContents()
-                                    NSPasteboard.general.setString(
-                                        pairing.enrollmentCode,
-                                        forType: .string
-                                    )
-                                }
-                            }
-                            Text("5 分钟内粘贴到显示器伴生应用的 Agent 页面；配对码只能使用一次。")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-
-                    ForEach(model.companionConnections) { connection in
-                        HStack {
-                            SettingsLabel(
-                                connection.clientName,
-                                detail: connection.scopes.contains("attention.respond")
-                                    ? "任务状态、跳转与受控处理"
-                                    : "只读任务状态与跳转"
-                            )
-                            Spacer(minLength: 12)
-                            Button("撤销", role: .destructive) {
-                                Task { await model.revokeCompanion(id: connection.id) }
-                            }
-                            .disabled(model.isCompanionBusy)
-                        }
-                    }
-
-                    if let error = model.companionPairingError {
-                        Label(error, systemImage: "exclamationmark.triangle.fill")
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                            .textSelection(.enabled)
-                    }
-                    } header: {
-                        Text("本机伴生应用")
-                    } footer: {
-                        Text("撤销后对应伴生应用会立即失去访问权限；每次操作仍由 Runtime 重新校验请求和通道。")
-                    }
-                }
             }
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)

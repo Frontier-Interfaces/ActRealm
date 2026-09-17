@@ -2,11 +2,10 @@
 
 Status: local v1, schema version 1. The first consumer is the display Companion.
 
-Runtime health reports `protocolVersion: 5` once all local Companion routes in
-this document, including activity, review and completion settings, are available. Consumers
-must not attempt Companion pairing with an older protocol. This compatibility
-gate is independent from the snapshot schema version above: protocol v5 still
-uses the allowlisted snapshot schema v1.
+Runtime health reports `protocolVersion: 7`. Native applications use the
+[verified local enrollment and pinned TLS service](NATIVE_SERVICE.md); they do
+not require AR1 pairing or an ActRealm-owned bootstrap session. The AR1 sections
+below describe legacy compatibility routes. Snapshot schema version remains 1.
 
 The optional `pricing` summary contains `source`, `updatedAt`, `modelCount`,
 `updating`, `refreshFailed` and `automaticIntervalMinutes`. Catalog reads run in

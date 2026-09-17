@@ -470,11 +470,6 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var isSettingsBusy = false
     @Published public private(set) var settingsSaveError: String?
     @Published public private(set) var settingsSaveNotice: String?
-    @Published public private(set) var companionPairing: CompanionPairingResponse?
-    @Published public private(set) var companionConnections: [CompanionConnection] = []
-    @Published public private(set) var companionPairingError: String?
-    @Published public private(set) var isCompanionBusy = false
-    @Published public var companionAllowsControl = true
     @Published public private(set) var appLanguage: AppLanguage
     @Published public private(set) var isQuotaRefreshBusy = false
     /// Persistent result shown in Settings. A main-window toast alone is not
@@ -696,9 +691,9 @@ public final class AppModel: ObservableObject {
         let client = self.client
         Task {
             supervisor.refreshDiagnostics()
-            await supervisor.start { baseURL, token in
+            await supervisor.start { credentials in
                 Task {
-                    await client.connect(baseURL: baseURL, token: token)
+                    await client.connect(credentials: credentials)
                     await self.refreshSetup()
                     await self.refreshSettings()
                     await client.recordMetric("app_opened")
@@ -742,9 +737,6 @@ public final class AppModel: ObservableObject {
         if let setup = await client.fetchSetup() {
             setupInfo = setup
         }
-        if let companions = await client.fetchCompanionConnections() {
-            companionConnections = companions
-        }
         runtimeDoctorReport = await supervisor.doctorReport()
     }
 
@@ -762,7 +754,9 @@ public final class AppModel: ObservableObject {
                     "唤醒后恢复失败：%@",
                     clientErrorMessage(error)
                 )
-                restartRuntime()
+                await supervisor.start { credentials in
+                    Task { await self.client.connect(credentials: credentials) }
+                }
             } else {
                 runtimeActionMessage = l10n("已恢复实时连接并请求额度更新")
                 supervisor.refreshDiagnostics()
@@ -778,9 +772,9 @@ public final class AppModel: ObservableObject {
         let client = self.client
         Task {
             client.disconnect()
-            let error = await supervisor.restart { baseURL, token in
+            let error = await supervisor.restart { credentials in
                 Task {
-                    await client.connect(baseURL: baseURL, token: token)
+                    await client.connect(credentials: credentials)
                     await self.refreshSetup()
                     await self.refreshSettings()
                 }
@@ -860,48 +854,6 @@ public final class AppModel: ObservableObject {
         }
         settingsSaveError = nil
         acceptSettings(response)
-    }
-
-    public func refreshCompanionConnections() async {
-        guard !isDemo else { return }
-        if let connections = await client.fetchCompanionConnections() {
-            companionConnections = connections
-            companionPairingError = nil
-        }
-    }
-
-    @discardableResult
-    public func createDisplayCompanionPairing() async -> Bool {
-        guard !isDemo, !isCompanionBusy else { return false }
-        isCompanionBusy = true
-        defer { isCompanionBusy = false }
-        let (pairing, error) = await client.createCompanionPairing(
-            allowControl: companionAllowsControl
-        )
-        guard let pairing else {
-            companionPairingError = clientErrorMessage(error)
-            return false
-        }
-        companionPairing = pairing
-        companionPairingError = nil
-        return true
-    }
-
-    public func clearCompanionPairing() {
-        companionPairing = nil
-        companionPairingError = nil
-    }
-
-    public func revokeCompanion(id: String) async {
-        guard !isDemo, !isCompanionBusy else { return }
-        isCompanionBusy = true
-        defer { isCompanionBusy = false }
-        if let error = await client.revokeCompanion(id: id) {
-            companionPairingError = clientErrorMessage(error)
-            return
-        }
-        companionPairingError = nil
-        await refreshCompanionConnections()
     }
 
     /// Updates the local view immediately, then persists the complete Runtime

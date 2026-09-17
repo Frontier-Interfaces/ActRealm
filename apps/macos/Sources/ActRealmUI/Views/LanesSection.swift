@@ -2863,7 +2863,7 @@ private struct ReviewDiffSheet: View {
                     Text(localized("本机 Diff", locale: locale))
                         .font(.system(size: 16, weight: .bold))
                     Text(localized(
-                        "只在本机按需读取；不会发送到伴生应用",
+                        "只在本机按需读取；不会发送到其他本机应用",
                         locale: locale
                     ))
                         .font(.system(size: 10))

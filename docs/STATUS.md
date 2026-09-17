@@ -2,6 +2,18 @@
 
 Last reviewed: 2026-09-17
 
+## 2026-09-17 Independent native Runtime — build 124 candidate
+
+Native clients now enroll directly with the shared user service. ActRealm no
+longer stops an existing Runtime to obtain a bootstrap token, and Display no
+longer needs cross-app pairing. Client sessions, setup access, certificate pins
+and revocation policy are enforced by Runtime. The native settings pairing
+section is removed; task data, Hook configuration and request semantics remain.
+
+See [NATIVE_SERVICE.md](NATIVE_SERVICE.md) for the protocol, migration boundary
+and validation requirements. This is a local test candidate, not a merge or
+public release. Exact package and lifecycle evidence is recorded with the PR.
+
 ## 2026-09-17 English follow-up — build 123
 
 Build 123 fills missing Data settings, pricing-source and quota tooltip

@@ -28,7 +28,7 @@ and a safe path back to the work.
 ## 2026-09 local-only product
 
 ActRealm keeps task control and usage data on this Mac. Optional Display
-Companions use authenticated localhost access. No ActRealm cloud account or
+Native clients automatically register with the independently managed local service. No ActRealm cloud account or
 Firebase backend is required. The embedded Web UI is retained as a legacy
 interface; current product work targets the native macOS app.
 
@@ -174,7 +174,7 @@ real event from a new local Provider session reaches the UI. See the
 checklist and recovery steps.
 
 For Display users, use Display's `Scripts/build-agent-display.sh` to fetch
-its exact pinned Runtime commit and produce a matched App. Runtime protocol v6
+its exact pinned Runtime commit and produce a matched App. Runtime protocol v7
 includes the first-run Codex Token/context fix; a healthy connection or installed
 Hook alone is not a metrics acceptance check. Verify a new local Codex Desktop
 task that has emitted usage and context-window fields. Never copy another user's
@@ -301,3 +301,6 @@ update compatibility tests whenever a Runtime contract changes.
 ## License
 
 [MIT](LICENSE)
+
+The native apps share one user Runtime service and use signed-client enrollment
+with pinned HTTPS/WSS. See [native service architecture](docs/NATIVE_SERVICE.md).
