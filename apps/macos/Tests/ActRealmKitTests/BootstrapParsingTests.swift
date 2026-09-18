@@ -29,6 +29,27 @@ struct BootstrapParsingTests {
         #expect(redacted == "ActRealm control panel: http://127.0.0.1:54321/#bootstrap=<redacted>")
     }
 
+    @Test func doctorReportDecodesProviderVersionsWithoutInventingChecks() throws {
+        let report = try #require(RuntimeSupervisor.decodeDoctorReport(Data(#"""
+        {
+          "schemaVersion": 1,
+          "generatedAtMs": 1800000000000,
+          "overall": "warning",
+          "checks": [{
+            "id": "codex.cli",
+            "status": "pass",
+            "summary": "codex CLI is available",
+            "detail": "/opt/bin/codex · codex-cli 0.144.6",
+            "repairability": "not_applicable"
+          }]
+        }
+        """#.utf8)))
+
+        #expect(report.overall == "warning")
+        #expect(report.check("codex.cli")?.detail.contains("0.144.6") == true)
+        #expect(report.check("claude.cli") == nil)
+    }
+
     @Test func nativeWebSocketUsesOneTimeTicketProtocolWithoutCredentialsInURL() throws {
         let request = try #require(RuntimeClient.webSocketRequest(
             baseURL: URL(string: "http://127.0.0.1:54321/")!,

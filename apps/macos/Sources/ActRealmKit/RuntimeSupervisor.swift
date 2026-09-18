@@ -2,10 +2,52 @@ import Combine
 import Darwin
 import Foundation
 
-/// Locates the `actrealm` Rust backend (bundled helper first, then a dev
-/// checkout), supervises it as a child process, and extracts the one-time
-/// bootstrap URL/token it prints on startup so a `RuntimeClient` can hand
-/// off into an authenticated session.
+public struct RuntimeDoctorReport: Codable, Equatable, Sendable {
+    public struct Check: Codable, Equatable, Identifiable, Sendable {
+        public let id: String
+        public let status: String
+        public let summary: String
+        public let detail: String
+        public let repairability: String
+        public let action: String?
+    }
+
+    public let schemaVersion: UInt16
+    public let generatedAtMs: UInt64
+    public let overall: String
+    public let checks: [Check]
+
+    public func check(_ id: String) -> Check? {
+        checks.first { $0.id == id }
+    }
+
+    public static let preview = RuntimeDoctorReport(
+        schemaVersion: 1,
+        generatedAtMs: 1_800_000_000_000,
+        overall: "pass",
+        checks: [
+            Check(
+                id: "claude.cli",
+                status: "pass",
+                summary: "claude CLI is available",
+                detail: "/usr/local/bin/claude · 2.1.226 (Claude Code)",
+                repairability: "not_applicable",
+                action: nil
+            ),
+            Check(
+                id: "codex.cli",
+                status: "pass",
+                summary: "codex CLI is available",
+                detail: "/usr/local/bin/codex · codex-cli 0.144.6",
+                repairability: "not_applicable",
+                action: nil
+            )
+        ]
+    )
+}
+
+/// Connects to the independent per-user Runtime service. Closing this client
+/// never stops the shared service or another application's connection.
 @MainActor
 public final class RuntimeSupervisor: ObservableObject {
     public struct ProcessResult: Equatable, Sendable {
@@ -57,14 +99,14 @@ public final class RuntimeSupervisor: ObservableObject {
     @Published public private(set) var diagnostics: Diagnostics = .empty
 
     private let repoPath: URL?
-    private var process: Process?
-    private var stdoutBuffer = Data()
     private var stdoutTail = ""
     private var stderrTail = ""
     private var endpoint: URL?
-    private var bootstrapHandler: ((URL, String) -> Void)?
+    private var connectionHandler: ((LocalRuntimeCredentials) -> Void)?
+    private var connectionMonitor: Task<Void, Never>?
+    private var localCredentials: LocalRuntimeCredentials?
+    private var connectionGeneration = 0
     private var desiredRunning = false
-    private var automaticRestartTask: Task<Void, Never>?
     private var consecutiveFailures = 0
 
     /// - Parameter repoPath: dev checkout of the Rust workspace used as a
@@ -122,108 +164,107 @@ public final class RuntimeSupervisor: ObservableObject {
         return candidateDevice == mainDevice && candidateFile == mainFile
     }
 
-    /// Ensures a backend binary exists (bundled helper, or a cargo release
-    /// build of the dev checkout), launches `actrealm serve`, and invokes
-    /// `onBootstrap` exactly once with the base URL and one-time token
-    /// parsed from its stdout.
-    public func start(onBootstrap: @escaping (URL, String) -> Void) async {
+    public func start(onConnect: @escaping (LocalRuntimeCredentials) -> Void) async {
         desiredRunning = true
-        bootstrapHandler = onBootstrap
-        automaticRestartTask?.cancel()
-        automaticRestartTask = nil
-        refreshDiagnostics()
-
-        guard await replaceAbandonedRuntimeIfNeeded() else { return }
+        connectionHandler = onConnect
+        connectionGeneration += 1
+        connectionMonitor?.cancel()
+        connectionMonitor = nil
         await launchConfiguredRuntime()
+        startConnectionMonitor()
     }
 
     private func launchConfiguredRuntime() async {
         guard desiredRunning else { return }
-        if let process, process.isRunning { return }
-        endpoint = nil
-
-        if let bundled = Self.bundledHelper() {
-            state = .launching
-            launch(binary: bundled, workingDirectory: nil)
-            return
+        let generation = connectionGeneration
+        state = .launching
+        do {
+            let helper = try await serviceHelper()
+            let credentials = try await Task.detached(priority: .utility) {
+                try LocalRuntimeService.connect(helper: helper)
+            }.value
+            guard desiredRunning, generation == connectionGeneration else { return }
+            localCredentials = credentials
+            endpoint = credentials.baseURL
+            state = .running
+            consecutiveFailures = 0
+            connectionHandler?(credentials)
+            refreshDiagnostics()
+        } catch {
+            guard desiredRunning, generation == connectionGeneration else { return }
+            localCredentials = nil
+            state = .failed(error.localizedDescription)
+            stderrTail = (error as? LocalRuntimeServiceError)?.diagnosticDescription ?? error.localizedDescription
+            consecutiveFailures += 1
+            refreshDiagnostics()
         }
+    }
 
-        guard let repoPath else {
-            state = .failed("app 内没有打包 actrealm Helper，也未配置开发仓库路径")
-            return
-        }
+    private func serviceHelper() async throws -> URL {
+        if let helper = Self.bundledHelper() { return helper }
+        guard let repoPath else { throw LocalRuntimeServiceError.unavailable }
         let binary = repoPath.appendingPathComponent("target/release/actrealm")
-        if !FileManager.default.fileExists(atPath: binary.path) {
+        if !FileManager.default.isExecutableFile(atPath: binary.path) {
             state = .buildingBackend
-            let succeeded = await Self.buildRelease(repoPath: repoPath)
-            guard succeeded else {
-                let message = "cargo build --release -p actrealm failed"
-                state = .failed(message)
-                scheduleAutomaticRestart(after: message)
-                return
+            guard await Self.buildRelease(repoPath: repoPath) else { throw LocalRuntimeServiceError.unavailable }
+        }
+        return binary
+    }
+
+    private func startConnectionMonitor() {
+        connectionMonitor?.cancel()
+        connectionMonitor = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                guard let self, self.desiredRunning, !Task.isCancelled else { return }
+                if let credentials = self.localCredentials, await LocalRuntimeService.isCurrent(credentials) { continue }
+                guard self.consecutiveFailures < 5 else { return }
+                await self.launchConfiguredRuntime()
             }
         }
-        state = .launching
-        launch(binary: binary, workingDirectory: repoPath)
     }
 
     public func stop() {
         desiredRunning = false
-        bootstrapHandler = nil
-        automaticRestartTask?.cancel()
-        automaticRestartTask = nil
+        connectionGeneration += 1
+        connectionMonitor?.cancel()
+        connectionMonitor = nil
+        connectionHandler = nil
+        localCredentials = nil
         state = .stopped
-        guard let process, process.isRunning else { return }
-        process.terminate()
+        // launchd owns Runtime. This operation only disconnects the app.
         refreshDiagnostics()
     }
 
-    /// Restarts the app-managed Runtime. If an earlier copy of this app left
-    /// its bundled helper holding `runtime.lock`, the lock owner is stopped
-    /// only after its executable path is verified as a known actrealm path.
     @discardableResult
-    public func restart(onBootstrap: @escaping (URL, String) -> Void) async -> String? {
-        state = .restarting
+    public func restart(onConnect: @escaping (LocalRuntimeCredentials) -> Void) async -> String? {
         desiredRunning = true
-        bootstrapHandler = onBootstrap
-        automaticRestartTask?.cancel()
-        automaticRestartTask = nil
-        consecutiveFailures = 0
-        refreshDiagnostics()
-
-        if await bootOutOutdatedLaunchAgent() {
-            stdoutTail = String((stdoutTail + "已停止参数过期的 com.frontier.actrealm.runtime LaunchAgent\n").suffix(4000))
+        connectionHandler = onConnect
+        connectionGeneration += 1
+        let generation = connectionGeneration
+        connectionMonitor?.cancel()
+        connectionMonitor = nil
+        state = .restarting
+        do {
+            let helper = try await serviceHelper()
+            let credentials = try await Task.detached(priority: .utility) {
+                try LocalRuntimeService.connect(helper: helper, restart: true)
+            }.value
+            guard desiredRunning, generation == connectionGeneration else { return nil }
+            localCredentials = credentials
+            endpoint = credentials.baseURL
+            state = .running
+            consecutiveFailures = 0
+            connectionHandler?(credentials)
+            refreshDiagnostics()
+            startConnectionMonitor()
+            return nil
+        } catch {
+            state = .failed(error.localizedDescription)
+            stderrTail = (error as? LocalRuntimeServiceError)?.diagnosticDescription ?? error.localizedDescription
+            refreshDiagnostics()
+            return error.localizedDescription
         }
-
-        if let process, process.isRunning {
-            await terminate(processID: process.processIdentifier)
-        }
-        process = nil
-
-        if let owner = Self.lockOwnerPID(), Self.isProcessAlive(owner) {
-            let ownerPath = Self.processPath(owner)
-            guard await isExpectedRuntimePath(ownerPath) else {
-                let path = ownerPath ?? "未知路径"
-                let message = "runtime.lock 由未识别进程 PID \(owner) 持有（\(path)），为避免误杀未自动停止"
-                state = .failed(message)
-                refreshDiagnostics()
-                return message
-            }
-            await terminate(processID: owner)
-            if Self.isProcessAlive(owner) {
-                let message = "无法停止旧 Runtime（PID \(owner)）"
-                state = .failed(message)
-                refreshDiagnostics()
-                return message
-            }
-        }
-
-        stdoutBuffer.removeAll(keepingCapacity: true)
-        stdoutTail = ""
-        stderrTail = ""
-        endpoint = nil
-        await launchConfiguredRuntime()
-        return nil
     }
 
     private nonisolated static func buildRelease(repoPath: URL) async -> Bool {
@@ -233,89 +274,6 @@ public final class RuntimeSupervisor: ObservableObject {
             currentDirectory: repoPath
         )
         return result.status == 0
-    }
-
-    private func launch(binary: URL, workingDirectory: URL?) {
-        let proc = Process()
-        proc.executableURL = binary
-        proc.arguments = ["serve"]
-        if let workingDirectory {
-            proc.currentDirectoryURL = workingDirectory
-        }
-        let stdout = Pipe()
-        let stderr = Pipe()
-        proc.standardOutput = stdout
-        proc.standardError = stderr
-
-        proc.terminationHandler = { [weak self] finished in
-            let status = finished.terminationStatus
-            Task { @MainActor in
-                guard let self, self.process === proc else { return }
-                self.process = nil
-                if !self.desiredRunning {
-                    self.state = .stopped
-                } else {
-                    let message = Self.failureMessage(status: status, stderr: self.stderrTail)
-                    self.state = .failed(message)
-                    self.scheduleAutomaticRestart(after: message)
-                }
-                self.refreshDiagnostics()
-            }
-        }
-        stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            Task { @MainActor in self?.ingest(data) }
-        }
-        stderr.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            Task { @MainActor in
-                guard let self else { return }
-                self.stderrTail = String(
-                    (self.stderrTail + Self.redactedDiagnosticText(text)).suffix(4000)
-                )
-                self.refreshDiagnostics()
-            }
-        }
-
-        do {
-            try proc.run()
-            process = proc
-            refreshDiagnostics()
-        } catch {
-            process = nil
-            let message = "failed to launch actrealm: \(error.localizedDescription)"
-            state = .failed(message)
-            scheduleAutomaticRestart(after: message)
-            refreshDiagnostics()
-        }
-    }
-
-    private nonisolated static func failureMessage(status: Int32, stderr: String) -> String {
-        if stderr.contains("failed to acquire") && stderr.contains(".lock") {
-            return "另一个 actrealm 实例已在运行（可先退出终端里的 serve）"
-        }
-        let tail = stderr
-            .split(separator: "\n", omittingEmptySubsequences: true)
-            .suffix(2)
-            .joined(separator: " · ")
-        return tail.isEmpty ? "actrealm 退出（状态码 \(status)）" : tail
-    }
-
-    private func ingest(_ data: Data) {
-        stdoutBuffer.append(data)
-        while let newline = stdoutBuffer.firstIndex(of: 0x0A) {
-            let lineData = stdoutBuffer[stdoutBuffer.startIndex..<newline]
-            stdoutBuffer.removeSubrange(stdoutBuffer.startIndex...newline)
-            if let line = String(data: lineData, encoding: .utf8) {
-                consume(line: line)
-                stdoutTail = String(
-                    (stdoutTail + Self.redactedDiagnosticText(line) + "\n").suffix(4000)
-                )
-            }
-        }
-        refreshDiagnostics()
     }
 
     /// Bootstrap credentials are one-time secrets. Diagnostics may retain the
@@ -332,63 +290,10 @@ public final class RuntimeSupervisor: ObservableObject {
         )
     }
 
-    private func consume(line: String) {
-        guard desiredRunning, let parsed = Self.parseBootstrapLine(line) else { return }
-        consecutiveFailures = 0
-        automaticRestartTask?.cancel()
-        automaticRestartTask = nil
-        state = .running
-        endpoint = parsed.baseURL
-        refreshDiagnostics()
-        bootstrapHandler?(parsed.baseURL, parsed.token)
-    }
-
-    private func replaceAbandonedRuntimeIfNeeded() async -> Bool {
-        guard process?.isRunning != true,
-              let owner = Self.lockOwnerPID(),
-              Self.isProcessAlive(owner)
-        else { return true }
-        let ownerPath = Self.processPath(owner)
-        guard await isExpectedRuntimePath(ownerPath) else {
-            let path = ownerPath ?? "未知路径"
-            state = .failed("runtime.lock 由未识别进程 PID \(owner) 持有（\(path)），为避免误杀未自动接管")
-            refreshDiagnostics()
-            return false
-        }
-        state = .restarting
-        await terminate(processID: owner)
-        guard !Self.isProcessAlive(owner) else {
-            state = .failed("无法安全替换遗留 Runtime（PID \(owner)）")
-            refreshDiagnostics()
-            return false
-        }
-        return true
-    }
-
-    private func scheduleAutomaticRestart(after failure: String) {
-        guard desiredRunning, automaticRestartTask == nil else { return }
-        guard let delay = Self.automaticRestartDelay(attempt: consecutiveFailures) else {
-            state = .failed("\(failure)；自动恢复连续失败 5 次，已停止重试")
-            return
-        }
-        consecutiveFailures += 1
-        state = .failed("\(failure)；将在 \(Self.delayLabel(delay)) 后自动重启")
-        automaticRestartTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(delay))
-            guard let self, !Task.isCancelled, self.desiredRunning else { return }
-            self.automaticRestartTask = nil
-            await self.launchConfiguredRuntime()
-        }
-    }
-
     public nonisolated static func automaticRestartDelay(attempt: Int) -> TimeInterval? {
         let delays: [TimeInterval] = [0.5, 1, 2, 4, 8]
         guard delays.indices.contains(attempt) else { return nil }
         return delays[attempt]
-    }
-
-    private nonisolated static func delayLabel(_ delay: TimeInterval) -> String {
-        delay < 1 ? "0.5 秒" : "\(Int(delay)) 秒"
     }
 
     public func refreshDiagnostics() {
@@ -396,7 +301,7 @@ public final class RuntimeSupervisor: ObservableObject {
         let ownerAlive = owner.map(Self.isProcessAlive) ?? false
         diagnostics = Diagnostics(
             checkedAt: Date(),
-            managedPID: process.flatMap { $0.isRunning ? $0.processIdentifier : nil },
+            managedPID: nil,
             lockOwnerPID: owner,
             lockOwnerPath: owner.flatMap(Self.processPath),
             lockOwnerIsAlive: ownerAlive,
@@ -409,6 +314,25 @@ public final class RuntimeSupervisor: ObservableObject {
         )
     }
 
+    public func doctorReport() async -> RuntimeDoctorReport? {
+        guard let helper = resolvedHelper(),
+              FileManager.default.isExecutableFile(atPath: helper.path)
+        else { return nil }
+        let result = await Self.runProcess(
+            executable: helper.path,
+            arguments: ["doctor", "--json"],
+            retainedBytes: 128 * 1024
+        )
+        guard result.status == 0 || !result.stdout.isEmpty else { return nil }
+        return Self.decodeDoctorReport(Data(result.stdout.utf8))
+    }
+
+    public nonisolated static func decodeDoctorReport(
+        _ data: Data
+    ) -> RuntimeDoctorReport? {
+        try? JSONDecoder().decode(RuntimeDoctorReport.self, from: data)
+    }
+
     public nonisolated static func parseLockOwnerPID(_ text: String) -> Int32? {
         Int32(text.trimmingCharacters(in: .whitespacesAndNewlines))
     }
@@ -417,49 +341,6 @@ public final class RuntimeSupervisor: ObservableObject {
         if let bundled = Self.bundledHelper() { return bundled }
         guard let repoPath else { return nil }
         return repoPath.appendingPathComponent("target/release/actrealm")
-    }
-
-    private func isExpectedRuntimePath(_ path: String?) async -> Bool {
-        guard let path else { return false }
-        var expected = [
-            Self.installedHelperURL.path,
-            Self.bundledHelper()?.path,
-            repoPath?.appendingPathComponent("target/release/actrealm").path,
-        ].compactMap { $0 }
-        if let process, process.executableURL?.path != nil {
-            expected.append(process.executableURL!.path)
-        }
-        if expected.contains(path) { return true }
-
-        // A previous ActRealm build may have been moved or replaced, so its
-        // helper path no longer equals the current bundle path. Production
-        // builds are accepted only when both app bundles share a non-empty
-        // Developer ID TeamIdentifier. Ad-hoc QA builds have no Team ID and
-        // are accepted only when the candidate app has the same bundle ID and
-        // its helper is owned by the current user.
-        let helperURL = URL(fileURLWithPath: path).standardizedFileURL
-        guard helperURL.lastPathComponent == "actrealm",
-              helperURL.deletingLastPathComponent().lastPathComponent == "Helpers"
-        else { return false }
-        let appURL = helperURL
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        guard appURL.pathExtension == "app" else { return false }
-        let candidateBundleID = Self.bundleIdentifier(at: appURL)
-        let currentBundleID = Bundle.main.bundleIdentifier
-        async let candidateTeamID = Self.codeSigningTeamIdentifier(at: appURL)
-        async let currentTeamID = Self.codeSigningTeamIdentifier(at: Bundle.main.bundleURL)
-        let candidateOwnerID = (try? FileManager.default.attributesOfItem(atPath: path)[.ownerAccountID])
-            .flatMap { ($0 as? NSNumber)?.uint32Value }
-        return Self.isCompatibleAppHelperIdentity(
-            currentBundleID: currentBundleID,
-            candidateBundleID: candidateBundleID,
-            currentTeamID: await currentTeamID,
-            candidateTeamID: await candidateTeamID,
-            candidateOwnerID: candidateOwnerID,
-            currentUserID: getuid()
-        )
     }
 
     nonisolated static func isCompatibleAppHelperIdentity(
@@ -475,56 +356,6 @@ public final class RuntimeSupervisor: ObservableObject {
             return candidateTeamID == currentTeamID
         }
         return candidateTeamID == nil && candidateOwnerID == currentUserID
-    }
-
-    private nonisolated static func bundleIdentifier(at appURL: URL) -> String? {
-        let plistURL = appURL.appendingPathComponent("Contents/Info.plist")
-        guard let data = try? Data(contentsOf: plistURL),
-              let plist = try? PropertyListSerialization.propertyList(from: data, format: nil),
-              let dictionary = plist as? [String: Any]
-        else { return nil }
-        return dictionary["CFBundleIdentifier"] as? String
-    }
-
-    private nonisolated static func codeSigningTeamIdentifier(at appURL: URL) async -> String? {
-        guard FileManager.default.fileExists(atPath: appURL.path) else { return nil }
-        let result = await runProcess(
-            executable: "/usr/bin/codesign",
-            arguments: ["-dv", "--verbose=4", appURL.path]
-        )
-        guard result.status == 0 else { return nil }
-        let text = result.stdout + result.stderr
-        for line in text.split(separator: "\n") where line.hasPrefix("TeamIdentifier=") {
-            let value = line.dropFirst("TeamIdentifier=".count)
-            return value == "not set" || value.isEmpty ? nil : String(value)
-        }
-        return nil
-    }
-
-    private func terminate(processID: Int32) async {
-        guard Self.isProcessAlive(processID) else { return }
-        kill(processID, SIGTERM)
-        let deadline = Date().addingTimeInterval(3)
-        while Self.isProcessAlive(processID), Date() < deadline {
-            try? await Task.sleep(for: .milliseconds(100))
-        }
-        if Self.isProcessAlive(processID) {
-            kill(processID, SIGKILL)
-        }
-        let killDeadline = Date().addingTimeInterval(1)
-        while Self.isProcessAlive(processID), Date() < killDeadline {
-            try? await Task.sleep(for: .milliseconds(100))
-        }
-        refreshDiagnostics()
-    }
-
-    private func bootOutOutdatedLaunchAgent() async -> Bool {
-        guard Self.launchAgentWarning() != nil else { return false }
-        let result = await Self.runProcess(
-            executable: "/bin/launchctl",
-            arguments: ["bootout", "gui/\(getuid())/com.frontier.actrealm.runtime"]
-        )
-        return result.status == 0
     }
 
     /// Runs a short-lived child away from MainActor and drains stdout/stderr

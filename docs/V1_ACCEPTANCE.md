@@ -75,6 +75,33 @@ The project does not require or claim a 48-hour soak for this candidate because
 that work was explicitly deferred. Historical unchecked 48-hour items remain
 historical records, not a hidden pass.
 
+## 2026-08-07 local Companion milestone
+
+- [x] Pairing is an explicit user action in ActRealm Settings; codes are
+      single-use, expire after five minutes, and never grant non-loopback
+      access.
+- [x] Every Companion receives a separate random token. ActRealm persists only
+      its SHA-256 hash in a current-user private file and supports immediate
+      revocation.
+- [x] Snapshot projection is a server-owned allowlist and excludes raw prompts,
+      full commands, Provider session locators, Hook payloads, transcripts,
+      answers, cookies, and Cloud credentials.
+- [x] `snapshot.read`, `session.jump`, and `attention.respond` are independent
+      scopes; control is absent unless explicitly enabled at pairing time.
+- [x] Jump, approval, denial, pass-through, acknowledgement, undo, and question
+      answers reuse the existing Runtime paths and revalidate live IDs,
+      capability, expiry, scope, and waiter ownership.
+- [x] Runtime restart discovery contains only a loopback endpoint and instance
+      ID in a `0600` file; no bearer token or Provider data is written there.
+- [x] Rust server tests cover pairing, scoped enrollment, private hashed token
+      persistence, sanitized snapshot access, revocation, and restart-safe
+      discovery. The native settings client exposes generation, scope choice,
+      connection listing, and revocation.
+
+This milestone adds a local client boundary; it does not broaden the public v1
+release decision, enable remote control, or transfer Runtime ownership to a
+companion application.
+
 ## Milestone gates
 
 ### M0 - provider control path
@@ -532,6 +559,26 @@ without making the final v1 release complete.
       languages; the local UI automation channel was unavailable for the final
       click-through.
 - [ ] Commit and push are separately authorized by the user.
+
+### H7 - layered control-plane diagnostics
+
+- [x] Authenticated Runtime diagnostics schema v2 freezes Runtime identity,
+      Snapshot freshness, SQLite health, Review/Token collectors, Companion
+      scopes, and neutral conditional features.
+- [x] Diagnostics exclude prompts, commands, paths, credentials, token values,
+      transcripts, file content, Diff, and Provider reply channels.
+- [x] macOS displays Runtime/Hook, Provider/Connector, Review/Git, Token,
+      Companion, and projection/UI independently with layer-scoped recovery.
+- [x] Claude Code and Codex show real version/setup/capability facts; Claude
+      Cowork is explicitly unsupported without a verified lifecycle source.
+- [x] H6 mobile/Cloud/Push remains paused and does not count as an H7 fault.
+- [x] Exact commit `5ddcfb0fbd24364c3e3a84163eaf0e195d004056`
+      is installed as Apple Development signed build 81; Doctor and Computer
+      Use checks pass, including scroll, disclosure, redaction, and refresh.
+- [x] A real Token rebuilding state affects only the Token layer; healthy
+      Runtime, Provider, Review, Companion, and projection layers remain green.
+- [ ] The user has explicitly accepted the complete ActRealm control-plane
+      experience and authorized H8 Display implementation.
 
 ## Publishing rule
 

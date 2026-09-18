@@ -4,10 +4,10 @@ use actrealm_core::{BridgeRequest, BridgeResponse, Decision, ReplyPayload};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -59,11 +59,35 @@ fn read_request(stream: &mut std::os::unix::net::UnixStream) -> BridgeRequest {
     serde_json::from_str(&line).unwrap()
 }
 
-fn wait_for_socket(path: &Path) {
+struct PromptRuntimeFixture {
+    child: Option<Child>,
+    root: PathBuf,
+}
+
+impl Drop for PromptRuntimeFixture {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn wait_for_socket(path: &Path, child: &mut Child) {
     let started = Instant::now();
     while !path.exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            let mut detail = String::new();
+            if let Some(stderr) = child.stderr.take() {
+                let _ = stderr.take(8_192).read_to_string(&mut detail);
+            }
+            panic!("runtime exited before its socket was ready: {status}: {detail}");
+        }
+        // This budget covers process launch and SQLite setup, not the reply
+        // deadline or the undo window tested below. Cold CI hosts can exceed 2s.
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < Duration::from_secs(10),
             "runtime socket did not become ready"
         );
         thread::sleep(Duration::from_millis(10));
@@ -330,22 +354,32 @@ fn deadline_and_socket_eof_both_fail_open() {
 
 #[test]
 fn prompt_decision_can_be_undone_without_reaching_provider() {
-    let path = temp_socket("undo");
-    let mut runtime = Command::new(env!("CARGO_BIN_EXE_actrealm"))
-        .args([
-            "serve",
-            "--approval",
-            "prompt",
-            "--socket",
-            path.to_str().unwrap(),
-        ])
-        .env("ACTREALM_COMMIT_DELAY_MS", "250")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    wait_for_socket(&path);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = PathBuf::from(format!("/tmp/actrealm-undo-{}-{nonce}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let path = root.join("runtime.sock");
+    let mut fixture = PromptRuntimeFixture { child: None, root };
+    fixture.child = Some(
+        Command::new(env!("CARGO_BIN_EXE_actrealm"))
+            .args([
+                "serve",
+                "--approval",
+                "prompt",
+                "--socket",
+                path.to_str().unwrap(),
+            ])
+            .env("ACTREALM_COMMIT_DELAY_MS", "250")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let runtime = fixture.child.as_mut().unwrap();
+    wait_for_socket(&path, runtime);
 
     // Propose allow, undo during the commit window, then explicitly return
     // ownership to the provider terminal. The hook must emit no old decision.
@@ -369,9 +403,7 @@ fn prompt_decision_can_be_undone_without_reaching_provider() {
     );
 
     assert!(stdout.is_empty());
-    runtime.kill().unwrap();
-    runtime.wait().unwrap();
-    let _ = fs::remove_file(path);
+    drop(fixture);
 }
 
 #[test]

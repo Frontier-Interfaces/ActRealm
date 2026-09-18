@@ -165,11 +165,24 @@ Usage and quota behavior:
   forcing fixed weekly labels;
 - a failed refresh preserves the last validated value with its real timestamp.
 
-Manual Claude quota refresh is available in Settings. If the official
-credential is expired and an official Claude CLI is available, ActRealm may
-run bounded `claude auth status --json` to let Claude maintain its own
-credential. ActRealm never stores a refresh token. Without a usable official
-CLI, open Claude/Claude Code and complete its login, then retry.
+Claude quota refresh runs every minute and is requested after launch or wake.
+Settings → Agents → Refresh limits waits for the shared refresh job and reports
+its result. When a credential needs renewal, the Runtime uses a bounded Claude
+CLI session with the built-in `/status` command, then re-reads the credential;
+`auth status` is only a signed-out check. No inference prompt is sent and
+ActRealm does not store or rotate a refresh token. Missing credentials require
+signing in once; rate limits and connection failures retain explicitly stale data.
+Long sleep and expired-credential recovery remain manual qualification cases.
+
+The native token dashboard keeps observed totals and coverage visible while
+history is incomplete. It includes composition, model/project/task breakdowns,
+heatmaps, trends and numeric JSON/CSV export. Estimated API cost remains distinct
+from subscription limits and actual billing.
+
+App language defaults to Follow system. An explicit Chinese or English choice
+is saved locally. UI copy changes immediately; macOS menus adopt the choice
+when ActRealm restarts. User task titles, questions and Provider-authored content
+remain in their original language.
 
 Recovery labels are capability statements:
 
@@ -227,7 +240,7 @@ to fail without partial deletion.
 settings but preserves Provider Hooks and configuration backups. Backup
 deletion is intentionally a separate operation.
 
-## 9. Local Web security
+## 9. Local API and legacy Web security
 
 The control page is served on a random loopback port. Session and CSRF secrets
 are generated from 32 bytes of OS randomness and compared in constant time.

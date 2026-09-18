@@ -59,6 +59,12 @@ struct ProviderAvatar: View {
                 Image(nsImage: icon)
                     .resizable()
                     .interpolation(.high)
+            } else if case .custom = kind {
+                Text(kind.avatarLetter)
+                    .font(.system(size: size * 0.52, weight: .bold))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .foregroundStyle(DT.providerText(kind))
+                    .background(DT.providerBg(kind))
             } else {
                 Image(systemName: "app.dashed")
                     .resizable()

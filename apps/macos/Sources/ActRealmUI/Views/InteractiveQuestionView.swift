@@ -37,7 +37,7 @@ struct InteractiveQuestionView: View {
                 Button("发送回答") { Task { await submit(action: "accept") } }
                     .buttonStyle(ActionButtonStyle(kind: .primary, compact: true))
                     .disabled(busy)
-                if prompt.kind == "claude_elicitation" {
+                if ["claude_elicitation", "agent_elicitation", "agent_question"].contains(prompt.kind) {
                     Button("拒绝提供") { Task { await submit(action: "decline") } }
                         .buttonStyle(ActionButtonStyle(kind: .secondary, compact: true))
                         .disabled(busy)
@@ -203,7 +203,7 @@ struct InteractiveQuestionView: View {
                     validationErrors[question.id] = "请选择一个答案。"
                     return
                 }
-                if ["claude_question", "codex_user_input"].contains(prompt.kind) {
+                if (["claude_question", "codex_user_input", "agent_question"].contains(prompt.kind) || question.multiSelect) {
                     answers[question.id] = .array(values.map(JSONValue.string))
                 } else if let first = values.first {
                     answers[question.id] = .string(first)
@@ -215,7 +215,7 @@ struct InteractiveQuestionView: View {
                     return
                 }
                 if !value.isEmpty {
-                    answers[question.id] = prompt.kind == "codex_user_input"
+                    answers[question.id] = ["codex_user_input", "agent_question"].contains(prompt.kind)
                         ? .array([.string(value)])
                         : .bool(value == "true")
                 }
@@ -237,7 +237,7 @@ struct InteractiveQuestionView: View {
                 } else {
                     normalized = .string(value)
                 }
-                if prompt.kind == "codex_user_input" {
+                if ["codex_user_input", "agent_question"].contains(prompt.kind) {
                     let codexValue: String
                     if case .number(let number) = normalized {
                         codexValue = number.rounded() == number

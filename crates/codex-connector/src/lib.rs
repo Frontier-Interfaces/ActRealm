@@ -113,6 +113,17 @@ impl CodexConnector {
         Self::connect_stdio(executable)
     }
 
+    /// Reads account quota through a short-lived app-server process. Runtime
+    /// uses this only when its persistent task connector is unavailable, so
+    /// quota polling keeps working after sleep or an early connector failure
+    /// without requiring the user to start a Codex task.
+    pub fn read_rate_limits_once(executable: &Path) -> Result<Value, ConnectorError> {
+        let (connector, _channels) = Self::connect_stdio(executable)?;
+        let result = connector.read_rate_limits();
+        connector.shutdown();
+        result
+    }
+
     fn connect_stdio(executable: &Path) -> Result<(Self, ConnectorChannels), ConnectorError> {
         // Codex app-server natively supports stdio. Keeping it as the direct
         // child of Runtime avoids a detached Unix-socket listener: if Runtime
@@ -286,6 +297,13 @@ impl CodexConnector {
         Ok(thread)
     }
 
+    /// Reads Codex account rate limits without starting or resuming a task.
+    /// The app-server owns authentication; ActRealm receives only the
+    /// allowlisted usage snapshot returned by the provider protocol.
+    pub fn read_rate_limits(&self) -> Result<Value, ConnectorError> {
+        self.call("account/rateLimits/read", json!({}), RPC_TIMEOUT)
+    }
+
     pub fn call(
         &self,
         method: &str,
@@ -328,6 +346,16 @@ impl CodexConnector {
 
     pub fn respond_error(&self, id: Value, code: i64, message: &str) -> Result<(), ConnectorError> {
         self.write(&json!({"id": id, "error": {"code": code, "message": message}}))
+    }
+
+    pub fn shutdown(&self) {
+        self.fail_all_pending("connector_shutdown");
+        if let Ok(mut managed) = self.inner.child.lock() {
+            if let Some(mut child) = managed.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
     }
 
     fn write(&self, value: &Value) -> Result<(), ConnectorError> {
@@ -516,16 +544,20 @@ if [ "$2" = "daemon" ]; then
   exit 0
 fi
 while IFS= read -r line; do
+  request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
     *'"method":"initialize"'*)
-      printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex","platformFamily":"unix","platformOs":"macos","userAgent":"codex_cli_rs/0.144.6"}}'
+      printf '{"id":%s,"result":{"codexHome":"/tmp/codex","platformFamily":"unix","platformOs":"macos","userAgent":"codex_cli_rs/0.144.6"}}\n' "$request_id"
       ;;
     *'"method":"thread/list"'*)
-      printf '%s\n' '{"id":2,"result":{"data":[{"id":"thread-1","sessionId":"session-1","cwd":"/tmp/project","name":"Recovered thread","status":{"type":"active","activeFlags":["waitingOnUserInput"]},"turns":[],"updatedAt":100}]}}'
+      printf '{"id":%s,"result":{"data":[{"id":"thread-1","sessionId":"session-1","cwd":"/tmp/project","name":"Recovered thread","status":{"type":"active","activeFlags":["waitingOnUserInput"]},"turns":[],"updatedAt":100}]}}\n' "$request_id"
       ;;
     *'"method":"thread/resume"'*)
-      printf '%s\n' '{"id":3,"result":{"thread":{"id":"thread-1","sessionId":"session-1","cwd":"/tmp/project","name":"Recovered thread","status":{"type":"active","activeFlags":["waitingOnUserInput"]},"turns":[],"updatedAt":100}}}'
+      printf '{"id":%s,"result":{"thread":{"id":"thread-1","sessionId":"session-1","cwd":"/tmp/project","name":"Recovered thread","status":{"type":"active","activeFlags":["waitingOnUserInput"]},"turns":[],"updatedAt":100}}}\n' "$request_id"
       printf '%s\n' '{"id":"server-request-1","method":"item/tool/requestUserInput","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","questions":[{"id":"choice","header":"Choice","question":"Continue?","isOther":false,"isSecret":false,"options":null}]}}'
+      ;;
+    *'"method":"account/rateLimits/read"'*)
+      printf '{"id":%s,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":12,"windowDurationMins":300,"resetsAt":1784140000}}}}\n' "$request_id"
       ;;
     *'"id":"server-request-1"'*)
       printf '%s\n' '{"method":"test/responseSeen","params":{"threadId":"thread-1"}}'
@@ -551,6 +583,11 @@ done
         assert_eq!(threads[0].active_flags, vec!["waitingOnUserInput"]);
         let resumed = connector.resume_thread("thread-1").unwrap();
         assert_eq!(resumed.name.as_deref(), Some("Recovered thread"));
+        let rate_limits = connector.read_rate_limits().unwrap();
+        assert_eq!(rate_limits["rateLimits"]["primary"]["usedPercent"], 12);
+
+        let one_shot = CodexConnector::read_rate_limits_once(&executable).unwrap();
+        assert_eq!(one_shot["rateLimits"]["primary"]["usedPercent"], 12);
         let request = channels
             .requests
             .recv_timeout(Duration::from_secs(1))
@@ -567,6 +604,17 @@ done
             .recv_timeout(Duration::from_secs(1))
             .unwrap();
         assert_eq!(notification.method, "test/responseSeen");
+        connector.shutdown();
+        assert!(
+            !Command::new("/bin/kill")
+                .args(["-0", &child_id.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success(),
+            "explicit shutdown must reap the managed app-server child"
+        );
         drop(connector);
         assert!(weak_connector.upgrade().is_none());
         assert!(

@@ -14,6 +14,204 @@
   --shadow: inset 0 1px 0 rgba(255, 255, 255, .95), 0 24px 60px rgba(40, 60, 120, .22);
 }
 
+.agent-detail-panels {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.agent-detail-panel {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid rgba(0, 0, 0, .08);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--glass-strong) 72%, transparent);
+}
+
+.agent-detail-panel-title {
+  display: block;
+  color: var(--ink);
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.agent-detail-source,
+.agent-detail-empty {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.agent-detail-empty.failed,
+.agent-workflow-row.failed {
+  color: var(--red);
+}
+
+.agent-detail-review-summary {
+  margin: 4px 0;
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.agent-review-validations {
+  display: grid;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.agent-checkpoint-actions,
+.agent-checkpoint-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.agent-checkpoint-actions input { min-width: 120px; flex: 1; }
+.agent-checkpoint-actions button,
+.agent-checkpoint-controls button {
+  border: 1px solid rgba(0, 0, 0, .1);
+  border-radius: 7px;
+  padding: 5px 7px;
+  background: var(--glass-strong);
+  font-size: 9px;
+}
+.agent-checkpoint-list { display: grid; gap: 6px; margin-top: 7px; }
+.agent-checkpoint-card {
+  padding: 8px;
+  border: 1px solid rgba(0, 0, 0, .08);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, .35);
+}
+.agent-checkpoint-card > strong,
+.agent-checkpoint-card > small { display: block; }
+.agent-checkpoint-card > small { margin-top: 2px; color: var(--muted); font-size: 8px; }
+.agent-checkpoint-controls button.danger { color: #b23630; }
+
+.agent-review-facts {
+  display: grid;
+  gap: 3px;
+  margin-bottom: 7px;
+}
+
+.agent-review-fact {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.agent-review-validation {
+  border-left: 2px solid var(--amber);
+  padding-left: 7px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.agent-review-validation.passed { border-left-color: var(--green); }
+.agent-review-validation.failed { border-left-color: var(--red); }
+
+.agent-review-diff-button,
+.agent-review-diff-file {
+  border: 1px solid rgba(0, 0, 0, .1);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .55);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+.agent-review-diff-button { margin-top: 7px; padding: 5px 8px; }
+.agent-review-diff { display: grid; gap: 7px; margin-top: 7px; }
+.agent-review-diff-files { display: flex; flex-wrap: wrap; gap: 4px; }
+.agent-review-diff-file { max-width: 100%; padding: 4px 7px; overflow-wrap: anywhere; }
+.agent-review-diff-patch {
+  max-height: 260px;
+  margin: 0;
+  overflow: auto;
+  padding: 8px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, .05);
+  color: var(--ink);
+  font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre;
+}
+
+.agent-detail-scroll {
+  max-height: 220px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.agent-plan-list {
+  display: grid;
+  gap: 7px;
+  margin: 7px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agent-plan-step {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 6px;
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.agent-plan-step small {
+  display: block;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.agent-plan-step.in_progress .agent-plan-state {
+  color: var(--blue);
+}
+
+.agent-plan-step.completed {
+  color: var(--muted);
+}
+
+.agent-workflow-earlier {
+  border: 0;
+  padding: 0 0 6px;
+  color: var(--blue);
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.agent-workflow-list {
+  display: grid;
+  gap: 2px;
+}
+
+.agent-workflow-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: baseline;
+  padding: 5px 0;
+  border-bottom: 1px solid rgba(0, 0, 0, .07);
+  color: var(--ink);
+  font-size: 11px;
+}
+
+.agent-workflow-copy {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-workflow-row small,
+.agent-workflow-row time {
+  color: var(--muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
 * { box-sizing: border-box; }
 
 [hidden], .legacy-only { display: none !important; }
@@ -221,6 +419,24 @@ button { color: inherit; }
 .task-list, .quota-list { margin-top: 11px; }
 .task-list { display: flex; flex-direction: column; gap: 6px; }
 .quota-list { display: flex; flex-direction: column; gap: 8px; }
+
+.token-decision-summary {
+  margin: 0 10px 10px;
+  padding: 10px;
+  border: 1px solid rgba(255, 255, 255, .1);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, .055);
+}
+.token-decision-title { display: block; margin-bottom: 7px; font-size: 9px; letter-spacing: .05em; }
+.token-decision-facts, .token-decision-row, .token-burn-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 3px 0; font-size: 8px; color: var(--muted);
+}
+.token-decision-facts { margin-bottom: 4px; border-bottom: 1px solid rgba(255, 255, 255, .07); }
+.token-decision-row span, .token-burn-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.token-burn-row { margin-top: 5px; padding-top: 6px; border-top: 1px solid rgba(255, 255, 255, .07); }
+.token-burn-row.elevated strong { color: var(--amber); }
+.token-decision-source { color: rgba(0, 0, 0, .34); font-size: 7px; }
 
 .empty-state {
   height: 100%;

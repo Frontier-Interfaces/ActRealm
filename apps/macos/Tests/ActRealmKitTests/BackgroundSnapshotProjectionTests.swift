@@ -5,7 +5,8 @@ import Testing
 private func projectionSession(
     id: String,
     execState: String = "thinking",
-    lastEventAt: UInt64 = 1_000
+    lastEventAt: UInt64 = 1_000,
+    activitySince: UInt64? = nil
 ) -> SessionRecord {
     SessionRecord(
         id: id,
@@ -17,7 +18,7 @@ private func projectionSession(
         execState: execState,
         approvalOwner: nil,
         activity: nil,
-        activitySince: nil,
+        activitySince: activitySince,
         planDone: nil,
         planTotal: nil,
         lastEventAt: lastEventAt
@@ -73,6 +74,40 @@ private func projectionQuota(remaining: Double) -> QuotaEntry {
 }
 
 @Suite struct NativeTaskProjectionTests {
+    @Test func activeTasksNeverAgeOutAndInactiveTasksHideImmediately() {
+        let now = Date(timeIntervalSince1970: 10_000)
+        let running = LaneTask(
+            session: projectionSession(
+                id: "running",
+                lastEventAt: 1_000,
+                activitySince: 1_000
+            ),
+            openAttention: []
+        )
+        let recentlyIdle = LaneTask(
+            session: projectionSession(
+                id: "recently-idle",
+                execState: "idle",
+                lastEventAt: 10_000_000,
+                activitySince: 9_000_000
+            ),
+            openAttention: []
+        )
+        let expiredIdleWithNewMetadata = LaneTask(
+            session: projectionSession(
+                id: "expired-idle",
+                execState: "idle",
+                lastEventAt: 10_000_000,
+                activitySince: 8_000_000
+            ),
+            openAttention: []
+        )
+
+        #expect(running.isVisibleInAgentTasks(at: now))
+        #expect(!recentlyIdle.isVisibleInAgentTasks(at: now))
+        #expect(!expiredIdleWithNewMetadata.isVisibleInAgentTasks(at: now))
+    }
+
     @Test func quotaAndMetricOnlySnapshotsDoNotRepublishUnchangedTaskCards() {
         var projector = TaskRenderProjector()
         let tasks = [projectionSession(id: "A")]
@@ -105,40 +140,6 @@ private func projectionQuota(remaining: Double) -> QuotaEntry {
         )
 
         #expect(result.changedTaskIDs == ["A"])
-    }
-
-    @Test func nativePresentationLatencyKeepsOneHundredNewestSamplesAndUsesP95Index() {
-        var latency = NativePresentationLatency()
-        let renderedAt = Date(timeIntervalSince1970: 10_000)
-
-        for milliseconds in 0 ... 100 {
-            let accepted = latency.record(
-                eventAt: renderedAt.addingTimeInterval(-Double(milliseconds) / 1_000),
-                renderedAt: renderedAt
-            )
-            #expect(accepted)
-        }
-
-        #expect(latency.sampleCount == 100)
-        #expect(latency.p95Milliseconds == 95)
-    }
-
-    @Test func nativePresentationLatencyRejectsFutureAndStaleEvents() {
-        var latency = NativePresentationLatency()
-        let renderedAt = Date(timeIntervalSince1970: 10_000)
-
-        let futureAccepted = latency.record(
-            eventAt: renderedAt.addingTimeInterval(0.001),
-            renderedAt: renderedAt
-        )
-        let staleAccepted = latency.record(
-            eventAt: renderedAt.addingTimeInterval(-10.001),
-            renderedAt: renderedAt
-        )
-        #expect(!futureAccepted)
-        #expect(!staleAccepted)
-        #expect(latency.sampleCount == 0)
-        #expect(latency.p95Milliseconds == nil)
     }
 
     @Test func projectsFiveHundredSessionsBelowThreeHundredMillisecondsWithoutWorkspaceFocus() {

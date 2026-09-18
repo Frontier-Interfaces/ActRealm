@@ -1,6 +1,6 @@
 use actrealm_installer::{
     BinaryHealth, CodexFeatureStatus, CodexTrustStatus, ConfigHealth, HookProvider, InstallIntent,
-    InstallOptions, InstallPaths, Installer, InstallerError,
+    InstallOptions, InstallPaths, Installer, InstallerError, ProviderAvailability,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -9,8 +9,31 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn app_server_prefers_the_desktop_bundled_codex_over_an_older_global_cli() {
+    let availability = ProviderAvailability {
+        cli_path: Some(PathBuf::from("/opt/homebrew/bin/codex")),
+        desktop_app_path: Some(PathBuf::from("/Applications/ChatGPT.app")),
+        bundled_cli_path: Some(PathBuf::from(
+            "/Applications/ChatGPT.app/Contents/Resources/codex",
+        )),
+    };
+
+    assert_eq!(
+        availability.app_server_executable(),
+        Some(Path::new(
+            "/Applications/ChatGPT.app/Contents/Resources/codex"
+        ))
+    );
+    assert_eq!(
+        availability.codex_review_command().as_deref(),
+        Some("/opt/homebrew/bin/codex")
+    );
+}
 
 struct TestDir(PathBuf);
 
@@ -67,6 +90,28 @@ fn write_file(path: &Path, bytes: &[u8], mode: u32) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, bytes).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+fn write_file_at_or_after(path: &Path, bytes: &[u8], mode: u32, minimum_millis: u64) {
+    for _ in 0..250 {
+        write_file(path, bytes, mode);
+        let modified_millis = fs::metadata(path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        if modified_millis >= minimum_millis {
+            return;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    panic!(
+        "test fixture could not advance {} past the installed definition timestamp; now={:?}",
+        path.display(),
+        SystemTime::now()
+    );
 }
 
 fn write_json(path: &Path, value: &Value) {
@@ -179,6 +224,46 @@ fn claude_install_backs_up_and_preserves_user_semantics() {
         0o640,
         "atomic replacement preserves an existing config mode"
     );
+}
+
+#[test]
+fn claude_install_replaces_legacy_product_hooks_instead_of_duplicating_them() {
+    let fixture = Fixture::new("claude-legacy-product");
+    write_json(
+        &fixture.paths.claude_settings,
+        &json!({
+            "hooks": {
+                "PermissionRequest": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/Users/example/.flow-agent/bin/flow-agent hook --provider claude",
+                        "timeout": 86400
+                    }]
+                }],
+                "PostToolUse": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/Users/example/.flow-agent/bin/flow-agent hook --provider claude",
+                        "timeout": 5
+                    }]
+                }]
+            }
+        }),
+    );
+
+    fixture
+        .installer()
+        .install(HookProvider::Claude, InstallOptions::default())
+        .unwrap();
+
+    let installed = read_json(&fixture.paths.claude_settings);
+    assert_eq!(
+        actrealm_handlers(&installed, "hook --provider claude").len(),
+        17
+    );
+    assert!(!installed
+        .to_string()
+        .contains("/.flow-agent/bin/flow-agent"));
 }
 
 #[test]
@@ -613,6 +698,9 @@ fn codex_inspection_distinguishes_review_from_trusted_state_and_feature_modes() 
         review.codex_trust_status,
         Some(CodexTrustStatus::ReviewRequired)
     );
+    let definition_changed_at_ms = review
+        .installed_definition_changed_at_ms
+        .expect("an installed Codex definition has a change timestamp");
 
     let source = fixture.paths.codex_hooks.to_string_lossy();
     let mut trust = String::from("[features]\nhooks = true\n");
@@ -626,7 +714,12 @@ fn codex_inspection_distinguishes_review_from_trusted_state_and_feature_modes() 
             "\n[hooks.state.\"{source}:{event}:0:0\"]\nenabled = true\ntrusted_hash = \"sha256:test-{event}\"\n"
         ));
     }
-    write_file(&fixture.paths.codex_config, trust.as_bytes(), 0o600);
+    write_file_at_or_after(
+        &fixture.paths.codex_config,
+        trust.as_bytes(),
+        0o600,
+        definition_changed_at_ms,
+    );
 
     let trusted = installer.inspect(HookProvider::Codex).unwrap();
     assert_eq!(

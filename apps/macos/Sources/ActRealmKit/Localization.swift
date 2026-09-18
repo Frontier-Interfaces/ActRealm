@@ -40,18 +40,21 @@ public enum AppLocalization {
         "plan": ("计划进度", "完成步数与进度条"),
         "sessionTokens": ("会话累计 Token", "折叠卡用量胶囊"),
         "context": ("上下文占用", "当前上下文百分比"),
-        "cost": ("估算 API 价格", "估算值，不是订阅账单"),
+        "cost": ("API 等价值", "理论 API 计价，不是订阅账单或实际支出"),
         "turnTokens": ("本轮 Token", "最近一轮 Token"),
         "inputOutputTokens": ("输入 / 输出 Token", "输入与输出拆分"),
         "cacheTokens": ("缓存读取 / 写入 Token", "缓存用量拆分"),
         "reasoningTokens": ("推理 Token", "Provider 推理用量"),
-        "tool": ("当前工具", nil),
+        "tool": ("当前动作", "语义类别与 Provider 工具名"),
+        "currentTarget": ("当前文件 / 目标", "仅使用 Provider 明确 path 字段的 basename"),
         "permissionMode": ("权限模式", nil),
         "subagents": ("运行中的子 Agent", nil),
         "environment": ("运行环境", nil),
         "recovery": ("恢复状态", nil),
         "control": ("托管能力", nil),
         "jump": ("打开应用", nil),
+        "taskFlow": ("任务流程", "展开任务后显示当前 Turn 的结构化计划步骤"),
+        "workflow": ("最近活动", "展开任务后显示当前 Turn 的重要工具活动"),
         "titleSource": ("标题来源", nil),
         "sessionId": ("ActRealm Session ID", nil),
         "providerSessionId": ("Provider Session ID", nil),
@@ -85,17 +88,34 @@ public enum AppLocalization {
         return bundle.localizedString(forKey: key, value: key, table: nil)
     }
 
+    private static let mainLocalizationBundles = localizationBundles(
+        in: Bundle.main
+    )
+
+    private static let moduleLocalizationBundles = localizationBundles(
+        in: Bundle.module
+    )
+
     private static func localizationBundle(identifier: String) -> Bundle? {
-        for container in [Bundle.module, Bundle.main] {
-            guard let resourcesURL = container.resourceURL else { continue }
+        // Packaged apps copy the language tables into Bundle.main. Prefer that
+        // path so window restoration never has to resolve SwiftPM's Bundle.module,
+        // whose generated fallback contains an absolute build-machine path.
+        // The right-hand side of ?? remains lazy, preserving package-test and
+        // development support when the executable has no embedded tables.
+        mainLocalizationBundles[identifier]
+            ?? moduleLocalizationBundles[identifier]
+    }
+
+    private static func localizationBundles(in container: Bundle) -> [String: Bundle] {
+        guard let resourcesURL = container.resourceURL else { return [:] }
+        return Dictionary(uniqueKeysWithValues: ["zh-Hans", "en"].compactMap {
+            identifier -> (String, Bundle)? in
             let localizationURL = resourcesURL
                 .appendingPathComponent(identifier, isDirectory: true)
                 .appendingPathExtension("lproj")
-            if let bundle = Bundle(url: localizationURL) {
-                return bundle
-            }
-        }
-        return nil
+            guard let bundle = Bundle(url: localizationURL) else { return nil }
+            return (identifier, bundle)
+        })
     }
 
     public static func formatted(
@@ -130,8 +150,14 @@ public enum AppLocalization {
         guard let message else {
             return localizedProviderText(fallback, language: language)
         }
-        let template = localized(message.code, language: language)
-        guard template != message.code else {
+        let singularQuotaWindows: Set<String> = [
+            "quota.window.months", "quota.window.weeks", "quota.window.days",
+            "quota.window.hours", "quota.window.minutes", "quota.window.scoped_weeks",
+        ]
+        let key = message.args["count"] == "1" && singularQuotaWindows.contains(message.code)
+            ? "\(message.code).one" : message.code
+        let template = localized(key, language: language)
+        guard template != key else {
             return localizedProviderText(fallback, language: language)
         }
         return message.args.reduce(template) { result, pair in
@@ -149,6 +175,33 @@ public enum AppLocalization {
             fallback: fallback,
             language: language
         )
+    }
+
+    /// Localize the components before combining them; translating a fully
+    /// assembled source/quality string leaves Chinese fragments in English UI.
+    public static func localizedUsageDescription(source: String?, quality: String?, language: AppLanguage) -> String {
+        let sourceKey = switch source {
+        case "statusline": "StatusLine"
+        case "grok_session_usage": "Grok 本机会话账本"
+        case "agent_connector": "Agent 本机用量记录"
+        case "claude_transcript": "Claude transcript"
+        case "claude_transcript_incremental": "Claude transcript（增量）"
+        case "codex_rollout": "Codex 本机 rollout"
+        case "codex_response_records": "Codex 本机响应账本"
+        case "codex_rollout_session_local": "Codex 本机会话记录"
+        case "codex_rollout_incremental": "Codex 本机 rollout（增量）"
+        case "codex_rollout_during_indexing": "Codex 本机记录（历史索引中）"
+        default: "Provider 未提供用量数据"
+        }
+        let qualityKey = switch quality {
+        case "official": "官方"
+        case "official_local": "已验证本机记录"
+        case "derived": "完整派生"
+        case "partial": "部分覆盖"
+        case "suspect": "数据可疑"
+        default: "完整性未知"
+        }
+        return localized(sourceKey, language: language) + " · " + localized(qualityKey, language: language)
     }
 
     public static func localizedAPIError(

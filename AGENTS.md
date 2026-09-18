@@ -39,8 +39,10 @@ Product invariants:
   after Thread/Turn reconnection.
 - Raw prompts, full commands, tool input/output, transcripts, and file contents
   are not persisted by default.
-- The runtime is local-only. Do not add telemetry, cloud SDKs, CDNs, or outbound
-  update checks.
+- ActRealm is a local-only product. Do not add team sharing, cloud account
+  synchronization, telemetry uploads, mobile control or Firebase dependencies.
+- Local Companion control stays on authenticated loopback routes and retains
+  per-request permission, expiry and live reply-channel validation.
 - The v1 web client uses native HTML/CSS/JS with no framework or build step.
 - The Rust Runtime remains the single owner of Hooks, SQLite, approval state,
   sanitization, and Provider reply channels. Native clients consume the
@@ -61,7 +63,27 @@ cargo clippy --workspace --all-targets --offline -- -D warnings
 cargo test --workspace --offline
 cargo build --workspace --release --offline
 ./scripts/check-actrealm-language.sh
+TZ=UTC apps/macos/Scripts/test.sh
 ```
+
+CI reproducibility rules:
+
+- Treat the GitHub job log as the source of truth; identify the exact failing
+  test and assertion before changing code or rerunning a workflow.
+- Tests must not combine `Date()`, `Calendar.current`, the host time zone, or
+  the host locale with fixed expected text. Inject a fixed clock, calendar,
+  time zone, and locale whenever the output depends on them.
+- Tests that distinguish file freshness or trust state must not rely on two
+  real filesystem writes landing in different clock ticks. Inject the clock or
+  set a deterministic timestamp gap before asserting the transition.
+- Adding a Runtime message or API error code requires updating the shared
+  contract and every implemented localization in the same change, followed by
+  `./scripts/check-actrealm-language.sh` before any push.
+- The macOS test script defaults to UTC, matching GitHub-hosted runners. Tests
+  for user-local behavior must inject and assert each intended zone explicitly.
+- Keep every action pinned to a full commit SHA and on a supported Node runtime;
+  a deprecation warning is a maintenance failure even when it is not yet the
+  failing step.
 
 Run milestone-specific integration, security, and performance checks in
 addition to this common gate. Documentation-only changes must still pass link,

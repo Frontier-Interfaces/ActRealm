@@ -13,6 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use toml_edit::DocumentMut;
 
+pub mod agents;
+
 const CONFIG_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
 const STATE_SCHEMA_VERSION: u32 = 1;
 const CLAUDE_ORIGINAL_STATUSLINE_KEY: &str = "_actRealmOriginalStatusLine";
@@ -80,6 +82,16 @@ impl ProviderAvailability {
             .or(self.bundled_cli_path.as_deref())
     }
 
+    /// Prefers the desktop application's bundled Codex for app-server
+    /// protocol work. A globally installed CLI can lag behind the desktop app
+    /// and expose an older account/rateLimits schema even while normal CLI
+    /// hooks remain healthy.
+    pub fn app_server_executable(&self) -> Option<&Path> {
+        self.bundled_cli_path
+            .as_deref()
+            .or(self.cli_path.as_deref())
+    }
+
     pub fn codex_review_command(&self) -> Option<String> {
         self.cli_path
             .as_ref()
@@ -90,11 +102,11 @@ impl ProviderAvailability {
 
 pub fn discover_provider_availability(provider: HookProvider) -> ProviderAvailability {
     let cli_path = provider_cli_candidates(provider).into_iter().next();
-    let mut desktop_app_path = None;
-    let mut bundled_cli_path = None;
 
     #[cfg(target_os = "macos")]
-    {
+    let (desktop_app_path, bundled_cli_path) = {
+        let mut desktop_app_path = None;
+        let mut bundled_cli_path = None;
         for root in application_roots() {
             let candidates: &[(&str, &str)] = match provider {
                 HookProvider::Claude => &[("Claude.app", "Contents/MacOS/Claude")],
@@ -118,7 +130,11 @@ pub fn discover_provider_availability(provider: HookProvider) -> ProviderAvailab
                 break;
             }
         }
-    }
+        (desktop_app_path, bundled_cli_path)
+    };
+
+    #[cfg(not(target_os = "macos"))]
+    let (desktop_app_path, bundled_cli_path): (Option<PathBuf>, Option<PathBuf>) = (None, None);
 
     ProviderAvailability {
         cli_path,
@@ -1205,36 +1221,71 @@ impl Installer {
         {
             return Err(InstallerError::UnsafeBackupEntry(backups));
         }
-        let entries = fs::read_dir(&backups).map_err(|source| InstallerError::Io {
-            path: backups.clone(),
-            source,
-        })?;
         let mut files = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|source| InstallerError::Io {
-                path: backups.clone(),
-                source,
-            })?;
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                return Err(InstallerError::UnsafeBackupEntry(path));
-            };
-            let metadata = fs::symlink_metadata(&path).map_err(|source| InstallerError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            if metadata.file_type().is_symlink()
-                || !metadata.is_file()
-                || metadata.permissions().mode() & 0o077 != 0
-                || !is_owned_backup_name(name)
-            {
-                return Err(InstallerError::UnsafeBackupEntry(path));
-            }
-            files.push((path, metadata.len()));
-        }
+        collect_managed_backups(&backups, false, &mut files)?;
         files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         Ok(files)
     }
+}
+
+// The new providers use one owned subdirectory. Validate every entry before
+// returning anything to clear_backups; never recurse into arbitrary folders.
+fn collect_managed_backups(
+    directory: &Path,
+    agents: bool,
+    files: &mut Vec<(PathBuf, u64)>,
+) -> Result<(), InstallerError> {
+    let entries = fs::read_dir(directory).map_err(|source| InstallerError::Io {
+        path: directory.to_owned(),
+        source,
+    })?;
+    for entry in entries {
+        let path = entry
+            .map_err(|source| InstallerError::Io {
+                path: directory.to_owned(),
+                source,
+            })?
+            .path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            return Err(InstallerError::UnsafeBackupEntry(path));
+        };
+        let metadata = fs::symlink_metadata(&path).map_err(|source| InstallerError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() || metadata.permissions().mode() & 0o077 != 0 {
+            return Err(InstallerError::UnsafeBackupEntry(path));
+        }
+        if !agents && name == "providers" && metadata.is_dir() {
+            collect_managed_backups(&path, true, files)?;
+            continue;
+        }
+        let owned = if agents {
+            is_owned_agent_backup_name(name)
+        } else {
+            is_owned_backup_name(name)
+        };
+        if !metadata.is_file() || !owned {
+            return Err(InstallerError::UnsafeBackupEntry(path));
+        }
+        files.push((path, metadata.len()));
+    }
+    Ok(())
+}
+
+fn is_owned_agent_backup_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".bak") else {
+        return false;
+    };
+    ["kimi-", "grok-", "grok-config-"].iter().any(|prefix| {
+        stem.strip_prefix(prefix).is_some_and(|rest| {
+            let parts = rest.split('-').collect::<Vec<_>>();
+            parts.len() == 3
+                && parts
+                    .iter()
+                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        })
+    })
 }
 
 fn is_owned_backup_name(name: &str) -> bool {
@@ -1393,8 +1444,33 @@ fn strip_owned_hooks(config: &mut Value, command: &str) -> Result<usize, String>
 }
 
 fn is_owned_handler(handler: &Value, command: &str) -> bool {
-    handler.get("type").and_then(Value::as_str) == Some("command")
-        && handler.get("command").and_then(Value::as_str) == Some(command)
+    if handler.get("type").and_then(Value::as_str) != Some("command") {
+        return false;
+    }
+    let Some(candidate) = handler.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    candidate == command || is_actrealm_family_hook(candidate, command)
+}
+
+fn is_actrealm_family_hook(candidate: &str, desired: &str) -> bool {
+    let Some((candidate_binary, candidate_provider)) = split_provider_hook(candidate) else {
+        return false;
+    };
+    let Some((_, desired_provider)) = split_provider_hook(desired) else {
+        return false;
+    };
+    if candidate_provider != desired_provider {
+        return false;
+    }
+    let normalized = candidate_binary.trim_matches(['\'', '"']);
+    normalized.ends_with("/.actrealm/bin/actrealm")
+        || normalized.ends_with("/.flow-agent/bin/flow-agent")
+}
+
+fn split_provider_hook(command: &str) -> Option<(&str, &str)> {
+    let (binary, provider) = command.rsplit_once(" hook --provider ")?;
+    (!binary.is_empty() && matches!(provider, "claude" | "codex")).then_some((binary, provider))
 }
 
 fn has_complete_owned_install(

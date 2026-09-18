@@ -351,8 +351,9 @@ CREATE TABLE approval_stats (       -- 仅展示历史批准/拒绝事实，不�
 );
 CREATE TABLE quota_snapshots (
   provider TEXT NOT NULL, window TEXT NOT NULL,  -- 5h|7d|weekly
+  limit_id TEXT NOT NULL DEFAULT '',             -- 同周期的 Provider 额度桶身份
   used_pct REAL, resets_at INTEGER, source TEXT, -- source: statusline|rollout|unavailable
-  captured_at INTEGER NOT NULL, PRIMARY KEY(provider, window)
+  captured_at INTEGER NOT NULL, PRIMARY KEY(provider, window, limit_id)
 );
 CREATE TABLE metrics_daily (        -- §21 验证埋点
   day TEXT PRIMARY KEY,             -- YYYY-MM-DD

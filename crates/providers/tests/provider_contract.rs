@@ -47,6 +47,38 @@ fn codex_permission_request_preserves_turn_id() {
 }
 
 #[test]
+fn tool_lifecycle_keeps_bounded_invocation_identity_and_source_version() {
+    let event = parse_hook(
+        Provider::Claude,
+        json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "claude-session",
+            "tool_name": "Bash",
+            "tool_use_id": "toolu_123",
+            "hook_version": "2.1.210"
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(event.tool_call_id.as_deref(), Some("toolu_123"));
+    assert_eq!(event.source_version.as_deref(), Some("2.1.210"));
+
+    let rejected = parse_hook(
+        Provider::Codex,
+        json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "codex-session",
+            "tool_name": "Bash",
+            "tool_call_id": "x".repeat(257),
+            "source_version": "1\nprivate"
+        }),
+    )
+    .unwrap();
+    assert_eq!(rejected.tool_call_id, None);
+    assert_eq!(rejected.source_version, None);
+}
+
+#[test]
 fn codex_request_permissions_tool_is_an_observed_native_request() {
     let event = parse_hook(
         Provider::Codex,
@@ -90,6 +122,29 @@ fn codex_plugin_install_tool_is_an_observed_native_request() {
     assert_eq!(event.kind, EventKind::PermissionRequested);
     assert_eq!(event.tool_name.as_deref(), Some("request_plugin_install"));
     assert_eq!(event.provider_turn_id.as_deref(), Some("turn-plugin"));
+}
+
+#[test]
+fn codex_update_plan_hook_is_a_structured_plan_event() {
+    let event = parse_hook(
+        Provider::Codex,
+        json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "codex-plan-session",
+            "turn_id": "turn-plan",
+            "tool_name": "update_plan",
+            "tool_input": {
+                "plan": [
+                    {"step": "Inspect", "status": "completed"},
+                    {"step": "Implement", "status": "in_progress"}
+                ]
+            }
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(event.kind, EventKind::PlanUpdated);
+    assert_eq!(event.provider_turn_id.as_deref(), Some("turn-plan"));
 }
 
 #[test]

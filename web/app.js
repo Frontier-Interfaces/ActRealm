@@ -1,6 +1,8 @@
 "use strict";
 
 const I18N = window.ActRealmI18n;
+const agentState = window.ActRealmAgentState;
+const agentDetail = window.ActRealmAgentDetail;
 const tr = (text) => I18N.tr(text);
 const currentLocale = () => I18N.resolvedLocale();
 
@@ -48,6 +50,9 @@ const ui = {
   muteCodex: document.querySelector("#mute-codex"),
   codexEnhanced: document.querySelector("#codex-enhanced"),
   codexConnectorStatus: document.querySelector("#codex-connector-status"),
+  completionHideMode: document.querySelector("#completion-hide-mode"),
+  completionAutoHideRow: document.querySelector("#completion-auto-hide-row"),
+  completionAutoHideMinutes: document.querySelector("#completion-auto-hide-minutes"),
   retentionDays: document.querySelector("#retention-days"),
   displayProfile: document.querySelector("#display-profile"),
   taskCardFields: document.querySelector("#task-card-fields"),
@@ -90,7 +95,7 @@ const ui = {
 
 let csrfToken = sessionStorage.getItem("actrealm.csrf");
 let snapshot = { sessions: [], attention: [], commands: [], quota: [], stats: {} };
-let currentAttention = 0;
+let currentAttentionID;
 let socket;
 let runtimeConnected = false;
 let reconnectDelay = 500;
@@ -108,9 +113,23 @@ let settingsState = {
   codexEnhancedActivity: true,
   retentionDays: 90,
   displayProfile: "detailed",
-  displayFieldsVersion: 3,
-  taskCardFields: ["project", "task", "model", "activity", "plan", "sessionTokens", "turnTokens", "inputOutputTokens", "cacheTokens", "reasoningTokens", "cost", "context", "tool", "subagents", "environment", "recovery", "control", "jump"],
+  displayFieldsVersion: 5,
+  taskCardFields: [...agentDetail.presets.detailed],
   quotaDisplayMode: "standard",
+  tokenUsageDisplayMode: "standard",
+  tokenUsageComponentsVisible: true,
+  tokenUsageHeatmapVisible: true,
+  tokenUsageCostVisible: true,
+  tokenUsageObservedTimeVisible: true,
+  tokenUsageExecutionTimeVisible: true,
+  tokenUsageUnitStyle: "automatic",
+  tokenUsageTaskProjectVisible: true,
+  tokenUsageBurnRateVisible: true,
+  tokenUsageAnomalyVisible: true,
+  tokenThresholdNotificationsEnabled: false,
+  tokenThresholdTokensPerMinute: 250000,
+  completionTaskHideMode: "afterConfirmation",
+  completionAutoHideMinutes: 30,
 };
 let displayCatalog = [];
 let claudeBridge = { status: "not_installed" };
@@ -142,6 +161,13 @@ let lastRuntimeMonitorAt = 0;
 let hiddenSessions = JSON.parse(localStorage.getItem("actrealm.hiddenSessions") || "{}");
 const SESSION_VISIBLE_FOR_MS = 30 * 60 * 1000;
 const RUNTIME_MESSAGES_ZH = {
+  "interaction.agent_question.title": "Agent 正在询问",
+  "quota.reason.agent_refresh_failed": "Agent 额度刷新失败，显示上次记录。",
+  "quota.reason.agent_unavailable": "Agent 暂未提供账户额度信息。",
+  "quota.window.claude_weekly": "总周额度",
+  "quota.window.scoped_weeks": "{name} · {count} 周",
+  "quota.window.scoped": "{name} 额度",
+  "quota.reason.cache_stale": "这是历史额度，正在等待 Provider 更新；不能作为当前剩余额度。",
   "session.activity.idle": "等待新任务",
   "session.activity.ended": "会话已结束",
   "session.activity.thinking": "正在思考",
@@ -197,10 +223,19 @@ const RUNTIME_MESSAGES_ZH = {
   "quota.reason.no_valid_window": "没有找到可验证的额度窗口。",
   "quota.reason.codex_rollout_missing": "未找到 Codex rollout 文件。",
   "quota.reason.codex_window_missing": "Codex rollout 中没有可验证的额度窗口。",
+  "quota.reason.claude_refresh_failed": "Claude 额度刷新失败，当前显示的是上次成功获取的数据。",
+  "quota.reason.codex_refresh_failed": "Codex 额度刷新失败，当前显示的是上次成功获取的数据。",
 };
 
 const API_ERRORS_ZH = {
+  CLAUDE_SIGN_IN_REQUIRED: "请先登录 Claude Code，再刷新额度；无需发送对话。",
+  CLAUDE_AUTH_REFRESH_FAILED: "Claude 凭据自动续期失败，请检查登录状态或重试。",
+  CLAUDE_QUOTA_RATE_LIMITED: "Claude 额度请求被限流，将稍后自动重试。",
+
+  ARTIFACT_REVEAL_FAILED: "访达未能定位该文件，请重试",
+  ARTIFACT_UNAVAILABLE: "关联文件已不可用，或已不属于当前结果",
   ANSWER_FAILED: "回答未能发送给 Agent",
+  AUTH_PERSIST_FAILED: "伴生应用授权无法保存",
   AUTH_UNAVAILABLE: "Runtime 身份验证暂不可用",
   BACKUP_CLEAR_FAILED: "配置备份未能安全清除",
   BACKUP_DELETE_CONFIRMATION_REQUIRED: "需要输入 DELETE BACKUPS 才能清除配置备份",
@@ -211,22 +246,38 @@ const API_ERRORS_ZH = {
   CODEX_REINSTALL_FAILED: "Codex Hook 重新安装失败",
   COMMAND_MISMATCH: "命令与当前请求不匹配",
   COMMIT_TOO_EARLY: "决定仍在撤回窗口内",
+  COMPANION_NOT_FOUND: "没有找到对应的伴生应用连接",
+  COMPANION_SCOPE_REQUIRED: "当前伴生应用没有这项操作权限",
+  COMPANION_UNAUTHORIZED: "伴生应用连接无效或已撤销",
   CONNECTOR_ATTACH_FAILED: "Connector 连接失败",
+  CURRENT_TURN_REQUIRED: "向前加载任务时间线时必须限定当前阶段",
   DELETE_CONFIRMATION_REQUIRED: "需要输入 DELETE 才能清除数据",
   EXPORT_FAILED: "本地数据导出失败",
   INVALID_ACTION: "当前操作无效",
   INVALID_ANSWER: "回答内容无效",
   INVALID_BOOTSTRAP: "启动凭据无效或已过期",
+  INVALID_CLIENT_NAME: "伴生应用名称无效",
   INVALID_COMMAND_ID: "命令标识无效",
+  INVALID_COMPANION_ID: "伴生应用标识无效",
   INVALID_HOST: "访问地址不是受信任的本机地址",
+  INVALID_HISTORY_LIMIT: "历史任务读取数量无效",
   INVALID_ORIGIN: "请求来源不受信任",
+  INVALID_PAIRING_CODE: "配对码无效或已经使用",
   INVALID_RESTART_TOKEN: "Runtime 重启凭据无效",
+  INVALID_SESSION_ID: "任务标识无效",
   INVALID_SETTINGS: "设置内容无效",
+  CHECKPOINT_NOT_FOUND: "没有找到对应 Checkpoint",
+  CHECKPOINT_INVALID: "Checkpoint 请求无效",
+  CHECKPOINT_GIT_FAILED: "无法安全创建或应用 Git Checkpoint",
+  CHECKPOINT_PREFLIGHT_FAILED: "Checkpoint 恢复预检未通过",
+  INVALID_TIMELINE_CURSOR: "任务时间线只能使用一个游标",
   JUMP_FAILED: "没有找到原窗口，或 macOS 尚未授予应用控制权限",
   JUMP_UNSUPPORTED: "当前环境不支持跳转",
   MANAGED_CONNECTOR_UNSUPPORTED: "当前会话不支持托管 Connector",
   METRIC_RECORD_FAILED: "本地统计记录失败",
   MISSING_REQUEST_ID: "当前请求没有可回复的请求标识",
+  PAIRING_EXPIRED: "配对码已经过期",
+  PAIRING_UNAVAILABLE: "当前没有可用的伴生应用配对请求",
   PROVIDER_CLIENT_MISSING: "没有找到对应的 Agent 客户端",
   PROVIDER_INSTALL_REQUIRED: "请先安装对应的 Agent 客户端",
   QUESTION_EXPIRED: "这个问题已经过期，不能再提交",
@@ -243,6 +294,7 @@ const API_ERRORS_ZH = {
   RUNTIME_AUTH_FAILED: "Runtime 身份验证失败",
   RUNTIME_SESSION_MISSING: "Runtime 没有返回本机会话",
   SESSION_NOT_FOUND: "没有找到对应任务",
+  TASK_STILL_ACTIVE: "任务仍在运行或等待处理，不能归档或删除历史",
   SETTINGS_READ_FAILED: "本机设置读取失败",
   SETUP_CHANGE_FAILED: "Agent 接入更新失败",
   SETUP_INSPECTION_FAILED: "Agent 接入状态检查失败",
@@ -277,42 +329,13 @@ function apiErrorText(error) {
   return tr("请求失败，请重试");
 }
 
-const DISPLAY_FIELDS_ZH = {
-  task: ["任务标题与摘要", "主标题；不同的任务摘要显示在下一行"],
-  activity: ["实时状态", "标题栏右侧的运行阶段与耗时"],
-  project: ["项目", "副标题中的项目名称"],
-  model: ["模型", "副标题中的模型名称"],
-  plan: ["计划进度", "完成步数与进度条"],
-  sessionTokens: ["会话累计 Token", "折叠卡用量胶囊"],
-  context: ["上下文占用", "当前上下文百分比"],
-  cost: ["估算 API 价格", "估算值，不是订阅账单"],
-  turnTokens: ["本轮 Token", "最近一轮 Token"],
-  inputOutputTokens: ["输入 / 输出 Token", "输入与输出拆分"],
-  cacheTokens: ["缓存读取 / 写入 Token", "缓存用量拆分"],
-  reasoningTokens: ["推理 Token", "Provider 推理用量"],
-  tool: ["当前工具", ""],
-  permissionMode: ["权限模式", ""],
-  subagents: ["运行中的子 Agent", ""],
-  environment: ["运行环境", ""],
-  recovery: ["恢复状态", ""],
-  control: ["托管能力", ""],
-  jump: ["打开应用", ""],
-  titleSource: ["标题来源", ""],
-  sessionId: ["ActRealm Session ID", ""],
-  providerSessionId: ["Provider Session ID", ""],
-  providerTurnId: ["Provider Turn ID", ""],
-  lastEventAt: ["最后事件时间", ""],
-};
+const DISPLAY_FIELDS_ZH = agentDetail.displayFieldsZh;
 
 const SOCKET_STALE_AFTER_MS = 25 * 1000;
 const SNAPSHOT_FALLBACK_AFTER_MS = 15 * 1000;
 const SETUP_FOCUS_REFRESH_AFTER_MS = 5 * 1000;
 const USER_GUIDE_URL = "https://github.com/Frontier-Interfaces/ActRealm/blob/agent/v1-full/docs/USER_GUIDE_zh-CN.md";
-const DISPLAY_PRESETS = {
-  concise: ["project", "task", "model", "activity", "plan", "sessionTokens", "context"],
-  detailed: ["project", "task", "model", "activity", "plan", "sessionTokens", "turnTokens", "inputOutputTokens", "cacheTokens", "reasoningTokens", "cost", "context", "tool", "subagents", "environment", "recovery", "control", "jump"],
-  developer: ["project", "task", "model", "activity", "plan", "sessionTokens", "turnTokens", "inputOutputTokens", "cacheTokens", "reasoningTokens", "cost", "context", "tool", "permissionMode", "subagents", "environment", "recovery", "control", "jump", "titleSource", "sessionId", "providerSessionId", "providerTurnId", "lastEventAt"],
-};
+const DISPLAY_PRESETS = agentDetail.presets;
 const DISPLAY_FIELD_GROUPS = [
   { id: "headline", title: "主标题与状态", detail: "折叠任务卡的第一、二行" },
   { id: "subtitle", title: "副标题与进度", detail: "折叠任务卡的身份信息与计划" },
@@ -428,10 +451,12 @@ function onboardingQuotaState() {
 
 function openItems() {
   const visibleStates = new Set(["open", "committing", "decision_sent"]);
-  const weights = { error: 4, approval: 3, question: 2, completion: 1 };
   return snapshot.attention
-    .filter((item) => visibleStates.has(item.state) && notificationRule(item) !== "ignore")
-    .sort((a, b) => (weights[b.kind] || 0) - (weights[a.kind] || 0) || a.createdAt - b.createdAt);
+    .filter((item) => visibleStates.has(item.state)
+      && !agentState.isAcknowledgedCompletion(item)
+      && notificationRule(item) !== "ignore")
+    .sort((a, b) => agentState.attentionPriority(a) - agentState.attentionPriority(b)
+      || a.createdAt - b.createdAt);
 }
 
 function recentOutcome() {
@@ -454,6 +479,10 @@ function outcomeSummary() {
 
 function providerName(provider) {
   return { claude: "Claude", codex: "Codex", gemini: "Gemini" }[provider] || provider || "Agent";
+}
+
+function providerCapabilityStatus(session, feature) {
+  return snapshot.capabilities?.providerMatrix?.providers?.[session.provider]?.[feature]?.status || "unknown";
 }
 
 function guideLink(className = "", label = "查看接入指南") {
@@ -727,6 +756,10 @@ function renderSettings() {
   ui.muteClaude.checked = Boolean(settingsState.providerMuted?.claude);
   ui.muteCodex.checked = Boolean(settingsState.providerMuted?.codex);
   ui.codexEnhanced.checked = Boolean(settingsState.codexEnhancedActivity);
+  const completionSettings = agentState.completionSettings(settingsState);
+  ui.completionHideMode.value = completionSettings.mode;
+  ui.completionAutoHideMinutes.value = String(completionSettings.minutes);
+  ui.completionAutoHideRow.hidden = completionSettings.mode !== "afterDelay";
   const connector = snapshot.capabilities?.codexConnector;
   setClientText(ui.codexConnectorStatus, connector?.status === "connected"
     ? `已连接 · ${connector.managedThreads || 0} 个托管对话`
@@ -851,9 +884,19 @@ function settingsFromForm() {
     codexEnhancedActivity: ui.codexEnhanced.checked,
     retentionDays: Number(ui.retentionDays.value),
     displayProfile: ui.displayProfile.value,
-    displayFieldsVersion: settingsState.displayFieldsVersion || 3,
+    displayFieldsVersion: settingsState.displayFieldsVersion || 4,
     taskCardFields: [...ui.taskCardFields.querySelectorAll("input:checked")].map((input) => input.value),
     quotaDisplayMode: normalizedQuotaDisplayMode(settingsState.quotaDisplayMode),
+    tokenUsageDisplayMode: settingsState.tokenUsageDisplayMode || "standard",
+    tokenUsageComponentsVisible: settingsState.tokenUsageComponentsVisible !== false,
+    tokenUsageHeatmapVisible: settingsState.tokenUsageHeatmapVisible !== false,
+    tokenUsageCostVisible: settingsState.tokenUsageCostVisible !== false,
+    tokenUsageObservedTimeVisible: settingsState.tokenUsageObservedTimeVisible !== false,
+    tokenUsageExecutionTimeVisible: settingsState.tokenUsageExecutionTimeVisible !== false,
+    tokenUsageUnitStyle: settingsState.tokenUsageUnitStyle || "automatic",
+    ...window.TokenDecision?.settings(settingsState),
+    completionTaskHideMode: ui.completionHideMode.value,
+    completionAutoHideMinutes: Number(ui.completionAutoHideMinutes.value),
   };
 }
 
@@ -1290,7 +1333,7 @@ function attentionRenderSignature() {
   const items = openItems();
   const sessionIds = new Set(items.map((item) => item.sessionId));
   return JSON.stringify({
-    currentAttention,
+    currentAttentionID,
     items,
     commands: snapshot.commands.filter((command) => items.some((item) => item.id === command.attentionId)),
     sessions: snapshot.sessions
@@ -1323,8 +1366,12 @@ function renderAttention() {
       : emptyState("✓", "全部处理完毕", "新的授权、问题、完成或错误会实时进入 OUTBOX。"));
     return;
   }
-  currentAttention = Math.min(currentAttention, items.length - 1);
-  const item = items[currentAttention];
+  const previous = items.find((candidate) => candidate.id === currentAttentionID);
+  const item = previous
+    && agentState.attentionPriority(previous) <= agentState.attentionPriority(items[0])
+    ? previous
+    : items[0];
+  currentAttentionID = item.id;
   const context = attentionContext(item);
   const card = element("article", `attention-card ${item.kind || "approval"}`);
   const kicker = element("div", "attention-kicker");
@@ -1366,12 +1413,12 @@ function renderAttention() {
       ));
     }
     if (item.expiresAt) risk.append(element("span", "risk-chip", `截止 ${new Date(item.expiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`));
+    if (item.autoHideAt) risk.append(element("span", "risk-chip", `自动隐藏 ${new Date(item.autoHideAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`));
     card.append(risk);
   }
 
   const actions = element("div", "actions");
   if (interactive) {
-    // The interactive form owns its submit, decline, cancel, and handoff actions.
   } else if (item.state === "open" && item.kind === "native_approval") {
     const openProvider = element("button", "action-button", "返回原窗口");
     openProvider.type = "button";
@@ -1396,7 +1443,9 @@ function renderAttention() {
     });
     actions.append(confirm);
   } else if (item.state === "open") {
-    const acknowledge = item.kind === "completion" ? "确认完成" : "标记已解决";
+    const acknowledge = item.kind === "completion"
+      ? (item.autoHideAt ? "知道了" : "确认完成")
+      : "标记已解决";
     actions.append(actionButton(acknowledge, "", "ack", item));
     if (item.kind === "completion" && session) {
       const back = element("button", "action-button ghost", "返回原窗口");
@@ -1419,7 +1468,7 @@ function renderAttention() {
     ui.attentionList.append(element("div", "queue-label", `队列 · 还有 ${items.length - 1} 项`));
     const queue = element("div", "attention-queue");
     items.forEach((candidate, index) => {
-      if (index === currentAttention) return;
+      if (candidate.id === currentAttentionID) return;
       const row = element("button", "queue-item");
       row.type = "button";
       row.append(
@@ -1429,7 +1478,7 @@ function renderAttention() {
         rawElement("strong", "", attentionTitle(candidate)),
         markLiveElapsed(element("span", ""), candidate.createdAt),
       );
-      row.addEventListener("click", () => { currentAttention = index; renderAttention(); });
+      row.addEventListener("click", () => { currentAttentionID = candidate.id; renderAttention(); });
       queue.append(row);
     });
     ui.attentionList.append(queue);
@@ -1449,7 +1498,10 @@ function sessionStatus(session) {
   }
   if (session.execState === "failed") return { label: tr("出错"), className: "failed" };
   const completion = pendingAttentionForSession(session).find((item) => item.kind === "completion");
-  if (!isSessionActive(session) && completion) return { label: tr("待确认"), className: "waiting" };
+  if (!isSessionActive(session) && completion) {
+    return completion.reminderAcknowledgedAt ? { label: tr("已完成"), className: "idle" }
+      : { label: tr("待确认"), className: "waiting" };
+  }
   if (["idle", "response_finished"].includes(session.execState)) return { label: tr("空闲"), className: "idle" };
   return { label: tr("在跑"), className: "" };
 }
@@ -1528,12 +1580,12 @@ function compactCount(value) {
 }
 
 function contextUsage(session) {
-  const used = Number(session.contextUsedTokens || 0);
+  const used = session.contextUsedTokens == null ? undefined : Number(session.contextUsedTokens);
   const windowSize = Number(session.contextWindowTokens || 0);
   const providerPercent = Number(session.contextUsedPercent);
   const percent = Number.isFinite(providerPercent) && session.contextUsedPercent != null
     ? Math.max(0, Math.min(100, providerPercent))
-    : used > 0 && windowSize > 0
+    : used != null && used > 0 && windowSize > 0
       ? Math.max(0, Math.min(100, Math.round(used / windowSize * 100)))
       : undefined;
   return { used, windowSize, percent };
@@ -1542,10 +1594,10 @@ function contextUsage(session) {
 function contextUsageText(session) {
   const context = contextUsage(session);
   if (!context.windowSize && context.percent == null) return "—";
-  if (context.used > 0 && context.windowSize > 0) {
+  if (context.used != null && context.windowSize > 0) {
     return `${compactCount(context.used)} / ${compactCount(context.windowSize)} · ${context.percent}%`;
   }
-  return context.percent == null ? `0 / ${compactCount(context.windowSize)}` : `${context.percent}%`;
+  return context.percent == null ? `— / ${compactCount(context.windowSize)}` : `${context.percent}%`;
 }
 
 function estimatedCostText(session) {
@@ -1601,7 +1653,8 @@ function closeSessionDetail() {
 
 function openSessionDetail(session) {
   detailSessionId = session.id;
-  ui.sessionDetailTitle.textContent = session.providerTitle || session.title || tr("任务详情");
+  ui.sessionDetailTitle.textContent = session.providerTitle || session.title
+    || (session.project ? `${providerName(session.provider)} · ${session.project}` : tr("任务详情"));
   ui.sessionDetailBody.replaceChildren();
   const fields = new Set(settingsState.taskCardFields || []);
   const status = sessionStatus(session);
@@ -1611,7 +1664,7 @@ function openSessionDetail(session) {
     detailPair("状态", status.label),
     fields.has("recovery") ? detailPair("恢复状态", recovery.label) : undefined,
     fields.has("control") ? detailPair("控制能力", tr(session.controlCapability === "managed" ? "Codex app-server 托管，可回答提问" : "外部 Hook，仅观察/授权")) : undefined,
-    fields.has("project") ? detailPair("项目", session.project) : undefined,
+    fields.has("project") ? detailPair("项目", session.project || tr("项目未知")) : undefined,
     fields.has("task") ? detailPair("任务", session.title) : undefined,
     fields.has("model") ? detailPair("模型", session.model) : undefined,
     fields.has("activity") ? detailPair("实时活动", activityDisplay(session).text) : undefined,
@@ -1632,16 +1685,22 @@ function openSessionDetail(session) {
       : `${compactCount(session.cacheReadTokens || 0)} / ${compactCount(session.cacheCreationTokens || 0)}`) : undefined,
     fields.has("reasoningTokens") ? detailPair("推理 Token", session.reasoningTokens == null ? undefined : compactCount(session.reasoningTokens)) : undefined,
     fields.has("turnTokens") ? detailPair("本轮 Token", session.lastTurnTokens == null ? undefined : compactCount(session.lastTurnTokens)) : undefined,
+    fields.has("sessionTokens") ? detailPair("Token 数据", agentDetail.usageFact(session, currentLocale())) : undefined,
     fields.has("cost") ? detailPair("估算 API 价格", estimatedCostText(session)) : undefined,
-    fields.has("tool") ? detailPair("当前工具", session.currentTool) : undefined,
+    fields.has("tool") ? detailPair("当前动作", agentDetail.currentAction(session, currentLocale())) : undefined,
+    fields.has("currentTarget") ? detailPair("当前文件 / 目标", agentDetail.currentTarget(
+      session,
+      providerCapabilityStatus(session, "currentTarget"),
+      currentLocale(),
+    )) : undefined,
     fields.has("permissionMode") ? detailPair("权限模式", session.permissionMode) : undefined,
-    fields.has("subagents") ? detailPair("运行中的子 Agent", String(session.activeSubagents || 0)) : undefined,
+    fields.has("subagents") ? detailPair("运行中的子 Agent", agentDetail.subagentText(session, providerCapabilityStatus(session, "subagents"), currentLocale())) : undefined,
     fields.has("environment") ? detailPair("运行环境", session.environment) : undefined,
     fields.has("jump") ? detailPair(
       "跳转能力",
       runtimeMessageText(session.jumpMessage, session.jumpLabel),
     ) : undefined,
-    fields.has("titleSource") ? detailPair("标题来源", session.providerTitleSource) : undefined,
+    fields.has("titleSource") ? detailPair("标题来源", agentDetail.titleSource(session.providerTitleSource, currentLocale())) : undefined,
     fields.has("sessionId") ? detailPair("ActRealm Session ID", session.id, "developer-value") : undefined,
     fields.has("providerSessionId") ? detailPair("Provider Session ID", session.providerSessionId, "developer-value") : undefined,
     fields.has("providerTurnId") ? detailPair("Provider Turn ID", session.providerTurnId, "developer-value") : undefined,
@@ -1670,15 +1729,11 @@ function visibleSessions() {
   return snapshot.sessions
     .filter((session) => {
       const hiddenAt = Number(hiddenSessions[session.id] || 0);
-      if (hiddenAt && Number(session.lastEventAt || 0) <= hiddenAt) return false;
+      if (agentState.isTaskDeleted(session, hiddenAt, snapshot.attention)) return false;
       const active = !["idle", "response_finished", "failed"].includes(session.execState);
       return active || Number(session.lastEventAt || 0) >= cutoff || attentionSessions.has(session.id);
     })
-    .sort((a, b) => {
-      if (a.id === selectedSessionId) return -1;
-      if (b.id === selectedSessionId) return 1;
-      return Number(b.lastEventAt || 0) - Number(a.lastEventAt || 0);
-    });
+    .sort((a, b) => agentState.compareSessions(a, b, snapshot.attention, selectedSessionId));
 }
 
 function activityDisplay(session) {
@@ -1703,6 +1758,9 @@ function activityDisplay(session) {
   }
   const completion = pendingAttentionForSession(session).find((item) => item.kind === "completion");
   if (!isSessionActive(session) && completion) {
+    if (completion.reminderAcknowledgedAt) {
+      return agentState.acknowledgedCompletionActivity(currentLocale(), turnTiming(session));
+    }
     return {
       className: "waiting",
       marker: "✓",
@@ -1717,7 +1775,7 @@ function activityDisplay(session) {
     return { className: "thinking", marker: "•••", text: `${runtimeActivity || tr("正在思考")} · ${timing}` };
   }
   if (session.execState === "tool_running") {
-    return { className: "tool", marker: "▌", text: `${runtimeActivity || tr("正在运行工具")} · ${timing}` };
+    return { className: "tool", marker: "▌", text: `${agentDetail.currentAction(session, currentLocale()) || runtimeActivity || tr("正在运行工具")} · ${timing}` };
   }
   if (session.execState === "compacting") {
     return { className: "compacting", marker: "◌", text: `${runtimeActivity || tr("正在压缩记忆")} · ${timing}` };
@@ -1795,40 +1853,15 @@ function activateSession(session) {
   void jumpSession(session);
 }
 
-async function dismissAttentionForTaskClear(item) {
-  if (item.kind === "question" && item.requestId) {
-    await api(`/api/v1/questions/${encodeURIComponent(item.requestId)}/answer`, {
-      method: "POST",
-      body: JSON.stringify({ action: "native" }),
-    });
-    return;
-  }
-  await api("/api/v1/commands", {
-    method: "POST",
-    body: JSON.stringify({
-      id: crypto.randomUUID(),
-      attentionId: item.id,
-      requestId: item.requestId || null,
-      action: "dismiss",
-    }),
-  });
-}
-
-async function clearSessionFromList(session) {
-  const related = openItems().filter((item) => item.sessionId === session.id);
-  const results = await Promise.allSettled(related.map(dismissAttentionForTaskClear));
-  const failed = results.filter((result) => result.status === "rejected").length;
-  hiddenSessions[session.id] = Number(session.lastEventAt || Date.now());
-  localStorage.setItem("actrealm.hiddenSessions", JSON.stringify(hiddenSessions));
+function clearSessionFromList(session) {
+  const next = { ...hiddenSessions,
+    [session.id]: agentState.deletionWatermark(session, Date.now(), snapshot.attention) };
+  try { localStorage.setItem("actrealm.hiddenSessions", JSON.stringify(next)); }
+  catch { showToast(tr("无法保存任务显示设置")); return; }
+  hiddenSessions = next;
   if (selectedSessionId === session.id) selectedSessionId = undefined;
-  await loadSnapshot().catch(() => renderSessions());
-  if (failed) {
-    showToast(`任务已清除；${failed} 项仍需在 Outbox 或 Agent 原界面处理`);
-  } else if (related.length) {
-    showToast(`任务已清除，并交还 ${related.length} 项待处理事项`);
-  } else {
-    showToast("已从列表移除；有新活动时会自动恢复");
-  }
+  renderSessions();
+  showToast(tr("已删除任务 · 收到该会话的新事件后自动显示"));
 }
 
 function sessionRenderSignature(session) {
@@ -1861,7 +1894,8 @@ function buildSessionRow(session) {
     top.append(providerIcon(session.provider));
     const copy = element("div", "row-copy");
     const title = element("div", "row-title");
-    const clientTitle = session.providerTitle || session.title || "等待下一条任务";
+    const clientTitle = session.providerTitle || session.title
+      || (session.project ? `${providerName(session.provider)} · ${session.project}` : "等待下一条任务");
     title.append(fields.has("task")
       ? rawElement("strong", "", clientTitle)
       : element("strong", "", providerName(session.provider)));
@@ -1873,12 +1907,12 @@ function buildSessionRow(session) {
       title.append(activityNode);
     }
     const taskContent = fields.has("task") && session.providerTitle && session.title && session.providerTitle !== session.title
-      ? rawElement("div", "session-question", session.title)
+      ? rawElement("div", "session-question", `${currentLocale() === "en" ? "Task summary" : "任务摘要"} · ${session.title}`)
       : undefined;
     copy.append(title);
     if (taskContent) copy.append(taskContent);
     const meta = [providerName(session.provider)];
-    if (fields.has("project") && session.project) meta.push(session.project);
+    if (fields.has("project")) meta.push(session.project || tr("项目未知"));
     if (fields.has("model")) meta.push(session.model || tr("模型未知"));
     if (fields.has("project") || fields.has("model")) {
       copy.append(rawElement("div", "session-meta", meta.join(" · ")));
@@ -1897,17 +1931,16 @@ function buildSessionRow(session) {
       track.append(fill);
       progress.append(label, track);
       if (fields.has("subagents")) {
-        progress.append(element("span", "", `${session.activeSubagents || 0} 个子 Agent 正在运行`));
+        progress.append(element("span", "", agentDetail.subagentText(session, providerCapabilityStatus(session, "subagents"), currentLocale())));
       }
       copy.append(progress);
     }
-    const clear = element("button", "session-clear", "清除");
+    const clear = element("button", "session-clear", tr("删除任务"));
     clear.type = "button";
-    clear.title = tr("从当前任务列表隐藏；收到新事件后会重新出现");
+    clear.title = tr("仅删除任务卡，不停止 Agent，也不删除原会话和 Token 记录");
     clear.addEventListener("click", (event) => {
       event.stopPropagation();
-      clear.disabled = true;
-      void clearSessionFromList(session);
+      clearSessionFromList(session);
     });
     copy.append(clear);
 
@@ -1920,6 +1953,7 @@ function buildSessionRow(session) {
         fields.has("plan") ? ["计划", plan] : undefined,
         fields.has("sessionTokens") ? ["会话累计 Token", session.tokenTotal == null ? "—" : compactCount(session.tokenTotal)] : undefined,
         fields.has("turnTokens") ? ["本轮 Token", session.lastTurnTokens == null ? "—" : compactCount(session.lastTurnTokens)] : undefined,
+        fields.has("sessionTokens") ? ["Token 数据", agentDetail.usageFact(session, currentLocale())] : undefined,
         fields.has("inputOutputTokens") ? ["输入 / 输出 Token", session.inputTokens == null && session.outputTokens == null
           ? "—"
           : `${compactCount(session.inputTokens || 0)} / ${compactCount(session.outputTokens || 0)}`] : undefined,
@@ -1928,16 +1962,21 @@ function buildSessionRow(session) {
           : `${compactCount(session.cacheReadTokens || 0)} / ${compactCount(session.cacheCreationTokens || 0)}`] : undefined,
         fields.has("reasoningTokens") ? ["推理 Token", session.reasoningTokens == null ? "—" : compactCount(session.reasoningTokens)] : undefined,
         fields.has("cost") ? ["估算 API 价格", estimatedCostText(session) || "—"] : undefined,
-        fields.has("tool") ? ["当前工具", session.currentTool || "—"] : undefined,
+        fields.has("tool") ? ["当前动作", agentDetail.currentAction(session, currentLocale())] : undefined,
+        fields.has("currentTarget") ? ["当前文件 / 目标", agentDetail.currentTarget(
+          session,
+          providerCapabilityStatus(session, "currentTarget"),
+          currentLocale(),
+        )] : undefined,
         fields.has("permissionMode") ? ["权限模式", session.permissionMode || "—"] : undefined,
-        fields.has("subagents") ? ["运行中的子 Agent", String(session.activeSubagents || 0)] : undefined,
+        fields.has("subagents") ? ["运行中的子 Agent", agentDetail.subagentText(session, providerCapabilityStatus(session, "subagents"), currentLocale())] : undefined,
         fields.has("recovery") ? ["恢复状态", recoveryDisplay(session).label] : undefined,
         fields.has("control") ? ["托管能力", tr(session.controlCapability === "managed" ? "Codex app-server 托管，可回答提问" : "外部 Hook，仅观察/授权")] : undefined,
         fields.has("jump") ? ["打开应用", runtimeMessageText(
           session.jumpMessage,
           session.jumpLabel ? tr(session.jumpLabel) : tr("当前环境不支持"),
         )] : undefined,
-        fields.has("titleSource") ? ["标题来源", session.providerTitleSource || "—"] : undefined,
+        fields.has("titleSource") ? ["标题来源", agentDetail.titleSource(session.providerTitleSource, currentLocale())] : undefined,
         fields.has("sessionId") ? ["ActRealm Session ID", session.id] : undefined,
         fields.has("providerSessionId") ? ["Provider Session ID", session.providerSessionId] : undefined,
         fields.has("providerTurnId") ? ["Provider Turn ID", session.providerTurnId || "—"] : undefined,
@@ -1948,13 +1987,19 @@ function buildSessionRow(session) {
         pair.append(element("span", "", label), rawElement("strong", "", value));
         details.append(pair);
       }
+      agentDetail.renderSections(details, session, fields, {
+        locale: currentLocale(),
+        api,
+        planCapability: providerCapabilityStatus(session, "plan"),
+        workflowCapability: providerCapabilityStatus(session, "toolLifecycle"),
+      });
       const waiting = openItems().find((item) => item.sessionId === session.id);
       if (waiting) {
         const locate = element("button", "task-locate", "查看待处理事项");
         locate.type = "button";
         locate.addEventListener("click", (event) => {
           event.stopPropagation();
-          currentAttention = openItems().findIndex((item) => item.id === waiting.id);
+          currentAttentionID = waiting.id;
           renderAttention();
           document.querySelector(".outbox-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
         });
@@ -2209,7 +2254,7 @@ function renderQuota() {
       row.append(title);
       row.title = quota.status === "stale"
         ? `${label} · 保留上次有效值`
-        : `${label} · 剩余 ${Math.round(quota.remainingPct)}%`;
+        : `${label} · 剩余 ${Math.round(quota.remainingPct)}% · 重置来源 ${agentDetail.quotaResetSourceLabel(quota)}`;
       ui.quotaList.append(row);
       continue;
     }
@@ -2233,12 +2278,13 @@ function renderQuota() {
       const reset = element(
         "span",
         "quota-compact-reset",
-        quota.status === "stale" ? "数据已过期" : "重置时间未提供",
+        quota.status === "stale" ? "数据已过期" : `重置时间 · ${agentDetail.quotaResetSourceLabel(quota)}`,
       );
       if (quota.resetsAt) {
         reset.dataset.quotaResetsAt = String(Number(quota.resetsAt) * 1000);
       }
       detail.append(reset);
+      if (quota.resetsAt) detail.append(element("span", "quota-source", agentDetail.quotaResetSourceLabel(quota)));
       row.append(detail);
       ui.quotaList.append(row);
       continue;
@@ -2255,6 +2301,7 @@ function renderQuota() {
     if (quota.status === "stale") meta.append(element("span", "quota-stale", "保留上次有效值"));
     const sourceLabel = {
       oauth_usage: "OAuth 自动同步",
+      codex_app_server: "Codex 自动同步",
       statusline: "Claude 对话同步",
       rollout_experimental: "本机 Session 同步",
     }[quota.source];
@@ -2266,6 +2313,7 @@ function renderQuota() {
       resetNode.dataset.quotaResetsAt = String(reset.getTime());
       meta.append(resetNode);
     }
+    meta.append(element("span", "quota-source", `重置来源 · ${agentDetail.quotaResetSourceLabel(quota)}`));
     if (quota.capturedAt) {
       const capturedNode = element("span", "");
       capturedNode.dataset.quotaCapturedAt = String(Number(quota.capturedAt));
@@ -2287,25 +2335,7 @@ function isProviderMuted(provider) {
 }
 
 function playNotificationSound() {
-  if (!settingsState.soundEnabled) return;
-  try {
-    const AudioContextType = window.AudioContext || window.webkitAudioContext;
-    if (!AudioContextType) return;
-    const context = new AudioContextType();
-    const oscillator = context.createOscillator();
-    const gain = context.createGain();
-    oscillator.frequency.value = 660;
-    gain.gain.setValueAtTime(0.0001, context.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.12, context.currentTime + 0.01);
-    gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.12);
-    oscillator.connect(gain);
-    gain.connect(context.destination);
-    oscillator.start();
-    oscillator.stop(context.currentTime + 0.13);
-    oscillator.addEventListener("ended", () => context.close());
-  } catch (_) {
-    // Browsers may require a user gesture before audio; the banner still works.
-  }
+  if (settingsState.soundEnabled) window.ActRealmNotificationSound?.play();
 }
 
 function showNotification(item) {
@@ -2350,6 +2380,7 @@ function render(nextSnapshot) {
   renderSessions();
   if (quotaRenderSignature() !== lastQuotaRenderSignature) renderQuota();
   else updateQuotaTimes();
+  window.TokenDecision?.render(snapshot.tokenDecision, settingsState);
   ui.eventCount.textContent = String(snapshot.stats?.eventCount || 0);
   const eventCount = Number(snapshot.stats?.eventCount || 0);
   if (eventCount > renderedEventCount) {
@@ -2386,9 +2417,7 @@ async function recordUiMetric(event) {
       method: "POST",
       body: JSON.stringify({ event }),
     });
-  } catch (_) {
-    // Metrics are local evidence only and never interfere with Agent control.
-  }
+  } catch (_) {}
 }
 
 async function bootstrapWithToken(token) {
@@ -2522,7 +2551,6 @@ async function refreshSnapshotFallback() {
   try {
     await loadSnapshot();
   } catch (_) {
-    // The WebSocket reconnect path owns the visible connection state.
   } finally {
     fallbackSnapshotInFlight = false;
   }
@@ -2670,9 +2698,7 @@ async function waitForRuntimeRestart(previousInstanceId, restartToken) {
     let health;
     try {
       health = await readPublicHealth();
-    } catch (_) {
-      // The old listener must disappear before the same port can be rebound.
-    }
+    } catch (_) {}
     if (health?.instanceId && health.instanceId !== previousInstanceId) {
       csrfToken = undefined;
       sessionStorage.removeItem("actrealm.csrf");
@@ -2711,9 +2737,6 @@ async function restartRuntime() {
         body: JSON.stringify({ restartToken }),
       });
     } catch (error) {
-      // The Runtime may close the old listener after accepting the command but
-      // before the HTTP response reaches the browser. The one-time token makes
-      // it safe to continue recovery; a rejected command still times out.
       if (!(error instanceof TypeError)) throw error;
       accepted = { previousInstanceId: previous.instanceId };
     }
@@ -2779,6 +2802,13 @@ ui.taskCardFields.addEventListener("change", () => {
   settingsState.taskCardFields = [...ui.taskCardFields.querySelectorAll("input:checked")].map((input) => input.value);
   saveSettings();
 });
+ui.completionHideMode.addEventListener("change", () => {
+  settingsState.completionTaskHideMode = ui.completionHideMode.value;
+  renderSettings(); saveSettings();
+});
+ui.completionAutoHideMinutes.addEventListener("change", () => {
+  settingsState.completionAutoHideMinutes = +ui.completionAutoHideMinutes.value; saveSettings();
+});
 for (const button of ui.quotaDisplayOptions) {
   button.addEventListener("click", () => {
     settingsState.quotaDisplayMode = normalizedQuotaDisplayMode(button.dataset.value);
@@ -2833,7 +2863,7 @@ ui.notificationClose.addEventListener("click", () => { ui.notificationBanner.hid
 ui.notificationView.addEventListener("click", () => {
   const items = openItems();
   const index = items.findIndex((item) => item.id === notificationItemId);
-  if (index >= 0) currentAttention = index;
+  if (index >= 0) currentAttentionID = items[index].id;
   renderAttention();
   ui.notificationBanner.hidden = true;
   document.querySelector("#attention-heading").focus?.();

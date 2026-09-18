@@ -2,6 +2,7 @@ name: Core release gates
 
 on:
   push:
+    branches: [main, agent/v1-full]
   pull_request:
   workflow_dispatch:
 
@@ -17,62 +18,41 @@ jobs:
     name: Rust, Swift, security, package
     runs-on: macos-26
     timeout-minutes: 45
+    env:
+      TZ: UTC
     steps:
-      - name: Check out repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Select supported Xcode
-        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90
         with:
           xcode-version: "26.6"
-
-      - name: Require the supported macOS SDK
+      - name: Install pinned Rust toolchain
         run: |
-          SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
-          test "${SDK_VERSION%%.*}" -ge 26 || { echo "macOS 26 SDK required, found $SDK_VERSION" >&2; exit 1; }
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
-        with:
-          toolchain: "1.97"
-          components: rustfmt, clippy
-
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: Fetch locked Rust dependencies
+          rustup toolchain install 1.97 --profile minimal --component rustfmt,clippy
+          rustup default 1.97
+      - name: Fetch locked dependencies
         run: cargo fetch --locked
-
-      - name: Validate tracked text and language contracts
+      - name: Text, language and workflow contracts
         run: |
           git diff --check
           ./scripts/check-ci-pins.sh
           ./scripts/check-actrealm-language.sh
           node --check web/app.js
           plutil -lint apps/macos/Resources/Info.plist
-
       - name: Rust format
         run: cargo fmt --all -- --check
-
       - name: Rust Clippy
         run: cargo clippy --workspace --all-targets --offline -- -D warnings
-
       - name: Rust tests
         run: cargo test --workspace --offline
-
       - name: Rust release build
         run: cargo build --workspace --release --offline
-
-      - name: Swift tests
+      - name: Native tests
         run: apps/macos/Scripts/test.sh
-
       - name: Install RustSec audit tool
         run: cargo install cargo-audit --version "0.22.2" --locked
-
       - name: RustSec audit
         run: cargo audit --deny warnings
-
-      - name: Assemble and verify local QA app
+      - name: Package and verify exact candidate
         env:
           ACTREALM_SKIP_RUST_BUILD: "1"
           ACTREALM_EXPECTED_ARCHS: arm64
@@ -80,11 +60,11 @@ jobs:
           apps/macos/Scripts/package-app.sh apps/macos/ci-dist
           codesign --verify --deep --strict --verbose=2 apps/macos/ci-dist/ActRealm.app
           test "$(/usr/libexec/PlistBuddy -c 'Print :ActRealmGitCommit' apps/macos/ci-dist/ActRealm.app/Contents/Info.plist)" = "$GITHUB_SHA"
-
+          ditto -c -k --sequesterRsrc --keepParent apps/macos/ci-dist/ActRealm.app apps/macos/ci-dist/ActRealm-qa.zip
       - name: Upload verified QA package
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
           name: ActRealm-${{ github.sha }}-unsigned-qa
-          path: apps/macos/ci-dist/ActRealm.app
+          path: apps/macos/ci-dist/ActRealm-qa.zip
           if-no-files-found: error
           retention-days: 7

@@ -33,6 +33,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+mod agent;
+mod service;
+
 const PROVIDER_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
@@ -48,8 +51,28 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Start a Kimi/Grok ACP session with live ActRealm approvals and questions.
+    Agent {
+        provider: String,
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        resume: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Ensure or inspect the independent local native Runtime service.
+    Service {
+        #[arg(value_enum)]
+        action: service::Action,
+    },
     /// Run the local runtime and control panel.
     Serve {
+        /// Launched by the per-user service; never print bootstrap credentials.
+        #[arg(long, hide = true)]
+        service: bool,
         #[arg(long, value_enum, default_value_t = ApprovalMode::Widget)]
         approval: ApprovalMode,
         #[arg(long)]
@@ -164,6 +187,8 @@ struct ServeLaunch {
     open: bool,
     api_bind: SocketAddr,
     bootstrap_token: Option<String>,
+    session_token: Option<String>,
+    csrf_token: Option<String>,
     restart_count: u32,
     restart_state_path: Option<PathBuf>,
 }
@@ -183,6 +208,10 @@ struct RestartState {
     api_enabled: bool,
     api_bind: SocketAddr,
     bootstrap_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    csrf_token: Option<String>,
     restart_count: u32,
 }
 
@@ -191,16 +220,25 @@ const RESTART_STATE_TTL_MS: u64 = 30_000;
 
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Agent {
+            provider,
+            cwd,
+            prompt,
+            resume,
+            model,
+        } => agent::run(Provider::from_str(&provider)?, cwd, prompt, resume, model),
+        Command::Service { action } => service::run(action),
         Command::Serve {
+            service,
             approval,
             socket,
             open,
             restart_state,
         } => {
             let launch = load_serve_launch(socket, approval, open, restart_state)?;
-            match serve(launch)? {
+            match serve(launch, service)? {
                 ServeOutcome::Stopped => Ok(()),
-                ServeOutcome::Restart(state_path) => replace_runtime_process(&state_path),
+                ServeOutcome::Restart(state_path) => replace_runtime_process(&state_path, service),
             }
         }
         Command::Hook { provider, socket } => {
@@ -1127,6 +1165,10 @@ fn parse_approval_mode(value: &str) -> Result<ApprovalMode> {
     }
 }
 
+fn valid_restart_secret(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn load_serve_launch(
     socket: Option<PathBuf>,
     approval: ApprovalMode,
@@ -1141,6 +1183,8 @@ fn load_serve_launch(
             open,
             api_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             bootstrap_token: None,
+            session_token: None,
+            csrf_token: None,
             restart_count: 0,
             restart_state_path: None,
         });
@@ -1169,6 +1213,11 @@ fn load_serve_launch(
     let state: RestartState =
         serde_json::from_slice(&payload).context("failed to parse restart state")?;
     let now = now_millis();
+    let preserved_auth_valid = match (&state.session_token, &state.csrf_token) {
+        (None, None) => true,
+        (Some(session), Some(csrf)) => valid_restart_secret(session) && valid_restart_secret(csrf),
+        _ => false,
+    };
     if state.schema_version != 1
         || !state.api_enabled
         || now.saturating_sub(state.created_at) > RESTART_STATE_TTL_MS
@@ -1176,6 +1225,7 @@ fn load_serve_launch(
         || !state.api_bind.ip().is_loopback()
         || state.api_bind.port() == 0
         || Uuid::parse_str(&state.bootstrap_token).is_err()
+        || !preserved_auth_valid
     {
         anyhow::bail!("restart state is invalid or expired");
     }
@@ -1186,6 +1236,8 @@ fn load_serve_launch(
         open: false,
         api_bind: state.api_bind,
         bootstrap_token: Some(state.bootstrap_token),
+        session_token: state.session_token,
+        csrf_token: state.csrf_token,
         restart_count: state.restart_count,
         restart_state_path: Some(state_path),
     })
@@ -1196,6 +1248,8 @@ fn write_restart_state(
     launch: &ServeLaunch,
     bootstrap_token: &str,
     api_bind: SocketAddr,
+    session_token: Option<String>,
+    csrf_token: Option<String>,
 ) -> Result<PathBuf> {
     let directory = paths
         .lock
@@ -1210,6 +1264,8 @@ fn write_restart_state(
         api_enabled: launch.api_enabled,
         api_bind,
         bootstrap_token: bootstrap_token.to_owned(),
+        session_token,
+        csrf_token,
         restart_count: launch.restart_count.saturating_add(1),
     };
     let mut file = OpenOptions::new()
@@ -1223,18 +1279,19 @@ fn write_restart_state(
     Ok(state_path)
 }
 
-fn replace_runtime_process(state_path: &Path) -> Result<()> {
+fn replace_runtime_process(state_path: &Path, service: bool) -> Result<()> {
     let executable = std::env::current_exe().context("failed to locate Runtime executable")?;
-    let error = std::process::Command::new(executable)
-        .arg("serve")
-        .arg("--restart-state")
-        .arg(state_path)
-        .exec();
+    let mut command = std::process::Command::new(executable);
+    command.arg("serve").arg("--restart-state").arg(state_path);
+    if service {
+        command.arg("--service");
+    }
+    let error = command.exec();
     let _ = fs::remove_file(state_path);
     Err(error).context("failed to replace Runtime process")
 }
 
-fn serve(launch: ServeLaunch) -> Result<ServeOutcome> {
+fn serve(launch: ServeLaunch, service: bool) -> Result<ServeOutcome> {
     let socket_path = launch.socket_path.clone();
     let approval = launch.approval;
     let open = launch.open;
@@ -1274,13 +1331,17 @@ fn serve(launch: ServeLaunch) -> Result<ServeOutcome> {
                 store.clone(),
                 waiters.clone(),
                 ApiServerConfig {
+                    enable_native_clients: true,
                     bind: launch.api_bind,
                     bootstrap_token: launch.bootstrap_token.clone(),
+                    initial_session_token: launch.session_token.clone(),
+                    initial_csrf_token: launch.csrf_token.clone(),
                     runtime_started_at,
                     restart_count: launch.restart_count,
                     commit_delay: commit_delay(),
                     enable_codex_connector: true,
                     enable_claude_oauth_quota: true,
+                    enable_live_usage_pricing: true,
                     runtime_restart: Some(RuntimeRestartHandle::new(
                         restart_sender,
                         socket_path.clone(),
@@ -1299,11 +1360,13 @@ fn serve(launch: ServeLaunch) -> Result<ServeOutcome> {
     }
     let mut runtime_output = io::stdout().lock();
     if let Some(api) = api.as_ref() {
-        let _ = writeln!(
-            runtime_output,
-            "ActRealm control panel: {}",
-            api.bootstrap_url()
-        );
+        if !service {
+            let _ = writeln!(
+                runtime_output,
+                "ActRealm control panel: {}",
+                api.bootstrap_url()
+            );
+        }
         if open {
             let _ = std::process::Command::new("open")
                 .arg(api.bootstrap_url())
@@ -1337,13 +1400,22 @@ fn serve(launch: ServeLaunch) -> Result<ServeOutcome> {
         let Some(stream) = listener.incoming().next() else {
             break;
         };
-        if let Ok(request) = restart_receiver.try_recv() {
+        let mut accepted_restart = None;
+        while let Ok(request) = restart_receiver.try_recv() {
+            if request.try_accept() {
+                accepted_restart = Some(request);
+                break;
+            }
+        }
+        if let Some(request) = accepted_restart {
             drop(stream);
             let state_path = match write_restart_state(
                 &paths,
                 &launch,
                 &request.bootstrap_token,
                 request.api_bind,
+                request.session_token.clone(),
+                request.csrf_token.clone(),
             ) {
                 Ok(path) => path,
                 Err(error) => {
@@ -1401,6 +1473,9 @@ fn serve(launch: ServeLaunch) -> Result<ServeOutcome> {
                 }
                 return;
             }
+            if actrealm_runtime::handle_agent_connection_event(&store, &waiters, &request) {
+                return;
+            }
             let _ = diagnostics.capture(&request, now_millis());
             let registration = if request.needs_reply {
                 let Ok(registration) = waiters.register_at(&request, now_millis()) else {
@@ -1443,6 +1518,26 @@ fn serve(launch: ServeLaunch) -> Result<ServeOutcome> {
             }
 
             if let Some(registration) = registration {
+                if approval == ApprovalMode::Widget
+                    && matches!(request.provider, Provider::Kimi | Provider::Grok)
+                {
+                    if let Some(response) = actrealm_runtime::wait_for_agent_reply(
+                        &store,
+                        &waiters,
+                        &request,
+                        &registration.ticket,
+                        &stream,
+                    ) {
+                        if BridgeListener::write_response(&mut stream, &response).is_err() {
+                            let _ = store.expire_approval(
+                                request.request_id.unwrap_or(request.id),
+                                "provider_disconnected",
+                                now_millis(),
+                            );
+                        }
+                    }
+                    return;
+                }
                 if approval == ApprovalMode::Widget {
                     let request_id = request.request_id.unwrap_or(request.id);
                     let wait_for = request
@@ -1631,6 +1726,24 @@ fn run_hook(provider: Provider, socket_path: PathBuf) -> Result<()> {
     }
     let input = read_hook_input()?;
     let mut raw: Value = serde_json::from_slice(&input)?;
+    // Grok imports Claude hook files. Its camelCase event must not be
+    // attributed to Claude by an inherited ActRealm command.
+    if provider == Provider::Claude
+        && raw.get("hookEventName").is_some()
+        && std::env::var_os("GROK_HOOK_EVENT").is_some()
+    {
+        return Ok(());
+    }
+    raw = actrealm_core::normalize_provider_payload(provider, raw);
+    if std::env::var("ACTREALM_CONNECTED_PROVIDER").ok().as_deref()
+        == Some(provider.to_string().as_str())
+        && !matches!(
+            raw["hook_event_name"].as_str(),
+            Some("SubagentStart" | "SubagentStop")
+        )
+    {
+        return Ok(());
+    }
     apply_codex_auto_review_fallback(provider, &mut raw);
     let request = BridgeRequest::from_hook(provider, raw);
     let timeout = if request.needs_reply {
@@ -1821,6 +1934,8 @@ mod tests {
             api_enabled: true,
             api_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 43121),
             bootstrap_token: Uuid::now_v7().to_string(),
+            session_token: Some("a".repeat(64)),
+            csrf_token: Some("b".repeat(64)),
             restart_count: 3,
         };
         let mut file = OpenOptions::new()
@@ -1863,6 +1978,14 @@ mod tests {
         assert_eq!(launch.api_bind.port(), 43121);
         assert_eq!(launch.restart_count, 3);
         assert!(launch.bootstrap_token.is_some());
+        assert_eq!(
+            launch.session_token.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            launch.csrf_token.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
         assert_eq!(launch.restart_state_path.as_deref(), Some(path.as_path()));
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
@@ -1902,6 +2025,8 @@ mod tests {
             open: false,
             api_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 43121),
             bootstrap_token: None,
+            session_token: None,
+            csrf_token: None,
             restart_count: 0,
             restart_state_path: None,
         };
@@ -1910,6 +2035,8 @@ mod tests {
             &launch,
             &Uuid::now_v7().to_string(),
             launch.api_bind,
+            None,
+            None,
         )
         .unwrap();
         let parent_mode = fs::metadata(&root).unwrap().permissions().mode() & 0o777;

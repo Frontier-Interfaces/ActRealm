@@ -72,6 +72,8 @@ Current snapshot fields are:
 | `quota.window.extra_usage` | Extra usage | 额外用量 |
 | `quota.reason.cache_missing` | Quota cache is missing | 额度缓存不存在 |
 | `quota.reason.no_valid_window` | No verifiable quota window was found | 没有找到可验证的额度窗口 |
+| `quota.reason.claude_refresh_failed` | Claude quota refresh failed; showing the last capture | Claude 额度刷新失败，显示上次数据 |
+| `quota.reason.codex_refresh_failed` | Codex quota refresh failed; showing the last capture | Codex 额度刷新失败，显示上次数据 |
 
 The JSON contract contains the complete list, including parameters and
 long-form quota failure guidance.

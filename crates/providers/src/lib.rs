@@ -1,4 +1,5 @@
 //! Provider-specific hook parsing.
+pub mod acp;
 
 use actrealm_core::{is_codex_native_attention_tool, EventKind, Provider};
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,8 @@ pub struct ParsedHookEvent {
     pub permission_mode: Option<String>,
     pub tool_name: Option<String>,
     pub tool_input: Option<Value>,
+    pub tool_call_id: Option<String>,
+    pub source_version: Option<String>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -49,6 +52,27 @@ pub fn parse_hook(provider: Provider, raw: Value) -> Result<ParsedHookEvent, Pro
         permission_mode: owned_string_field(&raw, "permission_mode"),
         tool_name: owned_string_field(&raw, "tool_name"),
         tool_input: raw.get("tool_input").cloned(),
+        tool_call_id: first_bounded_string_field(
+            &raw,
+            &[
+                "tool_use_id",
+                "tool_call_id",
+                "call_id",
+                "item_id",
+                "_codex_item_id",
+            ],
+            256,
+        ),
+        source_version: first_bounded_string_field(
+            &raw,
+            &[
+                "hook_version",
+                "source_version",
+                "schema_version",
+                "version",
+            ],
+            64,
+        ),
     })
 }
 
@@ -56,7 +80,7 @@ fn normalize_event(provider: Provider, event_name: &str, raw: &Value) -> EventKi
     match event_name {
         "SessionStart" => EventKind::SessionStarted,
         "SessionEnd" => EventKind::SessionEnded,
-        "UserPromptSubmit" | "BeforeAgent" => EventKind::PromptSubmitted,
+        "UserPromptSubmit" | "BeforeAgent" | "TurnStarted" => EventKind::PromptSubmitted,
         "PreToolUse"
             if provider == Provider::Claude
                 && raw.get("tool_name").and_then(Value::as_str) == Some("AskUserQuestion") =>
@@ -73,6 +97,16 @@ fn normalize_event(provider: Provider, event_name: &str, raw: &Value) -> EventKi
             // BridgeRequest keeps `needs_reply = false`.
             EventKind::PermissionRequested
         }
+        "PreToolUse"
+            if provider == Provider::Codex
+                && raw.get("tool_name").and_then(Value::as_str) == Some("update_plan") =>
+        {
+            // Codex Hooks expose update_plan as a local function call. Treat
+            // its allowlisted plan payload as the same fact as the managed
+            // app-server turn/plan/updated notification so observe-only
+            // desktop sessions can report honest progress too.
+            EventKind::PlanUpdated
+        }
         "PreToolUse" => EventKind::ToolStarted,
         "PostToolUse" | "AfterAgent" => EventKind::ToolFinished,
         "PostToolUseFailure" => EventKind::ToolFailed,
@@ -80,6 +114,12 @@ fn normalize_event(provider: Provider, event_name: &str, raw: &Value) -> EventKi
         "PermissionDenied" if provider != Provider::Gemini => EventKind::PermissionDenied,
         "Elicitation" if provider == Provider::Claude => EventKind::ElicitationRequested,
         "CodexRequestUserInput" if provider == Provider::Codex => EventKind::QuestionRequested,
+        "AgentQuestion" if matches!(provider, Provider::Kimi | Provider::Grok) => {
+            EventKind::QuestionRequested
+        }
+        "AgentElicitation" if matches!(provider, Provider::Kimi | Provider::Grok) => {
+            EventKind::ElicitationRequested
+        }
         "Notification" => EventKind::Notification,
         "SubagentStart" => EventKind::SubagentStarted,
         "SubagentStop" => EventKind::SubagentStopped,
@@ -102,4 +142,12 @@ fn string_field<'a>(raw: &'a Value, key: &str) -> Option<&'a str> {
 
 fn owned_string_field(raw: &Value, key: &str) -> Option<String> {
     string_field(raw, key).map(ToOwned::to_owned)
+}
+
+fn first_bounded_string_field(raw: &Value, keys: &[&str], maximum_bytes: usize) -> Option<String> {
+    keys.iter().find_map(|key| {
+        let value = string_field(raw, key)?.trim();
+        (!value.is_empty() && value.len() <= maximum_bytes && !value.chars().any(char::is_control))
+            .then(|| value.to_owned())
+    })
 }

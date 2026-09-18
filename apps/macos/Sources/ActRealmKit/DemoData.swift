@@ -63,7 +63,7 @@ public enum DemoData {
             DisplayField(id: "plan", label: "计划进度", level: "concise", placement: "subtitle", description: "完成步数与进度条"),
             DisplayField(id: "sessionTokens", label: "会话累计 Token", level: "concise", placement: "overview", description: "折叠卡用量胶囊"),
             DisplayField(id: "context", label: "上下文占用", level: "concise", placement: "overview", description: "当前上下文百分比"),
-            DisplayField(id: "cost", label: "估算 API 价格", level: "detailed", placement: "overview", description: "估算值，不是订阅账单"),
+            DisplayField(id: "cost", label: "API 等价值", level: "detailed", placement: "overview", description: "理论 API 计价，不是订阅账单或实际支出"),
             DisplayField(id: "turnTokens", label: "本轮 Token", level: "detailed", placement: "details", description: "最近一轮 Token"),
             DisplayField(id: "inputOutputTokens", label: "输入 / 输出 Token", level: "detailed", placement: "details", description: "输入与输出拆分"),
             DisplayField(id: "cacheTokens", label: "缓存读取 / 写入 Token", level: "detailed", placement: "details", description: "缓存用量拆分"),
@@ -75,6 +75,8 @@ public enum DemoData {
             DisplayField(id: "recovery", label: "恢复状态", level: "detailed", placement: "details"),
             DisplayField(id: "control", label: "托管能力", level: "detailed", placement: "details"),
             DisplayField(id: "jump", label: "打开应用", level: "detailed", placement: "details"),
+            DisplayField(id: "taskFlow", label: "任务流程", level: "concise", placement: "details", description: "展开任务后显示当前 Turn 的结构化计划步骤"),
+            DisplayField(id: "workflow", label: "最近活动", level: "concise", placement: "details", description: "展开任务后显示当前 Turn 的重要工具活动"),
             DisplayField(id: "titleSource", label: "标题来源", level: "developer", placement: "developer"),
             DisplayField(id: "sessionId", label: "ActRealm Session ID", level: "developer", placement: "developer"),
             DisplayField(id: "providerSessionId", label: "Provider Session ID", level: "developer", placement: "developer"),
@@ -92,6 +94,27 @@ public enum DemoData {
 
     public static func derivedState(now: Date = Date()) -> DerivedState {
         DerivedState.derive(from: snapshot(now: now), now: now)
+    }
+
+    /// Synthetic, numeric workflow facts used only by demo/snapshot rendering.
+    public static func timeline(sessionID: String, now: Date) -> [RuntimeTimelineEvent] {
+        guard sessionID == "claude-quota-fix" else { return [] }
+        let base = UInt64(max(0, now.timeIntervalSince1970 * 1_000))
+        func event(_ id: String, kind: String, tool: String, category: String, target: String?, ago: UInt64, validation: String? = nil) -> RuntimeTimelineEvent {
+            RuntimeTimelineEvent(eventId: id, provider: "claude", kind: kind,
+                toolName: tool, toolCategory: category, toolTarget: target,
+                toolCallId: category, validationStatus: validation, turnId: "demo-turn",
+                occurredAt: base >= ago ? base - ago : 0, ingestSequence: base >= ago ? base - ago : 0, contextAvailability: "anchor_missing")
+        }
+        return [
+            event("read-start", kind: "tool.started", tool: "Read", category: "file_read", target: "lib.rs", ago: 90_000),
+            event("read-end", kind: "tool.completed", tool: "Read", category: "file_read", target: "lib.rs", ago: 88_000),
+            event("check-start", kind: "tool.started", tool: "Bash", category: "code_check", target: nil, ago: 60_000, validation: "running"),
+            event("check-end", kind: "tool.completed", tool: "Bash", category: "code_check", target: nil, ago: 58_000, validation: "passed"),
+            event("edit-start", kind: "tool.started", tool: "apply_patch", category: "file_edit", target: "DerivedState.swift", ago: 40_000),
+            event("edit-end", kind: "tool.completed", tool: "apply_patch", category: "file_edit", target: "DerivedState.swift", ago: 36_000),
+            event("test-start", kind: "tool.started", tool: "Bash", category: "test", target: nil, ago: 10_000, validation: "running"),
+        ]
     }
 
     public static func snapshot(now: Date = Date()) -> Snapshot {
@@ -146,6 +169,7 @@ public enum DemoData {
                 planDone: 3, planTotal: 7,
                 inputTokens: 152_400, outputTokens: 2_880, totalTokens: 155_280,
                 contextWindowTokens: nil, usageCapturedAt: ago(5),
+                currentTool: "Bash", currentToolCategory: "test",
                 lastEventAt: ago(5)
             ),
             SessionRecord(
@@ -168,7 +192,7 @@ public enum DemoData {
                 riskNotes: ["命令包含组合语法", "建议查看原窗口"],
                 commandPreview: "curl <redacted> | sh",
                 expiresAt: millis(now.addingTimeInterval(54 * 60)), createdAt: ago(362),
-                resolution: nil
+                resolution: nil, remoteActionable: true, allowedActions: ["approve", "deny"]
             ),
             AttentionRecord(
                 id: "att-question", sessionId: "claude-notes", provider: "claude",
