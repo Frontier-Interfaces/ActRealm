@@ -240,6 +240,7 @@ private struct IntegratedWindowHeader: View {
 
     private var shouldShowAgentSetupNotice: Bool {
         model.setupInfo == nil || model.isFirstRun || model.pendingAgentSetupCount > 0
+            || model.setupInfo?.providers.contains(where: { $0.cliInstalled == true && $0.launchCommand != nil }) == true
     }
 
     private var runtimeIssueLabel: String {

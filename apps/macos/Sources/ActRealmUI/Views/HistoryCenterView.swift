@@ -693,7 +693,7 @@ private struct HistoryTaskDetail: View {
         }
     }
 
-    private var providerName: String { task.provider == "claude" ? "Claude Code" : "Codex" }
+    private var providerName: String { ProviderKind(record: task.provider)?.displayName ?? task.provider }
     private var jumpButtonTitle: String {
         switch task.jumpCapability {
         case "app_only": "打开 Agent 应用"

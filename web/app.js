@@ -161,6 +161,9 @@ let lastRuntimeMonitorAt = 0;
 let hiddenSessions = JSON.parse(localStorage.getItem("actrealm.hiddenSessions") || "{}");
 const SESSION_VISIBLE_FOR_MS = 30 * 60 * 1000;
 const RUNTIME_MESSAGES_ZH = {
+  "interaction.agent_question.title": "Agent 正在询问",
+  "quota.reason.agent_refresh_failed": "Agent 额度刷新失败，显示上次记录。",
+  "quota.reason.agent_unavailable": "Agent 暂未提供账户额度信息。",
   "quota.window.claude_weekly": "总周额度",
   "quota.window.scoped_weeks": "{name} · {count} 周",
   "quota.window.scoped": "{name} 额度",

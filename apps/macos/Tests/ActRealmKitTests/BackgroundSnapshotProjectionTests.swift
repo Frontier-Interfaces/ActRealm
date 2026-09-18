@@ -142,40 +142,6 @@ private func projectionQuota(remaining: Double) -> QuotaEntry {
         #expect(result.changedTaskIDs == ["A"])
     }
 
-    @Test func nativePresentationLatencyKeepsOneHundredNewestSamplesAndUsesP95Index() {
-        var latency = NativePresentationLatency()
-        let renderedAt = Date(timeIntervalSince1970: 10_000)
-
-        for milliseconds in 0 ... 100 {
-            let accepted = latency.record(
-                eventAt: renderedAt.addingTimeInterval(-Double(milliseconds) / 1_000),
-                renderedAt: renderedAt
-            )
-            #expect(accepted)
-        }
-
-        #expect(latency.sampleCount == 100)
-        #expect(latency.p95Milliseconds == 95)
-    }
-
-    @Test func nativePresentationLatencyRejectsFutureAndStaleEvents() {
-        var latency = NativePresentationLatency()
-        let renderedAt = Date(timeIntervalSince1970: 10_000)
-
-        let futureAccepted = latency.record(
-            eventAt: renderedAt.addingTimeInterval(0.001),
-            renderedAt: renderedAt
-        )
-        let staleAccepted = latency.record(
-            eventAt: renderedAt.addingTimeInterval(-10.001),
-            renderedAt: renderedAt
-        )
-        #expect(!futureAccepted)
-        #expect(!staleAccepted)
-        #expect(latency.sampleCount == 0)
-        #expect(latency.p95Milliseconds == nil)
-    }
-
     @Test func projectsFiveHundredSessionsBelowThreeHundredMillisecondsWithoutWorkspaceFocus() {
         let sessions = (0 ..< 500).map {
             projectionSession(id: "session-\($0)", lastEventAt: UInt64(1_000 + $0))

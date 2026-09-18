@@ -2,6 +2,8 @@
 //!
 //! The collector stores only numeric usage metadata. It never persists prompts,
 //! tool input/output, transcript text, or provider credentials.
+pub mod agents;
+pub mod grok;
 
 use ring::digest::{digest, SHA256};
 use serde::{Deserialize, Serialize};
@@ -1307,6 +1309,9 @@ impl CodexFileCheckpoint {
 /// are tailed on every call.
 pub struct UsageCollector {
     paths: UsagePaths,
+    kimi_root: Option<PathBuf>,
+    grok_root: Option<PathBuf>,
+    kimi_scanner: agents::KimiScanner,
     claude_files: HashMap<PathBuf, ClaudeFileState>,
     codex_files: HashMap<PathBuf, CodexFileState>,
     known_claude: Vec<PathBuf>,
@@ -1332,6 +1337,9 @@ impl UsageCollector {
         let checkpoint = load_usage_scan_checkpoint(&paths).unwrap_or_default();
         Self {
             paths,
+            kimi_root: None,
+            grok_root: None,
+            kimi_scanner: agents::KimiScanner::default(),
             claude_files: HashMap::new(),
             codex_files: HashMap::new(),
             known_claude: Vec::new(),
@@ -1365,6 +1373,14 @@ impl UsageCollector {
     /// remain deterministic and offline unless they opt in explicitly.
     pub fn enable_live_pricing(&mut self) {
         self.live_pricing_enabled = true;
+    }
+
+    pub fn enable_kimi_sources(&mut self, root: PathBuf) {
+        self.kimi_root = Some(root);
+    }
+
+    pub fn enable_grok_sources(&mut self, root: PathBuf) {
+        self.grok_root = Some(root);
     }
 
     pub fn live_pricing_enabled(&self) -> bool {
@@ -1432,7 +1448,12 @@ impl UsageCollector {
     /// having complete history are separate facts: the former stops the
     /// rebuild spinner, while the latter is required before data is verified.
     pub fn is_history_complete(&self) -> bool {
-        self.last_discovery.is_some()
+        // Agent logs/summaries can omit interrupted or externally deleted runs.
+        // Preserve available numbers without certifying whole-account history.
+        let agent_history_unverified = self.kimi_root.as_ref().is_some_and(|p| p.exists())
+            || self.grok_root.as_ref().is_some_and(|p| p.exists());
+        !agent_history_unverified
+            && self.last_discovery.is_some()
             && self.known_claude.iter().all(|path| {
                 self.claude_files
                     .get(path)
@@ -1581,6 +1602,9 @@ impl UsageCollector {
         }
 
         let mut records = HashMap::<(String, String), UsageRecord>::new();
+        if let Some(root) = &self.kimi_root {
+            self.kimi_scanner.poll(root, &self.paths.actrealm_home);
+        }
         for record in claude_records(self.claude_files.values(), now_ms, &self.pricing) {
             merge_record(&mut records, record);
         }
@@ -1589,6 +1613,17 @@ impl UsageCollector {
         }
         for record in read_status_caches(&self.paths.claude_status_cache_dir()) {
             merge_record(&mut records, record);
+        }
+        for record in agents::records(&self.paths.actrealm_home) {
+            merge_record(&mut records, record);
+        }
+        if let Some(root) = &self.grok_root {
+            for record in grok::records(root) {
+                records.insert(
+                    (record.provider.clone(), record.provider_session_id.clone()),
+                    record,
+                );
+            }
         }
         let output = records.into_values().collect::<Vec<_>>();
         // Persist bounded backfill progress as well as a completed scan. A

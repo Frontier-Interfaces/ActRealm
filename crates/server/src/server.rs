@@ -416,6 +416,8 @@ pub struct ApiServer {
     shutdown_flag: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
     usage_thread: Option<thread::JoinHandle<()>>,
+    grok_thread: Option<thread::JoinHandle<()>>,
+    kimi_thread: Option<thread::JoinHandle<()>>,
     review_thread: Option<thread::JoinHandle<()>>,
     usage_worker_failures: Arc<AtomicUsize>,
 }
@@ -464,6 +466,13 @@ impl ApiServer {
         };
         let mut usage_paths = UsagePaths::discover();
         usage_paths.actrealm_home = install_paths.actrealm_home.clone();
+        if config.install_paths.is_some() {
+            usage_paths.claude_projects = install_paths
+                .claude_settings
+                .parent()
+                .map(|p| vec![p.join("projects")])
+                .unwrap_or_default();
+        }
         let codex_home = install_paths
             .codex_config
             .parent()
@@ -499,6 +508,14 @@ impl ApiServer {
             CodexManager::disabled(store.clone())
         };
         let mut usage_collector = UsageCollector::new(usage_paths);
+        if let Some(home) = install_paths
+            .claude_settings
+            .parent()
+            .and_then(|p| p.parent())
+        {
+            usage_collector.enable_kimi_sources(home.join(".kimi-code/sessions"));
+            usage_collector.enable_grok_sources(home.join(".grok/sessions"));
+        }
         if config.enable_live_usage_pricing {
             usage_collector.enable_live_pricing();
         }
@@ -584,7 +601,41 @@ impl ApiServer {
             None
         };
         let quota_scheduler_state = state.clone();
+        let grok_thread = state
+            .installer
+            .paths()
+            .claude_settings
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|home| {
+                crate::grok_sessions::start(
+                    home.to_path_buf(),
+                    state.installer.paths().actrealm_home.clone(),
+                    state.store.clone(),
+                    state.waiters.clone(),
+                    shutdown_flag.clone(),
+                )
+            })
+            .transpose()
+            .map_err(|e| ApiServerError::Thread(e.to_string()))?;
         let usage_scheduler_state = state.clone();
+        let kimi_thread = state
+            .installer
+            .paths()
+            .claude_settings
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|home| {
+                crate::kimi_sessions::start(
+                    home.to_path_buf(),
+                    state.installer.paths().actrealm_home.clone(),
+                    state.store.clone(),
+                    state.waiters.clone(),
+                    shutdown_flag.clone(),
+                )
+            })
+            .transpose()
+            .map_err(|e| ApiServerError::Thread(e.to_string()))?;
         let usage_worker_failures = state.usage_worker_failures.clone();
         let router = router(state);
         let (shutdown, shutdown_receiver) = oneshot::channel();
@@ -639,6 +690,8 @@ impl ApiServer {
             shutdown_flag,
             thread: Some(api_thread),
             usage_thread: Some(usage_thread),
+            grok_thread,
+            kimi_thread,
             review_thread: None,
             usage_worker_failures,
         })
@@ -677,6 +730,12 @@ impl Drop for ApiServer {
             let _ = thread.join();
         }
         if let Some(thread) = self.usage_thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.grok_thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.kimi_thread.take() {
             let _ = thread.join();
         }
         if let Some(thread) = self.review_thread.take() {
@@ -2902,6 +2961,28 @@ async fn quota_refresh_loop(state: AppState) {
                     return;
                 }
                 state.codex.mark_credential_restart_failed();
+            }
+        }
+        if state.claude_oauth_quota {
+            let hooks = extra_agent_hooks(&state);
+            let enabled = fs::read(hooks.runtime_home.join("providers/kimi-hooks.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|value| value["installed"].as_bool())
+                .unwrap_or(false);
+            if enabled {
+                let quota_state = state.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = actrealm_quota::agents::refresh_kimi(
+                        &hooks.home,
+                        &hooks.runtime_home,
+                        now_millis(),
+                    );
+                    if let Ok(mut quota) = quota_state.quota.lock() {
+                        quota.refreshed_at = None;
+                    }
+                })
+                .await;
             }
         }
         // Quota freshness must not depend on a healthy WebSocket client.
@@ -5857,6 +5938,29 @@ async fn change_setup(
     if !authorized_setup(&state, &headers, true) {
         return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_MUTATION");
     }
+    if actrealm_installer::agents::AGENT_PROVIDERS.contains(&request.provider.as_str()) {
+        if !matches!(request.action.as_str(), "install" | "uninstall") {
+            return api_error(StatusCode::BAD_REQUEST, "UNKNOWN_SETUP_ACTION");
+        }
+        let hooks = extra_agent_hooks(&state);
+        if let Err(error) = hooks.change(&request.provider, request.action == "install") {
+            return api_error_detail(
+                StatusCode::CONFLICT,
+                "SETUP_CHANGE_FAILED",
+                &error.to_string(),
+            );
+        }
+        return setup_value(&state)
+            .map(Json)
+            .map(IntoResponse::into_response)
+            .unwrap_or_else(|error| {
+                api_error_detail(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "SETUP_INSPECTION_FAILED",
+                    &error,
+                )
+            });
+    }
     let provider = match request.provider.as_str() {
         "claude" => HookProvider::Claude,
         "codex" => HookProvider::Codex,
@@ -5905,6 +6009,25 @@ async fn change_setup(
                 &error,
             )
         })
+}
+
+fn extra_agent_hooks(state: &AppState) -> actrealm_installer::agents::AgentHooks {
+    actrealm_installer::agents::AgentHooks {
+        home: state
+            .installer
+            .paths()
+            .claude_settings
+            .parent()
+            .and_then(|path| path.parent())
+            .unwrap_or_else(|| FilePath::new("."))
+            .to_owned(),
+        runtime_home: state
+            .data_paths
+            .companion_auth
+            .parent()
+            .unwrap_or_else(|| FilePath::new("."))
+            .to_owned(),
+    }
 }
 
 fn setup_value(state: &AppState) -> Result<Value, String> {
@@ -5979,6 +6102,19 @@ fn setup_value(state: &AppState) -> Result<Value, String> {
                 && inspection.binary_health != BinaryHealth::Executable,
             "realEventVerified": real_event_verified,
         }));
+    }
+    let hooks = extra_agent_hooks(state);
+    for provider in actrealm_installer::agents::AGENT_PROVIDERS {
+        let last = runtime
+            .sessions
+            .iter()
+            .filter(|s| s.provider == *provider)
+            .map(|s| s.last_event_at)
+            .max();
+        match hooks.inspect(provider, last) {
+            Ok(inspection) => providers.push(inspection),
+            Err(error) => providers.push(json!({"provider":provider,"status":"error","cliInstalled":actrealm_installer::agents::agent_executable(provider).is_some(),"desktopInstalled":false,"detail":error.to_string()})),
+        }
     }
     let first_run = providers.iter().all(|provider| {
         matches!(
@@ -7357,14 +7493,30 @@ async fn websocket_loop(mut socket: WebSocket, state: AppState) {
     let _connection = WebSocketConnectionGuard::new(state.websocket_connections.clone());
     let mut last_payload = String::new();
     let mut last_heartbeat = Instant::now();
+    let mut sequence = 0u64;
     while !state.shutdown_flag.load(Ordering::Acquire) {
+        let started_at = monotonic_nanoseconds();
         let Ok(snapshot) = snapshot_value(&state) else {
             break;
         };
-        let payload = json!({ "type": "snapshot", "snapshot": snapshot }).to_string();
+        let mut envelope = json!({ "type": "snapshot", "snapshot": snapshot });
+        let payload = envelope.to_string();
         if payload != last_payload {
+            sequence = sequence.saturating_add(1);
+            // Timing belongs to this exact live frame, not to a Provider event
+            // or filtered session timestamp. Exclude timing from the equality
+            // check so an idle connection does not emit artificial updates.
+            if let (Some(started_at), Some(ready_at)) = (started_at, monotonic_nanoseconds()) {
+                envelope["deliveryTiming"] = json!({
+                    "runtimeInstanceId": state.instance_id,
+                    "sequence": sequence,
+                    "clock": "CLOCK_MONOTONIC",
+                    "startedAtNs": started_at,
+                    "readyAtNs": ready_at,
+                });
+            }
             if socket
-                .send(Message::Text(payload.clone().into()))
+                .send(Message::Text(envelope.to_string().into()))
                 .await
                 .is_err()
             {
@@ -7388,6 +7540,20 @@ async fn websocket_loop(mut socket: WebSocket, state: AppState) {
             Ok(Some(Ok(_))) | Err(_) => {}
         }
     }
+}
+
+fn monotonic_nanoseconds() -> Option<u64> {
+    let mut clock = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut clock) } != 0 {
+        return None;
+    }
+    u64::try_from(clock.tv_sec)
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::try_from(clock.tv_nsec).ok()?)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -7865,6 +8031,9 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
                         object.insert("currentTarget".into(), Value::Null);
                     }
                 }
+                if session.exec_state == "waiting_for_event" {
+                    object.insert("currentTool".to_owned(), Value::Null);
+                }
                 apply_live_codex_metrics(session, object, &live_codex_usage);
                 let blocking_attention = snapshot.attention.iter().find(|item| {
                     item.session_id == session.id
@@ -7935,6 +8104,41 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
                 Value::Array(status_messages::attention_risks(item)),
             );
             if let Some(request_id) = item.request_id {
+                // Full file targets are transient decision context for the
+                // native owner, never persisted or added to Companion fields.
+                if item.kind == "approval"
+                    && item.state == "open"
+                    && matches!(item.provider.as_str(), "kimi" | "grok")
+                {
+                    if let Ok(Some(raw)) = state.waiters.raw(request_id) {
+                        if let Some(plan) = raw["plan_content"]
+                            .as_str()
+                            .filter(|s| !s.is_empty() && s.len() <= 65536)
+                        {
+                            object.insert("requestPlan".into(), json!(plan));
+                        }
+                        let target = raw
+                            .pointer("/tool_input/file_path")
+                            .or_else(|| raw.pointer("/tool_input/path"))
+                            .and_then(Value::as_str)
+                            .filter(|s| {
+                                !s.is_empty() && s.len() <= 4096 && !s.chars().any(char::is_control)
+                            });
+                        if let Some(target) = target {
+                            let target = FilePath::new(target);
+                            let full = if target.is_absolute() {
+                                Some(target.to_owned())
+                            } else {
+                                raw["cwd"]
+                                    .as_str()
+                                    .map(|cwd| FilePath::new(cwd).join(target))
+                            };
+                            if let Some(full) = full {
+                                object.insert("requestTarget".to_owned(), json!(full));
+                            }
+                        }
+                    }
+                }
                 if let Ok(Some(interaction)) = state.waiters.interactive_prompt(request_id) {
                     object.insert(
                         "interaction".to_owned(),
@@ -8318,6 +8522,17 @@ fn refresh_session_usage(state: &AppState, now: u64) -> Result<(bool, bool), Sto
                 if live_pricing {
                     usage.collector.enable_live_pricing();
                 }
+                if let Some(home) = state
+                    .installer
+                    .paths()
+                    .claude_settings
+                    .parent()
+                    .and_then(|p| p.parent())
+                {
+                    usage
+                        .collector
+                        .enable_kimi_sources(home.join(".kimi-code/sessions"));
+                }
                 state.usage.clear_poison();
                 usage
             }
@@ -8382,6 +8597,18 @@ fn refresh_session_usage(state: &AppState, now: u64) -> Result<(bool, bool), Sto
     // previous committed ledger while a bounded historical scan is incomplete;
     // publishing each intermediate prefix makes totals wobble across restarts.
     if !records.1 {
+        // Fresh Agent samples must remain visible while an unrelated Codex
+        // historical scan rebuilds its shadow generation.
+        let agent_records = records
+            .0
+            .iter()
+            .filter(|r| matches!(r.provider.as_str(), "kimi" | "grok"))
+            .cloned()
+            .map(runtime_usage_record)
+            .collect::<Vec<_>>();
+        if !agent_records.is_empty() {
+            state.store.upsert_session_usages(agent_records)?;
+        }
         return Ok((false, records.2));
     }
     let generation = state.store.begin_usage_collection_generation()?;
@@ -8865,6 +9092,10 @@ fn quota_entries(state: &AppState) -> Result<Vec<QuotaEntry>, StoreError> {
             now,
         );
         entries.extend(codex_entries);
+        entries.extend(actrealm_quota::agents::read_agent_cache(
+            &quota.collector.paths().actrealm_home,
+            now,
+        ));
         quota.codex_rate_limits_captured_at = codex_captured_at;
         quota.entries = entries;
         quota.refreshed_at = Some(Instant::now());
@@ -11874,7 +12105,7 @@ done
             let setup_bytes = to_bytes(setup.into_body(), 16 * 1024).await.unwrap();
             let setup_payload: Value = serde_json::from_slice(&setup_bytes).unwrap();
             assert_eq!(setup_payload["schemaVersion"], 1);
-            assert_eq!(setup_payload["providers"].as_array().unwrap().len(), 2);
+            assert_eq!(setup_payload["providers"].as_array().unwrap().len(), 4);
 
             let setup_without_csrf = app
                 .clone()
@@ -14151,5 +14382,51 @@ done
         assert!(body["error"].get("detail").is_none());
         assert!(!body.to_string().contains("/Users/private"));
         assert!(!body.to_string().contains("bearer-secret"));
+    }
+    #[test]
+    fn agent_file_target_is_live_owner_context_and_never_a_companion_field() {
+        let root = std::env::temp_dir().join(format!("ar-agent-target-{}", Uuid::now_v7()));
+        let store = RuntimeStore::open(root.join("state.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        let at = now_millis();
+        let request=BridgeRequest::from_agent_request_at(Provider::Grok,"grok-file",Some("turn"),actrealm_core::BlockingRequestKind::Permission,
+            json!({"cwd":"/scratch","tool_name":"Edit","tool_input":{"path":"/scratch/review-target.txt"},"plan_content":"PRIVATE PLAN ONLY IN LIVE MEMORY"}),at,at+60000).unwrap();
+        let id = request.request_id.unwrap();
+        let _registration = state.waiters.register_at(&request, at).unwrap();
+        store.ingest(request).unwrap();
+        let owner = snapshot_value(&state).unwrap();
+        assert_eq!(
+            owner["attention"][0]["requestTarget"],
+            "/scratch/review-target.txt"
+        );
+        assert_eq!(
+            owner["attention"][0]["requestPlan"],
+            "PRIVATE PLAN ONLY IN LIVE MEMORY"
+        );
+        assert!(!store
+            .export_json(at + 1)
+            .unwrap()
+            .to_string()
+            .contains("PRIVATE PLAN ONLY IN LIVE MEMORY"));
+        let companion = companion_snapshot_value(
+            &state,
+            &CompanionAuthorization {
+                id: "display-test".into(),
+                scopes: vec![COMPANION_SCOPE_SNAPSHOT.into()],
+            },
+        )
+        .unwrap();
+        assert!(companion["attention"][0].get("requestTarget").is_none());
+        assert!(companion["attention"][0].get("requestPlan").is_none());
+        state.waiters.pass_through(id, "test_closed").unwrap();
+        assert!(snapshot_value(&state).unwrap()["attention"][0]
+            .get("requestTarget")
+            .is_none());
+        assert!(snapshot_value(&state).unwrap()["attention"][0]
+            .get("requestPlan")
+            .is_none());
+        drop(state);
+        drop(store);
+        let _ = fs::remove_dir_all(root);
     }
 }

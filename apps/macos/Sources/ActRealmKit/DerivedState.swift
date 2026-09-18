@@ -721,38 +721,6 @@ public struct TaskRenderProjector: Sendable {
     }
 }
 
-/// Native presentation timing is intentionally client-local. It is separate
-/// from Runtime transport measurements and accepts only a recent event that
-/// can be ordered at render time.
-public struct NativePresentationLatency: Sendable {
-    public static let maximumAge: TimeInterval = 10
-    public static let maximumSamples = 100
-
-    private var samples: [UInt64] = []
-
-    public init() {}
-
-    public var sampleCount: Int { samples.count }
-
-    public var p95Milliseconds: UInt64? {
-        guard !samples.isEmpty else { return nil }
-        let sorted = samples.sorted()
-        let index = Int(ceil(Double(sorted.count) * 0.95)) - 1
-        return sorted[index]
-    }
-
-    @discardableResult
-    public mutating func record(eventAt: Date, renderedAt: Date) -> Bool {
-        let interval = renderedAt.timeIntervalSince(eventAt)
-        guard interval >= 0, interval <= Self.maximumAge else { return false }
-        samples.append(UInt64((interval * 1_000).rounded(.down)))
-        if samples.count > Self.maximumSamples {
-            samples.removeFirst(samples.count - Self.maximumSamples)
-        }
-        return true
-    }
-}
-
 public struct Lane: Identifiable, Equatable, Sendable {
     public let provider: ProviderKind
     public let tasks: [LaneTask]
@@ -829,7 +797,7 @@ public struct QuotaSlot: Identifiable, Equatable, Sendable {
 
     public var providerDisplayName: String {
         if isSpark { return "Codex Spark" }
-        return slot.provider == .claude ? "Claude" : "Codex"
+        return slot.provider.displayName
     }
 
     public var displayPlanType: String? {

@@ -33,6 +33,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+mod agent;
 mod service;
 
 const PROVIDER_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -50,6 +51,18 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Start a Kimi/Grok ACP session with live ActRealm approvals and questions.
+    Agent {
+        provider: String,
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        resume: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// Ensure or inspect the independent local native Runtime service.
     Service {
         #[arg(value_enum)]
@@ -207,6 +220,13 @@ const RESTART_STATE_TTL_MS: u64 = 30_000;
 
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Agent {
+            provider,
+            cwd,
+            prompt,
+            resume,
+            model,
+        } => agent::run(Provider::from_str(&provider)?, cwd, prompt, resume, model),
         Command::Service { action } => service::run(action),
         Command::Serve {
             service,
@@ -1453,6 +1473,9 @@ fn serve(launch: ServeLaunch, service: bool) -> Result<ServeOutcome> {
                 }
                 return;
             }
+            if actrealm_runtime::handle_agent_connection_event(&store, &waiters, &request) {
+                return;
+            }
             let _ = diagnostics.capture(&request, now_millis());
             let registration = if request.needs_reply {
                 let Ok(registration) = waiters.register_at(&request, now_millis()) else {
@@ -1495,6 +1518,26 @@ fn serve(launch: ServeLaunch, service: bool) -> Result<ServeOutcome> {
             }
 
             if let Some(registration) = registration {
+                if approval == ApprovalMode::Widget
+                    && matches!(request.provider, Provider::Kimi | Provider::Grok)
+                {
+                    if let Some(response) = actrealm_runtime::wait_for_agent_reply(
+                        &store,
+                        &waiters,
+                        &request,
+                        &registration.ticket,
+                        &stream,
+                    ) {
+                        if BridgeListener::write_response(&mut stream, &response).is_err() {
+                            let _ = store.expire_approval(
+                                request.request_id.unwrap_or(request.id),
+                                "provider_disconnected",
+                                now_millis(),
+                            );
+                        }
+                    }
+                    return;
+                }
                 if approval == ApprovalMode::Widget {
                     let request_id = request.request_id.unwrap_or(request.id);
                     let wait_for = request
@@ -1683,6 +1726,24 @@ fn run_hook(provider: Provider, socket_path: PathBuf) -> Result<()> {
     }
     let input = read_hook_input()?;
     let mut raw: Value = serde_json::from_slice(&input)?;
+    // Grok imports Claude hook files. Its camelCase event must not be
+    // attributed to Claude by an inherited ActRealm command.
+    if provider == Provider::Claude
+        && raw.get("hookEventName").is_some()
+        && std::env::var_os("GROK_HOOK_EVENT").is_some()
+    {
+        return Ok(());
+    }
+    raw = actrealm_core::normalize_provider_payload(provider, raw);
+    if std::env::var("ACTREALM_CONNECTED_PROVIDER").ok().as_deref()
+        == Some(provider.to_string().as_str())
+        && !matches!(
+            raw["hook_event_name"].as_str(),
+            Some("SubagentStart" | "SubagentStop")
+        )
+    {
+        return Ok(());
+    }
     apply_codex_auto_review_fallback(provider, &mut raw);
     let request = BridgeRequest::from_hook(provider, raw);
     let timeout = if request.needs_reply {

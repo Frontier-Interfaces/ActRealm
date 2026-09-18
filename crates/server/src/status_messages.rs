@@ -96,6 +96,7 @@ pub(crate) fn session_activity(
     }
     let code = match session.exec_state.as_str() {
         "thinking" => "session.activity.thinking",
+        "waiting_for_event" => "session.activity.waiting_for_provider_event",
         "awaiting_approval" => "session.activity.awaiting_approval",
         "compacting" => "session.activity.compacting",
         "response_finished" => "session.activity.completed",
@@ -280,6 +281,8 @@ fn provider_name(provider: &str) -> String {
         "claude" => "Claude".to_owned(),
         "codex" => "Codex".to_owned(),
         "gemini" => "Gemini".to_owned(),
+        "kimi" => "Kimi Code".to_owned(),
+        "grok" => "Grok Build".to_owned(),
         other => other.to_owned(),
     }
 }

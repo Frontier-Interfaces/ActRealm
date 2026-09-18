@@ -475,9 +475,8 @@ public final class AppModel: ObservableObject {
     /// Persistent result shown in Settings. A main-window toast alone is not
     /// visible while the separate Settings scene is frontmost.
     @Published public private(set) var quotaRefreshMessage: String?
-    /// Local event-to-native-presentation timing. Runtime transport p95
-    /// remains a Runtime concern and is never combined with this window.
-    @Published public private(set) var nativePresentationP95Ms: UInt64?
+    /// Matched live snapshot arrival and client processing, never GPU/frame time.
+    @Published public private(set) var performanceMetrics: NativePerformanceSummary = .empty
     /// Factual task-card values are retained independently from quota, setup,
     /// metrics and the one-second display clock.
     @Published public private(set) var taskRenderSignatures: [TaskRenderSignature] = []
@@ -569,8 +568,7 @@ public final class AppModel: ObservableObject {
     }
     private var hasDeferredSnapshotProjection = false
     private var persistedUISettings: UISettings = .defaults
-    private var renderedEventCount: UInt64 = 0
-    private var nativePresentationLatency = NativePresentationLatency()
+    private var nativePerformance = NativePerformanceTracker()
     private var taskRenderProjector = TaskRenderProjector()
     private var started = false
     private var wakeRecoveryTask: Task<Void, Never>?
@@ -635,10 +633,10 @@ public final class AppModel: ObservableObject {
                 }
             }
 
-        client.$snapshot
+        client.snapshotUpdates
             .receive(on: RunLoop.main)
-            .sink { [weak self] snapshot in
-                self?.receive(snapshot: snapshot)
+            .sink { [weak self] update in
+                self?.receive(update: update)
             }
             .store(in: &cancellables)
         client.$connectionState
@@ -1120,6 +1118,7 @@ public final class AppModel: ObservableObject {
                 try? await Task.sleep(for: .seconds(1))
                 guard let self else { return }
                 let tick = Date()
+                self.refreshPerformanceMetrics()
                 let needsSecondPrecision = self.derived.pendingDecision != nil
                     || self.foregroundDispatch != nil
                     || self.hudArrivalDeadline != nil
@@ -1161,6 +1160,13 @@ public final class AppModel: ObservableObject {
     }
 
     func receive(snapshot: Snapshot) {
+        receive(update: SnapshotUpdate(snapshot: snapshot))
+    }
+
+    func receive(update: SnapshotUpdate) {
+        let snapshot = update.snapshot
+        let live = nativePerformance.receive(update.timing)
+        defer { refreshPerformanceMetrics() }
         let previous = latestSnapshot
         latestSnapshot = snapshot
         publishUsage(snapshot)
@@ -1174,6 +1180,15 @@ public final class AppModel: ObservableObject {
         }
         hasDeferredSnapshotProjection = false
         apply(snapshot: snapshot)
+        if live, let timing = update.timing {
+            nativePerformance.recordProcessing(start: timing.receivedAtNs,
+                end: PerformanceClock.now(), background: !isWorkspaceAnimationActive)
+        }
+    }
+
+    private func refreshPerformanceMetrics() {
+        let next = nativePerformance.summary(at: PerformanceClock.now())
+        if next != performanceMetrics { performanceMetrics = next }
     }
 
     private func publishUsage(_ snapshot: Snapshot) {
@@ -1268,17 +1283,6 @@ public final class AppModel: ObservableObject {
             startNextForegroundArrivalIfNeeded(at: Date())
         }
         if emitArrivals { lastSyncAt = Date() }
-        if emitArrivals, snapshot.stats.eventCount > renderedEventCount {
-            let latestEventAt = snapshot.sessions.map(\.lastEventAt).max() ?? 0
-            let currentMillis = UInt64(max(0, Date().timeIntervalSince1970 * 1000))
-            if latestEventAt > 0, currentMillis >= latestEventAt {
-                let eventAt = Date(timeIntervalSince1970: TimeInterval(latestEventAt) / 1_000)
-                if nativePresentationLatency.record(eventAt: eventAt, renderedAt: Date()) {
-                    nativePresentationP95Ms = nativePresentationLatency.p95Milliseconds
-                }
-            }
-            renderedEventCount = snapshot.stats.eventCount
-        }
         if snapshot.stats.eventCount != lastSetupRefreshEventCount {
             lastSetupRefreshEventCount = snapshot.stats.eventCount
             scheduleSetupRefresh()
@@ -1624,7 +1628,11 @@ public final class AppModel: ObservableObject {
         now = Date()
         if hasDeferredSnapshotProjection {
             hasDeferredSnapshotProjection = false
+            let startedAt = PerformanceClock.now()
             apply(snapshot: latestSnapshot)
+            nativePerformance.recordProcessing(start: startedAt,
+                end: PerformanceClock.now(), background: true)
+            refreshPerformanceMetrics()
         }
     }
 

@@ -1,6 +1,8 @@
 //! Local runtime state, persistence, waiters, spooling, and single-instance guard.
 
+mod agent_connection;
 mod diagnostics;
+pub use agent_connection::{handle_agent_connection_event, wait_for_agent_reply};
 mod fsutil;
 mod instance;
 mod outcome;

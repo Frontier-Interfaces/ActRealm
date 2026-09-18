@@ -243,12 +243,14 @@ private struct OutboxPrimaryCard: View {
                     .padding(.horizontal, 9)
                     .padding(.vertical, 2.5)
                     .background(DT.neutralChipBg, in: RoundedRectangle(cornerRadius: 7))
-                Text(entry.attention.commandPreview
-                    ?? localized("Provider 未提供命令预览", locale: locale))
+                Text(entry.attention.requestTarget ?? entry.attention.commandPreview
+                    ?? localized(entry.attention.requestPlan == nil ? "Provider 未提供命令预览" : "查看下方计划", locale: locale))
                     .font(.system(size: 13, design: .monospaced))
                     .foregroundStyle(DT.textPrimary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .help(entry.attention.requestTarget ?? entry.attention.commandPreview ?? "")
+                    .textSelection(.enabled)
             }
             .padding(.horizontal, 13)
             .padding(.vertical, 11)
@@ -256,6 +258,20 @@ private struct OutboxPrimaryCard: View {
             .background(DT.cardStrong.opacity(0.82), in: RoundedRectangle(cornerRadius: 13))
             .overlay(RoundedRectangle(cornerRadius: 13).strokeBorder(DT.hairline, lineWidth: 1))
             .padding(.top, 11)
+
+            if let plan = entry.attention.requestPlan {
+                ScrollView(.vertical) {
+                    Text(plan)
+                        .font(.system(size: 11))
+                        .foregroundStyle(DT.textPrimary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
+                .frame(maxHeight: 200)
+                .padding(10)
+                .background(DT.cardStrong, in: RoundedRectangle(cornerRadius: 10))
+                .padding(.top, 8)
+            }
 
             HStack(alignment: .top, spacing: 8) {
                 Chip(

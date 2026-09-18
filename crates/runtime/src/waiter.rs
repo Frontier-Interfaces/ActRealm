@@ -278,7 +278,7 @@ fn correlation_key(request: &BridgeRequest) -> String {
     let provider_key = match request.provider {
         Provider::Claude => request.prompt_id.as_deref(),
         Provider::Codex => request.provider_turn_id.as_deref(),
-        Provider::Gemini => None,
+        Provider::Gemini | Provider::Kimi | Provider::Grok => None,
     }
     .map(ToOwned::to_owned)
     .or_else(|| request.request_id.map(|id| id.to_string()))
@@ -315,6 +315,45 @@ fn parse_interactive_prompt(
     expires_at: u64,
     raw: &Value,
 ) -> Result<InteractivePrompt, WaiterError> {
+    if matches!(
+        raw.get("hook_event_name").and_then(Value::as_str),
+        Some("AgentQuestion" | "AgentElicitation")
+    ) {
+        let provider = raw
+            .get("_actrealm_provider")
+            .and_then(Value::as_str)
+            .filter(|p| matches!(*p, "kimi" | "grok"))
+            .ok_or(WaiterError::NotInteractive)?;
+        let elicitation = raw["hook_event_name"] == "AgentElicitation";
+        let mut prompt = if elicitation {
+            parse_agent_elicitation(request_id, expires_at, raw)?
+        } else {
+            parse_codex_user_input(request_id, expires_at, raw)?
+        };
+        prompt.provider = provider.to_owned();
+        prompt.kind = if elicitation {
+            "agent_elicitation"
+        } else {
+            "agent_question"
+        }
+        .to_owned();
+        prompt.title = "Agent is asking".to_owned();
+        prompt.title_code = "interaction.agent_question.title".to_owned();
+        prompt.supports_native = matches!(
+            raw["source_version"].as_str(),
+            Some("grok-leader/1" | "kimi-server/v1")
+        );
+        if !elicitation {
+            for (question, source) in prompt
+                .questions
+                .iter_mut()
+                .zip(raw["questions"].as_array().into_iter().flatten())
+            {
+                question.multi_select = source["multiSelect"].as_bool().unwrap_or(false);
+            }
+        }
+        return Ok(prompt);
+    }
     if raw.get("hook_event_name").and_then(Value::as_str) == Some("PreToolUse")
         && raw.get("tool_name").and_then(Value::as_str) == Some("AskUserQuestion")
     {
@@ -327,6 +366,63 @@ fn parse_interactive_prompt(
         return parse_codex_user_input(request_id, expires_at, raw);
     }
     Err(WaiterError::NotInteractive)
+}
+
+fn parse_agent_elicitation(
+    request_id: Uuid,
+    expires_at: u64,
+    raw: &Value,
+) -> Result<InteractivePrompt, WaiterError> {
+    let mut normalized = raw.clone();
+    let properties = normalized
+        .pointer_mut("/requestedSchema/properties")
+        .and_then(Value::as_object_mut)
+        .ok_or(WaiterError::NotInteractive)?;
+    let mut multiple = HashSet::new();
+    for (key, property) in properties {
+        let array = property["type"] == "array";
+        let field = if array {
+            property
+                .get("items")
+                .ok_or(WaiterError::NotInteractive)?
+                .clone()
+        } else {
+            property.clone()
+        };
+        let enumeration = field
+            .get("enum")
+            .and_then(Value::as_array)
+            .cloned()
+            .or_else(|| {
+                field
+                    .get("oneOf")
+                    .or_else(|| field.get("anyOf"))
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|v| v.get("const").cloned())
+                            .collect()
+                    })
+            });
+        if let Some(values) = enumeration {
+            if values.is_empty() || values.len() > 50 || values.iter().any(|v| !v.is_string()) {
+                return Err(WaiterError::NotInteractive);
+            }
+            property["type"] = Value::String("string".to_owned());
+            property["enum"] = Value::Array(values);
+            if array {
+                multiple.insert(key.clone());
+            }
+        } else if array {
+            return Err(WaiterError::NotInteractive);
+        }
+    }
+    let mut prompt = parse_claude_elicitation(request_id, expires_at, &normalized)?;
+    for question in &mut prompt.questions {
+        question.multi_select = multiple.contains(&question.id);
+    }
+    Ok(prompt)
 }
 
 fn parse_claude_question(
@@ -590,7 +686,12 @@ fn answer_payload(
         return Ok(ReplyPayload::ClaudeQuestion { answers });
     }
 
-    if prompt.kind == "codex_user_input" {
+    if matches!(prompt.kind.as_str(), "codex_user_input" | "agent_question") {
+        if prompt.kind == "agent_question" && matches!(action, "cancel" | "decline") {
+            return Ok(ReplyPayload::AgentQuestion {
+                answers: BTreeMap::new(),
+            });
+        }
         if action != "accept" {
             return Err(WaiterError::InvalidAnswer);
         }
@@ -608,16 +709,27 @@ fn answer_payload(
                 answer_strings(submitted.get(&question.id), question.multi_select)?,
             );
         }
-        return Ok(ReplyPayload::CodexUserInput { answers });
+        return Ok(if prompt.kind == "agent_question" {
+            ReplyPayload::AgentQuestion { answers }
+        } else {
+            ReplyPayload::CodexUserInput { answers }
+        });
     }
 
     if !matches!(action, "accept" | "decline" | "cancel") {
         return Err(WaiterError::InvalidAnswer);
     }
     if action != "accept" {
-        return Ok(ReplyPayload::ClaudeElicitation {
-            action: action.to_owned(),
-            content: None,
+        return Ok(if prompt.kind == "agent_elicitation" {
+            ReplyPayload::AgentElicitation {
+                action: action.to_owned(),
+                content: None,
+            }
+        } else {
+            ReplyPayload::ClaudeElicitation {
+                action: action.to_owned(),
+                content: None,
+            }
         });
     }
     let submitted = submission
@@ -640,9 +752,16 @@ fn answer_payload(
         let normalized = normalize_elicitation_value(question, value)?;
         content.insert(question.id.clone(), normalized);
     }
-    Ok(ReplyPayload::ClaudeElicitation {
-        action: "accept".to_owned(),
-        content: Some(Value::Object(content)),
+    Ok(if prompt.kind == "agent_elicitation" {
+        ReplyPayload::AgentElicitation {
+            action: "accept".to_owned(),
+            content: Some(Value::Object(content)),
+        }
+    } else {
+        ReplyPayload::ClaudeElicitation {
+            action: "accept".to_owned(),
+            content: Some(Value::Object(content)),
+        }
     })
 }
 
@@ -661,6 +780,18 @@ fn normalize_elicitation_value(
     question: &InteractiveQuestion,
     value: &Value,
 ) -> Result<Value, WaiterError> {
+    if question.multi_select {
+        let values = answer_strings(Some(value), true)?;
+        if values
+            .iter()
+            .any(|v| !question.options.iter().any(|o| &o.label == v))
+        {
+            return Err(WaiterError::InvalidAnswer);
+        }
+        return Ok(Value::Array(
+            values.into_iter().map(Value::String).collect(),
+        ));
+    }
     match question.input_type.as_str() {
         "boolean" => value
             .as_bool()
@@ -856,5 +987,53 @@ mod tests {
             })
         );
         assert!(registry.raw(request_id).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod agent_interaction_tests {
+    use super::*;
+    use actrealm_core::BlockingRequestKind;
+    #[test]
+    fn kimi_form_keeps_enumerated_multi_select_and_typed_answers() {
+        let raw = serde_json::json!({"requestedSchema":{"type":"object","required":["q0","q1"],"properties":{"q0":{"type":"string","oneOf":[{"const":"Blue","title":"Blue"},{"const":"Orange","title":"Orange"}]},"q1":{"type":"array","items":{"anyOf":[{"const":"Read"},{"const":"Test"}]}}}}});
+        let request = BridgeRequest::from_agent_request_at(
+            Provider::Kimi,
+            "kimi-session",
+            Some("turn"),
+            BlockingRequestKind::AgentElicitation,
+            raw,
+            1000,
+            10000,
+        )
+        .unwrap();
+        let registry = WaiterRegistry::default();
+        let registration = registry.register_at(&request, 1000).unwrap();
+        let prompt = registry
+            .interactive_prompt(request.request_id.unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(prompt.provider, "kimi");
+        assert_eq!(prompt.kind, "agent_elicitation");
+        assert!(prompt.questions[1].multi_select);
+        assert!(registry
+            .answer(
+                request.request_id.unwrap(),
+                &serde_json::json!({"action":"accept","answers":{"q0":"invalid","q1":["Read"]}})
+            )
+            .is_err());
+        registry.answer(request.request_id.unwrap(),&serde_json::json!({"action":"accept","answers":{"q0":"Blue","q1":["Read","Test"]}})).unwrap();
+        let response = registration
+            .ticket
+            .recv_timeout(Duration::from_millis(10))
+            .unwrap();
+        assert_eq!(
+            response.payload,
+            Some(ReplyPayload::AgentElicitation {
+                action: "accept".into(),
+                content: Some(serde_json::json!({"q0":"Blue","q1":["Read","Test"]}))
+            })
+        );
+        assert!(!registry.is_active(request.request_id.unwrap()).unwrap());
     }
 }

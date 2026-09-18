@@ -587,6 +587,8 @@ public struct InteractivePrompt: Codable, Equatable, Sendable {
 }
 
 public struct AttentionRecord: Codable, Identifiable, Equatable, Sendable {
+    public var requestTarget: String? = nil
+    public var requestPlan: String? = nil
     public let id: String
     public let sessionId: String
     public let provider: String
@@ -1785,6 +1787,17 @@ public struct Snapshot: Codable, Equatable, Sendable {
 struct SnapshotEnvelope: Codable {
     let type: String
     let snapshot: Snapshot
+    var deliveryTiming: SnapshotDeliveryTiming? = nil
+
+    private enum CodingKeys: String, CodingKey { case type, snapshot, deliveryTiming }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        type = try container.decode(String.self, forKey: .type)
+        snapshot = try container.decode(Snapshot.self, forKey: .snapshot)
+        // Optional diagnostics must never prevent tasks or approvals updating.
+        deliveryTiming = try? container.decodeIfPresent(SnapshotDeliveryTiming.self, forKey: .deliveryTiming)
+    }
 }
 
 public struct CompanionPairingResponse: Codable, Equatable, Sendable {
@@ -1877,6 +1890,9 @@ public struct SetupInfo: Codable, Equatable, Sendable {
         public let inlineEvents: [String]?
         public let canRepair: Bool?
         public let realEventVerified: Bool?
+        public var launchCommand: String? = nil
+        public var guideURL: String? = nil
+        public var connectionMode: String? = nil
 
         public var id: String { provider }
 

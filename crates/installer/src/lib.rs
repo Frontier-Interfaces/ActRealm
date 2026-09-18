@@ -13,6 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use toml_edit::DocumentMut;
 
+pub mod agents;
+
 const CONFIG_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
 const STATE_SCHEMA_VERSION: u32 = 1;
 const CLAUDE_ORIGINAL_STATUSLINE_KEY: &str = "_actRealmOriginalStatusLine";
@@ -1219,36 +1221,71 @@ impl Installer {
         {
             return Err(InstallerError::UnsafeBackupEntry(backups));
         }
-        let entries = fs::read_dir(&backups).map_err(|source| InstallerError::Io {
-            path: backups.clone(),
-            source,
-        })?;
         let mut files = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|source| InstallerError::Io {
-                path: backups.clone(),
-                source,
-            })?;
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                return Err(InstallerError::UnsafeBackupEntry(path));
-            };
-            let metadata = fs::symlink_metadata(&path).map_err(|source| InstallerError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            if metadata.file_type().is_symlink()
-                || !metadata.is_file()
-                || metadata.permissions().mode() & 0o077 != 0
-                || !is_owned_backup_name(name)
-            {
-                return Err(InstallerError::UnsafeBackupEntry(path));
-            }
-            files.push((path, metadata.len()));
-        }
+        collect_managed_backups(&backups, false, &mut files)?;
         files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         Ok(files)
     }
+}
+
+// The new providers use one owned subdirectory. Validate every entry before
+// returning anything to clear_backups; never recurse into arbitrary folders.
+fn collect_managed_backups(
+    directory: &Path,
+    agents: bool,
+    files: &mut Vec<(PathBuf, u64)>,
+) -> Result<(), InstallerError> {
+    let entries = fs::read_dir(directory).map_err(|source| InstallerError::Io {
+        path: directory.to_owned(),
+        source,
+    })?;
+    for entry in entries {
+        let path = entry
+            .map_err(|source| InstallerError::Io {
+                path: directory.to_owned(),
+                source,
+            })?
+            .path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            return Err(InstallerError::UnsafeBackupEntry(path));
+        };
+        let metadata = fs::symlink_metadata(&path).map_err(|source| InstallerError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() || metadata.permissions().mode() & 0o077 != 0 {
+            return Err(InstallerError::UnsafeBackupEntry(path));
+        }
+        if !agents && name == "providers" && metadata.is_dir() {
+            collect_managed_backups(&path, true, files)?;
+            continue;
+        }
+        let owned = if agents {
+            is_owned_agent_backup_name(name)
+        } else {
+            is_owned_backup_name(name)
+        };
+        if !metadata.is_file() || !owned {
+            return Err(InstallerError::UnsafeBackupEntry(path));
+        }
+        files.push((path, metadata.len()));
+    }
+    Ok(())
+}
+
+fn is_owned_agent_backup_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".bak") else {
+        return false;
+    };
+    ["kimi-", "grok-", "grok-config-"].iter().any(|prefix| {
+        stem.strip_prefix(prefix).is_some_and(|rest| {
+            let parts = rest.split('-').collect::<Vec<_>>();
+            parts.len() == 3
+                && parts
+                    .iter()
+                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        })
+    })
 }
 
 fn is_owned_backup_name(name: &str) -> bool {

@@ -14,6 +14,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+pub mod agents;
 mod claude_auth;
 use thiserror::Error;
 
@@ -40,6 +41,8 @@ static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
 pub enum QuotaError {
+    #[error("Agent account quota is unavailable; check the official CLI account status")]
+    AgentRequest,
     #[error("quota input exceeds {0} bytes")]
     TooLarge(u64),
     #[error("unsafe symbolic link refused: {0}")]

@@ -70,6 +70,56 @@
       "currentTarget": {
         "status": "unsupported"
       }
+    },
+    "kimi": {
+      "plan": {
+        "status": "supported",
+        "source": "connector:ACP/session-update.plan"
+      },
+      "subagents": {
+        "status": "supported",
+        "source": "hook:SubagentStart/SubagentStop"
+      },
+      "approvals": {
+        "status": "supported",
+        "source": "connector:ACP/session-request-permission"
+      },
+      "transcriptSlice": {
+        "status": "unsupported"
+      },
+      "toolLifecycle": {
+        "status": "supported",
+        "source": "hook:PreToolUse/PostToolUse/PostToolUseFailure"
+      },
+      "currentTarget": {
+        "status": "supported",
+        "source": "connector:ACP/tool-locations"
+      }
+    },
+    "grok": {
+      "plan": {
+        "status": "supported",
+        "source": "connector:ACP/session-update.plan"
+      },
+      "subagents": {
+        "status": "supported",
+        "source": "hook:SubagentStart/SubagentStop"
+      },
+      "approvals": {
+        "status": "supported",
+        "source": "connector:ACP/session-request-permission"
+      },
+      "transcriptSlice": {
+        "status": "unsupported"
+      },
+      "toolLifecycle": {
+        "status": "supported",
+        "source": "hook:PreToolUse/PostToolUse/PostToolUseFailure"
+      },
+      "currentTarget": {
+        "status": "supported",
+        "source": "connector:ACP/tool-locations"
+      }
     }
   }
 }

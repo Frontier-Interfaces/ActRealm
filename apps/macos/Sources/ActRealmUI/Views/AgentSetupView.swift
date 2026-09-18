@@ -86,10 +86,10 @@ struct AgentSetupView: View {
     private var overview: some View {
         HStack(spacing: 14) {
             VStack(alignment: .leading, spacing: 3) {
-                Text("Claude 与 Codex")
+                Text("Claude、Codex、Kimi 与 Grok")
                     .font(.system(size: 14, weight: .bold))
                     .foregroundStyle(DT.textStrong)
-                Text("安全接入、真实事件验证和 Codex 信任检查都在这里完成。")
+                Text("接入本机 Agent，核对真实事件，并在支持的会话中处理审批与问题。")
                     .font(.system(size: 10.5))
                     .foregroundStyle(DT.textWeak)
             }
@@ -157,7 +157,7 @@ private struct ProviderSetupCard: View {
             HStack(spacing: 12) {
                 ProviderAvatar(kind: kind, size: 34)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(kind == .claude ? "Claude Code" : "Codex")
+                    Text(kind.displayName)
                         .font(.system(size: 14, weight: .bold))
                         .foregroundStyle(DT.textStrong)
                     Text(localized(provider.detectedText, locale: locale))
@@ -182,6 +182,16 @@ private struct ProviderSetupCard: View {
             }
             .padding(.top, 11)
 
+            if provider.connectionMode == "grok_shared_session" {
+                Text("直接运行 grok 即可同步问题与审批。更新接入后，请退出并恢复已有终端会话，使共享连接生效。")
+                    .font(.system(size: 10.5)).foregroundStyle(DT.textSecondary).padding(.top, 7)
+            } else if provider.connectionMode == "kimi_local_sessions" {
+                Text("Kimi Code 桌面与 Web 会话自动同步问题和审批；独立 CLI 会话使用连接会话命令回传回答。")
+                    .font(.system(size: 10.5)).foregroundStyle(DT.textSecondary).padding(.top, 7)
+            } else if provider.connectionMode == "hooks_observe_acp_control" {
+                Text("普通 CLI 会话可显示活动；使用连接会话命令可在这里处理审批和问题。")
+                    .font(.system(size: 10.5)).foregroundStyle(DT.textSecondary).padding(.top, 7)
+            }
             Text(statusDetail)
                 .font(.system(size: 10.5))
                 .foregroundStyle(statusTone.text)
@@ -194,6 +204,13 @@ private struct ProviderSetupCard: View {
 
             HStack(spacing: 8) {
                 actions
+                if provider.cliInstalled == true, let command = provider.launchCommand {
+                    Button("复制连接会话命令") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(command, forType: .string)
+                    }
+                    .buttonStyle(PillButtonStyle(rank: .secondary, fontSize: 10.5, horizontalPadding: 12))
+                }
                 Spacer()
                 if model.isSetupBusy { ProgressView().controlSize(.small) }
             }
@@ -342,7 +359,7 @@ private struct ProviderSetupCard: View {
     }
 
     private func openGuide() {
-        guard let url = URL(string: "https://github.com/Frontier-Interfaces/ActRealm/blob/agent/v1-full/docs/USER_GUIDE_zh-CN.md") else { return }
+        guard let url = URL(string: provider.guideURL ?? "https://github.com/Frontier-Interfaces/ActRealm/blob/agent/v1-full/docs/USER_GUIDE_zh-CN.md") else { return }
         NSWorkspace.shared.open(url)
     }
 }

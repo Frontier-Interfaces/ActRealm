@@ -9,6 +9,7 @@ dependencies = [
  "actrealm-bridge",
  "actrealm-core",
  "actrealm-installer",
+ "actrealm-providers",
  "actrealm-quota",
  "actrealm-runtime",
  "actrealm-server",
@@ -79,9 +80,11 @@ version = "0.1.0"
 dependencies = [
  "actrealm-installer",
  "libc",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",
+ "toml_edit",
 ]
 
 [[package]]
@@ -104,9 +107,11 @@ dependencies = [
 name = "actrealm-server"
 version = "0.1.0"
 dependencies = [
+ "actrealm-bridge",
  "actrealm-codex-connector",
  "actrealm-core",
  "actrealm-installer",
+ "actrealm-providers",
  "actrealm-quota",
  "actrealm-runtime",
  "actrealm-usage",
@@ -116,6 +121,7 @@ dependencies = [
  "getrandom 0.3.4",
  "libc",
  "rcgen",
+ "reqwest",
  "ring",
  "rustls",
  "serde",

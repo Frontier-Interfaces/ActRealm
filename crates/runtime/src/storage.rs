@@ -5968,6 +5968,11 @@ fn ingest_transaction(
             |row| row.get::<_, bool>(0),
         )
         .map_err(storage_error)?;
+    if matches!(request.provider, Provider::Kimi | Provider::Grok)
+        && matches!(parsed.kind, EventKind::ToolFinished | EventKind::ToolFailed)
+    {
+        resolve_observed_agent_question(&transaction, &session_id, &request, occurred_at)?;
+    }
     let attention_id = match parsed.kind {
         EventKind::PermissionRequested if observed_native_permission => {
             Some(insert_native_permission_attention(
@@ -5987,6 +5992,9 @@ fn ingest_transaction(
             )?)
         }
         EventKind::QuestionRequested | EventKind::ElicitationRequested => {
+            if matches!(request.provider, Provider::Kimi | Provider::Grok) {
+                resolve_observed_agent_question(&transaction, &session_id, &request, occurred_at)?;
+            }
             Some(insert_nonapproval_attention(
                 &transaction,
                 &session_id,
@@ -5994,7 +6002,9 @@ fn ingest_transaction(
                 &request,
                 NonApprovalSpec {
                     kind: "question",
-                    title: if request.provider == Provider::Codex {
+                    title: if matches!(request.provider, Provider::Kimi | Provider::Grok) {
+                        "Agent is asking"
+                    } else if request.provider == Provider::Codex {
                         "Codex is asking"
                     } else if parsed.kind == EventKind::ElicitationRequested {
                         "Claude needs more information"
@@ -6192,6 +6202,12 @@ fn ingest_transaction(
                 "awaiting_approval",
                 Some("terminal"),
                 native_attention_activity(&request),
+            )
+        } else if native_permission_resolved && request.event_name() == Some("PermissionResult") {
+            (
+                "thinking",
+                None,
+                "Provider is continuing the active turn".to_owned(),
             )
         } else if preserves_native_request {
             (
@@ -7224,8 +7240,8 @@ fn mark_execution_unconfirmed_transaction(
     let transaction = connection.transaction().map_err(storage_error)?;
     let changed = transaction.execute(
         "UPDATE sessions SET exec_state = 'waiting_for_event', activity = NULL,
-         current_target = NULL
-         WHERE id = ?1 AND last_event_at = ?2 AND exec_state IN ('thinking', 'tool_running', 'compacting')
+         current_target = NULL, approval_owner = NULL
+         WHERE id = ?1 AND last_event_at = ?2 AND exec_state IN ('thinking', 'tool_running', 'compacting', 'awaiting_approval')
          AND NOT EXISTS (SELECT 1 FROM attention_items WHERE session_id = ?1
            AND kind IN ('approval', 'native_approval', 'question')
            AND state IN ('open', 'committing', 'decision_sent', 'snoozed'))",
@@ -7389,7 +7405,7 @@ fn sync_native_approval_transaction(
             let title = match provider {
                 Provider::Codex => "Approve in Codex",
                 Provider::Claude => "Approve in Claude",
-                Provider::Gemini => "Approve in the Agent",
+                Provider::Gemini | Provider::Kimi | Provider::Grok => "Approve in the Agent",
             };
             let detail = match provider {
                 Provider::Codex => {
@@ -7398,7 +7414,7 @@ fn sync_native_approval_transaction(
                 Provider::Claude => {
                     "Claude is waiting for a native permission decision. Approve or deny it in the corresponding conversation."
                 }
-                Provider::Gemini => {
+                Provider::Gemini | Provider::Kimi | Provider::Grok => {
                     "The Agent is waiting for a native permission decision. Handle it in the corresponding conversation."
                 }
             };
@@ -7725,6 +7741,8 @@ fn provider_display_name(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "Claude",
         Provider::Codex => "Codex",
+        Provider::Kimi => "Kimi Code",
+        Provider::Grok => "Grok Build",
         Provider::Gemini => "Agent",
     }
 }
@@ -10993,6 +11011,9 @@ fn insert_native_permission_attention(
 }
 
 fn native_attention_copy(request: &BridgeRequest) -> (String, String) {
+    if matches!(request.provider, Provider::Kimi | Provider::Grok) {
+        return ("Approve in the Agent".to_owned(), "The Agent is waiting for a native permission decision. Handle it in the corresponding conversation.".to_owned());
+    }
     let tool_name = request.raw.get("tool_name").and_then(Value::as_str);
     if tool_name == Some("request_plugin_install") {
         let plugin = request
@@ -11038,6 +11059,9 @@ fn native_attention_copy(request: &BridgeRequest) -> (String, String) {
 }
 
 fn native_attention_activity(request: &BridgeRequest) -> String {
+    if matches!(request.provider, Provider::Kimi | Provider::Grok) {
+        return "Handle the permission request in the original Agent interface".to_owned();
+    }
     if request.raw.get("tool_name").and_then(Value::as_str) == Some("request_plugin_install") {
         let plugin = request
             .raw
@@ -11157,6 +11181,31 @@ fn is_structured_question(raw: &Value) -> bool {
         .any(|value| value.eq_ignore_ascii_case("question"))
 }
 
+fn resolve_observed_agent_question(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    request: &BridgeRequest,
+    at: i64,
+) -> Result<(), StoreError> {
+    let Some(tool) = request
+        .raw
+        .get("tool_call_id")
+        .or_else(|| request.raw.get("tool_use_id"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+    transaction
+        .execute(
+            "UPDATE attention_items SET state='resolved', resolved_at=?2,
+        resolution='provider_handled', expires_at=NULL WHERE dedupe_key=?1 AND kind='question'
+        AND request_id IS NULL AND state IN ('open','snoozed')",
+            params![format!("{session_id}:question:{tool}"), at],
+        )
+        .map_err(storage_error)?;
+    Ok(())
+}
+
 fn attention_id_for_request(
     transaction: &Transaction<'_>,
     request_id: Uuid,
@@ -11215,6 +11264,9 @@ fn command_claim(
 }
 
 fn is_observed_codex_permission_start(request: &BridgeRequest) -> bool {
+    if matches!(request.provider, Provider::Kimi | Provider::Grok) {
+        return request.event_name() == Some("PermissionRequest") && !request.needs_reply;
+    }
     request.provider == Provider::Codex
         && request.event_name() == Some("PreToolUse")
         && is_codex_native_attention_tool(request.raw.get("tool_name").and_then(Value::as_str))
@@ -11298,6 +11350,22 @@ fn reconcile_observed_native_permission(
     kind: EventKind,
     occurred_at: i64,
 ) -> Result<bool, StoreError> {
+    if matches!(request.provider, Provider::Kimi | Provider::Grok) {
+        if !matches!(
+            request.event_name(),
+            Some(
+                "PermissionResult"
+                    | "PermissionDenied"
+                    | "TurnInterrupted"
+                    | "StopFailure"
+                    | "SessionEnd"
+            )
+        ) {
+            return Ok(false);
+        }
+        let count = transaction.execute("UPDATE attention_items SET state = 'resolved', resolved_at = ?2, resolution = 'provider_handled', expires_at = NULL WHERE session_id = ?1 AND kind = 'native_approval' AND state IN ('open', 'snoozed')", params![session_id, occurred_at]).map_err(storage_error)?;
+        return Ok(count != 0);
+    }
     if request.provider != Provider::Codex {
         return Ok(false);
     }
@@ -12239,6 +12307,11 @@ fn project_event<'a>(
             "Unrecognized event; the Provider version may be incompatible".to_owned(),
         ),
         EventKind::SubagentStarted => ("thinking", None, "A subagent is running".to_owned()),
+        EventKind::Notification if is_structured_question(raw) => (
+            "awaiting_approval",
+            Some("provider"),
+            "Waiting for your answer".to_owned(),
+        ),
         EventKind::Notification
         | EventKind::SubagentStopped
         | EventKind::TaskCreated

@@ -766,6 +766,9 @@
   "interaction.claude_question.title": "Claude is asking",
   "interaction.claude_elicitation.title": "Claude needs more information",
   "interaction.codex_user_input.title": "Codex is asking",
+  "interaction.agent_question.title": "Agent is asking",
+  "quota.reason.agent_unavailable": "The Agent did not return account quota information.",
+  "quota.reason.agent_refresh_failed": "Agent quota refresh failed; showing the last captured value.",
   "jump.exact_conversation": "Open exact conversation",
   "jump.terminal": "Open terminal",
   "jump.app_only": "Open application",
@@ -1211,6 +1214,18 @@
   "interaction.claude_elicitation.title": {
     "en": "Claude needs more information",
     "zh-Hans": "Claude 需要补充信息"
+  },
+  "quota.reason.agent_refresh_failed": {
+    "en": "Agent quota refresh failed; showing the last captured value.",
+    "zh-Hans": "Agent 额度刷新失败，显示上次记录。"
+  },
+  "quota.reason.agent_unavailable": {
+    "en": "The Agent did not return account quota information.",
+    "zh-Hans": "Agent 暂未提供账户额度信息。"
+  },
+  "interaction.agent_question.title": {
+    "en": "Agent is asking",
+    "zh-Hans": "Agent 正在询问"
   },
   "interaction.codex_user_input.title": {
     "en": "Codex is asking",

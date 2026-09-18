@@ -182,6 +182,8 @@ public enum AppLocalization {
     public static func localizedUsageDescription(source: String?, quality: String?, language: AppLanguage) -> String {
         let sourceKey = switch source {
         case "statusline": "StatusLine"
+        case "grok_session_usage": "Grok 本机会话账本"
+        case "agent_connector": "Agent 本机用量记录"
         case "claude_transcript": "Claude transcript"
         case "claude_transcript_incremental": "Claude transcript（增量）"
         case "codex_rollout": "Codex 本机 rollout"

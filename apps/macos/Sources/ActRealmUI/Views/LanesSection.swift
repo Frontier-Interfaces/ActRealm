@@ -3332,8 +3332,8 @@ private struct TokenUsageSummaryCard: View {
     }
 
     private var providerChips: some View {
-        HStack(spacing: 6) {
-            ForEach(knownProviderTotals.prefix(2)) { provider in
+        LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading), GridItem(.flexible(), alignment: .leading)], alignment: .leading, spacing: 6) {
+            ForEach(knownProviderTotals) { provider in
                 HStack(spacing: 4) {
                     Circle()
                         .fill(providerColor(provider.provider))
@@ -3353,7 +3353,6 @@ private struct TokenUsageSummaryCard: View {
                 .background(DT.cardMedium.opacity(0.72), in: Capsule())
                 .overlay(Capsule().strokeBorder(DT.neutralBadgeStroke, lineWidth: 1))
             }
-            Spacer(minLength: 0)
         }
     }
 
@@ -3421,7 +3420,8 @@ private struct TokenUsageSummaryCard: View {
 
     private var knownProviderTotals: [TokenUsageProviderTotal] {
         var values = totals.byProvider
-        for provider in ["codex", "claude"] where !values.contains(where: {
+        let installed = model.setupInfo?.providers.filter { $0.cliInstalled == true }.map(\.provider) ?? []
+        for provider in ["codex", "claude"] + installed where !values.contains(where: {
             $0.provider.caseInsensitiveCompare(provider) == .orderedSame
         }) {
             values.append(TokenUsageProviderTotal(provider: provider, total: 0))
@@ -3447,6 +3447,8 @@ private struct TokenUsageSummaryCard: View {
         switch provider.lowercased() {
         case "codex": "Codex"
         case "claude": "Claude"
+        case "kimi": "Kimi"
+        case "grok": "Grok"
         default: provider
         }
     }
@@ -3511,7 +3513,7 @@ private struct FirstRunQuotaState: View {
                         kind: ProviderKind(record: provider.provider) ?? .codex,
                         size: 18
                     )
-                    Text(provider.provider == "claude" ? "Claude" : "Codex")
+                    Text(ProviderKind(record: provider.provider)?.displayName ?? provider.provider)
                         .font(.system(size: 10.5, weight: .bold))
                         .foregroundStyle(DT.textSecondary)
                     Spacer()

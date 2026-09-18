@@ -13,9 +13,11 @@ actrealm-core = { path = "../core" }
 actrealm-quota = { path = "../quota" }
 actrealm-runtime = { path = "../runtime" }
 actrealm-usage = { path = "../usage" }
+actrealm-providers = { path = "../providers" }
 getrandom.workspace = true
 libc.workspace = true
 ring.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -26,6 +28,7 @@ rcgen = { version = "=0.14.8", default-features = false, features = ["crypto", "
 rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 
 [dev-dependencies]
+actrealm-bridge = { path = "../bridge" }
 futures-util = "0.3"
 tokio-tungstenite = "0.29.0"
 tower = { version = "0.5", features = ["util"] }

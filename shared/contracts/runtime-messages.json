@@ -403,6 +403,24 @@
       "parameters": [],
       "en": "This is a historical quota value; waiting for a fresh Provider update.",
       "zh-Hans": "这是历史额度，正在等待 Provider 更新；不能作为当前剩余额度。"
+    },
+    {
+      "code": "interaction.agent_question.title",
+      "parameters": [],
+      "en": "Agent is asking",
+      "zh-Hans": "Agent 正在询问"
+    },
+    {
+      "code": "quota.reason.agent_refresh_failed",
+      "parameters": [],
+      "en": "Agent quota refresh failed; showing the last captured value.",
+      "zh-Hans": "Agent 额度刷新失败，显示上次记录。"
+    },
+    {
+      "code": "quota.reason.agent_unavailable",
+      "parameters": [],
+      "en": "The Agent did not return account quota information.",
+      "zh-Hans": "Agent 暂未提供账户额度信息。"
     }
   ]
 }

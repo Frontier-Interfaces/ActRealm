@@ -1961,3 +1961,44 @@
 "本机 Runtime 版本需要更新。" = "The local Runtime needs an update.";
 "旧版 Runtime 仍在运行，请退出旧版应用后更新服务。" = "An older Runtime is running. Quit the older app before updating the service.";
 "无法启动本机 Runtime，请检查后台项目设置和诊断日志。" = "Could not start the local Runtime. Check background-item settings and diagnostics.";
+
+"interaction.agent_question.title" = "Agent is asking";
+"Claude、Codex、Kimi 与 Grok" = "Claude, Codex, Kimi and Grok";
+"接入本机 Agent，核对真实事件，并在支持的会话中处理审批与问题。" = "Connect local Agents, verify real events, and respond to supported approvals and questions.";
+"复制连接会话命令" = "Copy connected session command";
+"普通 CLI 会话可显示活动；使用连接会话命令可在这里处理审批和问题。" = "Regular CLI sessions report activity. Use a connected session to respond to approvals and questions here.";
+
+"quota.reason.agent_refresh_failed" = "Agent quota refresh failed; showing the last captured value.";
+
+"quota.reason.agent_unavailable" = "The Agent did not return account quota information.";
+
+"管理 Claude Code、Codex、Kimi 与 Grok。" = "Manage Claude Code, Codex, Kimi and Grok.";
+
+"Grok 本机会话账本" = "Grok local session ledger";
+"Agent 本机用量记录" = "Local Agent usage records";
+"%@ · 本机 Token 已按不重叠口径统计" = "%@ · Local tokens use non-overlapping buckets";
+"已接入的 Agent 使用同一套本机统计。只有取得真实 Token 数据后才显示数值；不会用额度百分比推算。" = "Connected Agents use the same local totals. Values require real token data; quota percentages are never used as token estimates.";
+
+"直接运行 grok 即可同步问题与审批。更新接入后，请退出并恢复已有终端会话，使共享连接生效。" = "Run grok normally to sync questions and approvals. After updating the connection, exit and resume existing terminal sessions to enable sharing.";
+
+"Kimi Code 桌面与 Web 会话自动同步问题和审批；独立 CLI 会话使用连接会话命令回传回答。" = "Kimi Code desktop and web sessions sync questions and approvals automatically. Standalone CLI sessions use the connected-session command to send answers.";
+
+"查看下方计划" = "Review the plan below";
+
+"采样窗口" = "Sample window";
+
+"快照到达 p95" = "Snapshot arrival p95";
+
+"界面处理 p95" = "UI processing p95";
+
+"后台补更新 p95" = "Background update p95";
+
+"%lld 个样本" = "%lld samples";
+
+"从 Runtime 开始生成本次快照，到客户端收到消息；包含生成、传输和接收调度。" = "From Runtime snapshot generation to client receipt, including generation, transport and receive scheduling.";
+
+"本次消息的解码、主线程排队和状态更新耗时；不代表屏幕绘制耗时。" = "Message decoding, main-thread queuing and state updates. This does not measure screen rendering.";
+
+"后台处理或恢复窗口时的状态更新耗时，单独统计，不包含窗口隐藏期间的等待。" = "State updates in the background or when restoring the window, measured separately without the time spent hidden.";
+
+"每项最多 100 个样本；首次连接与重连首帧不参与实时统计，旧样本在 5 分钟后过期。" = "Up to 100 samples per metric. Initial and reconnect baselines are excluded from live timing. Samples expire after 5 minutes.";

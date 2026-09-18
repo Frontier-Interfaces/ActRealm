@@ -521,7 +521,17 @@ fn onboarding_api_uses_the_installer_and_requires_a_post_install_real_event() {
         .as_array()
         .unwrap()
         .iter()
+        .filter(|provider| matches!(provider["provider"].as_str(), Some("claude" | "codex")))
         .all(|provider| provider["desktopInstalled"] == true));
+    for name in ["kimi", "grok"] {
+        let provider = initial.body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["provider"] == name)
+            .unwrap();
+        assert_eq!(provider["desktopInstalled"], false);
+    }
     let codex = initial.body["providers"]
         .as_array()
         .unwrap()

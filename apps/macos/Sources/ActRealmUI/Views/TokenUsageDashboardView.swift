@@ -888,6 +888,8 @@ enum TokenDashboardPresentation {
         switch provider.lowercased() {
         case "codex": "Codex"
         case "claude": "Claude"
+        case "kimi": "Kimi"
+        case "grok": "Grok"
         default: provider
         }
     }
@@ -2233,7 +2235,7 @@ private struct TokenUsageDashboardContent: View, Equatable {
             )
         }
         return localizedFormat(
-            "%@ · Codex 与 Claude 已统一为不重叠口径",
+            "%@ · 本机 Token 已按不重叠口径统计",
             locale: locale,
             periodMetricTitle
         )

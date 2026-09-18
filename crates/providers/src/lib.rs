@@ -1,4 +1,5 @@
 //! Provider-specific hook parsing.
+pub mod acp;
 
 use actrealm_core::{is_codex_native_attention_tool, EventKind, Provider};
 use serde::{Deserialize, Serialize};
@@ -79,7 +80,7 @@ fn normalize_event(provider: Provider, event_name: &str, raw: &Value) -> EventKi
     match event_name {
         "SessionStart" => EventKind::SessionStarted,
         "SessionEnd" => EventKind::SessionEnded,
-        "UserPromptSubmit" | "BeforeAgent" => EventKind::PromptSubmitted,
+        "UserPromptSubmit" | "BeforeAgent" | "TurnStarted" => EventKind::PromptSubmitted,
         "PreToolUse"
             if provider == Provider::Claude
                 && raw.get("tool_name").and_then(Value::as_str) == Some("AskUserQuestion") =>
@@ -113,6 +114,12 @@ fn normalize_event(provider: Provider, event_name: &str, raw: &Value) -> EventKi
         "PermissionDenied" if provider != Provider::Gemini => EventKind::PermissionDenied,
         "Elicitation" if provider == Provider::Claude => EventKind::ElicitationRequested,
         "CodexRequestUserInput" if provider == Provider::Codex => EventKind::QuestionRequested,
+        "AgentQuestion" if matches!(provider, Provider::Kimi | Provider::Grok) => {
+            EventKind::QuestionRequested
+        }
+        "AgentElicitation" if matches!(provider, Provider::Kimi | Provider::Grok) => {
+            EventKind::ElicitationRequested
+        }
         "Notification" => EventKind::Notification,
         "SubagentStart" => EventKind::SubagentStarted,
         "SubagentStop" => EventKind::SubagentStopped,

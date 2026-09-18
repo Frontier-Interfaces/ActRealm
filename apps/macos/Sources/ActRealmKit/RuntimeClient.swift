@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 public enum RuntimeClientError: Error, LocalizedError, Sendable {
     case notConnected
@@ -476,6 +477,7 @@ public final class RuntimeClient: ObservableObject {
 
     @Published public private(set) var connectionState: ConnectionState = .idle
     @Published public private(set) var snapshot: Snapshot = .empty
+    let snapshotUpdates = PassthroughSubject<SnapshotUpdate, Never>()
 
     private var session: URLSession
     private var baseURL: URL?
@@ -608,6 +610,7 @@ public final class RuntimeClient: ObservableObject {
         let next = try await get("api/v1/snapshot", as: Snapshot.self)
         guard generation == connectionGeneration else { throw CancellationError() }
         snapshot = next
+        snapshotUpdates.send(SnapshotUpdate(snapshot: next))
     }
 
     // MARK: - Attention and sessions
@@ -1091,9 +1094,12 @@ public final class RuntimeClient: ObservableObject {
                 let task = session.webSocketTask(with: request)
                 webSocketTask = task
                 task.resume()
+                let streamID = UUID()
+                var snapshotSequence: UInt64 = 0
                 var receivedMessage = false
                 while !Task.isCancelled {
                     let message = try await task.receive()
+                    let receivedAtNs = PerformanceClock.now()
                     guard !Task.isCancelled, generation == connectionGeneration else { return }
                     if !receivedMessage {
                         receivedMessage = true
@@ -1101,9 +1107,17 @@ public final class RuntimeClient: ObservableObject {
                         attempt = 0
                     }
                     switch message {
-                    case .string(let text): handleSocketText(text)
+                    case .string(let text):
+                        if handleSocketText(text, streamID: streamID,
+                            sequence: snapshotSequence + 1, receivedAtNs: receivedAtNs) {
+                            snapshotSequence += 1
+                        }
                     case .data(let data):
-                        if let text = String(data: data, encoding: .utf8) { handleSocketText(text) }
+                        if let text = String(data: data, encoding: .utf8),
+                           handleSocketText(text, streamID: streamID,
+                            sequence: snapshotSequence + 1, receivedAtNs: receivedAtNs) {
+                            snapshotSequence += 1
+                        }
                     @unknown default: break
                     }
                 }
@@ -1142,12 +1156,18 @@ public final class RuntimeClient: ObservableObject {
         return request
     }
 
-    private func handleSocketText(_ text: String) {
+    @discardableResult
+    private func handleSocketText(_ text: String, streamID: UUID,
+        sequence: UInt64, receivedAtNs: UInt64) -> Bool {
         guard let data = text.data(using: .utf8),
               let envelope = try? JSONDecoder().decode(SnapshotEnvelope.self, from: data),
               envelope.type == "snapshot"
-        else { return }
+        else { return false }
         snapshot = envelope.snapshot
+        snapshotUpdates.send(SnapshotUpdate(snapshot: envelope.snapshot,
+            timing: SnapshotReceiveTiming(streamID: streamID, sequence: sequence,
+                receivedAtNs: receivedAtNs, delivery: envelope.deliveryTiming)))
+        return true
     }
 
     // MARK: - Request helpers

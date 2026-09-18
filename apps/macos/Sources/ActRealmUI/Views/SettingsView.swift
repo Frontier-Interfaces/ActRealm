@@ -350,7 +350,7 @@ private struct AgentSettingsPage: View {
         VStack(spacing: 0) {
             SettingsPageHeader(
                 title: "settings.tab.agents",
-                subtitle: "管理 Claude Code、Codex 及可选的本机数据来源。"
+                subtitle: "管理 Claude Code、Codex、Kimi 与 Grok。"
             )
             Form {
                 Section {
@@ -555,7 +555,7 @@ private struct AgentSettingsPage: View {
     }
 
     private func providerName(_ provider: SetupInfo.ProviderSetup) -> String {
-        provider.provider == "claude" ? "Claude Code" : "Codex"
+        ProviderKind(record: provider.provider)?.displayName ?? provider.provider
     }
 
     private func copyTrustCommand(_ provider: SetupInfo.ProviderSetup) {
@@ -1447,7 +1447,7 @@ private struct DisplaySettingsPage: View {
                     } header: {
                         Text("Token 用量")
                     } footer: {
-                        Text("Codex 与 Claude 使用同一套本机统计。只有 Agent 提供真实 Token 数据后才显示数值；不会用额度百分比推算。")
+                        Text("已接入的 Agent 使用同一套本机统计。只有取得真实 Token 数据后才显示数值；不会用额度百分比推算。")
                     }
                 Section("显示档位") {
                     Picker("任务卡", selection: Binding(
@@ -1785,11 +1785,41 @@ private struct DataSettingsPage: View {
             GridRow {
                 metric(timeoutRate, "超时交还率")
                 metric(average, "平均响应")
-                metric(model.nativePresentationP95Ms.map { "\($0)ms" } ?? "—", "原生呈现 p95")
+                metric(localized("5 分钟", locale: locale), "采样窗口")
+            }
+            GridRow {
+                latencyMetric(model.performanceMetrics.delivery, "快照到达 p95")
+                    .help(localized("从 Runtime 开始生成本次快照，到客户端收到消息；包含生成、传输和接收调度。", locale: locale))
+                latencyMetric(model.performanceMetrics.processing, "界面处理 p95")
+                    .help(localized("本次消息的解码、主线程排队和状态更新耗时；不代表屏幕绘制耗时。", locale: locale))
+                latencyMetric(model.performanceMetrics.catchUp, "后台补更新 p95")
+                    .help(localized("后台处理或恢复窗口时的状态更新耗时，单独统计，不包含窗口隐藏期间的等待。", locale: locale))
+            }
+            GridRow {
+                Text("每项最多 100 个样本；首次连接与重连首帧不参与实时统计，旧样本在 5 分钟后过期。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .gridCellColumns(3)
             }
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 6)
+    }
+
+    private func latencyMetric(_ summary: LatencySummary, _ label: String) -> some View {
+        VStack(spacing: 3) {
+            Text(summary.p95Milliseconds.map {
+                $0 < 0.1 ? "<0.1 ms" : String(format: "%.1f ms", locale: locale, $0)
+            } ?? "—")
+                .font(.title3.weight(.semibold))
+                .monospacedDigit()
+            Text(LocalizedStringKey(label))
+                .font(.caption).foregroundStyle(.secondary)
+            Text(localizedFormat("%lld 个样本", locale: locale, Int64(summary.sampleCount)))
+                .font(.caption2).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
     }
 
     private func metric(_ value: String, _ label: String) -> some View {

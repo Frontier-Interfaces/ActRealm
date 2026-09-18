@@ -19,7 +19,7 @@ pub const fn permission_deadline_ms(provider: Provider) -> Option<u64> {
     match provider {
         Provider::Claude => Some(CLAUDE_PERMISSION_DEADLINE_MS),
         Provider::Codex => Some(CODEX_PERMISSION_DEADLINE_MS),
-        Provider::Gemini => None,
+        Provider::Gemini | Provider::Kimi | Provider::Grok => None,
     }
 }
 
@@ -29,6 +29,8 @@ pub enum Provider {
     Claude,
     Codex,
     Gemini,
+    Kimi,
+    Grok,
 }
 
 impl fmt::Display for Provider {
@@ -37,6 +39,8 @@ impl fmt::Display for Provider {
             Self::Claude => f.write_str("claude"),
             Self::Codex => f.write_str("codex"),
             Self::Gemini => f.write_str("gemini"),
+            Self::Kimi => f.write_str("kimi"),
+            Self::Grok => f.write_str("grok"),
         }
     }
 }
@@ -49,6 +53,8 @@ impl FromStr for Provider {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
             "gemini" => Ok(Self::Gemini),
+            "kimi" => Ok(Self::Kimi),
+            "grok" => Ok(Self::Grok),
             _ => Err(ParseProviderError(value.to_owned())),
         }
     }
@@ -263,6 +269,8 @@ pub enum BlockingRequestKind {
     ClaudeQuestion,
     ClaudeElicitation,
     CodexUserInput,
+    AgentQuestion,
+    AgentElicitation,
 }
 
 /// A capability explicitly granted by the trusted Runtime request adapter.
@@ -641,7 +649,7 @@ pub struct BridgeRequest {
     pub raw: Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TermContext {
     pub app: Option<String>,
@@ -662,13 +670,16 @@ impl BridgeRequest {
     }
 
     pub fn from_hook_at(provider: Provider, raw: Value, received_at: u64) -> Self {
+        let raw = normalize_provider_payload(provider, raw);
         let event_name = raw.get("hook_event_name").and_then(Value::as_str);
         let codex_permission_lifecycle = event_name == Some("PermissionRequest")
             || (event_name == Some("PreToolUse")
                 && raw.get("tool_name").and_then(Value::as_str) == Some("request_permissions"));
-        let provider_handles_approval = provider == Provider::Codex
-            && codex_permission_lifecycle
-            && codex_provider_handles_approval(&raw);
+        let provider_handles_approval = (matches!(provider, Provider::Kimi | Provider::Grok)
+            && event_name == Some("PermissionRequest"))
+            || (provider == Provider::Codex
+                && codex_permission_lifecycle
+                && codex_provider_handles_approval(&raw));
         let blocking_kind = match (provider, event_name, provider_handles_approval) {
             (Provider::Codex, Some("PermissionRequest"), true) => None,
             (Provider::Claude | Provider::Codex, Some("PermissionRequest"), false) => {
@@ -874,6 +885,121 @@ impl BridgeRequest {
     pub fn session_id(&self) -> Option<&str> {
         self.provider_session_id.as_deref()
     }
+
+    /// Only a live bidirectional connector may construct a replyable Kimi/Grok
+    /// request. Their shell Hooks, including PermissionRequest, are observations.
+    pub fn from_agent_request_at(
+        provider: Provider,
+        session_id: &str,
+        turn_id: Option<&str>,
+        kind: BlockingRequestKind,
+        raw: Value,
+        received_at: u64,
+        deadline_at: u64,
+    ) -> Option<Self> {
+        if !matches!(provider, Provider::Kimi | Provider::Grok)
+            || session_id.is_empty()
+            || session_id.len() > 256
+            || deadline_at <= received_at
+            || !matches!(
+                kind,
+                BlockingRequestKind::Permission
+                    | BlockingRequestKind::AgentQuestion
+                    | BlockingRequestKind::AgentElicitation
+            )
+        {
+            return None;
+        }
+        let event = match kind {
+            BlockingRequestKind::Permission => "PermissionRequest",
+            BlockingRequestKind::AgentQuestion => "AgentQuestion",
+            BlockingRequestKind::AgentElicitation => "AgentElicitation",
+            _ => return None,
+        };
+        let mut request =
+            Self::from_provider_event_at(provider, event, session_id, turn_id, raw, received_at);
+        request.raw["_actrealm_provider"] = serde_json::json!(provider.to_string());
+        request.request_id = Some(Uuid::now_v7());
+        request.role = "connector".to_owned();
+        request.needs_reply = true;
+        request.provider_handles_approval = false;
+        request.blocking_kind = Some(kind);
+        request.deadline_at = Some(deadline_at);
+        request.remote_action_capability =
+            (kind == BlockingRequestKind::Permission).then_some(RemoteActionCapability::Approval);
+        Some(request)
+    }
+}
+
+/// Provider spelling differences are normalized before constructing the bridge
+/// envelope. This does not confer control capability or interpret prose.
+pub fn normalize_provider_payload(provider: Provider, mut raw: Value) -> Value {
+    if !matches!(provider, Provider::Kimi | Provider::Grok) {
+        return raw;
+    }
+    let Some(object) = raw.as_object_mut() else {
+        return raw;
+    };
+    for (source, target) in [
+        ("hookEventName", "hook_event_name"),
+        ("sessionId", "session_id"),
+        ("turnId", "turn_id"),
+        ("toolName", "tool_name"),
+        ("toolInput", "tool_input"),
+        ("toolCallId", "tool_call_id"),
+        ("toolUseId", "tool_use_id"),
+        ("notificationType", "notification_type"),
+        ("subagentId", "subagent_id"),
+        ("subagentType", "subagent_type"),
+        ("workspaceRoot", "cwd"),
+        ("session_title", "session_name"),
+    ] {
+        if !object.contains_key(target) {
+            if let Some(value) = object.get(source).cloned() {
+                object.insert(target.to_owned(), value);
+            }
+        }
+    }
+    if let Some(tool) = object.get("tool_name").and_then(Value::as_str) {
+        let canonical = match tool {
+            "read_file" | "hashline_read" | "ReadFile" => Some("Read"),
+            "write" | "WriteFile" => Some("Write"),
+            "search_replace" | "hashline_edit" | "StrReplaceFile" => Some("Edit"),
+            "run_terminal_command" => Some("Bash"),
+            "list_dir" => Some("Glob"),
+            "grep" | "hashline_grep" => Some("Grep"),
+            "web_search" => Some("WebSearch"),
+            "web_fetch" => Some("WebFetch"),
+            "ask_user_question" | "AskUser" => Some("AskUserQuestion"),
+            _ => None,
+        };
+        if let Some(canonical) = canonical {
+            object.insert("tool_name".to_owned(), serde_json::json!(canonical));
+        }
+    }
+    if object.get("hook_event_name").and_then(Value::as_str) == Some("Interrupt") {
+        object.insert(
+            "hook_event_name".into(),
+            serde_json::json!("TurnInterrupted"),
+        );
+    }
+    if matches!(provider, Provider::Grok | Provider::Kimi)
+        && object.get("hook_event_name").and_then(Value::as_str) == Some("PreToolUse")
+        && object.get("tool_name").and_then(Value::as_str) == Some("AskUserQuestion")
+    {
+        // A standalone CLI still raises attention even before a shared reply
+        // channel is available. Never block a notification Hook or invent one.
+        object.insert("hook_event_name".into(), serde_json::json!("Notification"));
+        object.insert("notification_type".into(), serde_json::json!("question"));
+        if let Some(id) = object
+            .get("tool_call_id")
+            .or_else(|| object.get("tool_use_id"))
+            .cloned()
+        {
+            object.insert("notification_id".into(), id);
+        }
+    }
+    raw
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -914,6 +1040,13 @@ pub enum ReplyPayload {
     },
     CodexUserInput {
         answers: BTreeMap<String, Vec<String>>,
+    },
+    AgentQuestion {
+        answers: BTreeMap<String, Vec<String>>,
+    },
+    AgentElicitation {
+        action: String,
+        content: Option<Value>,
     },
 }
 
@@ -1042,7 +1175,7 @@ fn remote_action_capability(
             tool_name,
             Some("Bash" | "Write" | "Edit" | "WebFetch" | "exec_command" | "apply_patch")
         ),
-        Provider::Gemini => false,
+        Provider::Gemini | Provider::Kimi | Provider::Grok => false,
     };
     reviewed.then_some(RemoteActionCapability::Approval)
 }
@@ -1093,7 +1226,7 @@ fn infer_surface(app: Option<&str>, bundle_id: Option<&str>) -> Option<String> {
 }
 
 pub fn permission_directive(provider: Provider, decision: Decision) -> Option<Value> {
-    if provider == Provider::Gemini {
+    if !matches!(provider, Provider::Claude | Provider::Codex) {
         return None;
     }
 

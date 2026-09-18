@@ -1,6 +1,65 @@
 # ActRealm current status
 
-Last reviewed: 2026-09-17
+Last reviewed: 2026-09-18
+
+Current candidate review: [PR #10](https://github.com/Frontier-Interfaces/ActRealm/pull/10),
+targeting `agent/v1-full`. This update includes Kimi/Grok integrations, native
+interaction fixes, corrected performance metrics and provider-backup compatibility.
+Historical entries below retain their validation-time installation and submission
+status; they do not describe the current Git worktree.
+
+## 2026-09-18 Native p95 sampling correction — build 129
+
+The installed candidate replaces the misleading event-age-based native p95 with
+matched snapshot arrival, client processing and background-update measurements.
+Runtime attaches monotonic timing to each emitted WebSocket frame; timing is
+excluded from snapshot equality so idle connections do not generate samples.
+The client carries immutable timing with its snapshot, excludes connection
+baselines, deduplicates frame sequences and expires samples after five minutes.
+Real slow samples are retained. The UI shows each metric's sample count.
+
+Native settings inspection measured approximately 190 ms snapshot arrival,
+12 ms client processing and 6.2 ms background updates after a hide/restore cycle.
+These are distinct metrics; neither live metric
+claims GPU/frame completion. The same QA found and fixed new-provider backup
+directory handling in Settings; all 30 existing backups are now inventoried.
+434 Rust tests and 221 Swift tests passed, together with Clippy, release,
+localization, native signature and installed-hash checks. See
+[native p95 verification](reports/NATIVE_P95_2026-09-18.md).
+Display remains build 86. No new provider model calls, commits or pushes occurred.
+
+## 2026-09-18 Ordinary Grok questions and shared Provider interactions — build 127
+
+The user's ordinary Grok terminal session called `ask_user_question` but build
+126 had attached question replies only to its explicit ACP launcher. Build 127
+is installed and subscribes automatically to resident sessions on Grok's local
+shared leader. Setup enables the official shared-session preference with backup
+and reversible ownership tracking. Already-running standalone terminals must
+exit and resume once; no user terminal was forcibly restarted.
+
+Real two-client tests passed in both directions, followed by an installed native
+UI answer and verified file result. Kimi desktop/web pending interactions now
+use the existing authenticated loopback API. Standalone Kimi TUI direct replies
+still use the ACP command; real Kimi model acceptance remains user-deferred.
+Grok plan approval and MCP form replies are mapped separately, with transient
+native-only plan review. All 433 Rust and 213 Swift tests passed (three Rust
+tests ignored), along with Clippy, release build, language and signature checks.
+See [shared interaction verification](reports/PROVIDER_INTERACTION_PARITY_2026-09-18.md).
+Display remains build 86. No commit, push, merge or public release was performed.
+
+## 2026-09-18 Kimi / Grok provider candidate — build 126
+
+The local ActRealm candidate is installed and connected to the existing Runtime.
+Agent Setup supports Kimi Code and Grok Build observation Hooks and explicit ACP
+connected-session commands. Real Grok question/approval/file execution and
+numeric restart checks passed. The installed UI shows all four provider totals,
+retains partial-history coverage and labels Grok's local usage source correctly.
+Kimi model acceptance remains deferred by the user after its monthly allowance
+was exhausted; setup stays awaiting verification. Display remains build 86.
+All 423 Rust and 213 Swift tests passed (three Rust tests ignored), together with
+Clippy, release packaging and language checks. No commit, push, merge or public
+release is implied. See [KIMI_GROK_PROVIDERS.md](KIMI_GROK_PROVIDERS.md) and the
+[build 126 verification](reports/KIMI_GROK_2026-09-18.md) for scope and limits.
 
 ## 2026-09-17 Independent native Runtime — build 124 candidate
 
