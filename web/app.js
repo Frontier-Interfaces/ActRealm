@@ -1834,20 +1834,6 @@ async function jumpSession(session) {
   }
 }
 
-async function manageSession(session) {
-  if (!session?.canManage) return;
-  try {
-    await api(`/api/v1/sessions/${encodeURIComponent(session.id)}/manage`, {
-      method: "POST",
-      body: JSON.stringify({ action: "attach" }),
-    });
-    showToast("已连接 ActRealm app-server；Codex 原生窗口仍保留当前 Turn 的控制权");
-    await loadSnapshot();
-  } catch (error) {
-    showToast(`托管连接失败：${apiErrorText(error)}`);
-  }
-}
-
 function activateSession(session) {
   selectSession(session.id);
   void jumpSession(session);

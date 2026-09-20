@@ -1078,15 +1078,6 @@ public final class AppModel: ObservableObject {
         await jump(to: task)
     }
 
-    public func manage(_ task: LaneTask) async {
-        guard task.session.canManage == true else { return }
-        if let error = await client.manageSession(task.id) {
-            showToast(l10nFormat("托管连接失败：%@", clientErrorMessage(error)))
-        } else {
-            showToast(l10n("已连接 ActRealm app-server；Codex 原生窗口仍保留当前 Turn 的控制权"))
-        }
-    }
-
     private func providerDisplayName(_ provider: String) -> String {
         switch provider {
         case "claude": "Claude"

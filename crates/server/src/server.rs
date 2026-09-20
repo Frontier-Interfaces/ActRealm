@@ -57,11 +57,26 @@ use crate::codex_questions::{
     self, Observation, QuestionBatch, QuestionRegistry, QuestionScanner, ReplyRoute,
 };
 use crate::status_messages;
+#[path = "codex_auto_connect.rs"]
+mod codex_auto_connect;
 #[cfg(test)]
 #[path = "native_client_tests.rs"]
 mod native_client_tests;
 #[path = "native_clients.rs"]
 mod native_clients;
+
+#[cfg(test)]
+fn warm_codex_test_executable(path: &FilePath) {
+    // Resolve host cold-executable inspection before the protocol deadline.
+    // EOF makes these local protocol fixtures exit without sending any RPC.
+    assert!(ProcessCommand::new(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success());
+}
 
 const SESSION_COOKIE: &str = "actrealm_session";
 const CSRF_HEADER: &str = "x-actrealm-csrf";
@@ -565,6 +580,7 @@ impl ApiServer {
             usage_consecutive_failures: Arc::new(AtomicUsize::new(0)),
             usage_collection_in_progress: Arc::new(AtomicBool::new(false)),
             usage_collection_ready: Arc::new(AtomicBool::new(false)),
+            usage_collection_pending: Arc::new(AtomicBool::new(false)),
             usage_history_complete: Arc::new(AtomicBool::new(false)),
             usage_last_success_at: Arc::new(AtomicU64::new(0)),
             review_collection_in_progress: Arc::new(AtomicBool::new(false)),
@@ -773,6 +789,7 @@ struct AppState {
     usage_consecutive_failures: Arc<AtomicUsize>,
     usage_collection_in_progress: Arc<AtomicBool>,
     usage_collection_ready: Arc<AtomicBool>,
+    usage_collection_pending: Arc<AtomicBool>,
     usage_history_complete: Arc<AtomicBool>,
     usage_last_success_at: Arc<AtomicU64>,
     review_collection_in_progress: Arc<AtomicBool>,
@@ -913,6 +930,8 @@ struct CodexManagerState {
     threads: HashMap<String, CodexThread>,
     managed: HashSet<String>,
     resume_failed: HashSet<String>,
+    connecting: HashSet<String>,
+    owned_elsewhere: HashSet<String>,
     native_waiting: HashMap<String, bool>,
     native_synced: HashSet<String>,
     auto_reviewing: HashSet<String>,
@@ -1275,7 +1294,7 @@ impl CodexManager {
         if let Ok(mut current) = state.lock() {
             current.status = "connected".to_owned();
             current.error = None;
-            current.managed = managed.clone();
+            // Persisted IDs express reconnect intent, not a verified live attachment.
         }
         spawn_codex_handlers(
             connector.clone(),
@@ -1286,6 +1305,12 @@ impl CodexManager {
         );
         spawn_codex_initial_sync(
             connector.clone(),
+            Arc::clone(&state),
+            store.clone(),
+            waiters.clone(),
+        );
+        codex_auto_connect::spawn(
+            connector.downgrade(),
             Arc::clone(&state),
             store.clone(),
             waiters.clone(),
@@ -1307,37 +1332,13 @@ impl CodexManager {
             .connector
             .as_ref()
             .ok_or_else(|| "The Codex app-server Connector is unavailable".to_owned())?;
-        let thread = connector
-            .resume_thread(thread_id)
-            .map_err(|error| error.to_string())?;
-        let managed = {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| "Connector state is unavailable".to_owned())?;
-            state.managed.insert(thread_id.to_owned());
-            state.resume_failed.remove(thread_id);
-            state.threads.insert(thread.id.clone(), thread.clone());
-            let mut managed = state.managed.iter().cloned().collect::<Vec<_>>();
-            managed.sort();
-            managed
-        };
-        self.store
-            .write_setting(
-                MANAGED_CODEX_THREADS_KEY,
-                serde_json::to_string(&managed).map_err(|error| error.to_string())?,
-            )
-            .map_err(|error| error.to_string())?;
-        // An explicit attach is a positive status observation. Reassert an
-        // active turn immediately, but never use a possibly stale idle
-        // snapshot to end work owned by the original Codex window.
-        if thread.status == "active" {
-            let _ =
-                self.store
-                    .sync_provider_execution(Provider::Codex, thread_id, true, now_millis());
-        }
-        sync_initial_codex_native_attention(&self.state, &self.store, &self.waiters, &thread);
-        Ok(thread)
+        codex_auto_connect::attach(
+            connector,
+            &self.state,
+            &self.store,
+            &self.waiters,
+            thread_id,
+        )
     }
 
     fn capability_value(&self) -> Value {
@@ -1353,6 +1354,8 @@ impl CodexManager {
             "lastPlanSkipReason": state.last_plan_skip_reason,
             "lastPlanFieldKeys": state.last_plan_field_keys,
             "managedThreads": state.managed.len(),
+            "automaticConnection": true,
+            "sharedConnection": self.connector.as_ref().is_some_and(CodexConnector::is_shared_connection),
             "protocol": "app-server",
             "experimentalUserInput": true,
             "managedApprovals": self
@@ -1524,7 +1527,7 @@ impl CodexManager {
         (
             "external_hook".to_owned(),
             if ended { "ended" } else { "observing" }.to_owned(),
-            state.status == "connected",
+            false,
             status,
         )
     }
@@ -1552,7 +1555,6 @@ fn spawn_codex_initial_sync(
     state: Arc<Mutex<CodexManagerState>>,
     store: RuntimeStore,
     waiters: WaiterRegistry,
-    managed: HashSet<String>,
 ) {
     let failure_state = Arc::clone(&state);
     let result = thread::Builder::new()
@@ -1589,22 +1591,12 @@ fn spawn_codex_initial_sync(
                     }
                     sync_initial_codex_native_attention(&state, &store, &waiters, &thread);
                     if let Ok(mut current) = state.lock() {
-                        current.threads.insert(thread.id.clone(), thread);
+                        // Listing can race an automatic resume; it cannot replace
+                        // an already-confirmed attachment with a stale notLoaded row.
+                        if !current.managed.contains(&thread.id) {
+                            current.threads.insert(thread.id.clone(), thread);
+                        }
                     }
-                }
-            }
-
-            let mut managed = managed.into_iter().collect::<Vec<_>>();
-            managed.sort();
-            for thread_id in managed {
-                if let Ok(thread) = connector.resume_thread(&thread_id) {
-                    sync_initial_codex_native_attention(&state, &store, &waiters, &thread);
-                    if let Ok(mut current) = state.lock() {
-                        current.resume_failed.remove(&thread_id);
-                        current.threads.insert(thread.id.clone(), thread);
-                    }
-                } else if let Ok(mut current) = state.lock() {
-                    current.resume_failed.insert(thread_id);
                 }
             }
         });
@@ -1861,7 +1853,7 @@ fn handle_codex_approval_request(
         let _ = connector.respond_error(
             request.id,
             -32001,
-            "Thread is not explicitly managed by ActRealm",
+            "Thread has no verified ActRealm attachment",
         );
         return;
     }
@@ -2342,10 +2334,16 @@ fn update_codex_notification(
         }
     }
 
-    let (waiting, active, sync_native) = {
+    let (waiting, active, sync_native, sync_execution) = {
         let Ok(mut current) = state.lock() else {
             return;
         };
+        let was_active = current
+            .threads
+            .get(&thread_id)
+            .is_some_and(|t| t.status == "active");
+        let attachment_observation =
+            notification.method == "thread/started" || current.connecting.contains(&thread_id);
         current.resume_failed.remove(&thread_id);
         if let Some(thread) = started_thread {
             current.threads.insert(thread_id.clone(), thread);
@@ -2392,7 +2390,12 @@ fn update_codex_notification(
             "turn/completed" | "thread/closed"
         ) {
             if let Some(thread) = current.threads.get_mut(&thread_id) {
-                thread.status = "idle".to_owned();
+                thread.status = if notification.method == "thread/closed" {
+                    "notLoaded"
+                } else {
+                    "idle"
+                }
+                .to_owned();
                 thread.active_flags.clear();
             }
         } else if notification.method == "turn/started" {
@@ -2445,9 +2448,20 @@ fn update_codex_notification(
             .get(&thread_id)
             .is_some_and(|thread| thread.status == "active");
         let sync_native = changed || (waiting && !current.native_synced.contains(&thread_id));
-        (waiting, active, sync_native)
+        // Resume emits initial idle/notLoaded observations for an independent
+        // connection. Those are not terminal events from the original Turn.
+        let sync_execution = active
+            || (!attachment_observation && (was_active || notification.method == "turn/completed"));
+        (
+            waiting,
+            active,
+            sync_native && (waiting || !attachment_observation),
+            sync_execution,
+        )
     };
-    let _ = store.sync_provider_execution(Provider::Codex, &thread_id, active, observed_at);
+    if sync_execution {
+        let _ = store.sync_provider_execution(Provider::Codex, &thread_id, active, observed_at);
+    }
     if sync_native {
         sync_codex_native_attention(state, store, waiters, &thread_id, waiting, active);
     }
@@ -8067,6 +8081,20 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
                 );
                 object.insert("recoveryState".to_owned(), Value::String(recovery));
                 object.insert("canManage".to_owned(), Value::Bool(can_manage));
+                if session.provider == "codex" {
+                    let connection = state
+                        .codex
+                        .state
+                        .lock()
+                        .map(|current| {
+                            codex_auto_connect::connection_state(
+                                &current,
+                                &session.provider_session_id,
+                            )
+                        })
+                        .unwrap_or("unavailable");
+                    object.insert("managedConnectionState".to_owned(), json!(connection));
+                }
                 if let Some(status) = connector_status {
                     object.insert("connectorThreadStatus".to_owned(), Value::String(status));
                 }
@@ -8227,8 +8255,8 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
             // Keep the UI state stable across each bounded worker iteration.
             // The authenticated diagnostics endpoint still exposes the raw
             // in-progress bit; the workspace only needs to know whether the
-            // first scan has reached a complete published generation.
-            Value::Bool(!quality.ready),
+            // first scan or a pending backfill has reached a published generation.
+            Value::Bool(!quality.ready || state.usage_collection_pending.load(Ordering::Acquire)),
         );
         object.insert(
             "consecutiveFailures".to_owned(),
@@ -8566,7 +8594,8 @@ fn refresh_session_usage(state: &AppState, now: u64) -> Result<(bool, bool), Sto
         let history_complete = usage.collector.is_history_complete();
         usage.refreshed_at = Some(Instant::now());
         let ready = usage.collector.ready_codex_session_ids();
-        (records, caught_up, history_complete, ready)
+        let publishable = usage.collector.publishable_codex_session_ids();
+        (records, caught_up, history_complete, ready, publishable)
     };
     if state.shutdown_flag.load(Ordering::Acquire) {
         return Ok((false, false));
@@ -8597,17 +8626,21 @@ fn refresh_session_usage(state: &AppState, now: u64) -> Result<(bool, bool), Sto
     // previous committed ledger while a bounded historical scan is incomplete;
     // publishing each intermediate prefix makes totals wobble across restarts.
     if !records.1 {
-        // Fresh Agent samples must remain visible while an unrelated Codex
-        // historical scan rebuilds its shadow generation.
-        let agent_records = records
+        // Complete sessions may publish independently; incomplete sessions
+        // retain the prior ledger. This updates today's totals without
+        // requiring every unrelated historical file to finish in one pass.
+        let publishable_records = records
             .0
             .iter()
-            .filter(|r| matches!(r.provider.as_str(), "kimi" | "grok"))
+            .filter(|r| {
+                matches!(r.provider.as_str(), "kimi" | "grok")
+                    || (r.provider == "codex" && records.4.contains(&r.provider_session_id))
+            })
             .cloned()
             .map(runtime_usage_record)
             .collect::<Vec<_>>();
-        if !agent_records.is_empty() {
-            state.store.upsert_session_usages(agent_records)?;
+        if !publishable_records.is_empty() {
+            state.store.upsert_session_usages(publishable_records)?;
         }
         return Ok((false, records.2));
     }
@@ -8640,6 +8673,9 @@ fn run_usage_refresh_iteration(state: &AppState) -> bool {
         .store(false, Ordering::Release);
     match refreshed {
         Ok(Ok((caught_up, history_complete))) => {
+            state
+                .usage_collection_pending
+                .store(!caught_up, Ordering::Release);
             if caught_up {
                 state.usage_collection_ready.store(true, Ordering::Release);
                 state
@@ -10232,6 +10268,7 @@ while IFS= read -r line; do
 done
 "#).unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        warm_codex_test_executable(&executable);
         let (connector, _channels) =
             CodexConnector::connect(&executable, &root.join("test.sock")).unwrap();
         state.codex.connector = Some(connector.clone());
@@ -10422,6 +10459,7 @@ done
             usage_consecutive_failures: Arc::new(AtomicUsize::new(0)),
             usage_collection_in_progress: Arc::new(AtomicBool::new(false)),
             usage_collection_ready: Arc::new(AtomicBool::new(false)),
+            usage_collection_pending: Arc::new(AtomicBool::new(false)),
             usage_history_complete: Arc::new(AtomicBool::new(false)),
             usage_last_success_at: Arc::new(AtomicU64::new(0)),
             review_collection_in_progress: Arc::new(AtomicBool::new(false)),
@@ -10677,6 +10715,45 @@ done
         drop(state);
         drop(store);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn complete_live_session_publishes_totals_while_an_identified_historical_file_is_backfilled() {
+        let root = std::env::temp_dir().join(format!("actrealm-live-usage-{}", Uuid::now_v7()));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let sessions = root.join("codex/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let cold = sessions.join("cold.jsonl");
+        fs::write(
+            &cold,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"cold\"}}\n",
+        )
+        .unwrap();
+        let file = OpenOptions::new().write(true).open(&cold).unwrap();
+        file.set_len(40 * 1024 * 1024).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(5))
+            .unwrap();
+        let live = sessions.join("live.jsonl");
+        fs::write(&live, concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"live\"}}\n",
+            "{\"timestamp\":\"2026-09-20T00:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":120,\"output_tokens\":8,\"total_tokens\":128}}}}\n"
+        )).unwrap();
+        let state = test_state(store.clone(), &root);
+        assert!(run_usage_refresh_iteration(&state));
+        assert!(!state.usage_collection_ready.load(Ordering::Acquire));
+        assert!(state.usage_collection_pending.load(Ordering::Acquire));
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(snapshot.token_usage.total, 128);
+        assert!(state
+            .usage
+            .lock()
+            .unwrap()
+            .collector
+            .publishable_codex_session_ids()
+            .contains("live"));
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -14114,6 +14191,7 @@ done
         )
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        warm_codex_test_executable(&executable);
         let socket = root.join("unused.sock");
         let (connector, channels) = CodexConnector::connect(&executable, &socket).unwrap();
         assert!(connector.supports_managed_approvals());
@@ -14327,6 +14405,7 @@ done
         )
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        warm_codex_test_executable(&executable);
         let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
         let manager = CodexManager {
             connector: None,

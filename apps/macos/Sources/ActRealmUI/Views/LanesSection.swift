@@ -531,12 +531,6 @@ private struct TaskRow: View {
                     }
                     .buttonStyle(ActionButtonStyle(kind: .secondary, compact: true))
                 }
-                if fieldVisible("control"), task.session.canManage == true {
-                    Button("连接托管") {
-                        Task { await model.manage(task) }
-                    }
-                    .buttonStyle(ActionButtonStyle(kind: .secondary, compact: true))
-                }
                 Text(note)
                     .font(.system(size: 9.5))
                     .foregroundStyle(DT.textFaint)
@@ -1315,6 +1309,19 @@ private struct TaskRow: View {
         return localized(key, locale: locale)
     }
     private var controlText: String {
+        if task.session.provider == "codex" {
+            switch task.session.managedConnectionState {
+            case "pending", "connecting":
+                return localized("正在自动连接会话", locale: locale)
+            case "owned_elsewhere":
+                return localized("原窗口正在使用，等待自动接入", locale: locale)
+            case "retrying":
+                return localized("自动连接失败，正在重试", locale: locale)
+            case "unavailable":
+                return localized("自动连接暂不可用，继续观察", locale: locale)
+            default: break
+            }
+        }
         guard task.session.controlCapability == "managed" else {
             return localized("外部 Hook，仅观察 / 授权", locale: locale)
         }
@@ -1327,8 +1334,8 @@ private struct TaskRow: View {
             return localized("托管请求已接入，可直接审批", locale: locale)
         }
         return localized(model.client.snapshot.capabilities?.codexConnector?.managedApprovals == true
-            ? "app-server 已连接；原生审批仍需在 Codex 处理"
-            : "app-server 已连接；当前版本审批需原界面", locale: locale)
+            ? "已自动连接；原生审批仍需在 Codex 处理"
+            : "已自动连接；当前版本审批需原界面", locale: locale)
     }
     private var metaLine: String {
         var parts = [providerName]
@@ -3372,6 +3379,9 @@ private struct TokenUsageSummaryCard: View {
     }
 
     private var collectionStatusText: String {
+        if totals.collectionInProgress && totals.total > 0 {
+            return localized("正在补全本机用量", locale: locale)
+        }
         if totals.dataQuality == "suspect" {
             return localizedFormat(
                 "发现 %lld 项用量异常 · 打开仪表板查看",

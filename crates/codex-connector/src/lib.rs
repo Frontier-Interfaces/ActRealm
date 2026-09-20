@@ -1,12 +1,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-#[cfg(target_os = "macos")]
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-#[cfg(target_os = "macos")]
-use std::os::unix::fs::FileTypeExt;
-use std::path::Path;
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
@@ -76,6 +75,7 @@ struct Inner {
     pending: Mutex<HashMap<String, mpsc::Sender<Result<Value, String>>>>,
     protocol: Mutex<ProtocolSupport>,
     next_id: AtomicU64,
+    shared_connection: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -110,7 +110,8 @@ impl CodexConnector {
         socket_path: &Path,
     ) -> Result<(Self, ConnectorChannels), ConnectorError> {
         cleanup_legacy_socket_listeners(socket_path);
-        Self::connect_stdio(executable)
+        let shared_socket = shared_control_socket();
+        Self::connect_transport(executable, shared_socket.as_deref())
     }
 
     /// Reads account quota through a short-lived app-server process. Runtime
@@ -125,12 +126,27 @@ impl CodexConnector {
     }
 
     fn connect_stdio(executable: &Path) -> Result<(Self, ConnectorChannels), ConnectorError> {
-        // Codex app-server natively supports stdio. Keeping it as the direct
-        // child of Runtime avoids a detached Unix-socket listener: if Runtime
-        // is killed, the OS closes stdin and app-server exits on EOF instead
-        // of surviving as a PPID-1 orphan.
-        let mut child = Command::new(executable)
-            .args(["app-server", "--stdio"])
+        Self::connect_transport(executable, None)
+    }
+
+    pub fn is_shared_connection(&self) -> bool {
+        self.inner.shared_connection
+    }
+
+    fn connect_transport(
+        executable: &Path,
+        shared_socket: Option<&Path>,
+    ) -> Result<(Self, ConnectorChannels), ConnectorError> {
+        // The official proxy joins the existing service; killing our proxy
+        // never terminates its daemon or another client's active writer.
+        let mut command = Command::new(executable);
+        command.arg("app-server");
+        if let Some(socket) = shared_socket {
+            command.arg("proxy").arg("--sock").arg(socket);
+        } else {
+            command.arg("--stdio");
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -152,6 +168,7 @@ impl CodexConnector {
                 pending: Mutex::new(HashMap::new()),
                 protocol: Mutex::new(ProtocolSupport::default()),
                 next_id: AtomicU64::new(1),
+                shared_connection: shared_socket.is_some(),
             }),
         };
         let reader_connector = connector.downgrade();
@@ -395,6 +412,39 @@ impl CodexConnector {
     }
 }
 
+fn shared_control_socket() -> Option<PathBuf> {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
+    let path = home.join("app-server-control/app-server-control.sock");
+    trusted_control_socket(&path).then_some(path)
+}
+
+#[cfg(unix)]
+fn trusted_control_socket(path: &Path) -> bool {
+    let owner = unsafe { libc::geteuid() };
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(directory) = fs::symlink_metadata(parent) else {
+        return false;
+    };
+    let Ok(socket) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    directory.is_dir()
+        && directory.uid() == owner
+        && directory.mode() & 0o022 == 0
+        && socket.file_type().is_socket()
+        && socket.uid() == owner
+        && socket.mode() & 0o022 == 0
+}
+
+#[cfg(not(unix))]
+fn trusted_control_socket(_path: &Path) -> bool {
+    false
+}
+
 /// Releases listeners created by pre-stdio ActRealm builds. The private
 /// ActRealm socket path is the ownership boundary: ordinary Codex CLI/Desktop
 /// sessions never bind it, and no process with another command name is
@@ -527,6 +577,63 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::time::Instant;
+
+    #[test]
+    fn shared_control_socket_rejects_links_and_writable_endpoints() {
+        use std::os::unix::net::UnixListener;
+        let root =
+            std::env::temp_dir().join(format!("actrealm-shared-trust-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(trusted_control_socket(&path));
+        let link = root.join("link.sock");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(!trusted_control_socket(&link));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(!trusted_control_socket(&path));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!trusted_control_socket(&path));
+        drop(listener);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_transport_uses_official_proxy_arguments_and_only_owns_its_child() {
+        let root =
+            std::env::temp_dir().join(format!("actrealm-shared-proxy-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("fake-codex");
+        fs::write(&executable, r#"#!/bin/sh
+[ "$1" = app-server ] && [ "$2" = proxy ] && [ "$3" = --sock ] && [ "$4" = /fixture/control.sock ] || exit 1
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{"userAgent":"codex_cli_rs/0.144.6"}}' ;;
+  esac
+done
+"#).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(Command::new(&executable)
+            .args(["app-server", "proxy", "--sock", "/fixture/control.sock"])
+            .stdin(Stdio::null())
+            .status()
+            .unwrap()
+            .success());
+        let (connector, _channels) = CodexConnector::connect_transport(
+            &executable,
+            Some(Path::new("/fixture/control.sock")),
+        )
+        .unwrap();
+        assert!(connector.is_shared_connection());
+        let weak = connector.downgrade();
+        connector.shutdown();
+        drop(connector);
+        assert!(weak.upgrade().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn persistent_stdio_initializes_lists_resumes_and_routes_server_requests() {

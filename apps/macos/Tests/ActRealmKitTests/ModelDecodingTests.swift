@@ -333,6 +333,7 @@ struct ModelDecodingTests {
               "controlCapability": "external_hook",
               "recoveryState": "observing",
               "canManage": false,
+              "managedConnectionState": "retrying",
               "usageCapturedAt": 1737000090000,
               "facts": {
                 "schemaVersion": 1,
@@ -559,6 +560,7 @@ struct ModelDecodingTests {
         #expect(snapshot.sessions[0].currentTarget == "LanesSection.swift")
         #expect(snapshot.sessions[0].subagents.first?.agentType == "gpt-5.6-sol")
         #expect(snapshot.sessions[0].controlCapability == "external_hook")
+        #expect(snapshot.sessions[0].managedConnectionState == "retrying")
         #expect(snapshot.sessions[0].facts?.plan.sourceKind == .authoritative)
         #expect(snapshot.sessions[0].facts?.plan.verification == .verified)
         #expect(snapshot.sessions[0].facts?.currentTarget.sourceId == "hook:tool_input/allowlisted_basename")

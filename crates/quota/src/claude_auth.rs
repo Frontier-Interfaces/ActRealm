@@ -182,8 +182,16 @@ mod tests {
         let root = super::super::tests::root("auth-probe-terminal");
         fs::create_dir_all(&root).unwrap();
         let executable = root.join("fake-claude");
-        fs::write(&executable, "#!/bin/sh\n[ -t 0 ] && [ -t 1 ] || exit 1\nprintf '%s' $$ > pid\ntouch renewed\nwhile :; do sleep 1; done\n").unwrap();
+        fs::write(&executable, "#!/bin/sh\n[ \"$1\" = --warmup ] && exit 0\n[ -t 0 ] && [ -t 1 ] || exit 1\nprintf '%s' $$ > pid\n: > renewed\nwhile :; do sleep 1; done\n").unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        // Let macOS perform cold executable inspection before the two-second
+        // protocol deadline. This fixture tests PTY renewal and child reaping,
+        // not host-dependent first-launch latency.
+        assert!(Command::new(&executable)
+            .arg("--warmup")
+            .status()
+            .unwrap()
+            .success());
         assert!(refresh(&executable, &root, Duration::from_secs(2), || root
             .join("renewed")
             .exists())

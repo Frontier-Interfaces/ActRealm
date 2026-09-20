@@ -1318,6 +1318,9 @@ pub struct UsageCollector {
     known_codex: Vec<PathBuf>,
     next_usage_file_index: usize,
     last_discovery: Option<Instant>,
+    discovery_complete: bool,
+    claude_discovery: DiscoveryScan,
+    codex_discovery: DiscoveryScan,
     line_buffer: Vec<u8>,
     pricing: PricingSnapshot,
     live_pricing_enabled: bool,
@@ -1346,6 +1349,9 @@ impl UsageCollector {
             known_codex: Vec::new(),
             next_usage_file_index: 0,
             last_discovery: None,
+            discovery_complete: false,
+            claude_discovery: DiscoveryScan::default(),
+            codex_discovery: DiscoveryScan::default(),
             line_buffer: Vec::new(),
             pricing: cached_pricing.unwrap_or_else(embedded_pricing_snapshot),
             live_pricing_enabled: false,
@@ -1421,6 +1427,7 @@ impl UsageCollector {
     /// is not necessarily a complete historical rebuild.
     pub fn is_caught_up(&self) -> bool {
         self.last_discovery.is_some()
+            && self.discovery_complete
             && self.known_claude.iter().all(|path| {
                 self.claude_files.get(path).is_some_and(|state| {
                     source_is_caught_up(
@@ -1453,6 +1460,7 @@ impl UsageCollector {
         let agent_history_unverified = self.kimi_root.as_ref().is_some_and(|p| p.exists())
             || self.grok_root.as_ref().is_some_and(|p| p.exists());
         !agent_history_unverified
+            && self.discovery_complete
             && self.last_discovery.is_some()
             && self.known_claude.iter().all(|path| {
                 self.claude_files
@@ -1492,6 +1500,28 @@ impl UsageCollector {
             .collect()
     }
 
+    /// Only commit a per-session result once inventory is complete and every
+    /// source's session identity is known. Otherwise an undiscovered resume
+    /// fragment could make a smaller partial total replace committed history.
+    pub fn publishable_codex_session_ids(&self) -> HashSet<String> {
+        if !self.discovery_complete
+            || self.known_codex.iter().any(|path| {
+                self.codex_files.get(path).is_none_or(|state| {
+                    state.session_id.is_none()
+                        && !source_is_caught_up(
+                            path,
+                            state.offset,
+                            state.identity,
+                            state.discarding_oversized_line,
+                        )
+                })
+            })
+        {
+            return HashSet::new();
+        }
+        self.ready_codex_session_ids()
+    }
+
     /// Private local source inventory for the Runtime's transient question observer.
     pub fn codex_source_files(&self) -> Vec<PathBuf> {
         self.known_codex.clone()
@@ -1529,8 +1559,11 @@ impl UsageCollector {
             .last_discovery
             .is_none_or(|last| last.elapsed() >= DISCOVERY_INTERVAL)
         {
-            self.known_claude = discover_recent_files(&self.paths.claude_projects);
-            self.known_codex = discover_recent_files(&self.paths.codex_sessions);
+            let claude = self.claude_discovery.poll(&self.paths.claude_projects);
+            let codex = self.codex_discovery.poll(&self.paths.codex_sessions);
+            self.discovery_complete = claude.complete && codex.complete;
+            merge_discovered_files(&mut self.known_claude, claude);
+            merge_discovered_files(&mut self.known_codex, codex);
             self.last_discovery = Some(Instant::now());
             let claude_set = self.known_claude.iter().cloned().collect::<HashSet<_>>();
             let codex_set = self.known_codex.iter().cloned().collect::<HashSet<_>>();
@@ -1563,6 +1596,90 @@ impl UsageCollector {
                 .sum::<usize>();
             let mut response_slots = MAX_CODEX_RESPONSE_ENTRIES.saturating_sub(occupied);
             let mut scan_cancelled = false;
+            // Learn source identities before backfilling large transcripts.
+            // Publication must rule out an unread resume fragment, but doing
+            // that should not require reading every unrelated file to EOF.
+            let mut identity_budget = remaining_bytes / 4;
+            let initial_identity_budget = identity_budget;
+            for path in self.known_codex.clone() {
+                if identity_budget == 0 {
+                    break;
+                }
+                if self
+                    .codex_files
+                    .get(&path)
+                    .is_some_and(|state| state.session_id.is_some() || state.offset > 0)
+                {
+                    continue;
+                }
+                if collection_cancelled(shutdown) {
+                    break;
+                }
+                let Ok(metadata) = regular_file_metadata(&path) else {
+                    continue;
+                };
+                let Ok(file) = File::open(&path) else {
+                    continue;
+                };
+                let mut reader = BufReader::new(file);
+                let Ok((consumed, complete, too_large)) = read_bounded_line_into(
+                    &mut reader,
+                    identity_budget.min(64 * 1024) as usize,
+                    &mut line_buffer,
+                ) else {
+                    continue;
+                };
+                identity_budget = identity_budget.saturating_sub(consumed);
+                if !complete || too_large {
+                    continue;
+                }
+                let Ok(root) = serde_json::from_slice::<Value>(&line_buffer) else {
+                    continue;
+                };
+                if root["type"] != "session_meta" {
+                    continue;
+                }
+                let state = self.codex_files.entry(path).or_default();
+                apply_codex_session_metadata(
+                    state,
+                    &root["payload"],
+                    root["timestamp"].as_str().and_then(timestamp_millis),
+                );
+                state.offset = consumed;
+                state.size = metadata.len();
+                state.modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+                state.identity = Some((metadata.dev(), metadata.ino()));
+            }
+            remaining_bytes -= initial_identity_budget - identity_budget;
+            // Always tail the newest sources before historical round-robin
+            // work. Reserve half the remaining byte budget for older files so
+            // neither live activity nor a large backfill can starve the other.
+            let mut hot_budget = remaining_bytes / 2;
+            let initial_hot_budget = hot_budget;
+            let hot = (0..4)
+                .flat_map(|index| {
+                    [
+                        self.known_codex.get(index).map(|p| (false, p.clone())),
+                        self.known_claude.get(index).map(|p| (true, p.clone())),
+                    ]
+                    .into_iter()
+                    .flatten()
+                })
+                .collect::<Vec<_>>();
+            for (is_claude, path) in hot {
+                if is_claude {
+                    self.refresh_claude_file(&path, shutdown, &mut hot_budget, &mut line_buffer);
+                } else {
+                    self.refresh_codex_file(
+                        &path,
+                        shutdown,
+                        &mut hot_budget,
+                        &mut line_buffer,
+                        &mut response_slots,
+                    );
+                }
+            }
+            remaining_bytes -= initial_hot_budget - hot_budget;
             for turn in 0..known_files.len() {
                 if remaining_bytes == 0 {
                     break;
@@ -2190,8 +2307,123 @@ fn merge_record(records: &mut HashMap<(String, String), UsageRecord>, record: Us
         .or_insert(record);
 }
 
+enum DiscoveryVisit {
+    Path(PathBuf, usize),
+    Directory(fs::ReadDir, usize),
+}
+
+#[derive(Default)]
+struct DiscoveryScan {
+    pending: Vec<DiscoveryVisit>,
+    candidates: HashMap<PathBuf, SystemTime>,
+    incomplete: bool,
+}
+
+impl DiscoveryScan {
+    fn poll(&mut self, roots: &[PathBuf]) -> DiscoveryResult {
+        self.poll_with_budget(roots, &mut DiscoveryBudget::new())
+    }
+
+    fn poll_with_budget(
+        &mut self,
+        roots: &[PathBuf],
+        budget: &mut DiscoveryBudget,
+    ) -> DiscoveryResult {
+        if self.pending.is_empty() {
+            self.candidates.clear();
+            self.incomplete = false;
+            self.pending.extend(
+                roots
+                    .iter()
+                    .rev()
+                    .map(|p| DiscoveryVisit::Path(p.clone(), 0)),
+            );
+        }
+        while !self.pending.is_empty() && budget.reserve_ticket() {
+            match self.pending.pop().unwrap() {
+                DiscoveryVisit::Path(path, depth) => {
+                    #[cfg(test)]
+                    {
+                        budget.metadata_checks += 1;
+                    }
+                    if depth > 8 {
+                        self.incomplete = true;
+                        continue;
+                    }
+                    let metadata = match fs::symlink_metadata(&path) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            self.incomplete |= e.kind() != io::ErrorKind::NotFound;
+                            continue;
+                        }
+                    };
+                    if metadata.file_type().is_symlink() {
+                        continue;
+                    }
+                    if metadata.is_dir() {
+                        match fs::read_dir(path) {
+                            Ok(dir) => self.pending.push(DiscoveryVisit::Directory(dir, depth)),
+                            Err(_) => self.incomplete = true,
+                        }
+                    } else if metadata.is_file()
+                        && path.extension().and_then(|s| s.to_str()) == Some("jsonl")
+                    {
+                        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+                        if SystemTime::now()
+                            .duration_since(modified)
+                            .unwrap_or_default()
+                            <= RECENT_FILE_AGE
+                        {
+                            self.candidates.insert(path, modified);
+                            if self.candidates.len() > MAX_DISCOVERED_FILES {
+                                self.incomplete = true;
+                                if let Some(oldest) = self
+                                    .candidates
+                                    .iter()
+                                    .min_by_key(|(_, at)| **at)
+                                    .map(|(p, _)| p.clone())
+                                {
+                                    self.candidates.remove(&oldest);
+                                }
+                            }
+                        }
+                    }
+                }
+                DiscoveryVisit::Directory(mut entries, depth) => {
+                    #[cfg(test)]
+                    {
+                        budget.read_dir_nexts += 1;
+                    }
+                    if let Some(entry) = entries.next() {
+                        self.pending.push(DiscoveryVisit::Directory(entries, depth));
+                        match entry {
+                            Ok(entry) => self
+                                .pending
+                                .push(DiscoveryVisit::Path(entry.path(), depth + 1)),
+                            Err(_) => self.incomplete = true,
+                        }
+                    }
+                }
+            }
+        }
+        let mut files = self.candidates.iter().collect::<Vec<_>>();
+        files.sort_by(|(lp, lt), (rp, rt)| rt.cmp(lt).then_with(|| lp.cmp(rp)));
+        DiscoveryResult {
+            files: files.into_iter().map(|(p, _)| p.clone()).collect(),
+            complete: self.pending.is_empty() && !self.incomplete,
+            #[cfg(test)]
+            visited_entries: budget.visited_entries,
+            #[cfg(test)]
+            read_dir_nexts: budget.read_dir_nexts,
+            #[cfg(test)]
+            metadata_checks: budget.metadata_checks,
+        }
+    }
+}
+
 struct DiscoveryResult {
     files: Vec<PathBuf>,
+    complete: bool,
     #[cfg(test)]
     visited_entries: usize,
     #[cfg(test)]
@@ -2239,28 +2471,6 @@ impl DiscoveryBudget {
         true
     }
 
-    fn reserve_before_read_dir_next(&mut self) -> bool {
-        if !self.reserve_ticket() {
-            return false;
-        }
-        #[cfg(test)]
-        {
-            self.read_dir_nexts = self.read_dir_nexts.saturating_add(1);
-        }
-        true
-    }
-
-    fn metadata_allowed(&self) -> bool {
-        !self.time_exhausted()
-    }
-
-    fn record_metadata_check(&mut self) {
-        #[cfg(test)]
-        {
-            self.metadata_checks = self.metadata_checks.saturating_add(1);
-        }
-    }
-
     fn time_exhausted(&self) -> bool {
         (self.elapsed)() >= MAX_DISCOVERY_DURATION
     }
@@ -2270,99 +2480,32 @@ impl DiscoveryBudget {
     }
 }
 
-fn discover_recent_files(roots: &[PathBuf]) -> Vec<PathBuf> {
-    discover_recent_files_with_budget(roots).files
-}
-
+#[cfg(test)]
 fn discover_recent_files_with_budget(roots: &[PathBuf]) -> DiscoveryResult {
     let mut budget = DiscoveryBudget::new();
     discover_recent_files_with_budget_and_budget(roots, &mut budget)
 }
 
+#[cfg(test)]
 fn discover_recent_files_with_budget_and_budget(
     roots: &[PathBuf],
     budget: &mut DiscoveryBudget,
 ) -> DiscoveryResult {
-    let mut files = Vec::<(PathBuf, SystemTime)>::new();
-    for root in roots {
-        collect_jsonl(root, 0, &mut files, budget, false);
-        if budget.exhausted() {
-            break;
-        }
-    }
-    files.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
-    files.truncate(MAX_DISCOVERED_FILES);
-    DiscoveryResult {
-        files: files.into_iter().map(|(path, _)| path).collect(),
-        #[cfg(test)]
-        visited_entries: budget.visited_entries,
-        #[cfg(test)]
-        read_dir_nexts: budget.read_dir_nexts,
-        #[cfg(test)]
-        metadata_checks: budget.metadata_checks,
-    }
+    DiscoveryScan::default().poll_with_budget(roots, budget)
 }
 
-fn collect_jsonl(
-    path: &Path,
-    depth: usize,
-    output: &mut Vec<(PathBuf, SystemTime)>,
-    budget: &mut DiscoveryBudget,
-    already_visited: bool,
-) {
-    if depth > 8
-        || output.len() >= MAX_DISCOVERED_FILES.saturating_mul(4)
-        || (!already_visited && !budget.reserve_ticket())
-        || !budget.metadata_allowed()
-    {
+fn merge_discovered_files(known: &mut Vec<PathBuf>, result: DiscoveryResult) {
+    if result.complete {
+        *known = result.files;
         return;
     }
-    budget.record_metadata_check();
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return;
-    };
-    if metadata.file_type().is_symlink() {
-        return;
-    }
-    if metadata.is_file() {
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
-            return;
-        }
-        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
-        if SystemTime::now()
-            .duration_since(modified)
-            .unwrap_or_default()
-            <= RECENT_FILE_AGE
-        {
-            output.push((path.to_path_buf(), modified));
-        }
-        return;
-    }
-    if !metadata.is_dir() {
-        return;
-    }
-    let Ok(mut read_dir) = fs::read_dir(path) else {
-        return;
-    };
-    let mut entries = Vec::new();
-    loop {
-        if !budget.reserve_before_read_dir_next() {
-            break;
-        }
-        let Some(entry) = read_dir.next() else {
-            break;
-        };
-        if let Ok(entry) = entry {
-            entries.push(entry);
-        }
-    }
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        if !budget.metadata_allowed() {
-            break;
-        }
-        collect_jsonl(&entry.path(), depth + 1, output, budget, true);
-    }
+    // Absence from a bounded/failed walk is not evidence that a file was
+    // removed. Preserve parser offsets and numeric state for known sources.
+    let mut seen = result.files.iter().cloned().collect::<HashSet<_>>();
+    let mut combined = result.files;
+    combined.extend(known.iter().filter(|p| seen.insert((*p).clone())).cloned());
+    combined.truncate(MAX_DISCOVERED_FILES);
+    *known = combined;
 }
 
 fn regular_file_metadata(path: &Path) -> io::Result<fs::Metadata> {
@@ -2782,44 +2925,7 @@ fn parse_codex_tail_with_shutdown(
         let event_type = root.get("type").and_then(Value::as_str).unwrap_or_default();
         let payload = root.get("payload").unwrap_or(&Value::Null);
         match event_type {
-            "session_meta" => {
-                if codex_metadata_inherits_history(payload) {
-                    state.inherited_history = true;
-                    state.inherited_history_cutoff = event_at.or_else(|| {
-                        payload
-                            .get("timestamp")
-                            .and_then(Value::as_str)
-                            .and_then(timestamp_millis)
-                    });
-                }
-                if state.project_id.is_none() {
-                    if let Some(project) = project_identity_from_value(payload) {
-                        state.project_id = Some(project.id);
-                        state.project_label = Some(project.label);
-                    }
-                }
-                if state.parent_provider_session_id.is_none() {
-                    state.parent_provider_session_id = codex_parent_session_id(payload);
-                }
-                // A fork/compaction can replay a parent `session_meta` later
-                // in the child file. The first valid file identity is
-                // canonical; allowing a later replay to overwrite it merges
-                // independent child ledgers into the parent and pairs totals
-                // with unrelated daily rows.
-                if state.session_id.is_none() {
-                    state.fragment_started_at = event_at.or_else(|| {
-                        payload
-                            .get("timestamp")
-                            .and_then(Value::as_str)
-                            .and_then(timestamp_millis)
-                    });
-                    state.session_id = payload
-                        .get("id")
-                        .or_else(|| payload.get("session_id"))
-                        .and_then(Value::as_str)
-                        .and_then(safe_session_id);
-                }
-            }
+            "session_meta" => apply_codex_session_metadata(state, payload, event_at),
             "turn_context" => {
                 if let Some(model) = payload
                     .get("model")
@@ -2960,6 +3066,49 @@ fn parse_codex_tail_with_shutdown(
         state.session_id = path
             .file_stem()
             .and_then(|value| value.to_str())
+            .and_then(safe_session_id);
+    }
+}
+
+fn apply_codex_session_metadata(
+    state: &mut CodexFileState,
+    payload: &Value,
+    event_at: Option<u64>,
+) {
+    if codex_metadata_inherits_history(payload) {
+        state.inherited_history = true;
+        state.inherited_history_cutoff = event_at.or_else(|| {
+            payload
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(timestamp_millis)
+        });
+    }
+    if state.project_id.is_none() {
+        if let Some(project) = project_identity_from_value(payload) {
+            state.project_id = Some(project.id);
+            state.project_label = Some(project.label);
+        }
+    }
+    if state.parent_provider_session_id.is_none() {
+        state.parent_provider_session_id = codex_parent_session_id(payload);
+    }
+    // A fork/compaction can replay a parent `session_meta` later
+    // in the child file. The first valid file identity is
+    // canonical; allowing a later replay to overwrite it merges
+    // independent child ledgers into the parent and pairs totals
+    // with unrelated daily rows.
+    if state.session_id.is_none() {
+        state.fragment_started_at = event_at.or_else(|| {
+            payload
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(timestamp_millis)
+        });
+        state.session_id = payload
+            .get("id")
+            .or_else(|| payload.get("session_id"))
+            .and_then(Value::as_str)
             .and_then(safe_session_id);
     }
 }
@@ -4944,7 +5093,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_stops_after_entry_budget_when_all_files_are_old() {
+    fn discovery_bounds_each_slice_and_eventually_finds_recent_files_among_old_files() {
         let root = temp_dir("discovery-entry-budget");
         let link_target_root = temp_dir("discovery-link-target");
         let link_target = link_target_root.join("outside-recent.jsonl");
@@ -4978,19 +5127,25 @@ mod tests {
             )
             .expect("age older recent fixture");
 
-        let discovery = discover_recent_files_with_budget(std::slice::from_ref(&root));
+        let mut scan = DiscoveryScan::default();
+        let mut discovery = scan.poll_with_budget(
+            std::slice::from_ref(&root),
+            &mut DiscoveryBudget::with_elapsed_for_test(|| Duration::ZERO),
+        );
+        assert!(!discovery.complete);
+        for _ in 0..10 {
+            assert!(discovery.visited_entries <= MAX_DISCOVERY_VISITED_ENTRIES);
+            if discovery.complete {
+                break;
+            }
+            discovery = scan.poll_with_budget(
+                std::slice::from_ref(&root),
+                &mut DiscoveryBudget::with_elapsed_for_test(|| Duration::ZERO),
+            );
+        }
+        assert!(discovery.complete);
         let discovered = discovery.files;
-
-        assert!(
-            discovery.visited_entries <= MAX_DISCOVERY_VISITED_ENTRIES,
-            "visited {} entries with a hard budget of {MAX_DISCOVERY_VISITED_ENTRIES}",
-            discovery.visited_entries
-        );
-        assert_eq!(
-            discovered,
-            vec![recent.clone(), older_recent.clone()],
-            "charged candidates must be processed newest-first even after later descent exhausts the budget"
-        );
+        assert_eq!(discovered, vec![recent.clone(), older_recent.clone()]);
         assert!(
             !discovered
                 .iter()
@@ -5002,6 +5157,122 @@ mod tests {
     }
 
     #[test]
+    fn discovery_continues_after_budget_exhaustion_instead_of_restarting_the_same_prefix() {
+        let root = temp_dir("discovery-resume");
+        for index in 0..700 {
+            fs::write(root.join(format!("old-{index}.txt")), b"x").unwrap();
+        }
+        let latest = root.join("latest.jsonl");
+        fs::write(&latest, "{}\n").unwrap();
+        let mut scan = DiscoveryScan::default();
+        let mut result = scan.poll_with_budget(
+            std::slice::from_ref(&root),
+            &mut DiscoveryBudget::with_elapsed_for_test(|| Duration::ZERO),
+        );
+        assert!(!result.complete);
+        for _ in 0..10 {
+            assert!(result.visited_entries <= MAX_DISCOVERY_VISITED_ENTRIES);
+            if result.complete {
+                break;
+            }
+            result = scan.poll_with_budget(
+                std::slice::from_ref(&root),
+                &mut DiscoveryBudget::with_elapsed_for_test(|| Duration::ZERO),
+            );
+        }
+        assert!(result.complete);
+        assert_eq!(result.files, vec![latest]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn live_usage_publishes_before_large_unrelated_sources_finish_backfill() {
+        let root = temp_dir("live-before-history");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        for index in 0..12 {
+            let path = sessions.join(format!("cold-{index}.jsonl"));
+            fs::write(
+                &path,
+                format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"cold-{index}\"}}}}\n"),
+            )
+            .unwrap();
+            let file = File::options().write(true).open(path).unwrap();
+            file.set_len(MAX_JSONL_BYTES_PER_REFRESH * 2).unwrap();
+            file.set_modified(UNIX_EPOCH + Duration::from_secs(1))
+                .unwrap();
+        }
+        let live = sessions.join("live.jsonl");
+        fs::write(&live, concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"live\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"output_tokens\":8,\"total_tokens\":108}}}}\n"
+        )).unwrap();
+        let mut collector = UsageCollector::new(UsagePaths {
+            actrealm_home: root.join("cache"),
+            claude_projects: vec![],
+            codex_sessions: vec![],
+        });
+        collector.known_codex = vec![live.clone()];
+        collector
+            .known_codex
+            .extend((0..12).map(|i| sessions.join(format!("cold-{i}.jsonl"))));
+        collector.last_discovery = Some(Instant::now());
+        collector.discovery_complete = true;
+        let records = collector.collect(100);
+        assert!(!collector.is_caught_up());
+        assert!(collector.publishable_codex_session_ids().contains("live"));
+        assert_eq!(
+            records
+                .iter()
+                .find(|r| r.provider_session_id == "live")
+                .unwrap()
+                .token_total,
+            Some(108)
+        );
+        assert!(collector
+            .codex_files
+            .values()
+            .all(|s| s.session_id.is_some()));
+        assert!(
+            collector
+                .codex_files
+                .values()
+                .map(|s| s.offset)
+                .sum::<u64>()
+                <= MAX_JSONL_BYTES_PER_REFRESH
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incomplete_discovery_keeps_known_sources_and_never_certifies_a_full_generation() {
+        let root = temp_dir("discovery-partial-preservation");
+        let first = root.join("a.jsonl");
+        let second = root.join("b.jsonl");
+        fs::write(&first, "{}\n").unwrap();
+        fs::write(&second, "{}\n").unwrap();
+        let mut collector = UsageCollector::new(UsagePaths {
+            actrealm_home: root.join("cache"),
+            claude_projects: vec![],
+            codex_sessions: vec![root.clone()],
+        });
+        collector.collect(100);
+        assert!(collector.is_caught_up());
+        let before = collector.codex_files[&second].offset;
+        let mut partial = discover_recent_files_with_budget(&[]);
+        partial.files = vec![first.clone()];
+        partial.complete = false;
+        merge_discovered_files(&mut collector.known_codex, partial);
+        collector.discovery_complete = false;
+        collector.collect(101);
+        assert_eq!(collector.codex_files[&second].offset, before);
+        assert!(collector.known_codex.contains(&second));
+        assert!(!collector.is_caught_up());
+        assert!(collector.publishable_codex_session_ids().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn discovery_charges_before_next_and_caps_metadata_work() {
         let root = temp_dir("discovery-ticket-bound");
         for index in 0..MAX_DISCOVERY_VISITED_ENTRIES {
@@ -5009,14 +5280,18 @@ mod tests {
                 .expect("write recent fixture");
         }
 
-        let mut budget = DiscoveryBudget::new();
+        let mut budget = DiscoveryBudget::with_elapsed_for_test(|| Duration::ZERO);
         let discovery =
             discover_recent_files_with_budget_and_budget(std::slice::from_ref(&root), &mut budget);
 
         assert_eq!(discovery.visited_entries, MAX_DISCOVERY_VISITED_ENTRIES);
-        assert_eq!(discovery.read_dir_nexts, MAX_DISCOVERY_VISITED_ENTRIES - 1);
-        assert_eq!(discovery.metadata_checks, MAX_DISCOVERY_VISITED_ENTRIES);
-        assert_eq!(discovery.files.len(), MAX_DISCOVERY_VISITED_ENTRIES - 1);
+        assert!(!discovery.complete);
+        assert_eq!(
+            discovery.read_dir_nexts + discovery.metadata_checks,
+            discovery.visited_entries
+        );
+        assert_eq!(discovery.read_dir_nexts, MAX_DISCOVERY_VISITED_ENTRIES / 2);
+        assert_eq!(discovery.files.len(), discovery.metadata_checks - 1);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -5302,6 +5577,7 @@ mod tests {
         });
         collector.known_codex = vec![first.clone(), second.clone()];
         collector.last_discovery = Some(Instant::now());
+        collector.discovery_complete = true;
 
         assert!(collector.collect(100).is_empty());
         let first_round = collector
@@ -5310,7 +5586,8 @@ mod tests {
             .expect("first file receives the initial turn")
             .offset;
         assert!(first_round <= MAX_JSONL_BYTES_PER_REFRESH);
-        assert!(!collector.codex_files.contains_key(&second));
+        let second_first_round = collector.codex_files.get(&second).map_or(0, |s| s.offset);
+        assert!(first_round + second_first_round <= MAX_JSONL_BYTES_PER_REFRESH);
 
         assert!(collector.collect(200).is_empty());
         let second_round = collector
@@ -5323,12 +5600,12 @@ mod tests {
             .get(&first)
             .expect("first state remains known")
             .offset;
-        assert_eq!(first_after_second, first_round);
+        assert!(first_after_second >= first_round);
         assert!(second_round <= MAX_JSONL_BYTES_PER_REFRESH);
         assert!(
             first_after_second
                 .saturating_add(second_round)
-                .saturating_sub(first_round)
+                .saturating_sub(first_round + second_first_round)
                 <= MAX_JSONL_BYTES_PER_REFRESH,
             "all files share one byte budget per collection"
         );
@@ -5342,13 +5619,11 @@ mod tests {
         assert!(
             first_after_third.saturating_sub(first_after_second) <= MAX_JSONL_BYTES_PER_REFRESH
         );
-        assert_eq!(
-            collector
-                .codex_files
-                .get(&second)
-                .expect("second state remains known")
-                .offset,
-            second_round
+        let second_after_third = collector.codex_files.get(&second).unwrap().offset;
+        assert!(second_after_third >= second_round);
+        assert!(
+            first_after_third + second_after_third - first_after_second - second_round
+                <= MAX_JSONL_BYTES_PER_REFRESH
         );
         assert!(
             first_after_third.saturating_sub(first_after_second) <= MAX_JSONL_BYTES_PER_REFRESH,
@@ -5369,6 +5644,7 @@ mod tests {
         });
         collector.known_codex = vec![path.clone()];
         collector.last_discovery = Some(Instant::now());
+        collector.discovery_complete = true;
 
         assert!(!collector.is_caught_up());
         assert!(collector.collect(100).is_empty());

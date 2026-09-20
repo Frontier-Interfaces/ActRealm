@@ -184,6 +184,19 @@ is saved locally. UI copy changes immediately; macOS menus adopt the choice
 when ActRealm restarts. User task titles, questions and Provider-authored content
 remain in their original language.
 
+Observed Codex sessions connect automatically in the background. There is no
+per-task managed-connection button or opt-in. Runtime connects existing task
+cards at startup, discovers new tasks, and retries failed attachments with
+backoff. The task detail shows connecting, retrying or unavailable states; a
+successful attachment is required before it is called connected. A thread held
+by an independent Codex window may reject another writer; it stays observed
+and displays that it is waiting for automatic access. The official shared local
+app-server is preferred when its control socket is available at startup. Reopening a
+stored thread does not start a model turn or transfer a running Desktop turn.
+Original-client approval and question ownership still require a live reply
+channel. Claude Hooks and supported Grok/Kimi local sessions keep their existing
+automatic integration; standalone Kimi CLI still requires its ACP entry point.
+
 Recovery labels are capability statements:
 
 - **Reconnected, controllable:** a managed Codex Thread was resumed and a live

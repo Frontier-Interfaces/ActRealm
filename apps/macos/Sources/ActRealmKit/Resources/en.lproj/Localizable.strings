@@ -2002,3 +2002,13 @@
 "后台处理或恢复窗口时的状态更新耗时，单独统计，不包含窗口隐藏期间的等待。" = "State updates in the background or when restoring the window, measured separately without the time spent hidden.";
 
 "每项最多 100 个样本；首次连接与重连首帧不参与实时统计，旧样本在 5 分钟后过期。" = "Up to 100 samples per metric. Initial and reconnect baselines are excluded from live timing. Samples expire after 5 minutes.";
+
+"正在补全本机用量" = "Catching up on local usage";
+
+"正在自动连接会话" = "Connecting session automatically";
+"自动连接失败，正在重试" = "Automatic connection failed; retrying";
+"自动连接暂不可用，继续观察" = "Automatic connection unavailable; observing";
+"已自动连接；原生审批仍需在 Codex 处理" = "Automatically connected; native approvals remain in Codex";
+"已自动连接；当前版本审批需原界面" = "Automatically connected; approvals require the provider app on this version";
+
+"原窗口正在使用，等待自动接入" = "In use by the original window; waiting to connect automatically";

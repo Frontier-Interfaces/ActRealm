@@ -843,21 +843,6 @@ public final class RuntimeClient: ObservableObject {
         try await refreshSnapshotThrowing()
     }
 
-    public func manageSession(_ sessionId: String) async -> String? {
-        do {
-            _ = try await sendJSON(
-                "api/v1/sessions/\(sessionId)/manage",
-                method: "POST",
-                body: ["action": "attach"],
-                as: JSONValue.self
-            )
-            try await refreshSnapshotThrowing()
-            return nil
-        } catch {
-            return error.localizedDescription
-        }
-    }
-
     // MARK: - Setup (Provider Hooks)
 
     public func fetchSetup() async -> SetupInfo? {

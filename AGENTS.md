@@ -15,7 +15,7 @@ Product invariants:
   does not own the provider session and must never imply interrupt or steer
   support. Claude `AskUserQuestion` and `Elicitation` may use their official
   blocking Hook reply channels, but answers remain memory-only.
-- Codex direct question answers require an explicitly attached, version-gated
+- Codex direct question answers require a successfully attached, version-gated
   app-server Connector. Hook-only Codex sessions remain observe/approval-only
   and must never be shown as managed or directly answerable.
 - Provider-native approval is not the same as a request-keyed ActRealm reply

@@ -345,6 +345,7 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
     public let controlCapability: String?
     public let recoveryState: String?
     public let canManage: Bool?
+    public let managedConnectionState: String?
     public let connectorThreadStatus: String?
     public let facts: RuntimeSessionFacts?
     public let lastEventAt: UInt64
@@ -401,6 +402,7 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
         controlCapability: String? = nil,
         recoveryState: String? = nil,
         canManage: Bool? = nil,
+        managedConnectionState: String? = nil,
         connectorThreadStatus: String? = nil,
         facts: RuntimeSessionFacts? = nil,
         lastEventAt: UInt64
@@ -453,6 +455,7 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
         self.controlCapability = controlCapability
         self.recoveryState = recoveryState
         self.canManage = canManage
+        self.managedConnectionState = managedConnectionState
         self.connectorThreadStatus = connectorThreadStatus
         self.facts = facts
         self.lastEventAt = lastEventAt
@@ -468,7 +471,7 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
         case costKind, pricingSource, usageSource, usageQuality, usageCapturedAt
         case permissionMode, currentTool, currentToolCategory, currentTarget
         case activeSubagents, subagents, providerTurnId, environment
-        case jumpCapability, jumpLabel, jumpMessage, controlCapability, recoveryState, canManage
+        case jumpCapability, jumpLabel, jumpMessage, controlCapability, recoveryState, canManage, managedConnectionState
         case connectorThreadStatus, facts, lastEventAt
     }
 
@@ -528,6 +531,7 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
         controlCapability = try values.decodeIfPresent(String.self, forKey: .controlCapability)
         recoveryState = try values.decodeIfPresent(String.self, forKey: .recoveryState)
         canManage = try values.decodeIfPresent(Bool.self, forKey: .canManage)
+        managedConnectionState = try values.decodeIfPresent(String.self, forKey: .managedConnectionState)
         connectorThreadStatus = try values.decodeIfPresent(String.self, forKey: .connectorThreadStatus)
         facts = try? values.decode(RuntimeSessionFacts.self, forKey: .facts)
         lastEventAt = try values.decode(UInt64.self, forKey: .lastEventAt)

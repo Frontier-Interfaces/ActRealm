@@ -1,12 +1,49 @@
 # ActRealm current status
 
-Last reviewed: 2026-09-18
+Last reviewed: 2026-09-20
 
 Current candidate review: [PR #10](https://github.com/Frontier-Interfaces/ActRealm/pull/10),
-targeting `agent/v1-full`. This update includes Kimi/Grok integrations, native
-interaction fixes, corrected performance metrics and provider-backup compatibility.
+targeting `agent/v1-full`. This update includes Kimi/Grok integrations, automatic
+Codex connection attempts, current Token usage recovery, native interaction
+fixes, corrected performance metrics and provider-backup compatibility.
 Historical entries below retain their validation-time installation and submission
 status; they do not describe the current Git worktree.
+
+## 2026-09-20 Automatic session connections — build 133
+
+The installed candidate removes the per-task Codex managed-connection choice.
+A background worker attempts to attach observed current sessions, discovers new
+sessions, restores
+connections after Runtime restart, and backs off failed resumes. There is no
+32-session opt-in limit for automatic discovery. Native task details expose
+actual pending, connecting, retrying, owned-elsewhere, unavailable and connected
+states. The official shared control socket is preferred when available. Current
+Desktop sessions can reject independent attachment with an active-writer lock;
+those remain observed and wait for automatic access rather than being marked
+connected.
+Attachment does not start a model turn or take over requests owned by another
+Codex window. Existing live-waiter and protocol-version checks remain enforced.
+444 Rust tests (3 ignored), 221 Swift tests and installed signature/hash/UI checks
+pass. This candidate is included in PR #10. See
+[automatic connection verification](reports/AUTO_MANAGED_2026-09-20.md).
+
+## 2026-09-20 Current Token usage recovery — build 131
+
+Build 131 restores current Codex task usage and today's totals while historical
+logs are backfilled. Discovery resumes across bounded slices, first-line source
+identities are read ahead of large transcripts, and complete sessions publish
+without waiting for unrelated history. Incomplete scans retain existing values
+and show that local history is still being filled in.
+
+Installed native UI and authenticated snapshots both show current usage again.
+The prior task's 93,835,323 tokens match its official local input/output counters;
+Runtime restart preserves the value and current-task usage continues increasing.
+438 Rust tests (3 ignored) and 221 Swift tests pass, along with Clippy, release,
+localization and formatting checks. The app and shared helper pass strict
+signatures and match hashes. Display build 86 is unchanged. This recovery is
+included in PR #10; build 133 retains it alongside automatic connections.
+See [recovery verification](reports/TOKEN_USAGE_RECOVERY_2026-09-20.md) for the
+remaining historical backfill and test evidence.
 
 ## 2026-09-18 Native p95 sampling correction — build 129
 
@@ -330,7 +367,7 @@ whole-workspace counts and performance/security checks will be recorded in
   pass-through.
 - Claude `AskUserQuestion` and `Elicitation` can be answered only while their
   official blocking Hook waiter is alive. Answers remain memory-only.
-- Codex direct question/approval actions require an explicitly attached,
+- Codex direct question/approval actions require a successfully attached,
   version-gated app-server connection and a matching live request.
 - Provider-native `request_permissions` / `waitingOnApproval` is observation
   only. ActRealm opens the Provider interface; it does not invent allow/deny
