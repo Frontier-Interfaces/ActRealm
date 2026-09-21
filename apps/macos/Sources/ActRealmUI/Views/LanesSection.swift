@@ -1209,14 +1209,8 @@ private struct TaskRow: View {
         else { return nil }
         return taskTitle
     }
-    private var workspace: String {
-        if let environment = task.session.environment, !environment.isEmpty { return environment }
-        switch provider {
-        case .claude: return "Claude Code CLI"
-        case .codex: return "Codex CLI"
-        case .gemini: return "Gemini CLI"
-        case .custom: return "Provider 连接器"
-        }
+    private var clientSourceText: String {
+        localized(task.session.clientSourceLabelKey, locale: locale)
     }
     private var contextText: String {
         if let used = task.contextUsedTokens, let window = task.contextWindowTokens {
@@ -1353,7 +1347,7 @@ private struct TaskRow: View {
     }
     private var detailItems: [(label: String, value: String, emphasized: Bool)] {
         var items: [(String, String, Bool)] = []
-        if fieldVisible("environment") { items.append(("工作区", workspace, false)) }
+        if fieldVisible("environment") { items.append(("客户端来源", clientSourceText, false)) }
         if fieldVisible("context") { items.append(("本轮上下文", contextText, contextIsTight)) }
         if fieldVisible("plan") { items.append(("计划", planText, false)) }
         if fieldVisible("sessionTokens") {
@@ -1415,7 +1409,7 @@ private struct TaskRow: View {
         from items: [(label: String, value: String, emphasized: Bool)]
     ) -> [(label: String, value: String, emphasized: Bool)] {
         let primaryLabels: Set<String> = [
-            "工作区",
+            "客户端来源",
             "本轮上下文",
             "当前动作",
             "当前文件 / 目标",

@@ -1695,7 +1695,7 @@ function openSessionDetail(session) {
     )) : undefined,
     fields.has("permissionMode") ? detailPair("权限模式", session.permissionMode) : undefined,
     fields.has("subagents") ? detailPair("运行中的子 Agent", agentDetail.subagentText(session, providerCapabilityStatus(session, "subagents"), currentLocale())) : undefined,
-    fields.has("environment") ? detailPair("运行环境", session.environment) : undefined,
+    fields.has("environment") ? detailPair("客户端来源", agentDetail.clientSource(session, currentLocale())) : undefined,
     fields.has("jump") ? detailPair(
       "跳转能力",
       runtimeMessageText(session.jumpMessage, session.jumpLabel),
@@ -1934,7 +1934,7 @@ function buildSessionRow(session) {
       const details = element("div", "task-expanded");
       const plan = Number(session.planTotal || 0) > 0 ? tr(`${session.planDone || 0}/${session.planTotal}（进行中）`) : tr("未提供");
       const pairs = [
-        fields.has("environment") ? ["工作区", session.environment || session.project || `${providerName(session.provider)} 客户端`] : undefined,
+        fields.has("environment") ? ["客户端来源", agentDetail.clientSource(session, currentLocale())] : undefined,
         fields.has("context") ? ["本轮上下文", contextUsageText(session)] : undefined,
         fields.has("plan") ? ["计划", plan] : undefined,
         fields.has("sessionTokens") ? ["会话累计 Token", session.tokenTotal == null ? "—" : compactCount(session.tokenTotal)] : undefined,

@@ -1,6 +1,6 @@
 # ActRealm current status
 
-Last reviewed: 2026-09-20
+Last reviewed: 2026-09-21
 
 Current candidate review: [PR #10](https://github.com/Frontier-Interfaces/ActRealm/pull/10),
 targeting `agent/v1-full`. This update includes Kimi/Grok integrations, automatic
@@ -8,6 +8,21 @@ Codex connection attempts, current Token usage recovery, native interaction
 fixes, corrected performance metrics and provider-backup compatibility.
 Historical entries below retain their validation-time installation and submission
 status; they do not describe the current Git worktree.
+
+## 2026-09-21 Client source coverage — build 135
+
+Client-source classification now combines bounded process ancestry, actual
+macOS host-bundle metadata and known environment hints. Internal connector
+notifications no longer adopt Runtime's host or overwrite observed client
+identity. Desktop/IDE/terminal/remote/ACP sources use one classifier; missing
+sources are explicitly unidentified in native and web details instead of
+being labelled as a provider CLI. Safe source-app jump fallback is expanded.
+Installed acceptance shows the current task as "Codex 桌面端" instead of
+"Codex CLI", with original execution and managed-connection status preserved.
+450 Rust tests (3 ignored), 223 Swift tests and 9 web tests pass, alongside
+Clippy, release, localization and installed signature/hash checks. This update
+is included in PR #10. See
+[client source coverage](reports/CLIENT_SOURCE_2026-09-21.md).
 
 ## 2026-09-20 Automatic session connections — build 133
 

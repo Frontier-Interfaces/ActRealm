@@ -18,7 +18,7 @@
     currentTarget: ["当前文件 / 目标", "仅使用 Provider 明确 path 字段的 basename"],
     permissionMode: ["权限模式", ""],
     subagents: ["运行中的子 Agent", ""],
-    environment: ["运行环境", ""],
+    environment: ["客户端来源", ""],
     recovery: ["恢复状态", ""],
     control: ["托管能力", ""],
     jump: ["打开应用", ""],
@@ -57,6 +57,11 @@
   function categoryLabel(category, locale = "zh") {
     const labels = categoryLabels[category];
     return labels?.[locale === "en" ? 1 : 0];
+  }
+
+  function clientSource(session, locale = "zh") {
+    const source = typeof session?.environment === "string" ? session.environment.trim() : "";
+    return source || (locale === "en" ? "Source unidentified" : "来源未识别");
   }
 
   function currentAction(session, locale = "zh") {
@@ -661,6 +666,7 @@
     displayFieldsZh,
     presets,
     categoryLabel,
+    clientSource,
     currentAction,
     currentTarget,
     titleSource,

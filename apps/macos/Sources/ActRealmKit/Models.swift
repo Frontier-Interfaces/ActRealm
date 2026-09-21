@@ -350,6 +350,11 @@ public struct SessionRecord: Codable, Identifiable, Equatable, Sendable {
     public let facts: RuntimeSessionFacts?
     public let lastEventAt: UInt64
 
+    public var clientSourceLabelKey: String {
+        let source = environment?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return source.isEmpty ? "来源未识别" : source
+    }
+
     public var totalTokens: UInt64? { tokenTotal }
 
     public init(

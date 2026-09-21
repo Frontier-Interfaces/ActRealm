@@ -528,7 +528,7 @@ impl Client {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .insert(request_id);
-                request.term = Some(provider_term(self.child.id()));
+                request.term = Some(provider_term(request.provider, self.child.id()));
                 eprintln!("Waiting for your response in ActRealm.");
                 std::thread::spawn(move || {
                     let response = BridgeClient::new(default_socket_path())
@@ -602,16 +602,17 @@ fn write_frame(writer: &Writer, frame: &Value) -> Result<()> {
     writer.flush()?;
     Ok(())
 }
-fn provider_term(pid: u32) -> TermContext {
-    let mut term = BridgeRequest::from_hook(Provider::Kimi, json!({}))
-        .term
-        .unwrap_or_default();
+fn provider_term(provider: Provider, pid: u32) -> TermContext {
+    let mut term = actrealm_core::capture_client_context(provider, pid);
     term.provider_pid = Some(pid);
-    term.surface = Some("terminal".to_owned());
+    if term.surface.is_none() {
+        term.surface = Some("connector".to_owned());
+        term.app = Some("ActRealm ACP".to_owned());
+    }
     term
 }
 fn publish(child: &Child, mut request: BridgeRequest) {
-    request.term = Some(provider_term(child.id()));
+    request.term = Some(provider_term(request.provider, child.id()));
     let _ = BridgeClient::new(default_socket_path()).send(&request, Duration::from_millis(200));
 }
 fn now() -> u64 {

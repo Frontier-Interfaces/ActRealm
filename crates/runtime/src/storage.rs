@@ -6278,13 +6278,22 @@ fn ingest_transaction(
                    provider_title_source = COALESCE(?11, provider_title_source),
                    token_total = COALESCE(?12, token_total),
                    context_window_tokens = COALESCE(?13, context_window_tokens),
-                   term_app = COALESCE(?14, term_app),
-                   term_session_id = COALESCE(?15, term_session_id),
-                   term_tty = COALESCE(?16, term_tty),
+                   term_app = CASE WHEN ?27 = 1 AND (?28 = 0 OR COALESCE(term_surface, 'connector') = 'connector')
+                     THEN ?14 ELSE term_app END,
+                   term_session_id = CASE WHEN ?27 = 1 AND ?28 = 0
+                     AND (term_app IS NOT ?14 OR term_bundle_id IS NOT ?18 OR term_surface IS NOT ?19)
+                     THEN ?15 ELSE COALESCE(?15, term_session_id) END,
+                   term_tty = CASE WHEN ?27 = 1 AND ?28 = 0
+                     AND (term_app IS NOT ?14 OR term_bundle_id IS NOT ?18 OR term_surface IS NOT ?19)
+                     THEN ?16 ELSE COALESCE(?16, term_tty) END,
                    term_title = COALESCE(?17, term_title),
-                   term_bundle_id = COALESCE(?18, term_bundle_id),
-                   term_surface = COALESCE(?19, term_surface),
-                   provider_pid = COALESCE(?20, provider_pid),
+                   term_bundle_id = CASE WHEN ?27 = 1 AND (?28 = 0 OR COALESCE(term_surface, 'connector') = 'connector')
+                     THEN ?18 ELSE term_bundle_id END,
+                   term_surface = CASE WHEN ?27 = 1 AND (?28 = 0 OR COALESCE(term_surface, 'connector') = 'connector')
+                     THEN ?19 ELSE term_surface END,
+                   provider_pid = CASE WHEN ?27 = 1 AND ?28 = 0
+                     AND (term_app IS NOT ?14 OR term_bundle_id IS NOT ?18 OR term_surface IS NOT ?19)
+                     THEN ?20 ELSE COALESCE(?20, provider_pid) END,
                    permission_mode = COALESCE(?21, permission_mode),
                    model = COALESCE(?26, model),
                    current_target = CASE
@@ -6342,6 +6351,10 @@ fn ingest_transaction(
                     review_workdir.as_deref(),
                     i64::from(parsed.kind == EventKind::PromptSubmitted),
                     parsed.model.as_deref(),
+                    i64::from(request.term.as_ref().is_some_and(|term| {
+                        term.app.is_some() || term.bundle_id.is_some() || term.surface.is_some()
+                    })),
+                    i64::from(request.term.as_ref().is_some_and(|term| term.surface.as_deref() == Some("connector"))),
                 ],
             )
             .map_err(storage_error)?;
@@ -9342,7 +9355,11 @@ fn read_snapshot(
                     term_bundle_id.as_deref(),
                     term_surface.as_deref(),
                 );
-                let environment = environment_label(term_surface.as_deref(), term_app.as_deref());
+                let environment = actrealm_core::client_environment(
+                    term_surface.as_deref(),
+                    term_app.as_deref(),
+                    term_bundle_id.as_deref(),
+                );
                 Ok(SessionRecord {
                     id: row.get(0)?,
                     provider,
@@ -10069,21 +10086,6 @@ fn session_query_params<'a>(
         .iter()
         .map(|session_id| session_id as &dyn ToSql)
         .chain(std::iter::once(limit as &dyn ToSql))
-}
-
-fn environment_label(surface: Option<&str>, app: Option<&str>) -> Option<String> {
-    match surface {
-        Some("codex_app") => Some("Codex app".to_owned()),
-        Some("claude_app") => Some("Claude app".to_owned()),
-        Some("terminal") => Some(
-            app.filter(|value| !value.trim().is_empty())
-                .unwrap_or("Terminal")
-                .chars()
-                .take(64)
-                .collect(),
-        ),
-        _ => None,
-    }
 }
 
 fn read_metrics_and_token_usage(
@@ -13281,9 +13283,13 @@ fn jump_descriptor(
     term_bundle_id: Option<&str>,
     term_surface: Option<&str>,
 ) -> (String, String) {
+    if term_surface == Some("remote") {
+        return ("unsupported".to_owned(), "Jump is not supported".to_owned());
+    }
     let app = term_app.unwrap_or_default().to_ascii_lowercase();
     let bundle = term_bundle_id.unwrap_or_default().to_ascii_lowercase();
-    let codex_app = term_surface == Some("codex_app") || bundle == "com.openai.codex";
+    let codex_app = term_surface == Some("codex_app")
+        || matches!(bundle.as_str(), "com.openai.codex" | "com.openai.chat");
     if provider == "codex" && codex_app && Uuid::parse_str(provider_session_id).is_ok() {
         return (
             "exact_conversation".to_owned(),
@@ -13295,7 +13301,8 @@ fn jump_descriptor(
     if (iterm && term_session_id.is_some()) || (terminal && term_tty.is_some()) {
         return ("terminal".to_owned(), "Open terminal".to_owned());
     }
-    let known_app = codex_app
+    let known_app = term_bundle_id.is_some_and(actrealm_core::valid_client_bundle_id)
+        || codex_app
         || term_surface == Some("claude_app")
         || bundle == "com.anthropic.claudefordesktop"
         || iterm
@@ -13357,6 +13364,74 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    #[test]
+    fn client_source_survives_internal_events_and_changes_as_one_identity() {
+        use actrealm_core::{BridgeRequest, Provider, TermContext};
+        let root = std::env::temp_dir().join(format!("actrealm-client-source-{}", Uuid::now_v7()));
+        let store = super::RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let event = |at| {
+            BridgeRequest::from_hook_at(
+                Provider::Codex,
+                json!({
+                    "hook_event_name":"PreToolUse", "session_id":"source-session", "turn_id":"source-turn",
+                    "tool_name":"Bash", "tool_use_id":format!("call-{at}")
+                }),
+                at,
+            )
+        };
+        let mut first = event(1000);
+        first.term = Some(TermContext {
+            app: Some("Codex app".to_owned()),
+            bundle_id: Some("com.openai.codex".to_owned()),
+            surface: Some("codex_app".to_owned()),
+            provider_pid: Some(100),
+            ..Default::default()
+        });
+        store.ingest(first).unwrap();
+        store.ingest(event(1001)).unwrap();
+        let mut connector = event(1002);
+        connector.term = Some(TermContext {
+            app: Some("ActRealm ACP".to_owned()),
+            surface: Some("connector".to_owned()),
+            ..Default::default()
+        });
+        store.ingest(connector).unwrap();
+        let session = store.snapshot().unwrap().sessions.remove(0);
+        assert_eq!(session.environment.as_deref(), Some("Codex app"));
+        assert_eq!(session.provider_pid, Some(100));
+        let mut terminal = event(1003);
+        terminal.term = Some(TermContext {
+            app: Some("Ghostty".to_owned()),
+            bundle_id: Some("com.example.ghostty".to_owned()),
+            surface: Some("terminal".to_owned()),
+            provider_pid: Some(200),
+            session_id: Some("terminal-session".to_owned()),
+            tty: Some("/dev/ttys001".to_owned()),
+            ..Default::default()
+        });
+        store.ingest(terminal).unwrap();
+        assert_eq!(
+            store.snapshot().unwrap().sessions[0].environment.as_deref(),
+            Some("Ghostty")
+        );
+        let mut remote = event(1004);
+        remote.term = Some(TermContext {
+            app: Some("SSH".to_owned()),
+            surface: Some("remote".to_owned()),
+            ..Default::default()
+        });
+        store.ingest(remote).unwrap();
+        let session = store.snapshot().unwrap().sessions.remove(0);
+        assert_eq!(session.environment.as_deref(), Some("SSH"));
+        assert_eq!(session.term_bundle_id, None);
+        assert_eq!(session.term_session_id, None);
+        assert_eq!(session.term_tty, None);
+        assert_eq!(session.provider_pid, None);
+        assert_eq!(session.jump_capability, "unsupported");
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn local_only_upgrade_removes_collaboration_metadata_and_keeps_tasks_and_usage() {

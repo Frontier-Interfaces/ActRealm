@@ -1371,3 +1371,13 @@
 "已自动连接；当前版本审批需原界面" = "已自动连接；当前版本审批需原界面";
 
 "原窗口正在使用，等待自动接入" = "原窗口正在使用，等待自动接入";
+
+"客户端来源" = "客户端来源";
+"来源未识别" = "来源未识别";
+"Codex app" = "Codex 桌面端";
+"ChatGPT app" = "ChatGPT 桌面端";
+"Claude app" = "Claude 桌面端";
+"Kimi Code app" = "Kimi Code 桌面端";
+"Grok app" = "Grok 桌面端";
+"Agent connector" = "Agent 连接器";
+"Remote session" = "远程会话";

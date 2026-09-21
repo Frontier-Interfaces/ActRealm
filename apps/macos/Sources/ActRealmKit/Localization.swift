@@ -49,7 +49,7 @@ public enum AppLocalization {
         "currentTarget": ("当前文件 / 目标", "仅使用 Provider 明确 path 字段的 basename"),
         "permissionMode": ("权限模式", nil),
         "subagents": ("运行中的子 Agent", nil),
-        "environment": ("运行环境", nil),
+        "environment": ("客户端来源", nil),
         "recovery": ("恢复状态", nil),
         "control": ("托管能力", nil),
         "jump": ("打开应用", nil),

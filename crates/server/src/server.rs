@@ -7136,7 +7136,7 @@ enum JumpTarget {
     CodexThread(String),
     ITermSession,
     TerminalTty,
-    AppBundle(&'static str),
+    AppBundle(String),
 }
 
 async fn jump_session(
@@ -7234,6 +7234,9 @@ fn jump_target(session: &SessionRecord) -> Option<JumpTarget> {
 
 fn jump_targets(session: &SessionRecord) -> Vec<JumpTarget> {
     let mut targets = Vec::new();
+    if session.term_surface.as_deref() == Some("remote") {
+        return targets;
+    }
     let app = session
         .term_app
         .as_deref()
@@ -7247,8 +7250,8 @@ fn jump_targets(session: &SessionRecord) -> Vec<JumpTarget> {
     let codex_thread = (session.provider == "codex"
         && Uuid::parse_str(&session.provider_session_id).is_ok())
     .then(|| JumpTarget::CodexThread(session.provider_session_id.clone()));
-    let codex_app =
-        session.term_surface.as_deref() == Some("codex_app") || bundle == "com.openai.codex";
+    let codex_app = session.term_surface.as_deref() == Some("codex_app")
+        || matches!(bundle.as_str(), "com.openai.codex" | "com.openai.chat");
     let iterm = app.contains("iterm") || bundle == "com.googlecode.iterm2";
     let terminal = app == "apple_terminal" || bundle == "com.apple.terminal";
     let vscode = app == "vscode" || bundle == "com.microsoft.vscode";
@@ -7258,27 +7261,45 @@ fn jump_targets(session: &SessionRecord) -> Vec<JumpTarget> {
         if let Some(target) = codex_thread.clone() {
             targets.push(target);
         }
-        targets.push(JumpTarget::AppBundle("com.openai.codex"));
+        targets.push(JumpTarget::AppBundle(
+            session
+                .term_bundle_id
+                .as_deref()
+                .filter(|id| actrealm_core::valid_client_bundle_id(id))
+                .unwrap_or("com.openai.codex")
+                .to_owned(),
+        ));
     } else if iterm {
         if session.term_session_id.as_deref().is_some_and(safe_locator) {
             targets.push(JumpTarget::ITermSession);
         }
-        targets.push(JumpTarget::AppBundle("com.googlecode.iterm2"));
+        targets.push(JumpTarget::AppBundle("com.googlecode.iterm2".to_owned()));
     } else if terminal {
         if session.term_tty.as_deref().is_some_and(safe_locator) {
             targets.push(JumpTarget::TerminalTty);
         }
-        targets.push(JumpTarget::AppBundle("com.apple.Terminal"));
+        targets.push(JumpTarget::AppBundle("com.apple.Terminal".to_owned()));
     } else if vscode {
-        targets.push(JumpTarget::AppBundle("com.microsoft.VSCode"));
+        targets.push(JumpTarget::AppBundle("com.microsoft.VSCode".to_owned()));
     } else if warp {
-        targets.push(JumpTarget::AppBundle("dev.warp.Warp-Stable"));
+        targets.push(JumpTarget::AppBundle("dev.warp.Warp-Stable".to_owned()));
     } else if session.term_surface.as_deref() == Some("claude_app")
         || bundle == "com.anthropic.claudefordesktop"
     {
-        targets.push(JumpTarget::AppBundle("com.anthropic.claudefordesktop"));
+        targets.push(JumpTarget::AppBundle(
+            "com.anthropic.claudefordesktop".to_owned(),
+        ));
     }
 
+    if targets.is_empty() {
+        if let Some(bundle) = session
+            .term_bundle_id
+            .as_deref()
+            .filter(|b| actrealm_core::valid_client_bundle_id(b))
+        {
+            targets.push(JumpTarget::AppBundle(bundle.to_owned()));
+        }
+    }
     if let Some(target) = codex_thread {
         if !targets.contains(&target) {
             targets.push(target);
@@ -7300,10 +7321,12 @@ fn jump_target_label(target: &JumpTarget) -> &'static str {
         JumpTarget::CodexThread(_) => "Open exact conversation",
         JumpTarget::ITermSession => "Return to iTerm",
         JumpTarget::TerminalTty => "Return to Terminal",
-        JumpTarget::AppBundle("com.microsoft.VSCode") => "Return to VS Code",
-        JumpTarget::AppBundle("com.googlecode.iterm2") => "Open iTerm",
-        JumpTarget::AppBundle("com.apple.Terminal") => "Open Terminal",
-        JumpTarget::AppBundle("com.anthropic.claudefordesktop") => "Open Claude",
+        JumpTarget::AppBundle(bundle) if bundle == "com.microsoft.VSCode" => "Return to VS Code",
+        JumpTarget::AppBundle(bundle) if bundle == "com.googlecode.iterm2" => "Open iTerm",
+        JumpTarget::AppBundle(bundle) if bundle == "com.apple.Terminal" => "Open Terminal",
+        JumpTarget::AppBundle(bundle) if bundle == "com.anthropic.claudefordesktop" => {
+            "Open Claude"
+        }
         JumpTarget::AppBundle(_) => "Open task source",
     }
 }
@@ -7342,7 +7365,7 @@ fn run_jump_target(target: &JumpTarget, session: &SessionRecord) -> io::Result<b
             )
             .status()?,
         JumpTarget::AppBundle(bundle) => ProcessCommand::new("/usr/bin/open")
-            .args(["-b", *bundle])
+            .args(["-b", bundle.as_str()])
             .status()?,
     };
     Ok(status.success())
@@ -9024,10 +9047,10 @@ fn recovery_from_persisted_process(
     external_process_recovery_state(provider, pid, bundle_id, surface).to_owned()
 }
 
-/// Returns `None` when the Hook only identifies a terminal surface. A terminal
-/// can legitimately host many shells and provider launchers, so its bundle ID
-/// is not executable identity evidence. Desktop app surfaces are direct
-/// evidence and must match the live PID path before ActRealm claims observing.
+/// Client identity and provider process identity are separate. A desktop/IDE
+/// can launch another provider or an interpreter-backed agent. Such a host
+/// mismatch is not evidence that the provider died. Keep rejecting a clearly
+/// unrelated replacement process for a native desktop provider.
 fn direct_app_identity_matches(
     provider: &str,
     bundle_id: Option<&str>,
@@ -9035,6 +9058,31 @@ fn direct_app_identity_matches(
     executable_path: Option<&str>,
 ) -> Option<bool> {
     let provider = provider.to_ascii_lowercase();
+    let executable = executable_path
+        .and_then(|p| FilePath::new(p).file_name())
+        .and_then(|p| p.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let native_provider = match provider.as_str() {
+        "codex" => executable == "codex",
+        "claude" => matches!(executable.as_str(), "claude" | "claude-code"),
+        "kimi" => matches!(executable.as_str(), "kimi" | "kimi-code"),
+        "grok" => matches!(executable.as_str(), "grok" | "grok-build"),
+        "gemini" => executable == "gemini",
+        _ => false,
+    };
+    if native_provider {
+        return Some(true);
+    }
+    if matches!(
+        executable.as_str(),
+        "node" | "nodejs" | "bun" | "deno" | "python" | "python3"
+    ) || executable
+        .strip_prefix("python3.")
+        .is_some_and(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()))
+    {
+        return None;
+    }
     let bundle = bundle_id.unwrap_or_default().to_ascii_lowercase();
     let surface = surface.unwrap_or_default().to_ascii_lowercase();
     let (expected_provider, expected): (&str, &[&str]) = if surface == "codex_app"
@@ -9047,7 +9095,7 @@ fn direct_app_identity_matches(
         return None;
     };
     if provider != expected_provider {
-        return Some(false);
+        return None;
     }
     let Some(path) = executable_path else {
         return Some(false);
@@ -9708,6 +9756,16 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    fn live_test_request(mut request: BridgeRequest) -> BridgeRequest {
+        // This fixture models a live original provider; do not inherit the
+        // test runner's terminal/desktop environment as production evidence.
+        request.term = Some(actrealm_core::TermContext {
+            provider_pid: Some(std::process::id()),
+            ..Default::default()
+        });
+        request
+    }
+
     #[test]
     fn companion_pairing_is_explicit_scoped_persistent_and_revocable() {
         let root = std::env::temp_dir().join(format!(
@@ -9777,7 +9835,7 @@ mod tests {
             let companion_id = enrollment["companionId"].as_str().unwrap();
 
             store
-                .ingest(BridgeRequest::from_hook_at(
+                .ingest(live_test_request(BridgeRequest::from_hook_at(
                     Provider::Claude,
                     json!({
                         "hook_event_name": "UserPromptSubmit",
@@ -9787,7 +9845,7 @@ mod tests {
                         "session_title": "Companion projection audit"
                     }),
                     1_000,
-                ))
+                )))
                 .unwrap();
             store
                 .ingest(BridgeRequest::from_hook_at(
@@ -12071,7 +12129,7 @@ done
         assert_eq!(vscode_codex.jump_label, "Open application");
         assert!(matches!(
             jump_target(vscode_codex),
-            Some(JumpTarget::AppBundle("com.microsoft.VSCode"))
+            Some(JumpTarget::AppBundle(ref bundle)) if bundle == "com.microsoft.VSCode"
         ));
         let terminal = snapshot
             .sessions
@@ -12088,7 +12146,9 @@ done
         assert_eq!(app.jump_label, "Open application");
         assert_eq!(
             jump_target(app),
-            Some(JumpTarget::AppBundle("com.anthropic.claudefordesktop"))
+            Some(JumpTarget::AppBundle(
+                "com.anthropic.claudefordesktop".to_owned()
+            ))
         );
         drop(store);
         fs::remove_dir_all(root).unwrap();
@@ -13403,7 +13463,7 @@ done
                 }),
                 now_millis(),
             );
-            let term = request.term.as_mut().unwrap();
+            let term = request.term.get_or_insert_default();
             term.provider_pid = Some(pid);
             term.bundle_id = None;
             term.surface = None;
@@ -13498,6 +13558,46 @@ done
     }
 
     #[test]
+    fn client_host_is_independent_of_nested_and_interpreter_provider_processes() {
+        assert_eq!(
+            direct_app_identity_matches(
+                "grok",
+                Some("com.openai.codex"),
+                Some("codex_app"),
+                Some("/usr/local/bin/grok")
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            direct_app_identity_matches(
+                "kimi",
+                Some("com.kimi.code.desktop"),
+                Some("kimi_app"),
+                Some("/usr/local/bin/python3.13")
+            ),
+            None
+        );
+        assert_eq!(
+            direct_app_identity_matches(
+                "grok",
+                Some("com.openai.codex"),
+                Some("codex_app"),
+                Some("/usr/local/bin/node")
+            ),
+            None
+        );
+        assert_eq!(
+            direct_app_identity_matches(
+                "codex",
+                Some("com.openai.codex"),
+                Some("codex_app"),
+                Some("/Applications/Unrelated.app/Contents/MacOS/Unrelated")
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn managed_waiting_recovery_uses_persisted_process_liveness() {
         // The test runner is a live process, not a verified desktop Provider.
         // Exercise liveness through a terminal surface; app identity is tested
@@ -13546,15 +13646,17 @@ done
         ));
         let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
         store
-            .ingest(actrealm_core::BridgeRequest::from_hook_at(
-                actrealm_core::Provider::Codex,
-                json!({
-                    "hook_event_name":"PreToolUse",
-                    "session_id":"managed-live-thread",
-                    "tool_name":"Bash",
-                    "tool_input":{}
-                }),
-                now_millis(),
+            .ingest(live_test_request(
+                actrealm_core::BridgeRequest::from_hook_at(
+                    actrealm_core::Provider::Codex,
+                    json!({
+                        "hook_event_name":"PreToolUse",
+                        "session_id":"managed-live-thread",
+                        "tool_name":"Bash",
+                        "tool_input":{}
+                    }),
+                    now_millis(),
+                ),
             ))
             .unwrap();
         assert_eq!(
@@ -13597,6 +13699,48 @@ done
         );
 
         drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn observed_client_bundles_support_editor_desktop_and_terminal_jump_fallbacks() {
+        let root = std::env::temp_dir().join(format!("actrealm-source-jump-{}", Uuid::now_v7()));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        for (index, (app, bundle, surface)) in [
+            ("Cursor", "com.example.cursor", "editor"),
+            ("Kimi Code", "com.kimi.code.desktop", "kimi_app"),
+            ("Ghostty", "com.example.ghostty", "terminal"),
+            ("Custom Client", "com.example.custom-client", "desktop_app"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut request = BridgeRequest::from_hook_at(
+                Provider::Codex,
+                json!({
+                    "hook_event_name":"UserPromptSubmit", "session_id":format!("source-{index}"), "prompt":"fixture"
+                }),
+                now_millis(),
+            );
+            request.term = Some(actrealm_core::TermContext {
+                app: Some((*app).to_owned()),
+                bundle_id: Some((*bundle).to_owned()),
+                surface: Some((*surface).to_owned()),
+                ..Default::default()
+            });
+            store.ingest(request).unwrap();
+        }
+        for session in store.snapshot().unwrap().sessions {
+            assert!(session.environment.is_some());
+            assert_eq!(session.jump_capability, "app_only");
+            assert_eq!(
+                jump_target(&session),
+                Some(JumpTarget::AppBundle(
+                    session.term_bundle_id.clone().unwrap()
+                ))
+            );
+        }
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }

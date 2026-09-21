@@ -2012,3 +2012,13 @@
 "已自动连接；当前版本审批需原界面" = "Automatically connected; approvals require the provider app on this version";
 
 "原窗口正在使用，等待自动接入" = "In use by the original window; waiting to connect automatically";
+
+"客户端来源" = "Client source";
+"来源未识别" = "Source unidentified";
+"Codex app" = "Codex desktop";
+"ChatGPT app" = "ChatGPT desktop";
+"Claude app" = "Claude desktop";
+"Kimi Code app" = "Kimi Code desktop";
+"Grok app" = "Grok desktop";
+"Agent connector" = "Agent connector";
+"Remote session" = "Remote session";

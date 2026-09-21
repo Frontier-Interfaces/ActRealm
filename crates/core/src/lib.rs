@@ -1,3 +1,6 @@
+mod client_source;
+pub use client_source::{capture_client_context, client_environment, valid_client_bundle_id};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -666,7 +669,9 @@ pub struct TermContext {
 
 impl BridgeRequest {
     pub fn from_hook(provider: Provider, raw: Value) -> Self {
-        Self::from_hook_at(provider, raw, now_millis())
+        let mut request = Self::from_hook_at(provider, raw, now_millis());
+        request.term = Some(capture_client_context(provider, unsafe { libc::getppid() } as u32));
+        request
     }
 
     pub fn from_hook_at(provider: Provider, raw: Value, received_at: u64) -> Self {
@@ -721,7 +726,10 @@ impl BridgeRequest {
             provider_handles_approval,
             blocking_kind,
             remote_action_capability,
-            term: terminal_context(),
+            // Provider/connector events do not originate in the Runtime's
+            // own GUI or terminal. Only the external Hook entry point captures
+            // ambient client identity; callers may set explicit provenance.
+            term: None,
             raw,
         }
     }
@@ -1178,51 +1186,6 @@ fn remote_action_capability(
         Provider::Gemini | Provider::Kimi | Provider::Grok => false,
     };
     reviewed.then_some(RemoteActionCapability::Approval)
-}
-
-fn terminal_context() -> Option<TermContext> {
-    let app = std::env::var("TERM_PROGRAM")
-        .ok()
-        .or_else(|| std::env::var("LC_TERMINAL").ok());
-    let bundle_id = std::env::var("__CFBundleIdentifier").ok();
-    let surface = std::env::var("ACTREALM_SURFACE")
-        .ok()
-        .filter(|value| matches!(value.as_str(), "terminal" | "codex_app" | "claude_app"))
-        .or_else(|| infer_surface(app.as_deref(), bundle_id.as_deref()));
-    let context = TermContext {
-        app,
-        session_id: std::env::var("TERM_SESSION_ID").ok(),
-        tty: std::env::var("TTY").ok(),
-        title: std::env::var("ACTREALM_TERM_TITLE").ok(),
-        bundle_id,
-        surface,
-        provider_pid: u32::try_from(unsafe { libc::getppid() }).ok(),
-    };
-    (context.app.is_some()
-        || context.session_id.is_some()
-        || context.tty.is_some()
-        || context.title.is_some()
-        || context.bundle_id.is_some()
-        || context.surface.is_some()
-        || context.provider_pid.is_some())
-    .then_some(context)
-}
-
-fn infer_surface(app: Option<&str>, bundle_id: Option<&str>) -> Option<String> {
-    let app = app.unwrap_or_default().to_ascii_lowercase();
-    let bundle = bundle_id.unwrap_or_default().to_ascii_lowercase();
-    if bundle == "com.openai.codex" || app == "codex" {
-        return Some("codex_app".to_owned());
-    }
-    if bundle == "com.anthropic.claudefordesktop" || app == "claude" {
-        return Some("claude_app".to_owned());
-    }
-    (!app.is_empty()
-        || bundle == "com.apple.terminal"
-        || bundle == "com.googlecode.iterm2"
-        || bundle == "com.microsoft.vscode"
-        || bundle.starts_with("dev.warp."))
-    .then(|| "terminal".to_owned())
 }
 
 pub fn permission_directive(provider: Provider, decision: Decision) -> Option<Value> {

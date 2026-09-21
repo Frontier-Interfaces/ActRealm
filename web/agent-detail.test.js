@@ -62,3 +62,15 @@ test("fact metadata explains source, staleness, absence, and control without raw
   }, "en"), "No source · Stale · Unverified · Provider did not supply it");
   assert.equal(detail.factSummary({schemaVersion: 9}, "en"), "No trusted fact metadata");
 });
+
+
+test("client source never guesses CLI or uses a project as the client", () => {
+  for (const provider of ["codex", "claude", "kimi", "grok", "gemini", "custom"]) {
+    for (const environment of [undefined, "", "   ", null]) {
+      assert.equal(detail.clientSource({ provider, project: "repo", environment }), "来源未识别");
+      assert.equal(detail.clientSource({ provider, project: "repo", environment }, "en"), "Source unidentified");
+    }
+  }
+  assert.equal(detail.clientSource({provider:"codex", environment:"Cursor", controlCapability:"external_hook"}), "Cursor");
+  assert.equal(detail.clientSource({provider:"kimi", environment:"ActRealm ACP"}), "ActRealm ACP");
+});
