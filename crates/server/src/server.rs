@@ -156,6 +156,8 @@ const AGENT_DETAIL_JS: &str = include_str!("../../../web/agent-detail.js");
 const APP_JS: &str = include_str!("../../../web/app.js");
 const CLAUDE_ICON: &[u8] = include_bytes!("../../../web/assets/claude.png");
 const CODEX_ICON: &[u8] = include_bytes!("../../../web/assets/codex.png");
+const GROK_ICON: &[u8] = include_bytes!("../../../web/assets/grok.png");
+const KIMI_ICON: &[u8] = include_bytes!("../../../web/assets/kimi.png");
 const FACT_METADATA_SCHEMA_VERSION: u16 = 1;
 const FACT_LIVE_MAX_AGE_MS: u64 = 30_000;
 const FACT_DELAYED_MAX_AGE_MS: u64 = 2 * 60_000;
@@ -2681,6 +2683,8 @@ fn router(state: AppState) -> Router {
         .route("/app.js", get(script))
         .route("/assets/claude.png", get(claude_icon))
         .route("/assets/codex.png", get(codex_icon))
+        .route("/assets/grok.png", get(grok_icon))
+        .route("/assets/kimi.png", get(kimi_icon))
         .route("/api/v1/health", get(health))
         .route("/api/v1/native/session", get(native_session_health))
         .route("/api/v1/runtime/status", get(runtime_status))
@@ -2841,6 +2845,14 @@ async fn claude_icon() -> Response {
 
 async fn codex_icon() -> Response {
     static_binary_response("image/png", CODEX_ICON)
+}
+
+async fn grok_icon() -> Response {
+    static_binary_response("image/png", GROK_ICON)
+}
+
+async fn kimi_icon() -> Response {
+    static_binary_response("image/png", KIMI_ICON)
 }
 
 async fn refresh_quota(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -8383,6 +8395,7 @@ fn companion_snapshot_value(
             "jumpLabel",
             "jumpMessage",
             "controlCapability",
+            "managedConnectionState",
             "recoveryState",
             "connectorThreadStatus",
             "facts",
@@ -13292,6 +13305,26 @@ done
             },
         )
         .unwrap();
+        // Connection observation is visible even without response authority.
+        // It must not manufacture a live approval channel or grant any scope.
+        let companion_codex = read_only_companion["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["provider"] == "codex")
+            .unwrap();
+        let owner_codex = active["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == companion_codex["id"])
+            .unwrap();
+        assert!(owner_codex["managedConnectionState"].is_string());
+        assert_eq!(
+            companion_codex["managedConnectionState"],
+            owner_codex["managedConnectionState"]
+        );
+        assert_eq!(read_only_companion["capabilities"]["canRespond"], false);
         assert!(read_only_companion["attention"]
             .as_array()
             .unwrap()

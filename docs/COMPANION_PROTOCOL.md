@@ -271,3 +271,12 @@ Token/context availability still depends on local Provider usage events and
 readable local sources. A Hook or a healthy Runtime alone is not proof that
 `token_count` and context-window data have been collected. See the current
 source-build and first-run guide instead of the historical public-repo setup.
+
+### Connection observation
+
+Session `managedConnectionState` carries the Runtime automatic-connection status
+(`pending`, `connecting`, `connected`, `owned_elsewhere`, `retrying`, or
+`unavailable`) to authenticated local clients. It is optional for older Runtime
+versions and non-Codex providers. This observation never grants response scope
+or substitutes for a live request channel. `tokenUsage` remains the Runtime
+aggregation; partial history must not be presented as complete account usage.

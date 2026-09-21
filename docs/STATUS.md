@@ -9,6 +9,18 @@ fixes, corrected performance metrics and provider-backup compatibility.
 Historical entries below retain their validation-time installation and submission
 status; they do not describe the current Git worktree.
 
+## 2026-09-21 Display connection observation and official icons — build 136
+
+Authenticated Companion snapshots carry the actual automatic-connection state,
+including original-writer conflicts, without granting response authority.
+Grok/Kimi native and web icons now use original official website assets.
+Installed build 136 and the shared helper pass strict signatures and matching
+hash checks. The current task remains running across Runtime restart, with
+its source and usage preserved. 450 Rust tests (3 ignored), 223 Swift tests,
+14 web tests, Clippy, release, format, localization and CI pin checks pass.
+The candidate retains its pre-submission base commit and source-modified marker.
+See [Display parity](reports/DISPLAY_PARITY_2026-09-21.md).
+
 ## 2026-09-21 Client source coverage — build 135
 
 Client-source classification now combines bounded process ancestry, actual

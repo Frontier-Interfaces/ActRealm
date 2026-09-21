@@ -387,6 +387,8 @@ function providerIcon(provider) {
   const source = {
     claude: "/assets/claude.png",
     codex: "/assets/codex.png",
+    kimi: "/assets/kimi.png",
+    grok: "/assets/grok.png",
   }[normalized];
   if (!source) return element("span", "provider-glyph provider-fallback", "?");
   const icon = element("img", `provider-glyph provider-${normalized}`);

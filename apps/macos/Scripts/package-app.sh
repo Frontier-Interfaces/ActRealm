@@ -130,6 +130,9 @@ for localization in "$PACKAGE_DIR/Sources/ActRealmKit/Resources/"*.lproj; do
 done
 cp "$REPO_ROOT/web/assets/claude.png" "$APP/Contents/Resources/ProviderIcons/claude.png"
 cp "$REPO_ROOT/web/assets/codex.png" "$APP/Contents/Resources/ProviderIcons/codex.png"
+cp "$REPO_ROOT/web/assets/grok.png" "$APP/Contents/Resources/ProviderIcons/grok.png"
+cp "$REPO_ROOT/web/assets/kimi.png" "$APP/Contents/Resources/ProviderIcons/kimi.png"
+cp "$REPO_ROOT/web/assets/PROVIDER_ICON_SOURCES.md" "$APP/Contents/Resources/ProviderIcons/SOURCES.md"
 BUILD_NUMBER="${ACTREALM_BUILD_NUMBER:-$(git -C "$REPO_ROOT" rev-list --count HEAD)}"
 BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 plutil -replace CFBundleVersion -string "$BUILD_NUMBER" "$APP/Contents/Info.plist"

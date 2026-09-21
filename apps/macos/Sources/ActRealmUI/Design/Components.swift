@@ -99,10 +99,10 @@ struct ProviderAvatar: View {
             bundleIdentifiers = []
             applicationPaths = []
             assetName = ""
-        case .custom:
+        case let .custom(provider):
             bundleIdentifiers = []
             applicationPaths = []
-            assetName = ""
+            assetName = ["grok", "kimi"].contains(provider) ? "\(provider).png" : ""
         }
 
         for identifier in bundleIdentifiers {
