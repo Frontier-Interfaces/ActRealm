@@ -291,7 +291,7 @@ struct MenuBarLanePresentation: Equatable {
             case .waiting:
                 subtitle = "\(provider.displayName) · \(AppLocalization.localized("等待处理", language: language))"
             case .running:
-                subtitle = "\(provider.displayName) · \(AppLocalization.localized(featured.activity ?? "运行中", language: language))"
+                subtitle = "\(provider.displayName) · \(featured.localizedCurrentAction(language: language))"
             case .failed:
                 subtitle = "\(provider.displayName) · \(AppLocalization.localized("运行失败", language: language))"
             case .done:
@@ -394,6 +394,14 @@ private struct CompactApprovalCard: View {
                     .foregroundStyle(DT.textSecondary)
                     .lineLimit(2)
             }
+            if entry.kind == .approval {
+                Text(localized(entry.risk.badgeText, locale: locale)
+                    + " · " + (entry.localizedRiskReason(language: model.appLanguage)
+                        ?? localized("风险等级仅作提示，请核对操作内容", locale: locale)))
+                    .font(DT.micro(10.5))
+                    .foregroundStyle(entry.risk.needsVerification ? DT.redText : DT.textSecondary)
+                    .lineLimit(2)
+            }
             Text(contextLine)
                 .font(DT.micro(10.5))
                 .foregroundStyle(DT.textWeak)
@@ -424,16 +432,20 @@ private struct CompactApprovalCard: View {
     @ViewBuilder
     private var buttons: some View {
         switch entry.kind {
-        case .approval where entry.risk.needsVerification:
-            Button("拒绝") { model.deny(entry) }
-                .buttonStyle(PillButtonStyle(rank: .secondary, fontSize: 11.5, horizontalPadding: 14))
-            Button("去核对") { model.passThrough(entry) }
-                .buttonStyle(PillButtonStyle(rank: .primary, fontSize: 11.5, horizontalPadding: 14))
         case .approval:
-            Button("拒绝") { model.deny(entry) }
-                .buttonStyle(PillButtonStyle(rank: .secondary, fontSize: 11.5, horizontalPadding: 14))
-            Button("允许") { model.approve(entry) }
-                .buttonStyle(PillButtonStyle(rank: .primary, fontSize: 11.5, horizontalPadding: 14))
+            let actions = model.approvalActions(for: entry)
+            if actions.contains("deny") {
+                Button("拒绝") { model.deny(entry) }
+                    .buttonStyle(PillButtonStyle(rank: .secondary, fontSize: 11.5, horizontalPadding: 14))
+            }
+            if actions.contains("approve") {
+                Button("允许") { model.approve(entry) }
+                    .buttonStyle(PillButtonStyle(rank: .primary, fontSize: 11.5, horizontalPadding: 14))
+            }
+            if actions.isEmpty {
+                Button("去核对") { Task { await model.jump(to: entry) } }
+                    .buttonStyle(PillButtonStyle(rank: .primary, fontSize: 11.5, horizontalPadding: 14))
+            }
         case .nativeApproval:
             Button("稍后提醒") { model.snooze(entry) }
                 .buttonStyle(PillButtonStyle(rank: .secondary, fontSize: 11.5, horizontalPadding: 14))
@@ -456,7 +468,9 @@ private struct CompactApprovalCard: View {
         case .completion:
             Button("稍后提醒") { model.snooze(entry) }
                 .buttonStyle(PillButtonStyle(rank: .secondary, fontSize: 11.5, horizontalPadding: 14))
-            Button("确认完成") { model.acknowledge(entry) }
+            Button(entry.autoHideAt == nil ? "确认完成" : "知道了") {
+                model.acknowledge(entry)
+            }
                 .buttonStyle(ActionButtonStyle(kind: .success, compact: true))
         }
     }

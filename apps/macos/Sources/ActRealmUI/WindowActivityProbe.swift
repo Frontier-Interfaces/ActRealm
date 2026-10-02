@@ -77,11 +77,18 @@ struct WindowActivityProbe: NSViewRepresentable {
                 NSWindow.didMiniaturizeNotification,
                 NSWindow.didDeminiaturizeNotification,
                 NSWindow.didChangeOcclusionStateNotification,
+                NSWindow.didBecomeKeyNotification,
+                NSWindow.didResignKeyNotification,
+                NSWindow.willCloseNotification,
             ].map {
                 NotificationCenter.default.publisher(for: $0, object: window).eraseToAnyPublisher()
             })
             .receive(on: RunLoop.main)
-            .sink { [weak self] _ in self?.evaluate() }
+            .sink { [weak self] _ in
+                // `willClose` and key changes can arrive before AppKit has
+                // updated `isVisible`; evaluate on the following run-loop turn.
+                DispatchQueue.main.async { self?.evaluate() }
+            }
             .store(in: &cancellables)
         }
     }

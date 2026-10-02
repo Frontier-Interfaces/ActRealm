@@ -1,19 +1,16 @@
 import ActRealmKit
 import SwiftUI
 
+
 struct OutboxSection: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.snapshotRendering) private var snapshotRendering
     @Environment(\.locale) private var locale
 
-    private var entries: [OutboxEntry] { model.derived.openOutbox }
+    private var localEntries: [OutboxEntry] { model.derived.openOutbox }
+    private var entryCount: Int { localEntries.count }
     private var selectedEntry: OutboxEntry? {
-        if let selectedID = model.selectedOutboxID,
-           let entry = entries.first(where: { $0.id == selectedID })
-        {
-            return entry
-        }
-        return entries.first
+        localEntries.first(where: { $0.id == model.selectedOutboxID }) ?? localEntries.first
     }
 
     var body: some View {
@@ -27,7 +24,7 @@ struct OutboxSection: View {
                     .font(.system(size: 11))
                     .foregroundStyle(DT.textSecondary)
                 Spacer()
-                Text("\(entries.count)")
+                Text("\(entryCount)")
                     .font(.system(size: 11, weight: .bold))
                     .foregroundStyle(DT.amberText)
                     .frame(minWidth: 20)
@@ -41,7 +38,7 @@ struct OutboxSection: View {
                 .foregroundStyle(DT.textWeak)
                 .padding(.top, 3)
 
-            if entries.isEmpty {
+            if entryCount == 0 {
                 OutboxEmpty()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if snapshotRendering {
@@ -92,21 +89,22 @@ struct OutboxSection: View {
         LazyVStack(alignment: .leading, spacing: 0) {
             if let selectedEntry {
                 OutboxPrimaryCard(entry: selectedEntry)
-                    .id(primaryAnchor(selectedEntry.id))
-                    .padding(.top, 14)
+                .id(primaryAnchor(selectedEntry.id))
+                .padding(.top, 14)
 
-                let rest = entries.filter { $0.id != selectedEntry.id }
-                if !rest.isEmpty {
+                let localRest = localEntries.filter { $0.id != selectedEntry.id }
+                let restCount = localRest.count
+                if restCount > 0 {
                     Text(localizedFormat(
                         "队列 · 还有 %lld 项",
                         locale: locale,
-                        Int64(rest.count)
+                        Int64(restCount)
                     ))
                         .font(.system(size: 11))
                         .foregroundStyle(DT.textWeak)
                         .padding(.top, 16)
                         .padding(.bottom, 8)
-                    ForEach(rest) { entry in
+                    ForEach(localRest) { entry in
                         QueueRow(entry: entry) {
                             withAnimation(.easeOut(duration: 0.2)) {
                                 model.selectOutbox(id: entry.id)
@@ -122,9 +120,11 @@ struct OutboxSection: View {
     }
 
     private var subtitle: String {
-        guard let wait = model.derived.longestWait else {
+        let oldest = localEntries.map(\.createdAt).min()
+        guard let oldest else {
             return localized("暂无需要处理的事项", locale: locale)
         }
+        let wait = Date().timeIntervalSince(oldest)
         return localizedFormat(
             "最久等待 %lld 分钟",
             locale: locale,
@@ -142,7 +142,6 @@ private struct OutboxPrimaryCard: View {
     @Environment(\.snapshotRendering) private var snapshotRendering
     @Environment(\.locale) private var locale
     let entry: OutboxEntry
-    @State private var confirming = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -208,6 +207,7 @@ private struct OutboxPrimaryCard: View {
                 .padding(.top, 9)
             }
 
+
             switch entry.kind {
             case .approval:
                 approvalBody
@@ -232,7 +232,6 @@ private struct OutboxPrimaryCard: View {
                 .strokeBorder(cardBorder, lineWidth: 1)
         )
         .shadow(color: DT.cardShadow.opacity(0.55), radius: 20, y: 8)
-        .animation(.easeOut(duration: 0.2), value: confirming)
     }
 
     private var approvalBody: some View {
@@ -244,12 +243,14 @@ private struct OutboxPrimaryCard: View {
                     .padding(.horizontal, 9)
                     .padding(.vertical, 2.5)
                     .background(DT.neutralChipBg, in: RoundedRectangle(cornerRadius: 7))
-                Text(entry.attention.commandPreview
-                    ?? localized("Provider 未提供命令预览", locale: locale))
+                Text(entry.attention.requestTarget ?? entry.attention.commandPreview
+                    ?? localized(entry.attention.requestPlan == nil ? "Provider 未提供命令预览" : "查看下方计划", locale: locale))
                     .font(.system(size: 13, design: .monospaced))
                     .foregroundStyle(DT.textPrimary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .help(entry.attention.requestTarget ?? entry.attention.commandPreview ?? "")
+                    .textSelection(.enabled)
             }
             .padding(.horizontal, 13)
             .padding(.vertical, 11)
@@ -257,6 +258,39 @@ private struct OutboxPrimaryCard: View {
             .background(DT.cardStrong.opacity(0.82), in: RoundedRectangle(cornerRadius: 13))
             .overlay(RoundedRectangle(cornerRadius: 13).strokeBorder(DT.hairline, lineWidth: 1))
             .padding(.top, 11)
+
+            if let plan = entry.attention.requestPlan {
+                ScrollView(.vertical) {
+                    Text(plan)
+                        .font(.system(size: 11))
+                        .foregroundStyle(DT.textPrimary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
+                .frame(maxHeight: 200)
+                .padding(10)
+                .background(DT.cardStrong, in: RoundedRectangle(cornerRadius: 10))
+                .padding(.top, 8)
+            }
+
+            HStack(alignment: .top, spacing: 8) {
+                Chip(
+                    text: localized(entry.risk.badgeText, locale: locale),
+                    tone: riskTone,
+                    fontSize: 9
+                )
+                Text(entry.localizedRiskReason(language: model.appLanguage)
+                    ?? localized(
+                        "风险等级仅作提示，请核对操作内容",
+                        locale: locale
+                    ))
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(entry.risk.needsVerification
+                        ? DT.redText
+                        : DT.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.top, 9)
 
             Text(expiryLine)
                 .font(.system(size: 11))
@@ -266,73 +300,67 @@ private struct OutboxPrimaryCard: View {
             if entry.state != .open {
                 Text(localized(
                     entry.state == .committing
-                        ? "决定将在 3 秒撤回窗口后提交"
+                        ? "决定尚未提交；撤回窗口结束后才会发送给 Provider"
                         : "决定已写给 Provider，等待后续事件确认",
                     locale: locale
                 ))
                     .font(.system(size: 10.5, weight: .semibold))
                     .foregroundStyle(DT.amberText)
                     .padding(.top, 12)
-            } else if confirming {
-                HStack(spacing: 8) {
-                    Text("确认允许运行这条命令？")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(DT.redText)
-                    Spacer(minLength: 2)
-                    Button("确认允许") { model.approve(entry); confirming = false }
-                        .buttonStyle(ActionButtonStyle(kind: .danger, compact: true))
-                        .disabled(!model.canControlRuntime)
-                    Button("取消") { confirming = false }
-                        .buttonStyle(ActionButtonStyle(kind: .secondary, compact: true))
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .background(DT.redBg.opacity(0.72), in: RoundedRectangle(cornerRadius: 12))
-                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(DT.redStroke, lineWidth: 1))
-                .padding(.top, 12)
             } else {
                 ViewThatFits(in: .horizontal) {
                     HStack(spacing: 9) {
-                        compactApprovalButton(
-                            "允许",
-                            kind: .primary,
-                            action: { model.approve(entry) }
-                        )
-                        compactApprovalButton(
-                            "拒绝",
-                            kind: .secondary,
-                            action: { model.deny(entry) }
-                        )
-                        compactApprovalButton(
-                            "二次确认后允许",
-                            kind: .tertiary,
-                            action: { confirming = true }
-                        )
+                        compactApprovalActions
                     }
                     .fixedSize(horizontal: true, vertical: false)
 
                     VStack(spacing: 9) {
-                        HStack(spacing: 9) {
-                            fullWidthApprovalButton(
-                                "允许",
-                                kind: .primary,
-                                action: { model.approve(entry) }
-                            )
-                            fullWidthApprovalButton(
-                                "拒绝",
-                                kind: .secondary,
-                                action: { model.deny(entry) }
-                            )
-                        }
-                        fullWidthApprovalButton(
-                            "二次确认后允许",
-                            kind: .tertiary,
-                            action: { confirming = true }
-                        )
+                        fullWidthApprovalActions
                     }
                 }
                 .padding(.top, 14)
             }
+        }
+    }
+
+    private var approvalActions: Set<String> { model.approvalActions(for: entry) }
+
+    @ViewBuilder
+    private var compactApprovalActions: some View {
+        if approvalActions.contains("approve") {
+            compactApprovalButton("允许", kind: .primary, action: { model.approve(entry) })
+        }
+        if approvalActions.contains("deny") {
+            compactApprovalButton("拒绝", kind: .secondary, action: { model.deny(entry) })
+        }
+        if approvalActions.isEmpty {
+            compactApprovalButton("去原窗口核对", kind: .primary) {
+                Task { await model.jump(to: entry) }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var fullWidthApprovalActions: some View {
+        if approvalActions.contains("approve") {
+            fullWidthApprovalButton("允许", kind: .primary, action: { model.approve(entry) })
+        }
+        if approvalActions.contains("deny") {
+            fullWidthApprovalButton("拒绝", kind: .secondary, action: { model.deny(entry) })
+        }
+        if approvalActions.isEmpty {
+            fullWidthApprovalButton("去原窗口核对", kind: .primary) {
+                Task { await model.jump(to: entry) }
+            }
+        }
+    }
+
+    private var riskTone: Chip.Tone {
+        switch entry.risk {
+        case .low: .green
+        case .med: .amber
+        case .high: .red
+        case .unknown: .neutral
         }
     }
 
@@ -440,8 +468,16 @@ private struct OutboxPrimaryCard: View {
                 .padding(.vertical, 9)
                 .background(DT.greenBg.opacity(0.7), in: RoundedRectangle(cornerRadius: 10))
                 .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(DT.greenStroke, lineWidth: 1))
+            if entry.autoHideAt != nil {
+                Label(completionAutoHideLine, systemImage: "clock.arrow.circlepath")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(DT.greenText)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
             HStack(spacing: 7) {
-                Button("确认完成") { model.acknowledge(entry) }
+                Button(entry.autoHideAt == nil ? "确认完成" : "知道了") {
+                    model.acknowledge(entry)
+                }
                     .buttonStyle(ActionButtonStyle(kind: .success))
                     .disabled(!model.canControlRuntime)
                 Button("打开应用") {
@@ -451,6 +487,17 @@ private struct OutboxPrimaryCard: View {
             }
         }
         .padding(.top, 9)
+    }
+
+    private var completionAutoHideLine: String {
+        guard let autoHideAt = entry.autoHideAt else { return "" }
+        let seconds = max(0, autoHideAt.timeIntervalSince(model.now))
+        let minutes = max(1, Int(ceil(seconds / 60)))
+        return localizedFormat(
+            "%lld 分钟后自动隐藏；不会删除历史",
+            locale: locale,
+            Int64(minutes)
+        )
     }
 
     private var errorBody: some View {
@@ -536,6 +583,8 @@ private struct OutboxPrimaryCard: View {
         }
     }
 }
+
+
 
 private struct QueueRow: View {
     @EnvironmentObject private var model: AppModel
@@ -657,6 +706,7 @@ private struct UndoBar: View {
 
 struct ActionButtonStyle: ButtonStyle {
     enum Kind { case primary, secondary, tertiary, danger, success }
+    @Environment(\.isEnabled) private var isEnabled
     let kind: Kind
     var compact = false
 
@@ -670,19 +720,21 @@ struct ActionButtonStyle: ButtonStyle {
             .background(background, in: Capsule())
             .overlay(Capsule().strokeBorder(stroke, lineWidth: stroke == .clear ? 0 : 1))
             .shadow(color: shadow, radius: compact ? 8 : 10, y: compact ? 3 : 5)
-            .opacity(configuration.isPressed ? 0.82 : 1)
-            .scaleEffect(configuration.isPressed ? 0.98 : 1)
+            .opacity(isEnabled && configuration.isPressed ? 0.82 : 1)
+            .scaleEffect(isEnabled && configuration.isPressed ? 0.98 : 1)
     }
 
     private var foreground: Color {
-        switch kind {
+        guard isEnabled else { return DT.textWeak }
+        return switch kind {
         case .primary, .danger, .success: .white
         case .secondary: DT.textPrimary
         case .tertiary: DT.textSecondary
         }
     }
     private var background: AnyShapeStyle {
-        switch kind {
+        guard isEnabled else { return AnyShapeStyle(DT.cardMedium) }
+        return switch kind {
         case .primary: AnyShapeStyle(DT.primaryGradient)
         case .danger: AnyShapeStyle(LinearGradient(colors: [Color.red.opacity(0.72), Color.red], startPoint: .top, endPoint: .bottom))
         case .success: AnyShapeStyle(LinearGradient(colors: [Color.green.opacity(0.72), DT.greenDot], startPoint: .top, endPoint: .bottom))
@@ -691,13 +743,15 @@ struct ActionButtonStyle: ButtonStyle {
         }
     }
     private var stroke: Color {
-        switch kind {
+        guard isEnabled else { return DT.neutralBadgeStroke }
+        return switch kind {
         case .secondary, .tertiary: DT.neutralBadgeStroke
         default: .clear
         }
     }
     private var shadow: Color {
-        switch kind {
+        guard isEnabled else { return .clear }
+        return switch kind {
         case .primary: DT.blue.opacity(0.32)
         case .danger: DT.redText.opacity(0.28)
         case .success: DT.greenDot.opacity(0.28)

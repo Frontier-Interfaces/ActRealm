@@ -126,7 +126,15 @@ fn event_to_websocket_render_entry_p95_is_below_300_ms() {
             HeaderValue::from_str(&protocol).unwrap(),
         );
         let (mut websocket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
-        let _ = websocket.next().await.unwrap().unwrap();
+        let first = websocket.next().await.unwrap().unwrap();
+        let first: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+        let instance = first["deliveryTiming"]["runtimeInstanceId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut sequence = first["deliveryTiming"]["sequence"].as_u64().unwrap();
+        assert_eq!(sequence, 1);
+        assert!(!instance.is_empty());
         let mut samples = Vec::new();
         for index in 0..20 {
             let started = Instant::now();
@@ -149,6 +157,24 @@ fn event_to_websocket_render_entry_p95_is_below_300_ms() {
                     .unwrap();
                 let payload: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
                 if payload["snapshot"]["stats"]["eventCount"].as_u64() == Some(expected) {
+                    let timing = &payload["deliveryTiming"];
+                    assert_eq!(timing["runtimeInstanceId"], instance);
+                    assert_eq!(timing["clock"], "CLOCK_MONOTONIC");
+                    assert!(timing["sequence"].as_u64().unwrap() > sequence);
+                    sequence = timing["sequence"].as_u64().unwrap();
+                    let started_at = timing["startedAtNs"].as_u64().unwrap();
+                    let ready_at = timing["readyAtNs"].as_u64().unwrap();
+                    let mut received = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    };
+                    assert_eq!(
+                        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut received) },
+                        0
+                    );
+                    let received_at =
+                        received.tv_sec as u64 * 1_000_000_000 + received.tv_nsec as u64;
+                    assert!(started_at > 0 && started_at <= ready_at && ready_at <= received_at);
                     break;
                 }
             }

@@ -96,7 +96,8 @@ public enum ZhFormat {
         return "\(total / 86_400) 天后过期"
     }
 
-    /// "周一 00:00 重置" if on another day, "14:30 重置" if today.
+    /// "8月20日 周四 14:59 重置" on another day, "14:30 重置" if today.
+    /// A different calendar year is included so a distant reset is unambiguous.
     public static func resetTime(
         _ resetsAt: Date,
         now: Date,
@@ -105,6 +106,7 @@ public enum ZhFormat {
     ) -> String {
         let formatter = DateFormatter()
         formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
         formatter.locale = language.locale
         formatter.dateFormat = "HH:mm"
         let clock = formatter.string(from: resetsAt)
@@ -112,16 +114,31 @@ public enum ZhFormat {
             if calendar.isDate(resetsAt, inSameDayAs: now) {
                 return "Resets at \(clock)"
             }
-            formatter.dateFormat = "EEE"
-            return "Resets \(formatter.string(from: resetsAt)) \(clock)"
+            let includeYear = calendar.component(.year, from: resetsAt)
+                != calendar.component(.year, from: now)
+            formatter.dateFormat = includeYear ? "MMM d, yyyy · EEE" : "MMM d · EEE"
+            return "Resets \(formatter.string(from: resetsAt)) at \(clock)"
         }
         if calendar.isDate(resetsAt, inSameDayAs: now) {
             return "\(clock) 重置"
         }
+        let includeYear = calendar.component(.year, from: resetsAt)
+            != calendar.component(.year, from: now)
+        formatter.dateFormat = includeYear ? "yyyy年M月d日" : "M月d日"
+        let date = formatter.string(from: resetsAt)
         let weekdayNames = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
         let weekday = calendar.component(.weekday, from: resetsAt) - 1
         let name = weekdayNames[max(0, min(6, weekday))]
-        return "\(name) \(clock) 重置"
+        return "\(date) \(name) \(clock) 重置"
+    }
+
+    public static func timestamp(_ date: Date, calendar: Calendar = .current, language: AppLanguage) -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
+        formatter.locale = language.locale
+        formatter.setLocalizedDateFormatFromTemplate("yMMMdHHmmss")
+        return formatter.string(from: date)
     }
 
     /// "09:41:22" for the bottom status bar.

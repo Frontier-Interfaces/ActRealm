@@ -241,15 +241,15 @@ Task { @MainActor in
 
     model.expandedTaskId = "claude-quota-fix"
     model.pinnedSessionId = "claude-quota-fix"
-    render(
+    renderHosted(
         Backdrop(dark: false) {
             MainWindowView()
                 .environmentObject(model)
-                .frame(width: 1536, height: 820)
+                .frame(width: 1536, height: 1_140)
                 .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
                 .padding(40)
         },
-        size: CGSize(width: 1616, height: 900),
+        size: CGSize(width: 1616, height: 1_220),
         to: "\(outDir)/main-expanded-light.png"
     )
 
@@ -329,20 +329,24 @@ Task { @MainActor in
     // This catches sidebar, row-label, control, and helper-text regressions
     // without mutating the user's real preferences.
     for section in SettingsSection.allCases {
+        let settingsHeight: CGFloat = 740
         renderHosted(
             Backdrop(dark: false) {
-                SettingsView(initialSection: section)
+                SettingsView(
+                    initialSection: section
+                )
                     .environmentObject(model)
-                    .frame(width: 920, height: 660)
+                    .frame(width: 920, height: settingsHeight - 80)
                     .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                     .padding(40)
             },
-            size: CGSize(width: 1000, height: 740),
+            size: CGSize(width: 1000, height: settingsHeight),
             to: "\(outDir)/settings-\(section.rawValue)-light.png"
         )
     }
 
-    // HUD capsule.
+    // HUD capsule: show a request instead of rendering an empty notification.
+    model.previewHUD()
     for dark in [false, true] {
         let name = dark ? "hud-dark" : "hud-light"
         render(

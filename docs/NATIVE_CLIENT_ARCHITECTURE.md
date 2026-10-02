@@ -32,6 +32,14 @@ ActRealm/
 | Foreground scheduling policy | Supplies attention facts | Owns local preference |
 | App/window activation | No | Owns per platform |
 
+Local companion applications are a third, narrower client class. They never
+bootstrap through the Web session and receive no SQLite, Hook, Provider, or
+Cloud access. The Runtime issues each explicitly paired companion an
+independent bearer token with `snapshot.read`, `session.jump`, and optionally
+`attention.respond` scopes. The Runtime still owns sanitization, capability
+declaration, expiry, waiter liveness, Provider replies, and the three-second
+approval commit window.
+
 This boundary prevents two processes from competing for SQLite or Provider
 reply channels and keeps foreground behavior replaceable per operating system.
 
@@ -51,6 +59,26 @@ Claude/Codex event
 The client may foreground an Agent application when a sanitized Attention item
 arrives. It must not infer that the Provider supports a reply, or mark an item
 approved, denied, or completed without a matching Runtime transition.
+
+## Local companion flow
+
+```text
+ActRealm Settings creates one-time pairing code
+  -> companion enrolls over 127.0.0.1
+  -> Runtime stores only SHA-256(token) and explicit scopes
+  -> companion stores the token in its own OS credential store
+  -> companion polls the sanitized allowlist snapshot
+  -> user chooses an available action
+  -> Runtime revalidates scope + capability + ID + expiry + live waiter
+  -> existing Runtime command/question path owns the Provider reply
+```
+
+Pairing codes expire after five minutes and are single-use. Registrations are
+revocable from ActRealm Settings. Runtime port discovery uses
+`~/.actrealm/run/companion-endpoint.json`, a current-user private file that
+contains only schema version, loopback endpoint, and Runtime instance ID. It
+does not contain a bearer token or Provider state. The complete contract and
+threat model are in `COMPANION_PROTOCOL.md`.
 
 ## Foreground scheduling
 

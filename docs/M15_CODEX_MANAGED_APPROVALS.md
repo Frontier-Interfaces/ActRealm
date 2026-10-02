@@ -7,9 +7,11 @@ real Codex Desktop acceptance pass is still required before release.
 
 ActRealm answers a Codex approval request only when all of these are true:
 
-1. Runtime started the official Codex `app-server --stdio` child;
-2. the request itself arrived on that ActRealm-owned app-server connection;
-3. the user explicitly attached the Thread to ActRealm;
+1. Runtime established an official Codex app-server connection through its
+   owned stdio child or the official proxy to a trusted local shared socket;
+2. the request itself arrived on that ActRealm client connection;
+3. Runtime successfully attached the observed Thread under the automatic
+   connection policy;
 4. initialize returned a supported server version;
 5. the request is one of the verified methods below; and
 6. the in-memory waiter is still live.
@@ -53,9 +55,9 @@ Tasks display one of these truthful states:
   ActRealm connector is available;
 - `原界面处理` for a Provider-owned native approval.
 
-Hook-only and independently running Codex Desktop conversations are not
-silently claimed. Merely enumerating, attaching, or resuming their Thread is
-not sufficient to approve an in-flight native request.
+Observed Codex conversations connect automatically. Independently running
+Codex Desktop turns still retain their original request ownership. Merely
+enumerating, attaching, or resuming their Thread is not sufficient to approve an in-flight native request.
 
 ## Automated coverage
 

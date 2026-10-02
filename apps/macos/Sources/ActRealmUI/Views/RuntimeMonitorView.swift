@@ -10,6 +10,7 @@ public struct RuntimeMonitorView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.snapshotRendering) private var snapshotRendering
     @Environment(\.locale) private var locale
+    @State private var showingTechnicalDetails = false
 
     public var body: some View {
         VStack(spacing: 0) {
@@ -23,12 +24,21 @@ public struct RuntimeMonitorView: View {
             }
             actionBar
         }
-        .frame(width: 640, height: 550)
+        .frame(
+            minWidth: 640,
+            idealWidth: 780,
+            maxWidth: 900,
+            minHeight: snapshotRendering ? 1_040 : 560,
+            idealHeight: snapshotRendering ? 1_040 : 760,
+            maxHeight: snapshotRendering ? 1_040 : 880
+        )
         .modifier(WindowGlassBackground())
         .task {
+            await model.refreshControlPlaneDiagnostics(includeDoctor: true)
             while !Task.isCancelled {
-                model.refreshRuntimeDiagnostics()
-                try? await Task.sleep(for: .seconds(2))
+                try? await Task.sleep(for: .seconds(5))
+                guard !Task.isCancelled else { return }
+                await model.refreshControlPlaneDiagnostics(includeDoctor: false)
             }
         }
     }
@@ -39,8 +49,30 @@ public struct RuntimeMonitorView: View {
             if let warning = model.runtimeDiagnostics.launchAgentWarning {
                 warningCard(warning)
             }
-            processDetails
-            logPanel
+            ControlPlaneDiagnosticsView()
+                .environmentObject(model)
+            DisclosureGroup(
+                isExpanded: $showingTechnicalDetails
+            ) {
+                VStack(alignment: .leading, spacing: 12) {
+                    processDetails
+                    logPanel
+                }
+                .padding(.top, 10)
+            } label: {
+                Label(
+                    localized("技术详情与最近 Runtime 输出", locale: locale),
+                    systemImage: "wrench.and.screwdriver"
+                )
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(DT.textWeak)
+            }
+            .padding(12)
+            .liquidGlassSurface(
+                tint: DT.cardFaint.opacity(0.12),
+                radius: 14,
+                stroke: DT.hairlineSoft
+            )
         }
         .padding(18)
     }
@@ -178,12 +210,27 @@ public struct RuntimeMonitorView: View {
                     symbol: "cable.connector",
                     tone: model.runtimeDiagnostics.socketExists ? DT.greenDot : DT.redText
                 )
+                detailCell(
+                    title: "Codex 连接器",
+                    value: codexConnectorStatus,
+                    symbol: "point.3.connected.trianglepath.dotted",
+                    tone: codexConnectorTone
+                )
+                detailCell(
+                    title: "最近 Provider 通知",
+                    value: codexLastNotification,
+                    symbol: "clock.arrow.circlepath",
+                    tone: codexLastNotificationTone
+                )
             }
 
             detailRow(title: "Endpoint", value: model.runtimeDiagnostics.endpoint ?? "尚未建立")
             detailRow(title: "Helper", value: model.runtimeDiagnostics.helperPath ?? "未找到")
             if let ownerPath = model.runtimeDiagnostics.lockOwnerPath {
                 detailRow(title: "锁持有者", value: ownerPath)
+            }
+            if let diagnostic = codexPlanDiagnostic {
+                detailRow(title: "计划诊断", value: diagnostic)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -279,10 +326,20 @@ public struct RuntimeMonitorView: View {
                 dismiss()
             }
             .buttonStyle(PillButtonStyle(rank: .tertiary, fontSize: 10.5, horizontalPadding: 12))
-            Button("重新检查") {
-                model.refreshRuntimeDiagnostics()
+            Button {
+                Task {
+                    await model.refreshControlPlaneDiagnostics(includeDoctor: true)
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    if model.isRefreshingControlPlaneDiagnostics {
+                        ProgressView().controlSize(.small)
+                    }
+                    Text(localized("重新检查", locale: locale))
+                }
             }
             .buttonStyle(PillButtonStyle(rank: .secondary, fontSize: 10.5, horizontalPadding: 13))
+            .disabled(model.isRefreshingControlPlaneDiagnostics)
             Button {
                 model.restartRuntime()
             } label: {
@@ -322,6 +379,11 @@ public struct RuntimeMonitorView: View {
         if model.isRestartingRuntime {
             return localized("正在重启 Runtime", locale: locale)
         }
+        if model.controlPlaneDiagnosticsError != nil,
+           model.bridgeStatus.isListening
+        {
+            return localized("Runtime 在线 · 诊断延迟", locale: locale)
+        }
         let key = switch model.bridgeStatus {
         case .listening: "Runtime 在线"
         case .starting: "Runtime 正在启动"
@@ -337,6 +399,11 @@ public struct RuntimeMonitorView: View {
                 locale: locale
             )
         }
+        if let error = model.controlPlaneDiagnosticsError,
+           model.bridgeStatus.isListening
+        {
+            return error
+        }
         let key = switch model.bridgeStatus {
         case .listening:
             "控制连接可用，Hook 事件可以进入主界面。"
@@ -351,6 +418,11 @@ public struct RuntimeMonitorView: View {
     private var statusColor: Color {
         if model.isDemo { return DT.blue }
         if model.isRestartingRuntime { return DT.blue }
+        if model.controlPlaneDiagnosticsError != nil,
+           model.bridgeStatus.isListening
+        {
+            return DT.amberDot
+        }
         switch model.bridgeStatus {
         case .listening: return DT.greenDot
         case .starting: return DT.amberDot
@@ -367,6 +439,60 @@ public struct RuntimeMonitorView: View {
         let date = model.runtimeDiagnostics.checkedAt
         guard date != .distantPast else { return "—" }
         return ZhFormat.syncClock(date)
+    }
+
+    private var codexConnector: CodexConnectorCapability? {
+        model.client.snapshot.capabilities?.codexConnector
+    }
+
+    private var codexConnectorStatus: String {
+        switch codexConnector?.status {
+        case "connected":
+            localized("已连接", locale: locale)
+        case "disabled":
+            localized("未启用", locale: locale)
+        case "unavailable":
+            localized("不可用", locale: locale)
+        case let status?:
+            status
+        case nil:
+            localized("尚无数据", locale: locale)
+        }
+    }
+
+    private var codexConnectorTone: Color {
+        codexConnector?.status == "connected" ? DT.greenDot : DT.textWeak
+    }
+
+    private var codexLastNotification: String {
+        guard let method = codexConnector?.lastNotificationMethod,
+              !method.isEmpty else {
+            return localized("未收到", locale: locale)
+        }
+        guard let millis = codexConnector?.lastNotificationAt else {
+            return method
+        }
+        let time = ZhFormat.syncClock(Date(timeIntervalSince1970: Double(millis) / 1_000))
+        return "\(method) · \(time)"
+    }
+
+    private var codexLastNotificationTone: Color {
+        codexConnector?.lastNotificationMethod == nil ? DT.textWeak : DT.greenDot
+    }
+
+    private var codexPlanDiagnostic: String? {
+        switch codexConnector?.lastPlanSkipReason {
+        case "missing_thread_id":
+            return localized("计划通知缺少 threadId", locale: locale)
+        case "missing_plan_array":
+            let fields = codexConnector?.lastPlanFieldKeys?.joined(separator: ", ") ?? ""
+            let base = localized("计划通知缺少步骤数组", locale: locale)
+            return fields.isEmpty ? base : "\(base) · \(fields)"
+        case let reason?:
+            return reason
+        case nil:
+            return nil
+        }
     }
 
     private var lockOwnerText: String {

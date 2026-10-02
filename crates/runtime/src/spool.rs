@@ -69,7 +69,51 @@ impl EventSpool {
             return Err(SpoolError::PermissionRequest);
         }
         self.ensure_directory()?;
-        let bytes = serde_json::to_vec(request)?;
+        // Offline replay keeps lifecycle metadata, never prompts, reply text,
+        // commands or tool input/output. Enhanced tool Hooks must not turn a
+        // Runtime outage into durable transcript capture.
+        let mut durable = request.clone();
+        let keys = [
+            "hook_event_name",
+            "session_id",
+            "turn_id",
+            "prompt_id",
+            "cwd",
+            "model",
+            "permission_mode",
+            "tool_name",
+            "tool_use_id",
+            "tool_call_id",
+            "call_id",
+            "item_id",
+            "_codex_item_id",
+            "source",
+            "source_version",
+            "agent_id",
+            "agent_type",
+            "task_id",
+        ];
+        let mut raw = serde_json::Map::new();
+        for key in keys {
+            if let Some(value) = request.raw.get(key).and_then(serde_json::Value::as_str) {
+                raw.insert(
+                    key.to_owned(),
+                    serde_json::Value::String(value.chars().take(2048).collect()),
+                );
+            }
+        }
+        if let Some(code) = request
+            .raw
+            .pointer("/tool_response/exit_code")
+            .and_then(serde_json::Value::as_i64)
+        {
+            raw.insert(
+                "tool_response".to_owned(),
+                serde_json::json!({"exit_code": code}),
+            );
+        }
+        durable.raw = serde_json::Value::Object(raw);
+        let bytes = serde_json::to_vec(&durable)?;
         let final_path = self
             .path
             .join(format!("{:020}-{}.json", request.received_at, request.id));

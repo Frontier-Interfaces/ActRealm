@@ -19,13 +19,18 @@ and a safe path back to the work.
 [Current status](docs/STATUS.md) ·
 [Native client architecture](docs/NATIVE_CLIENT_ARCHITECTURE.md)
 
-> **Project status:** the current release-hardening candidate is based on
-> `1dff02d879443876a1ab59aca1654ca9d084e7ed` plus uncommitted local changes.
-> Tasks 1–9 of the 2026-07-27 hardening plan have passed their scoped Rust,
-> Swift, security, performance, language, backup, and CI-pin gates. It is still
-> a local test candidate: the final whole-tree gate, packaged-candidate
-> installation, real workflow acceptance, commit, push, tag, and release have
-> not been authorized. This candidate makes no 48-hour-soak claim.
+> **Project status:** this is the current local macOS test candidate, including
+> native approval controls, semantic activity, local token analytics, and
+> System/Chinese/English presentation. See [current status](docs/STATUS.md) for
+> supported behavior and verification. Public signing/notarization, clean-Mac
+> acceptance, and the continuous stability gate remain separate release work.
+
+## 2026-09 local-only product
+
+ActRealm keeps task control and usage data on this Mac. Optional Display
+Native clients automatically register with the independently managed local service. No ActRealm cloud account or
+Firebase backend is required. The embedded Web UI is retained as a legacy
+interface; current product work targets the native macOS app.
 
 ## A different operating model for agent work
 
@@ -41,8 +46,8 @@ ActRealm organizes that loop around four principles:
    tasks become visible local state instead of something you repeatedly hunt
    for across windows.
 3. **Interruption matches risk.** Routine updates stay quiet; decisions carry
-   concise context; high-risk actions return you to the original interface for
-   verification.
+   concise context; high-risk actions keep an explicit warning while the live
+   Runtime reply capability determines which decisions are available.
 4. **People retain authority.** ActRealm only offers a direct action when the
    Runtime owns a live, official reply channel. It never invents approval state.
 
@@ -133,7 +138,7 @@ that branch explicitly:
 ```bash
 git clone --branch agent/v1-full https://github.com/Frontier-Interfaces/ActRealm.git
 cd ActRealm
-cargo build --workspace --release
+cargo build --workspace --release --locked
 ```
 
 Install only the Provider integrations present on your machine:
@@ -167,6 +172,13 @@ control loop is reachable, the selected Hooks are installed and trusted, and a
 real event from a new local Provider session reaches the UI. See the
 [Chinese installation guide](docs/USER_GUIDE_zh-CN.md) for the full acceptance
 checklist and recovery steps.
+
+For Display users, use Display's `Scripts/build-agent-display.sh` to fetch
+its exact pinned Runtime commit and produce a matched App. Runtime protocol v7
+includes the first-run Codex Token/context fix; a healthy connection or installed
+Hook alone is not a metrics acceptance check. Verify a new local Codex Desktop
+task that has emitted usage and context-window fields. Never copy another user's
+ActRealm database, Codex history or credentials to reproduce their installation.
 
 ## Native macOS client
 
@@ -289,3 +301,6 @@ update compatibility tests whenever a Runtime contract changes.
 ## License
 
 [MIT](LICENSE)
+
+The native apps share one user Runtime service and use signed-client enrollment
+with pinned HTTPS/WSS. See [native service architecture](docs/NATIVE_SERVICE.md).

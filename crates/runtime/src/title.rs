@@ -33,7 +33,7 @@ pub(crate) fn resolve_event_title(
             transcript.and_then(|path| claude_title_from_transcript(&path))
         }
         Provider::Codex => codex_title_from_index(&codex_index_path(), provider_session_id),
-        Provider::Gemini => None,
+        Provider::Gemini | Provider::Kimi | Provider::Grok => None,
     }
 }
 
@@ -74,6 +74,8 @@ fn explicit_provider_title(provider: Provider, raw: &Value) -> Option<ProviderTi
     let source = match provider {
         Provider::Claude => "claude_session_title",
         Provider::Codex => "codex_thread_name",
+        Provider::Kimi => "kimi_hook",
+        Provider::Grok => "grok_hook",
         Provider::Gemini => return None,
     };
     Some(ProviderTitle { title, source })

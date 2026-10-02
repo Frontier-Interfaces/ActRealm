@@ -16,9 +16,17 @@ struct AppThemeMediaView: View {
             case .image:
                 AppThemeImage(url: url)
             case .animatedImage:
-                AnimatedGIFView(url: url)
+                if ProductScope.animatedThemeMediaEnabled {
+                    AnimatedGIFView(url: url)
+                } else {
+                    Color.clear
+                }
             case .video:
-                LoopingVideoView(url: url)
+                if ProductScope.animatedThemeMediaEnabled {
+                    LoopingVideoView(url: url)
+                } else {
+                    Color.clear
+                }
             }
         }
         .clipped()

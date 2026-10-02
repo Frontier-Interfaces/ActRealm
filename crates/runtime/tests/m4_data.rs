@@ -48,6 +48,21 @@ fn event(session: &str, received_at: u64) -> BridgeRequest {
 }
 
 #[test]
+fn storage_diagnostics_report_current_schema_and_integrity_without_a_path() {
+    let database = Database::new("diagnostics");
+    let store = RuntimeStore::open(&database.path).unwrap();
+    let diagnostics = store.storage_diagnostics().unwrap();
+
+    assert_eq!(
+        diagnostics.schema_version,
+        diagnostics.expected_schema_version
+    );
+    assert_eq!(diagnostics.integrity, "ok");
+    let encoded = serde_json::to_string(&diagnostics).unwrap();
+    assert!(!encoded.contains(database.path.to_str().unwrap()));
+}
+
+#[test]
 fn settings_quota_pruning_and_export_are_transactional_and_local() {
     let database = Database::new("export");
     let store = RuntimeStore::open(&database.path).unwrap();
@@ -63,6 +78,7 @@ fn settings_quota_pruning_and_export_are_transactional_and_local() {
         .replace_quota_snapshots(vec![QuotaRecord {
             provider: "claude".to_owned(),
             window: "5h".to_owned(),
+            limit_id: None,
             used_pct: 23.5,
             resets_at: 1_784_140_000,
             source: "statusline".to_owned(),
@@ -118,12 +134,70 @@ fn retention_and_quota_validation_reject_ambiguous_values() {
         .replace_quota_snapshots(vec![QuotaRecord {
             provider: "codex".to_owned(),
             window: "5h".to_owned(),
+            limit_id: None,
             used_pct: 101.0,
             resets_at: 1,
             source: "rollout_experimental".to_owned(),
             captured_at: 1,
         }])
         .is_err());
+}
+
+#[test]
+fn quota_schema_migrates_and_keeps_same_window_limit_buckets_distinct() {
+    let database = Database::new("quota-limit-identity");
+    let connection = Connection::open(&database.path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE quota_snapshots (
+               provider TEXT NOT NULL, window TEXT NOT NULL,
+               used_pct REAL, resets_at INTEGER, source TEXT,
+               captured_at INTEGER NOT NULL, PRIMARY KEY(provider, window)
+             );
+             INSERT INTO quota_snapshots(
+               provider, window, used_pct, resets_at, source, captured_at
+             ) VALUES ('claude', '5h', 25, 100, 'statusline', 10);
+             PRAGMA user_version = 18;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = RuntimeStore::open(&database.path).unwrap();
+    let migrated = store.export_json(20).unwrap();
+    assert_eq!(migrated["tables"]["quota_snapshots"][0]["limit_id"], "");
+
+    store
+        .replace_quota_snapshots(vec![
+            QuotaRecord {
+                provider: "codex".to_owned(),
+                window: "10080m".to_owned(),
+                limit_id: Some("codex".to_owned()),
+                used_pct: 1.0,
+                resets_at: 1_787_209_188,
+                source: "codex_app_server".to_owned(),
+                captured_at: 1_786_608_000_000,
+            },
+            QuotaRecord {
+                provider: "codex".to_owned(),
+                window: "10080m".to_owned(),
+                limit_id: Some("codex_bengalfox".to_owned()),
+                used_pct: 0.0,
+                resets_at: 1_787_213_254,
+                source: "codex_app_server".to_owned(),
+                captured_at: 1_786_608_000_000,
+            },
+        ])
+        .unwrap();
+
+    let export = store.export_json(30).unwrap();
+    let rows = export["tables"]["quota_snapshots"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    let mut limit_ids = rows
+        .iter()
+        .filter_map(|row| row["limit_id"].as_str())
+        .collect::<Vec<_>>();
+    limit_ids.sort_unstable();
+    assert_eq!(limit_ids, vec!["codex", "codex_bengalfox"]);
 }
 
 #[test]

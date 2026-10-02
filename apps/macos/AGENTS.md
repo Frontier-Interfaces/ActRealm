@@ -5,6 +5,8 @@
 - Keep Hook installation, SQLite access, sanitization, approval ownership, and
   Provider replies in Rust. Swift communicates through the authenticated
   localhost API and WebSocket.
+- Keep the native client local-only; it uses the Runtime API and local
+  Companion pairing without cloud identity or remote decision relays.
 - Keep scheduling policy/timers in `ActRealmKit` and macOS window/app activation
   in `ActRealmUI/ForegroundSchedulingController.swift`.
 - Do not infer approval capabilities from visible Provider state. Render only

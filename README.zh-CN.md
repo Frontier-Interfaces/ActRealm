@@ -1,3 +1,4 @@
+<!-- Current product: local-only ActRealm, 2026-09-16. -->
 # ActRealm
 
 [English](README.md) | 简体中文
@@ -16,11 +17,10 @@ ActRealm 不替代 macOS，也不替代底层 Agent 工具。它补上桌面 Age
 [当前开发状态](docs/STATUS.md) ·
 [原生客户端架构](docs/NATIVE_CLIENT_ARCHITECTURE.md)
 
-> **项目状态：** 功能实现已经推进到 M14，并包含后续的实时状态与 Runtime
-> 受控恢复优化，但当前源码仍是供本地测试的候选版本，不是最终 v1 Release。
-> 后续的用量与 OAuth 加固已经通过自动化及资源门禁，仍需精确安装候选版本并由
-> 用户本机验收。
-> M13 真实 Provider 验收和连续 48 小时 Runtime 稳定性门禁仍未完成。
+> **项目状态：** 当前是纯本机 macOS 测试候选，包含原生审批、具体动作与事件、
+> Token 仪表板，以及默认跟随系统的中英文界面。以[当前状态](docs/STATUS.md)
+> 和验收记录为准。公开签名／公证、全新 Mac 安装和持续稳定性仍是独立发布门禁。
+> 内嵌 Web 界面作为旧版兼容入口保留，当前产品迭代以原生 macOS App 为主。
 
 ## 为 Agent 工作建立新的操作模型
 
@@ -34,7 +34,7 @@ ActRealm 用四条原则组织这个闭环：
 2. **Agent 工作变成可见状态。** 运行、等待、阻塞和完成不再散落在不同窗口中，
    而是成为可以统一查看的本地状态。
 3. **打扰强度由风险决定。** 普通更新保持安静；需要判断时提供简洁上下文；
-   高风险操作必须回到原始界面核验。
+   高风险操作保留明确提示，能否直接处理由 Runtime 的有效回复能力决定。
 4. **人保留最终权限。** 只有 Runtime 拥有真实、有效的官方回复通道时，ActRealm
    才提供直接操作；它不会虚构批准能力或审批结果。
 
@@ -56,8 +56,8 @@ ActRealm 用四条原则组织这个闭环：
   Terminal/iTerm 会话、仅打开应用，或暂不支持；
 - **缺失信息诚实降级**：计划详情、工具事件、回复能力或额度信息缺失、过期时，
   明确显示不可用，而不是用推断补齐；
-- **受隐私边界约束的实时用量信息**：显示累计 Token、本轮上下文占用、明确标注的
-  API 价格估算，并在后台刷新 Claude OAuth 额度；失败时保留本地有效值；
+- **来源明确的官方额度**：显示 Codex/Claude 实际返回的额度窗口与重置时间；本地
+  Token 历史未完整时仍显示已观测用量和覆盖状态，不与订阅额度混算；
 - **有界的用量与凭据恢复**：区分当前可选与历史模型的来源标注离线价格、用
   transcript/rollout 结构化模型补全任务卡、增量压缩 transcript、优先直查
   Keychain 固定服务，并在存在 Claude CLI 时委托官方 CLI 恢复临近过期的 OAuth；
@@ -100,7 +100,7 @@ Runtime 数据库。
 - Rust stable 1.85 或更高版本；
 - 至少一个本机 Provider：Claude Code CLI/Desktop 或 Codex CLI/Desktop。
 
-当前产品实现位于 `agent/v1-full`，因此需要明确克隆这个分支：
+当前收敛候选位于 `agent/v1-full` 分支：
 
 ```bash
 git clone --branch agent/v1-full https://github.com/Frontier-Interfaces/ActRealm.git
@@ -160,7 +160,8 @@ open apps/macos/dist/ActRealm.app
 | Claude Code 与 Codex | 当前构建 | 只覆盖本机会话；直接操作取决于事件是否带有真实回复通道 |
 | 原生 macOS 客户端 | 可测试源码 | 支持 macOS 26+、Apple Silicon；本地打包可用，全新 Mac 发布验收仍未完成 |
 | ActRealm 工作区自动排布 | 实验性能力 | 需要 macOS 辅助功能权限，失败时不得修改 Runtime 任务状态 |
-| ActRealm Review | 开发中 | 规划包含测试、diff、证据与检查点审阅；不属于当前构建 |
+| ActRealm Review | 暂停 | 旧实现无法可靠归属共享工作区变化；只有未来具备准确 task branch/commit、Diff 与验证证据后才重新评估 |
+| 本机 Companion | 支持 | 本机配对、状态读取与受控操作；逐请求验证权限 |
 | Gemini CLI 适配器 | 开发中 | 尚未作为当前正式支持的 Provider 交付 |
 | Windows 客户端 | 路线图 | 必须先完成 Runtime 平台抽象，再开发 WinUI 客户端 |
 | 公开签名安装包 | 发布门禁中 | 流程已具备；仍需正式签名/公证凭证和全新 Mac 验收 |

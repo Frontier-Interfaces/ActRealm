@@ -5,7 +5,9 @@ binary=${1:-target/release/actrealm}
 duration=${ACTREALM_RESOURCE_DURATION_SECONDS:-15}
 interval=${ACTREALM_RESOURCE_INTERVAL_SECONDS:-1}
 report=${ACTREALM_RESOURCE_REPORT:-/tmp/actrealm-m5-resource-report.json}
-root=${TMPDIR:-/tmp}/actrealm-m5-resource-$$
+# macOS TMPDIR can be long enough that the native enrollment socket exceeds
+# sockaddr_un's path limit. Keep the isolated Runtime home short and private.
+root=$(mktemp -d /tmp/actrealm-m5-XXXXXX)
 socket=$root/bridge.sock
 samples=$root/samples.txt
 

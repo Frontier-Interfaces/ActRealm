@@ -82,6 +82,7 @@
           </div>
           <h2 class="sr-only" id="quota-heading">额度</h2>
           <div class="panel-scroll quota-list" id="quota-list" aria-live="polite"></div>
+          <div class="token-decision-summary" id="token-decision-summary" hidden></div>
           <footer class="runtime-footer">
             <div><span class="runtime-dot"></span><strong id="runtime-footer-label">Runtime · 本机在线</strong></div>
             <span id="quota-sync-time">最近同步 · --:--:--</span>
@@ -188,6 +189,22 @@
           </article>
         </div>
         <p class="settings-section-note">关闭某项后，此类事件仍会保留在任务记录中，但不会出现在 Outbox。</p>
+        <div class="retention-row">
+          <div><strong>已完成任务</strong><p>只对 Runtime 已确认完成的任务生效</p></div>
+          <select id="completion-hide-mode" aria-label="已完成任务隐藏方式">
+            <option value="afterConfirmation">确认后隐藏</option>
+            <option value="afterDelay">自动隐藏</option>
+          </select>
+        </div>
+        <div class="retention-row" id="completion-auto-hide-row" hidden>
+          <div><strong>完成后保留</strong><p>“知道了”只关闭提醒；到达设定时间才隐藏任务</p></div>
+          <select id="completion-auto-hide-minutes" aria-label="已完成任务自动隐藏时间">
+            <option value="5">5 分钟</option>
+            <option value="15">15 分钟</option>
+            <option value="30">30 分钟</option>
+            <option value="60">60 分钟</option>
+          </select>
+        </div>
       </section>
 
       <section class="settings-glass display-settings">
@@ -280,6 +297,10 @@
     </aside>
     <div class="toast" id="toast" role="status" hidden></div>
     <script src="/i18n.js" defer></script>
+    <script src="/agent-state.js" defer></script>
+    <script src="/agent-detail.js" defer></script>
+    <script src="/notification-sound.js" defer></script>
+    <script src="/token-decision.js" defer></script>
     <script src="/app.js" defer></script>
   </body>
 </html>

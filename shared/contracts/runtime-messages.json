@@ -362,6 +362,65 @@
       "parameters": [],
       "en": "No verifiable quota window was found in the Codex rollout.",
       "zh-Hans": "Codex rollout 中没有可验证的额度窗口。"
+    },
+    {
+      "code": "quota.reason.claude_refresh_failed",
+      "parameters": [],
+      "en": "Claude quota refresh failed. The last successfully captured values are shown.",
+      "zh-Hans": "Claude 额度刷新失败，当前显示的是上次成功获取的数据。"
+    },
+    {
+      "code": "quota.reason.codex_refresh_failed",
+      "parameters": [],
+      "en": "Codex quota refresh failed. The last successfully captured values are shown.",
+      "zh-Hans": "Codex 额度刷新失败，当前显示的是上次成功获取的数据。"
+    },
+    {
+      "code": "quota.window.claude_weekly",
+      "parameters": [],
+      "en": "Weekly · all models",
+      "zh-Hans": "总周额度"
+    },
+    {
+      "code": "quota.window.scoped_weeks",
+      "parameters": [
+        "name",
+        "count"
+      ],
+      "en": "{name} · {count} weeks",
+      "zh-Hans": "{name} · {count} 周"
+    },
+    {
+      "code": "quota.window.scoped",
+      "parameters": [
+        "name"
+      ],
+      "en": "{name} quota",
+      "zh-Hans": "{name} 额度"
+    },
+    {
+      "code": "quota.reason.cache_stale",
+      "parameters": [],
+      "en": "This is a historical quota value; waiting for a fresh Provider update.",
+      "zh-Hans": "这是历史额度，正在等待 Provider 更新；不能作为当前剩余额度。"
+    },
+    {
+      "code": "interaction.agent_question.title",
+      "parameters": [],
+      "en": "Agent is asking",
+      "zh-Hans": "Agent 正在询问"
+    },
+    {
+      "code": "quota.reason.agent_refresh_failed",
+      "parameters": [],
+      "en": "Agent quota refresh failed; showing the last captured value.",
+      "zh-Hans": "Agent 额度刷新失败，显示上次记录。"
+    },
+    {
+      "code": "quota.reason.agent_unavailable",
+      "parameters": [],
+      "en": "The Agent did not return account quota information.",
+      "zh-Hans": "Agent 暂未提供账户额度信息。"
     }
   ]
 }

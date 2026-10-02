@@ -1,13 +1,24 @@
 #![cfg(unix)]
 
+use actrealm_bridge::BridgeClient;
+use actrealm_core::BridgeRequest;
 use actrealm_runtime::{RuntimeStore, StoreSnapshot};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+static RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn runtime_test_guard() -> MutexGuard<'static, ()> {
+    RUNTIME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn temp_root(name: &str) -> PathBuf {
     PathBuf::from("/tmp").join(format!(
@@ -43,6 +54,30 @@ fn wait_until_for(description: &str, timeout: Duration, condition: impl Fn() -> 
     }
 }
 
+fn runtime_event_count(socket: &Path) -> Option<u64> {
+    let received_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    let probe = BridgeRequest::doctor_probe_at(received_at);
+    let response = BridgeClient::new(socket)
+        .send(&probe, Duration::from_millis(500))
+        .ok()??;
+    if response.reason.as_deref() != Some("doctor_probe_ok") {
+        return None;
+    }
+    serde_json::from_str::<Value>(response.message.as_deref()?)
+        .ok()?
+        .get("eventCount")?
+        .as_u64()
+}
+
+fn wait_for_runtime(socket: &Path) {
+    wait_until("runtime control loop", || {
+        runtime_event_count(socket).is_some()
+    });
+}
+
 fn wait_for_store_snapshot(
     database: &Path,
     description: &str,
@@ -64,6 +99,28 @@ fn write_payload(child: &mut Child, payload: &Value) {
 
 fn spawn_hook(socket: &Path, payload: &Value) -> Child {
     spawn_provider_hook(socket, "codex", payload)
+}
+
+fn run_hook_after_runtime_ready(
+    socket: &Path,
+    payload: &Value,
+    expected_event_count: u64,
+) -> Output {
+    wait_for_runtime(socket);
+    // A non-reply hook returns as soon as its frame is written. Let the
+    // single-threaded test Runtime finish the preceding connection before the
+    // next short-lived hook process tries to connect.
+    thread::sleep(Duration::from_millis(20));
+    let output = spawn_hook(socket, payload).wait_with_output().unwrap();
+    if output.status.success() {
+        // A successful non-reply Hook only proves that its frame reached the
+        // socket. Wait for Runtime's own API to report durable ingestion
+        // before opening a second RuntimeStore observer on the same database.
+        wait_until("hook event ingestion", || {
+            runtime_event_count(socket).is_some_and(|count| count >= expected_event_count)
+        });
+    }
+    output
 }
 
 fn spawn_provider_hook(socket: &Path, provider: &str, payload: &Value) -> Child {
@@ -98,8 +155,7 @@ fn spawn_provider_hook_with_timeout(
     child
 }
 
-fn session_attention_state(database: &Path, provider_session_id: &str) -> Option<String> {
-    let store = RuntimeStore::open(database).ok()?;
+fn session_attention_state(store: &RuntimeStore, provider_session_id: &str) -> Option<String> {
     let snapshot = store.snapshot().ok()?;
     let session = snapshot
         .sessions
@@ -123,6 +179,7 @@ fn assert_success(output: &Output) {
 
 #[test]
 fn non_permission_event_spools_offline_and_replays_once_on_startup() {
+    let _guard = runtime_test_guard();
     warm_binary();
     let home = temp_root("spool-replay");
     let socket = home.join("run/bridge.sock");
@@ -158,7 +215,7 @@ fn non_permission_event_spools_offline_and_replays_once_on_startup() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    wait_until("runtime socket", || socket.exists());
+    wait_for_runtime(&socket);
     wait_until("spool drain", || {
         fs::read_dir(home.join("spool"))
             .map(|mut entries| entries.next().is_none())
@@ -177,6 +234,7 @@ fn non_permission_event_spools_offline_and_replays_once_on_startup() {
 
 #[test]
 fn duplicate_permission_passes_old_waiter_and_decides_only_the_new_one() {
+    let _guard = runtime_test_guard();
     warm_binary();
     let root = temp_root("duplicate");
     fs::create_dir_all(&root).unwrap();
@@ -195,7 +253,7 @@ fn duplicate_permission_passes_old_waiter_and_decides_only_the_new_one() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    wait_until("runtime socket", || socket.exists());
+    wait_for_runtime(&socket);
 
     let payload = json!({
         "hook_event_name": "PermissionRequest",
@@ -246,6 +304,7 @@ fn duplicate_permission_passes_old_waiter_and_decides_only_the_new_one() {
 
 #[test]
 fn second_runtime_cannot_replace_the_live_instance_or_its_socket() {
+    let _guard = runtime_test_guard();
     warm_binary();
     let root = temp_root("single-instance");
     fs::create_dir_all(&root).unwrap();
@@ -264,7 +323,7 @@ fn second_runtime_cannot_replace_the_live_instance_or_its_socket() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    wait_until("first runtime socket", || socket.exists());
+    wait_for_runtime(&socket);
 
     let second = Command::new(env!("CARGO_BIN_EXE_actrealm"))
         .args([
@@ -300,6 +359,7 @@ fn second_runtime_cannot_replace_the_live_instance_or_its_socket() {
 
 #[test]
 fn provider_side_tool_progress_releases_widget_waiters_for_claude_and_codex() {
+    let _guard = runtime_test_guard();
     warm_binary();
     let root = temp_root("provider-resolution");
     fs::create_dir_all(&root).unwrap();
@@ -319,7 +379,10 @@ fn provider_side_tool_progress_releases_widget_waiters_for_claude_and_codex() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    wait_until("runtime socket", || socket.exists());
+    wait_for_runtime(&socket);
+    // Keep one observer alive. Re-running additive schema initialization on
+    // every 20 ms poll can starve the child Runtime's writer on a busy host.
+    let observer = RuntimeStore::open(&database).unwrap();
 
     for provider in ["claude", "codex"] {
         let session = format!("{provider}-provider-resolution");
@@ -333,7 +396,7 @@ fn provider_side_tool_progress_releases_widget_waiters_for_claude_and_codex() {
         });
         let waiting = spawn_provider_hook_with_timeout(&socket, provider, &permission, 10_000);
         wait_until_for("open provider approval", Duration::from_secs(10), || {
-            session_attention_state(&database, &session).as_deref() == Some("open")
+            session_attention_state(&observer, &session).as_deref() == Some("open")
         });
 
         let progress = json!({
@@ -354,17 +417,19 @@ fn provider_side_tool_progress_releases_widget_waiters_for_claude_and_codex() {
         assert_success(&waiting_output);
         assert!(waiting_output.stdout.is_empty());
         wait_until("resolved provider approval", || {
-            session_attention_state(&database, &session).as_deref() == Some("resolved")
+            session_attention_state(&observer, &session).as_deref() == Some("resolved")
         });
     }
 
     runtime.kill().unwrap();
     runtime.wait().unwrap();
+    drop(observer);
     fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn codex_native_permission_hook_lifecycle_is_observed_neutrally_for_five_rounds() {
+    let _guard = runtime_test_guard();
     warm_binary();
     let root = temp_root("codex-native-permission");
     fs::create_dir_all(&root).unwrap();
@@ -384,15 +449,17 @@ fn codex_native_permission_hook_lifecycle_is_observed_neutrally_for_five_rounds(
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    wait_until("runtime socket", || socket.exists());
+    wait_for_runtime(&socket);
 
     let provider_session_id = "codex-desktop-native-permission";
     for round in 1..=5 {
+        let events_before_round = (round - 1) * 5;
+        let turn_id = format!("desktop-turn-{round}");
         let tool_use_id = format!("request-permissions-{round}");
         let started = json!({
             "hook_event_name":"PreToolUse",
             "session_id":provider_session_id,
-            "turn_id":"desktop-turn",
+            "turn_id":turn_id,
             "cwd":"/tmp/example-project",
             "permission_mode":"default",
             "tool_name":"request_permissions",
@@ -402,7 +469,7 @@ fn codex_native_permission_hook_lifecycle_is_observed_neutrally_for_five_rounds(
                 "reason":format!("第 {round} 轮：请求终端访问网络。")
             }
         });
-        let output = spawn_hook(&socket, &started).wait_with_output().unwrap();
+        let output = run_hook_after_runtime_ready(&socket, &started, events_before_round + 1);
         assert_success(&output);
         assert!(
             output.stdout.is_empty(),
@@ -417,7 +484,8 @@ fn codex_native_permission_hook_lifecycle_is_observed_neutrally_for_five_rounds(
             else {
                 return false;
             };
-            session.exec_state == "awaiting_approval"
+            snapshot.event_count > events_before_round
+                && session.exec_state == "awaiting_approval"
                 && session.approval_owner.as_deref() == Some("terminal")
                 && snapshot.attention.iter().any(|item| {
                     item.session_id == session.id
@@ -432,43 +500,41 @@ fn codex_native_permission_hook_lifecycle_is_observed_neutrally_for_five_rounds(
         let activity = json!({
             "hook_event_name":"Notification",
             "session_id":provider_session_id,
-            "turn_id":"desktop-turn",
+            "turn_id":turn_id,
             "message":"still waiting in Codex"
         });
-        let output = spawn_hook(&socket, &activity).wait_with_output().unwrap();
+        let output = run_hook_after_runtime_ready(&socket, &activity, events_before_round + 2);
         assert_success(&output);
         assert!(output.stdout.is_empty());
-        let store = RuntimeStore::open(&database).unwrap();
-        let snapshot = store.snapshot().unwrap();
-        let session = snapshot
-            .sessions
-            .iter()
-            .find(|session| session.provider_session_id == provider_session_id)
-            .unwrap();
-        assert_eq!(session.exec_state, "awaiting_approval");
-        assert_eq!(session.approval_owner.as_deref(), Some("terminal"));
-        drop(store);
+        wait_for_store_snapshot(&database, "native permission activity", |snapshot| {
+            snapshot.event_count >= events_before_round + 2
+                && snapshot.sessions.iter().any(|session| {
+                    session.provider_session_id == provider_session_id
+                        && session.exec_state == "awaiting_approval"
+                        && session.approval_owner.as_deref() == Some("terminal")
+                })
+        });
 
         let handled = json!({
             "hook_event_name":"PostToolUse",
             "session_id":provider_session_id,
-            "turn_id":"desktop-turn",
+            "turn_id":turn_id,
             "cwd":"/tmp/example-project",
             "tool_name":"request_permissions",
             "tool_use_id":tool_use_id,
             "tool_response":{"status":"handled"}
         });
-        let output = spawn_hook(&socket, &handled).wait_with_output().unwrap();
+        let output = run_hook_after_runtime_ready(&socket, &handled, events_before_round + 3);
         assert_success(&output);
         assert!(output.stdout.is_empty());
 
         let stopped = json!({
             "hook_event_name":"Stop",
             "session_id":provider_session_id,
-            "turn_id":"desktop-turn",
+            "turn_id":turn_id,
             "cwd":"/tmp/example-project"
         });
-        let output = spawn_hook(&socket, &stopped).wait_with_output().unwrap();
+        let output = run_hook_after_runtime_ready(&socket, &stopped, events_before_round + 4);
         assert_success(&output);
         assert!(output.stdout.is_empty());
 
@@ -486,7 +552,8 @@ fn codex_native_permission_hook_lifecycle_is_observed_neutrally_for_five_rounds(
                 else {
                     return false;
                 };
-                session.exec_state == "awaiting_approval"
+                snapshot.event_count >= events_before_round + 4
+                    && session.exec_state == "awaiting_approval"
                     && session.approval_owner.as_deref() == Some("terminal")
                     && snapshot.attention.iter().any(|item| {
                         item.session_id == session.id
@@ -501,13 +568,13 @@ fn codex_native_permission_hook_lifecycle_is_observed_neutrally_for_five_rounds(
         let continued = json!({
             "hook_event_name":"PreToolUse",
             "session_id":provider_session_id,
-            "turn_id":"desktop-turn",
+            "turn_id":turn_id,
             "cwd":"/tmp/example-project",
             "tool_name":"Bash",
             "tool_use_id":format!("continued-tool-{round}"),
             "tool_input":{"command":"printf local-regression"}
         });
-        let output = spawn_hook(&socket, &continued).wait_with_output().unwrap();
+        let output = run_hook_after_runtime_ready(&socket, &continued, events_before_round + 5);
         assert_success(&output);
         assert!(output.stdout.is_empty());
 
@@ -522,7 +589,8 @@ fn codex_native_permission_hook_lifecycle_is_observed_neutrally_for_five_rounds(
                 else {
                     return false;
                 };
-                session.approval_owner.is_none()
+                snapshot.event_count >= events_before_round + 5
+                    && session.approval_owner.is_none()
                     && !snapshot.attention.iter().any(|item| {
                         item.session_id == session.id
                             && item.kind == "native_approval"

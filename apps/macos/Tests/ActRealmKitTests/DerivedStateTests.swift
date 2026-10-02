@@ -8,16 +8,24 @@ private func makeAttention(
     createdAt: UInt64,
     state: String = "open",
     risk: String = "low",
+    primaryCategory: String? = nil,
+    commandPreview: String? = nil,
     title: String = "允许 Bash？",
     titleMessage: RuntimeMessage? = nil,
-    sessionId: String = "s"
+    sessionId: String = "s",
+    autoHideAt: UInt64? = nil,
+    reminderAcknowledgedAt: UInt64? = nil
 ) -> AttentionRecord {
     AttentionRecord(
         id: id, sessionId: sessionId, provider: "codex", project: "proj",
         requestId: kind == "approval" ? UUID() : nil, kind: kind, title: title,
         titleMessage: titleMessage,
-        detail: nil, state: state, risk: risk, riskNotes: [], commandPreview: nil,
-        expiresAt: nil, createdAt: createdAt, resolution: nil
+        detail: nil, state: state, risk: risk, riskNotes: [],
+        primaryCategory: primaryCategory,
+        commandPreview: commandPreview,
+        expiresAt: nil, autoHideAt: autoHideAt,
+        reminderAcknowledgedAt: reminderAcknowledgedAt,
+        createdAt: createdAt, resolution: nil
     )
 }
 
@@ -49,6 +57,36 @@ private func makeSnapshot(
         sessions: sessions, attention: attention, commands: commands,
         quota: quota, stats: Snapshot.empty.stats
     )
+}
+
+@Suite struct TaskFactPresentationTests {
+    @Test func directRuntimeFactIsExplicitAndDoesNotExposeRawSourceData() {
+        let fact = RuntimeFactMetadata(
+            sourceKind: .authoritative,
+            sourceId: "runtime:live_reply_waiter",
+            freshness: .live,
+            verification: .verified,
+            capability: .direct
+        )
+        #expect(TaskFactPresentation.summary(
+            fact,
+            language: .simplifiedChinese
+        ) == "Runtime · 实时 · 已验证 · 可直接处理")
+    }
+
+    @Test func unavailableFactExplainsProviderAbsenceInEnglish() {
+        let fact = RuntimeFactMetadata(
+            sourceKind: .unavailable,
+            freshness: .stale,
+            verification: .unverified,
+            absenceReason: .providerNotSupplied,
+            capability: .unavailable
+        )
+        #expect(TaskFactPresentation.summary(
+            fact,
+            language: .english
+        ) == "No source · Stale · Unverified · Provider did not supply it")
+    }
 }
 
 @Suite struct OutboxOrderingTests {
@@ -137,6 +175,24 @@ private func makeSnapshot(
         #expect(derived.outbox.map(\.id) == ["live"])
     }
 
+    @Test func acknowledgedAutomaticCompletionLeavesDoneTaskButClosesOutboxReminder() throws {
+        let derived = DerivedState.derive(from: makeSnapshot(
+            sessions: [makeSession(id: "s", execState: "response_finished")],
+            attention: [makeAttention(
+                id: "done",
+                kind: "completion",
+                createdAt: 100,
+                autoHideAt: 2_000,
+                reminderAcknowledgedAt: 1_500
+            )]
+        ))
+        #expect(derived.openOutbox.isEmpty)
+        let task = try #require(derived.agentTasks.first)
+        #expect(task.status == .done)
+        #expect(task.hasVisibleAttention)
+        #expect(task.openOutboxCount == 0)
+    }
+
     @Test func snoozedItemsStayOutOfOutboxUntilRuntimeReopensThem() {
         let snapshot = makeSnapshot(attention: [
             makeAttention(id: "later", kind: "completion", createdAt: 100, state: "snoozed")
@@ -155,10 +211,10 @@ private func makeSnapshot(
         #expect(entry.actionTitle == "Codex 请求运行 Bash，等待批准")
     }
 
-    @Test func highAndUnknownRiskNeedVerification() {
+    @Test func riskWarningRemainsIndependentOfApprovalCapabilities() {
         #expect(RiskLevel(record: "high").needsVerification)
         #expect(RiskLevel(record: "unknown").needsVerification)
-        #expect(!RiskLevel(record: "med").needsVerification)
+        #expect(RiskLevel(record: "med").needsVerification)
         #expect(!RiskLevel(record: "low").needsVerification)
     }
 
@@ -226,6 +282,21 @@ private func makeSnapshot(
         #expect(
             AppModel.acknowledgementToast(for: completion)
                 == "已确认任务完成：任务 s"
+        )
+
+        let automaticCompletion = try #require(DerivedState.derive(from: makeSnapshot(
+            sessions: [makeSession(id: "auto")],
+            attention: [makeAttention(
+                id: "auto-done",
+                kind: "completion",
+                createdAt: 1,
+                sessionId: "auto",
+                autoHideAt: 2_000
+            )]
+        )).openOutbox.first)
+        #expect(
+            AppModel.acknowledgementToast(for: automaticCompletion)
+                == "已关闭完成提醒：任务 auto"
         )
 
         let error = try #require(DerivedState.derive(from: makeSnapshot(
@@ -343,7 +414,8 @@ private func makeSnapshot(
         let snapshot = makeSnapshot(quota: [
             QuotaEntry(
                 provider: "claude", window: "5h", status: "available",
-                usedPct: 32, remainingPct: 68, resetsAt: 1_784_193_000, source: "statusline",
+                usedPct: 32, remainingPct: 68, resetsAt: 1_784_193_000,
+                resetSource: "statusline", resetCapturedAt: 900_000, source: "oauth_usage",
                 capturedAt: 1_000_000, reason: nil
             )
         ])
@@ -354,7 +426,26 @@ private func makeSnapshot(
         }
         #expect(pct == 68)
         #expect(resetsAt?.timeIntervalSince1970 == 1_784_193_000)
+        #expect(slot.source == "oauth_usage")
+        #expect(slot.resetSource == "statusline")
+        #expect(slot.resetCapturedAt?.timeIntervalSince1970 == 900)
         #expect(!slot.isTight)
+    }
+
+    @Test func staleQuotaPreservesItsLastValueWithoutClaimingCurrentAvailability() {
+        let snapshot = makeSnapshot(quota: [
+            QuotaEntry(
+                provider: "claude", window: "5h", status: "stale",
+                usedPct: 32, remainingPct: 68, resetsAt: nil, source: "oauth_usage",
+                capturedAt: 1_000_000, reason: "temporary refresh failure"
+            )
+        ])
+        let slot = DerivedState.derive(from: snapshot).quotaSlots[0]
+        guard case .stale(let pct, _, _) = slot.availability else {
+            Issue.record("expected an explicitly stale last-known value")
+            return
+        }
+        #expect(pct == 68)
     }
 
     @Test func below20PercentIsTight() {
@@ -388,6 +479,78 @@ private func makeSnapshot(
         #expect(slots.map(\.title) == ["主窗口", "Fable"])
         #expect(slots.map(\.planType) == ["Plus", "Plus"])
         #expect(slots.map(\.windowMinutes) == [300, 1_440])
+    }
+
+    @Test func proSparkQuotaIsNamedSeparatelyAndPlanLabelsAreReadable() {
+        let snapshot = makeSnapshot(quota: [
+            QuotaEntry(
+                provider: "codex", window: "10080m", status: "available",
+                usedPct: 1, remainingPct: 99, resetsAt: nil, source: "codex_app_server",
+                windowMinutes: 10_080, limitId: "codex", planType: "pro",
+                capturedAt: 1_000, reason: nil
+            ),
+            QuotaEntry(
+                provider: "codex", window: "10080m", status: "available",
+                usedPct: 0, remainingPct: 100, resetsAt: nil, source: "codex_app_server",
+                windowMinutes: 10_080, limitId: "codex_bengalfox", quotaKind: "spark",
+                planType: "pro",
+                capturedAt: 1_000, reason: nil
+            ),
+        ])
+
+        let slots = DerivedState.derive(from: snapshot).quotaSlots
+        #expect(slots.map(\.providerDisplayName) == ["Codex", "Codex Spark"])
+        #expect(slots.map(\.displayPlanType) == ["pro", "pro"])
+        #expect(slots.map(\.isSpark) == [false, true])
+    }
+
+    @Test func sparkQuotaIsHiddenUnlessCodexReportsAProPlan() {
+        for planType in ["plus", "business", nil] as [String?] {
+            let snapshot = makeSnapshot(quota: [
+                QuotaEntry(
+                    provider: "codex", window: "10080m", status: "available",
+                    usedPct: 10, remainingPct: 90, resetsAt: nil,
+                    source: "codex_app_server", windowMinutes: 10_080,
+                    limitId: "codex", planType: planType, capturedAt: 1_000, reason: nil
+                ),
+                QuotaEntry(
+                    provider: "codex", window: "10080m", status: "available",
+                    usedPct: 20, remainingPct: 80, resetsAt: nil,
+                    source: "codex_app_server", windowMinutes: 10_080,
+                    limitId: "codex_bengalfox", quotaKind: "spark", planType: planType,
+                    capturedAt: 1_000, reason: nil
+                ),
+            ])
+
+            let slots = DerivedState.derive(from: snapshot).quotaSlots
+            #expect(slots.count == 1)
+            #expect(slots[0].providerDisplayName == "Codex")
+        }
+    }
+
+    @Test func unknownPlanLabelIsPreservedInsteadOfGuessed() {
+        let snapshot = makeSnapshot(quota: [
+            QuotaEntry(
+                provider: "codex", window: "300m", status: "available",
+                usedPct: 10, remainingPct: 90, resetsAt: nil, source: "codex_app_server",
+                windowMinutes: 300, limitId: "codex", planType: "future-tier",
+                capturedAt: 1_000, reason: nil
+            ),
+        ])
+
+        #expect(DerivedState.derive(from: snapshot).quotaSlots[0].displayPlanType == "future-tier")
+    }
+
+    @Test func calendarMonthQuotaDoesNotRenderAsHundredsOfHours() {
+        let snapshot = makeSnapshot(quota: [
+            QuotaEntry(
+                provider: "codex", window: "43800m", status: "available",
+                usedPct: 60, remainingPct: 40, resetsAt: 1_788_219_474,
+                source: "codex_app_server", windowMinutes: 43_800,
+                capturedAt: 1_785_744_057_000, reason: nil
+            )
+        ])
+        #expect(DerivedState.derive(from: snapshot).quotaSlots[0].title == "1 month")
     }
 }
 
@@ -488,7 +651,8 @@ private func makeSnapshot(
             openAttention: []
         )
 
-        #expect(task.status == .running)
+        #expect(task.status == .idle)
+        #expect(task.executionIsUnconfirmed)
         #expect(task.recoveryPresentation != .ended)
     }
 
@@ -555,5 +719,103 @@ private func makeSnapshot(
     @Test func expiryText() {
         #expect(ZhFormat.expiry(54 * 60) == "54 分钟后过期")
         #expect(ZhFormat.expiry(-5) == "已过期")
+    }
+
+    @Test func longQuotaResetUsesTheInjectedCalendarTimeZone() {
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(secondsFromGMT: 0)!
+        let utcText = ZhFormat.resetTime(
+            Date(timeIntervalSince1970: 1_788_219_474),
+            now: Date(timeIntervalSince1970: 1_785_744_057),
+            calendar: utc,
+            language: .simplifiedChinese
+        )
+        #expect(utcText.contains("8月31日"))
+
+        var shanghai = Calendar(identifier: .gregorian)
+        shanghai.timeZone = TimeZone(identifier: "Asia/Shanghai")!
+        let shanghaiText = ZhFormat.resetTime(
+            Date(timeIntervalSince1970: 1_788_219_474),
+            now: Date(timeIntervalSince1970: 1_785_744_057),
+            calendar: shanghai,
+            language: .simplifiedChinese
+        )
+        #expect(shanghaiText.contains("9月1日"))
+    }
+
+    @Test func futureQuotaResetAlwaysIncludesDateWeekdayAndTime() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "Asia/Shanghai")!
+        let now = calendar.date(from: DateComponents(
+            year: 2026, month: 8, day: 13, hour: 16, minute: 30
+        ))!
+        let reset = calendar.date(from: DateComponents(
+            year: 2026, month: 8, day: 20, hour: 14, minute: 59
+        ))!
+
+        #expect(ZhFormat.resetTime(
+            reset,
+            now: now,
+            calendar: calendar,
+            language: .simplifiedChinese
+        ) == "8月20日 周四 14:59 重置")
+        #expect(ZhFormat.resetTime(
+            reset,
+            now: now,
+            calendar: calendar,
+            language: .english
+        ) == "Resets Aug 20 · Thu at 14:59")
+    }
+
+    @Test func crossYearQuotaResetIncludesTheYear() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "Asia/Shanghai")!
+        let now = calendar.date(from: DateComponents(
+            year: 2026, month: 12, day: 31, hour: 23
+        ))!
+        let reset = calendar.date(from: DateComponents(
+            year: 2027, month: 1, day: 2, hour: 9, minute: 30
+        ))!
+
+        #expect(ZhFormat.resetTime(
+            reset,
+            now: now,
+            calendar: calendar,
+            language: .simplifiedChinese
+        ) == "2027年1月2日 周六 09:30 重置")
+        #expect(ZhFormat.resetTime(
+            reset,
+            now: now,
+            calendar: calendar,
+            language: .english
+        ) == "Resets Jan 2, 2027 · Sat at 09:30")
+    }
+}
+
+@Suite struct LocalTaskTruthRegressionTests {
+    @Test func deadOrUnconfirmedExecutionIsExcludedFromRunningTasks() {
+        for recovery in ["lost_control", "waiting_for_event", "ended"] {
+            let session = makeSession(id: "s", execState: "thinking", recoveryState: recovery)
+            let task = LaneTask(session: session, openAttention: [])
+            #expect(task.status == .idle)
+            #expect(task.executionIsUnconfirmed)
+            #expect(!task.isVisibleInAgentTasks(at: Date(timeIntervalSince1970: 500)))
+        }
+        let live = LaneTask(session: makeSession(id: "live", execState: "tool_running", recoveryState: "observing"), openAttention: [])
+        #expect(live.status == .running)
+    }
+
+    @Test func unconfirmedExecutionPreservesRealPendingRequests() {
+        let task = LaneTask(session: makeSession(id: "s", execState: "thinking", recoveryState: "lost_control"), openAttention: [makeAttention(id: "approval", kind: "approval", createdAt: 1000)])
+        #expect(task.status == .waiting)
+        #expect(task.openOutboxCount == 1)
+    }
+
+    @Test func observedUsageIsRetainedWithoutClaimingCompleteCoverage() throws {
+        let session = try JSONDecoder().decode(SessionRecord.self, from: Data(#"{"id":"s","provider":"codex","providerSessionId":"s","execState":"thinking","lastEventAt":1000,"totalTokens":12345,"lastTurnTokens":2345,"usageQuality":"partial","usageSource":"codex_rollout_during_indexing"}"#.utf8))
+        let task = LaneTask(session: session, openAttention: [])
+        #expect(task.totalTokens == 12345)
+        #expect(task.lastTurnTokens == 2345)
+        #expect(task.usageIsProvisional)
     }
 }

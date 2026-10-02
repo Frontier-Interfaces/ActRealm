@@ -1,12 +1,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-#[cfg(target_os = "macos")]
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-#[cfg(target_os = "macos")]
-use std::os::unix::fs::FileTypeExt;
-use std::path::Path;
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
@@ -76,6 +75,7 @@ struct Inner {
     pending: Mutex<HashMap<String, mpsc::Sender<Result<Value, String>>>>,
     protocol: Mutex<ProtocolSupport>,
     next_id: AtomicU64,
+    shared_connection: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -110,16 +110,43 @@ impl CodexConnector {
         socket_path: &Path,
     ) -> Result<(Self, ConnectorChannels), ConnectorError> {
         cleanup_legacy_socket_listeners(socket_path);
-        Self::connect_stdio(executable)
+        let shared_socket = shared_control_socket();
+        Self::connect_transport(executable, shared_socket.as_deref())
+    }
+
+    /// Reads account quota through a short-lived app-server process. Runtime
+    /// uses this only when its persistent task connector is unavailable, so
+    /// quota polling keeps working after sleep or an early connector failure
+    /// without requiring the user to start a Codex task.
+    pub fn read_rate_limits_once(executable: &Path) -> Result<Value, ConnectorError> {
+        let (connector, _channels) = Self::connect_stdio(executable)?;
+        let result = connector.read_rate_limits();
+        connector.shutdown();
+        result
     }
 
     fn connect_stdio(executable: &Path) -> Result<(Self, ConnectorChannels), ConnectorError> {
-        // Codex app-server natively supports stdio. Keeping it as the direct
-        // child of Runtime avoids a detached Unix-socket listener: if Runtime
-        // is killed, the OS closes stdin and app-server exits on EOF instead
-        // of surviving as a PPID-1 orphan.
-        let mut child = Command::new(executable)
-            .args(["app-server", "--stdio"])
+        Self::connect_transport(executable, None)
+    }
+
+    pub fn is_shared_connection(&self) -> bool {
+        self.inner.shared_connection
+    }
+
+    fn connect_transport(
+        executable: &Path,
+        shared_socket: Option<&Path>,
+    ) -> Result<(Self, ConnectorChannels), ConnectorError> {
+        // The official proxy joins the existing service; killing our proxy
+        // never terminates its daemon or another client's active writer.
+        let mut command = Command::new(executable);
+        command.arg("app-server");
+        if let Some(socket) = shared_socket {
+            command.arg("proxy").arg("--sock").arg(socket);
+        } else {
+            command.arg("--stdio");
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -141,6 +168,7 @@ impl CodexConnector {
                 pending: Mutex::new(HashMap::new()),
                 protocol: Mutex::new(ProtocolSupport::default()),
                 next_id: AtomicU64::new(1),
+                shared_connection: shared_socket.is_some(),
             }),
         };
         let reader_connector = connector.downgrade();
@@ -286,6 +314,13 @@ impl CodexConnector {
         Ok(thread)
     }
 
+    /// Reads Codex account rate limits without starting or resuming a task.
+    /// The app-server owns authentication; ActRealm receives only the
+    /// allowlisted usage snapshot returned by the provider protocol.
+    pub fn read_rate_limits(&self) -> Result<Value, ConnectorError> {
+        self.call("account/rateLimits/read", json!({}), RPC_TIMEOUT)
+    }
+
     pub fn call(
         &self,
         method: &str,
@@ -330,6 +365,16 @@ impl CodexConnector {
         self.write(&json!({"id": id, "error": {"code": code, "message": message}}))
     }
 
+    pub fn shutdown(&self) {
+        self.fail_all_pending("connector_shutdown");
+        if let Ok(mut managed) = self.inner.child.lock() {
+            if let Some(mut child) = managed.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
     fn write(&self, value: &Value) -> Result<(), ConnectorError> {
         let mut writer = self
             .inner
@@ -365,6 +410,39 @@ impl CodexConnector {
             }
         }
     }
+}
+
+fn shared_control_socket() -> Option<PathBuf> {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
+    let path = home.join("app-server-control/app-server-control.sock");
+    trusted_control_socket(&path).then_some(path)
+}
+
+#[cfg(unix)]
+fn trusted_control_socket(path: &Path) -> bool {
+    let owner = unsafe { libc::geteuid() };
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(directory) = fs::symlink_metadata(parent) else {
+        return false;
+    };
+    let Ok(socket) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    directory.is_dir()
+        && directory.uid() == owner
+        && directory.mode() & 0o022 == 0
+        && socket.file_type().is_socket()
+        && socket.uid() == owner
+        && socket.mode() & 0o022 == 0
+}
+
+#[cfg(not(unix))]
+fn trusted_control_socket(_path: &Path) -> bool {
+    false
 }
 
 /// Releases listeners created by pre-stdio ActRealm builds. The private
@@ -501,6 +579,63 @@ mod tests {
     use std::time::Instant;
 
     #[test]
+    fn shared_control_socket_rejects_links_and_writable_endpoints() {
+        use std::os::unix::net::UnixListener;
+        let root =
+            std::env::temp_dir().join(format!("actrealm-shared-trust-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(trusted_control_socket(&path));
+        let link = root.join("link.sock");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(!trusted_control_socket(&link));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(!trusted_control_socket(&path));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!trusted_control_socket(&path));
+        drop(listener);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_transport_uses_official_proxy_arguments_and_only_owns_its_child() {
+        let root =
+            std::env::temp_dir().join(format!("actrealm-shared-proxy-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("fake-codex");
+        fs::write(&executable, r#"#!/bin/sh
+[ "$1" = app-server ] && [ "$2" = proxy ] && [ "$3" = --sock ] && [ "$4" = /fixture/control.sock ] || exit 1
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{"userAgent":"codex_cli_rs/0.144.6"}}' ;;
+  esac
+done
+"#).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(Command::new(&executable)
+            .args(["app-server", "proxy", "--sock", "/fixture/control.sock"])
+            .stdin(Stdio::null())
+            .status()
+            .unwrap()
+            .success());
+        let (connector, _channels) = CodexConnector::connect_transport(
+            &executable,
+            Some(Path::new("/fixture/control.sock")),
+        )
+        .unwrap();
+        assert!(connector.is_shared_connection());
+        let weak = connector.downgrade();
+        connector.shutdown();
+        drop(connector);
+        assert!(weak.upgrade().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn persistent_stdio_initializes_lists_resumes_and_routes_server_requests() {
         let root = std::env::temp_dir().join(format!(
             "actrealm-codex-connector-{}-{}",
@@ -516,16 +651,20 @@ if [ "$2" = "daemon" ]; then
   exit 0
 fi
 while IFS= read -r line; do
+  request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
     *'"method":"initialize"'*)
-      printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex","platformFamily":"unix","platformOs":"macos","userAgent":"codex_cli_rs/0.144.6"}}'
+      printf '{"id":%s,"result":{"codexHome":"/tmp/codex","platformFamily":"unix","platformOs":"macos","userAgent":"codex_cli_rs/0.144.6"}}\n' "$request_id"
       ;;
     *'"method":"thread/list"'*)
-      printf '%s\n' '{"id":2,"result":{"data":[{"id":"thread-1","sessionId":"session-1","cwd":"/tmp/project","name":"Recovered thread","status":{"type":"active","activeFlags":["waitingOnUserInput"]},"turns":[],"updatedAt":100}]}}'
+      printf '{"id":%s,"result":{"data":[{"id":"thread-1","sessionId":"session-1","cwd":"/tmp/project","name":"Recovered thread","status":{"type":"active","activeFlags":["waitingOnUserInput"]},"turns":[],"updatedAt":100}]}}\n' "$request_id"
       ;;
     *'"method":"thread/resume"'*)
-      printf '%s\n' '{"id":3,"result":{"thread":{"id":"thread-1","sessionId":"session-1","cwd":"/tmp/project","name":"Recovered thread","status":{"type":"active","activeFlags":["waitingOnUserInput"]},"turns":[],"updatedAt":100}}}'
+      printf '{"id":%s,"result":{"thread":{"id":"thread-1","sessionId":"session-1","cwd":"/tmp/project","name":"Recovered thread","status":{"type":"active","activeFlags":["waitingOnUserInput"]},"turns":[],"updatedAt":100}}}\n' "$request_id"
       printf '%s\n' '{"id":"server-request-1","method":"item/tool/requestUserInput","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","questions":[{"id":"choice","header":"Choice","question":"Continue?","isOther":false,"isSecret":false,"options":null}]}}'
+      ;;
+    *'"method":"account/rateLimits/read"'*)
+      printf '{"id":%s,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":12,"windowDurationMins":300,"resetsAt":1784140000}}}}\n' "$request_id"
       ;;
     *'"id":"server-request-1"'*)
       printf '%s\n' '{"method":"test/responseSeen","params":{"threadId":"thread-1"}}'
@@ -551,6 +690,11 @@ done
         assert_eq!(threads[0].active_flags, vec!["waitingOnUserInput"]);
         let resumed = connector.resume_thread("thread-1").unwrap();
         assert_eq!(resumed.name.as_deref(), Some("Recovered thread"));
+        let rate_limits = connector.read_rate_limits().unwrap();
+        assert_eq!(rate_limits["rateLimits"]["primary"]["usedPercent"], 12);
+
+        let one_shot = CodexConnector::read_rate_limits_once(&executable).unwrap();
+        assert_eq!(one_shot["rateLimits"]["primary"]["usedPercent"], 12);
         let request = channels
             .requests
             .recv_timeout(Duration::from_secs(1))
@@ -567,6 +711,17 @@ done
             .recv_timeout(Duration::from_secs(1))
             .unwrap();
         assert_eq!(notification.method, "test/responseSeen");
+        connector.shutdown();
+        assert!(
+            !Command::new("/bin/kill")
+                .args(["-0", &child_id.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success(),
+            "explicit shutdown must reap the managed app-server child"
+        );
         drop(connector);
         assert!(weak_connector.upgrade().is_none());
         assert!(
