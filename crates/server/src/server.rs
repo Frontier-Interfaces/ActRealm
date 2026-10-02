@@ -8596,6 +8596,9 @@ fn refresh_session_usage(state: &AppState, now: u64) -> Result<(bool, bool), Sto
                     usage
                         .collector
                         .enable_kimi_sources(home.join(".kimi-code/sessions"));
+                    usage
+                        .collector
+                        .enable_grok_sources(home.join(".grok/sessions"));
                 }
                 state.usage.clear_poison();
                 usage
@@ -10822,6 +10825,73 @@ done
             .collector
             .publishable_codex_session_ids()
             .contains("live"));
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incomplete_grok_scan_preserves_committed_totals_and_recovers_after_repair() {
+        let root = std::env::temp_dir().join(format!("actrealm-grok-usage-{}", Uuid::now_v7()));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        // The normal collector-recovery path reconstructs sources from these
+        // installer paths. Use the same root to verify a poisoned restart too.
+        let sessions = root.join("home/.grok/sessions");
+        let summary = sessions.join("%2Fproject/session-1/usage.json");
+        fs::create_dir_all(summary.parent().unwrap()).unwrap();
+        let write_summary = |input: u64| {
+            let usage = json!({
+                "inputTokens": input, "outputTokens": 20,
+                "cachedReadTokens": 0, "cacheCreationTokens": 0,
+                "totalTokens": input + 20, "modelCalls": 1,
+                "primaryModelId": "grok-test", "endedAt": "2026-09-20T12:00:00Z"
+            });
+            fs::write(
+                &summary,
+                json!({
+                    "sessionId": "session-1", "updatedAt": "2026-09-20T12:00:00Z",
+                    "session": usage, "turns": [usage]
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        write_summary(80);
+        state
+            .usage
+            .lock()
+            .unwrap()
+            .collector
+            .enable_grok_sources(sessions);
+        assert!(run_usage_refresh_iteration(&state));
+        assert_eq!(store.snapshot().unwrap().token_usage.total, 100);
+        assert!(!state.usage_collection_pending.load(Ordering::Acquire));
+
+        for missing in [false, true] {
+            if missing {
+                fs::remove_file(&summary).unwrap();
+            } else {
+                fs::write(&summary, b"{").unwrap();
+            }
+            state.usage.lock().unwrap().refreshed_at = None;
+            assert!(run_usage_refresh_iteration(&state));
+            assert!(state.usage_collection_pending.load(Ordering::Acquire));
+            assert_eq!(store.snapshot().unwrap().token_usage.total, 100);
+        }
+
+        write_summary(180);
+        let usage = state.usage.clone();
+        assert!(thread::spawn(move || {
+            let _guard = usage.lock().unwrap();
+            panic!("simulate collector failure");
+        })
+        .join()
+        .is_err());
+        assert!(run_usage_refresh_iteration(&state));
+        assert!(!state.usage.is_poisoned());
+        assert!(!state.usage_collection_pending.load(Ordering::Acquire));
+        assert_eq!(store.snapshot().unwrap().token_usage.total, 200);
         drop(state);
         drop(store);
         fs::remove_dir_all(root).unwrap();

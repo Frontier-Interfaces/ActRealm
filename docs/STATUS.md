@@ -1,6 +1,6 @@
 # ActRealm current status
 
-Last reviewed: 2026-09-21
+Last reviewed: 2026-10-02
 
 Current candidate review: [PR #10](https://github.com/Frontier-Interfaces/ActRealm/pull/10),
 targeting `agent/v1-full`. This update includes Kimi/Grok integrations, automatic
@@ -8,6 +8,19 @@ Codex connection attempts, current Token usage recovery, native interaction
 fixes, corrected performance metrics and provider-backup compatibility.
 Historical entries below retain their validation-time installation and submission
 status; they do not describe the current Git worktree.
+
+## 2026-10-02 PR #10 validation repairs
+
+Independent Codex question RPCs retain separate reply channels even when their
+text matches. Complete Codex usage can publish while Claude discovery remains
+partial. Incomplete Grok summary scans preserve committed usage, and collector
+recovery restores Grok sources. PTY fixtures use the system shell and verify
+timeout/reaping; resource checks use a short private directory for Unix sockets.
+
+Local verification passed: 458 Rust tests (3 ignored), 223 Swift tests, 14 Web
+tests, format, Clippy, language/workflow contracts, RustSec audit, release build,
+and Apple Silicon QA package/signature checks. The 120-second resource check
+measured 0.264% average idle CPU and 29,008 KiB maximum Runtime RSS.
 
 ## 2026-09-21 Display connection observation and official icons — build 136
 

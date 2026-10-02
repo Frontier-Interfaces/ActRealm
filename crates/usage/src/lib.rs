@@ -1319,8 +1319,10 @@ pub struct UsageCollector {
     next_usage_file_index: usize,
     last_discovery: Option<Instant>,
     discovery_complete: bool,
+    codex_discovery_complete: bool,
     claude_discovery: DiscoveryScan,
     codex_discovery: DiscoveryScan,
+    grok_scan_complete: bool,
     line_buffer: Vec<u8>,
     pricing: PricingSnapshot,
     live_pricing_enabled: bool,
@@ -1350,8 +1352,10 @@ impl UsageCollector {
             next_usage_file_index: 0,
             last_discovery: None,
             discovery_complete: false,
+            codex_discovery_complete: false,
             claude_discovery: DiscoveryScan::default(),
             codex_discovery: DiscoveryScan::default(),
+            grok_scan_complete: true,
             line_buffer: Vec::new(),
             pricing: cached_pricing.unwrap_or_else(embedded_pricing_snapshot),
             live_pricing_enabled: false,
@@ -1387,6 +1391,7 @@ impl UsageCollector {
 
     pub fn enable_grok_sources(&mut self, root: PathBuf) {
         self.grok_root = Some(root);
+        self.grok_scan_complete = false;
     }
 
     pub fn live_pricing_enabled(&self) -> bool {
@@ -1428,6 +1433,7 @@ impl UsageCollector {
     pub fn is_caught_up(&self) -> bool {
         self.last_discovery.is_some()
             && self.discovery_complete
+            && self.grok_scan_complete
             && self.known_claude.iter().all(|path| {
                 self.claude_files.get(path).is_some_and(|state| {
                     source_is_caught_up(
@@ -1500,11 +1506,11 @@ impl UsageCollector {
             .collect()
     }
 
-    /// Only commit a per-session result once inventory is complete and every
+    /// Only commit a per-session result once Codex inventory is complete and every
     /// source's session identity is known. Otherwise an undiscovered resume
     /// fragment could make a smaller partial total replace committed history.
     pub fn publishable_codex_session_ids(&self) -> HashSet<String> {
-        if !self.discovery_complete
+        if !self.codex_discovery_complete
             || self.known_codex.iter().any(|path| {
                 self.codex_files.get(path).is_none_or(|state| {
                     state.session_id.is_none()
@@ -1562,6 +1568,7 @@ impl UsageCollector {
             let claude = self.claude_discovery.poll(&self.paths.claude_projects);
             let codex = self.codex_discovery.poll(&self.paths.codex_sessions);
             self.discovery_complete = claude.complete && codex.complete;
+            self.codex_discovery_complete = codex.complete;
             merge_discovered_files(&mut self.known_claude, claude);
             merge_discovered_files(&mut self.known_codex, codex);
             self.last_discovery = Some(Instant::now());
@@ -1735,7 +1742,14 @@ impl UsageCollector {
             merge_record(&mut records, record);
         }
         if let Some(root) = &self.grok_root {
-            for record in grok::records(root) {
+            let scan = grok::records(root);
+            self.grok_scan_complete = scan.complete;
+            if !scan.complete {
+                // A failed official summary read must not replace its prior
+                // resume-stable ledger with a smaller process-local fallback.
+                records.retain(|(provider, _), _| provider != "grok");
+            }
+            for record in scan.records {
                 records.insert(
                     (record.provider.clone(), record.provider_session_id.clone()),
                     record,
@@ -5218,6 +5232,7 @@ mod tests {
             .extend((0..12).map(|i| sessions.join(format!("cold-{i}.jsonl"))));
         collector.last_discovery = Some(Instant::now());
         collector.discovery_complete = true;
+        collector.codex_discovery_complete = true;
         let records = collector.collect(100);
         assert!(!collector.is_caught_up());
         assert!(collector.publishable_codex_session_ids().contains("live"));
@@ -5264,11 +5279,121 @@ mod tests {
         partial.complete = false;
         merge_discovered_files(&mut collector.known_codex, partial);
         collector.discovery_complete = false;
+        collector.codex_discovery_complete = false;
         collector.collect(101);
         assert_eq!(collector.codex_files[&second].offset, before);
         assert!(collector.known_codex.contains(&second));
         assert!(!collector.is_caught_up());
         assert!(collector.publishable_codex_session_ids().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incomplete_claude_inventory_does_not_block_complete_codex_sessions() {
+        let root = temp_dir("codex-independent-discovery");
+        let claude = root.join("claude");
+        let codex = root.join("codex");
+        fs::create_dir_all(&claude).unwrap();
+        fs::create_dir_all(&codex).unwrap();
+        for index in 0..=MAX_DISCOVERED_FILES {
+            fs::write(claude.join(format!("{index}.jsonl")), "{}\n").unwrap();
+        }
+        fs::write(codex.join("live.jsonl"), concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"live\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"output_tokens\":8,\"total_tokens\":108}}}}\n"
+        )).unwrap();
+        let mut collector = UsageCollector::new(UsagePaths {
+            actrealm_home: root.join("cache"),
+            claude_projects: vec![claude.clone()],
+            codex_sessions: vec![codex],
+        });
+        let records = collector.collect(100);
+        // Finish the over-cap Claude walk with a deterministic time budget.
+        while !collector.claude_discovery.pending.is_empty() {
+            let discovery = collector.claude_discovery.poll_with_budget(
+                std::slice::from_ref(&claude),
+                &mut DiscoveryBudget::with_elapsed_for_test(|| Duration::ZERO),
+            );
+            collector.discovery_complete = discovery.complete && collector.codex_discovery_complete;
+            merge_discovered_files(&mut collector.known_claude, discovery);
+        }
+        assert!(!collector.discovery_complete);
+        assert!(!collector.is_caught_up());
+        assert!(collector.publishable_codex_session_ids().contains("live"));
+        assert_eq!(
+            records
+                .iter()
+                .find(|r| r.provider_session_id == "live")
+                .unwrap()
+                .token_total,
+            Some(108)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incomplete_grok_scan_blocks_replacement_and_smaller_cached_fallback() {
+        let root = temp_dir("grok-generation-completeness")
+            .canonicalize()
+            .unwrap();
+        let summaries = root.join("grok");
+        let session = summaries.join("workspace/session-1");
+        fs::create_dir_all(&session).unwrap();
+        let usage = serde_json::json!({
+            "inputTokens":160,"outputTokens":40,"totalTokens":200,
+            "primaryModelId":"grok-test","endedAt":"2026-09-20T12:00:00Z"
+        });
+        let summary = serde_json::json!({
+            "sessionId":"session-1","updatedAt":"2026-09-20T12:00:00Z",
+            "session":usage,"turns":[usage]
+        });
+        let path = session.join("usage.json");
+        fs::write(&path, serde_json::to_vec(&summary).unwrap()).unwrap();
+        let mut collector = UsageCollector::new(UsagePaths {
+            actrealm_home: root.join("runtime"),
+            claude_projects: vec![],
+            codex_sessions: vec![],
+        });
+        collector.enable_grok_sources(summaries);
+        assert!(!collector.is_caught_up());
+        agents::capture_agent_usage(
+            &collector.paths.actrealm_home,
+            "grok",
+            "session-1",
+            "process-one",
+            None,
+            agents::AgentUsageSample {
+                model: Some("grok-test".into()),
+                input_tokens: Some(80),
+                output_tokens: Some(20),
+                token_total: Some(100),
+                ..Default::default()
+            },
+            timestamp_millis("2026-09-20T12:00:00Z").unwrap(),
+        )
+        .unwrap();
+        let records = collector.collect(100);
+        assert!(collector.is_caught_up());
+        assert_eq!(records[0].token_total, Some(200));
+        assert_eq!(records[0].usage_source, "grok_session_usage");
+
+        // A partial in-place summary write cannot certify absence or expose
+        // the smaller process-local cache as a replacement for official usage.
+        fs::write(&path, b"{").unwrap();
+        let records = collector.collect(101);
+        assert!(!collector.is_caught_up());
+        assert!(records.iter().all(|record| record.provider != "grok"));
+
+        fs::remove_file(&path).unwrap();
+        let records = collector.collect(102);
+        assert!(!collector.is_caught_up());
+        assert!(records.iter().all(|record| record.provider != "grok"));
+
+        fs::write(&path, serde_json::to_vec(&summary).unwrap()).unwrap();
+        let records = collector.collect(103);
+        assert!(collector.is_caught_up());
+        assert_eq!(records[0].token_total, Some(200));
+        assert_eq!(records[0].usage_source, "grok_session_usage");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -5578,6 +5703,7 @@ mod tests {
         collector.known_codex = vec![first.clone(), second.clone()];
         collector.last_discovery = Some(Instant::now());
         collector.discovery_complete = true;
+        collector.codex_discovery_complete = true;
 
         assert!(collector.collect(100).is_empty());
         let first_round = collector
@@ -5645,6 +5771,7 @@ mod tests {
         collector.known_codex = vec![path.clone()];
         collector.last_discovery = Some(Instant::now());
         collector.discovery_complete = true;
+        collector.codex_discovery_complete = true;
 
         assert!(!collector.is_caught_up());
         assert!(collector.collect(100).is_empty());

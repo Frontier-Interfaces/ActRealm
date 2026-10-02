@@ -3,59 +3,129 @@
 use super::*;
 use std::collections::BTreeMap;
 
-pub(super) fn records(root: &Path) -> Vec<UsageRecord> {
-    let mut result = Vec::new();
+pub(super) struct ScanResult {
+    pub records: Vec<UsageRecord>,
+    pub complete: bool,
+}
+
+pub(super) fn records(root: &Path) -> ScanResult {
     let start = Instant::now();
-    let mut budget = 16 * 1024 * 1024u64;
-    let Ok(workspaces) = fs::read_dir(root) else {
-        return result;
+    records_with_budget(root, 16 * 1024 * 1024, || start.elapsed())
+}
+
+fn records_with_budget(root: &Path, mut budget: u64, elapsed: impl Fn() -> Duration) -> ScanResult {
+    let mut result = ScanResult {
+        records: Vec::new(),
+        complete: true,
     };
-    for workspace in workspaces.take(512).flatten() {
-        if !workspace.file_type().is_ok_and(|t| t.is_dir()) {
+    let workspaces = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            result.complete = error.kind() == io::ErrorKind::NotFound;
+            return result;
+        }
+    };
+    for (index, workspace) in workspaces.enumerate() {
+        if index >= 512 || elapsed() > Duration::from_millis(250) || budget == 0 {
+            result.complete = false;
+            return result;
+        }
+        let workspace = match workspace {
+            Ok(entry) => entry,
+            Err(_) => {
+                result.complete = false;
+                continue;
+            }
+        };
+        let kind = match workspace.file_type() {
+            Ok(kind) => kind,
+            Err(_) => {
+                result.complete = false;
+                continue;
+            }
+        };
+        if !kind.is_dir() {
             continue;
         }
-        let Ok(sessions) = fs::read_dir(workspace.path()) else {
-            continue;
+        let sessions = match fs::read_dir(workspace.path()) {
+            Ok(entries) => entries,
+            Err(_) => {
+                result.complete = false;
+                continue;
+            }
         };
-        for session in sessions.take(512).flatten() {
-            if result.len() >= 512 || start.elapsed() > Duration::from_millis(250) || budget == 0 {
+        for (index, session) in sessions.enumerate() {
+            if index >= 512
+                || result.records.len() >= 512
+                || elapsed() > Duration::from_millis(250)
+                || budget == 0
+            {
+                result.complete = false;
                 return result;
             }
-            if !session.file_type().is_ok_and(|t| t.is_dir()) {
+            let session = match session {
+                Ok(entry) => entry,
+                Err(_) => {
+                    result.complete = false;
+                    continue;
+                }
+            };
+            let kind = match session.file_type() {
+                Ok(kind) => kind,
+                Err(_) => {
+                    result.complete = false;
+                    continue;
+                }
+            };
+            if !kind.is_dir() {
                 continue;
             }
             let path = session.path().join("usage.json");
-            let Ok(file) = OpenOptions::new()
+            let file = match OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(&path)
-            else {
+            {
+                Ok(file) => file,
+                Err(_) => {
+                    // A pending or temporarily replaced summary cannot
+                    // certify removal of this session's committed usage.
+                    result.complete = false;
+                    continue;
+                }
+            };
+            let Ok(meta) = file.metadata() else {
+                result.complete = false;
                 continue;
             };
-            let Ok(meta) = file.metadata() else { continue };
             if !meta.is_file()
                 || meta.uid() != unsafe { libc::getuid() }
                 || meta.len() > 8 * 1024 * 1024
                 || meta.len() > budget
             {
+                result.complete = false;
                 continue;
             }
             let mut bytes = Vec::new();
             if file
-                .take(8 * 1024 * 1024 + 1)
+                .take((8 * 1024 * 1024 + 1).min(budget))
                 .read_to_end(&mut bytes)
                 .is_err()
             {
+                result.complete = false;
                 continue;
             }
             budget = budget.saturating_sub(bytes.len() as u64);
             let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+                result.complete = false;
                 continue;
             };
             let Some(mut record) = parse(&value) else {
+                result.complete = false;
                 continue;
             };
             if session.file_name().to_str() != Some(record.provider_session_id.as_str()) {
+                result.complete = false;
                 continue;
             }
             if let Some(project) = workspace
@@ -67,7 +137,7 @@ pub(super) fn records(root: &Path) -> Vec<UsageRecord> {
                 record.project_id = Some(project.id);
                 record.project_label = Some(project.label);
             }
-            result.push(record);
+            result.records.push(record);
         }
     }
     result
@@ -224,6 +294,67 @@ fn decode_workspace(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn summary_fixture() -> PathBuf {
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "actrealm-grok-scan-{}-{}",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let session = root.join("workspace/session-1");
+        fs::create_dir_all(&session).unwrap();
+        let usage = serde_json::json!({
+            "inputTokens":80,"outputTokens":20,"totalTokens":100,
+            "primaryModelId":"grok-test","endedAt":"2026-09-20T12:00:00Z"
+        });
+        let summary = serde_json::json!({
+            "sessionId":"session-1","updatedAt":"2026-09-20T12:00:00Z",
+            "session":usage,"turns":[usage]
+        });
+        fs::write(
+            session.join("usage.json"),
+            serde_json::to_vec(&summary).unwrap(),
+        )
+        .unwrap();
+        root
+    }
+
+    #[test]
+    fn bounded_scans_do_not_certify_a_replacement_generation() {
+        let root = summary_fixture();
+        let bytes = fs::metadata(root.join("workspace/session-1/usage.json"))
+            .unwrap()
+            .len();
+        for budget in [0, bytes - 1] {
+            let scan = records_with_budget(&root, budget, || Duration::ZERO);
+            assert!(!scan.complete);
+            assert!(scan.records.is_empty());
+        }
+        let scan = records_with_budget(&root, bytes, || Duration::from_millis(251));
+        assert!(!scan.complete);
+        assert!(scan.records.is_empty());
+        let scan = records_with_budget(&root, bytes, || Duration::ZERO);
+        assert!(scan.complete);
+        assert_eq!(scan.records[0].token_total, Some(100));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_limit_is_partial_until_the_inventory_fits() {
+        let root = summary_fixture();
+        fs::remove_dir_all(root.join("workspace")).unwrap();
+        for index in 0..=512 {
+            fs::create_dir(root.join(format!("workspace-{index}"))).unwrap();
+        }
+        let scan = records_with_budget(&root, 1, || Duration::ZERO);
+        assert!(!scan.complete);
+        fs::remove_dir(root.join("workspace-512")).unwrap();
+        let scan = records_with_budget(&root, 1, || Duration::ZERO);
+        assert!(scan.complete);
+        assert!(scan.records.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn canonical_resume_total_is_not_added_to_its_turn_deltas() {
         let usage = serde_json::json!({"inputTokens":80,"outputTokens":20,"cachedReadTokens":30,"cacheCreationTokens":0,"totalTokens":100,"modelCalls":1,"primaryModelId":"grok-test"});

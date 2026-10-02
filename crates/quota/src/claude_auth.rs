@@ -35,6 +35,20 @@ pub(super) fn refresh(
     executable: &Path,
     directory: &Path,
     timeout: Duration,
+    credential_changed: impl FnMut() -> bool,
+) -> io::Result<bool> {
+    refresh_command(
+        Command::new(executable),
+        directory,
+        timeout,
+        credential_changed,
+    )
+}
+
+fn refresh_command(
+    mut command: Command,
+    directory: &Path,
+    timeout: Duration,
     mut credential_changed: impl FnMut() -> bool,
 ) -> io::Result<bool> {
     DirBuilder::new()
@@ -47,7 +61,6 @@ pub(super) fn refresh(
     }
     fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
     let (mut master, slave) = terminal()?;
-    let mut command = Command::new(executable);
     command
         .args([
             "--tools", "", "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}",
@@ -72,6 +85,9 @@ pub(super) fn refresh(
         });
     }
     let mut child = ProbeChild(command.spawn()?);
+    // Command retains its configured Stdio handles after spawn. Close the
+    // parent's slave handles so only the child owns that side of the PTY.
+    drop(command);
     let started = Instant::now();
     let mut next_check = Duration::from_millis(500);
     let mut sent_status = false;
@@ -164,6 +180,14 @@ fn terminal() -> io::Result<(File, File)> {
 mod tests {
     use super::*;
 
+    fn fixture_command(script: &Path) -> Command {
+        // Use the signed system shell directly so PTY timing tests do not
+        // depend on first-launch inspection of freshly created executables.
+        let mut command = Command::new("/bin/sh");
+        command.arg(script);
+        command
+    }
+
     #[test]
     fn successful_process_exit_is_not_credential_renewal() {
         let root = super::super::tests::root("auth-probe-exit");
@@ -182,19 +206,13 @@ mod tests {
         let root = super::super::tests::root("auth-probe-terminal");
         fs::create_dir_all(&root).unwrap();
         let executable = root.join("fake-claude");
-        fs::write(&executable, "#!/bin/sh\n[ \"$1\" = --warmup ] && exit 0\n[ -t 0 ] && [ -t 1 ] || exit 1\nprintf '%s' $$ > pid\n: > renewed\nwhile :; do sleep 1; done\n").unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-        // Let macOS perform cold executable inspection before the two-second
-        // protocol deadline. This fixture tests PTY renewal and child reaping,
-        // not host-dependent first-launch latency.
-        assert!(Command::new(&executable)
-            .arg("--warmup")
-            .status()
-            .unwrap()
-            .success());
-        assert!(refresh(&executable, &root, Duration::from_secs(2), || root
-            .join("renewed")
-            .exists())
+        fs::write(&executable, "[ -t 0 ] && [ -t 1 ] || exit 1\nprintf '%s' $$ > pid\n: > renewed\nwhile :; do sleep 1; done\n").unwrap();
+        assert!(refresh_command(
+            fixture_command(&executable),
+            &root,
+            Duration::from_secs(2),
+            || root.join("renewed").exists()
+        )
         .unwrap());
         let pid: i32 = fs::read_to_string(root.join("pid"))
             .unwrap()
@@ -209,10 +227,50 @@ mod tests {
         let root = super::super::tests::root("auth-probe-timeout");
         fs::create_dir_all(&root).unwrap();
         let executable = root.join("fake-claude");
-        fs::write(&executable, "#!/bin/sh\nprintf 'Sign in to Claude Code\\n'\nread -r reply\nprintf '%s' \"$reply\" > accepted\n").unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(!refresh(&executable, &root, Duration::from_millis(150), || false).unwrap());
+        fs::write(&executable, "printf '%s' $$ > pid\nprintf 'Sign in to Claude Code\\n'\nread -r reply\nprintf '%s' \"$reply\" > accepted\n").unwrap();
+        let started = Instant::now();
+        assert!(!refresh_command(
+            fixture_command(&executable),
+            &root,
+            Duration::from_secs(1),
+            || false
+        )
+        .unwrap());
+        assert!(started.elapsed() < Duration::from_secs(2));
         assert!(!root.join("accepted").exists());
+        let pid: i32 = fs::read_to_string(root.join("pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn silent_terminal_is_bounded_and_process_is_reaped() {
+        let root = super::super::tests::root("auth-probe-silent");
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("fake-claude");
+        fs::write(
+            &executable,
+            "printf '%s' $$ > pid\nread -r reply\nprintf '%s' \"$reply\" > accepted\n",
+        )
+        .unwrap();
+        let started = Instant::now();
+        assert!(!refresh_command(
+            fixture_command(&executable),
+            &root,
+            Duration::from_secs(1),
+            || false
+        )
+        .unwrap());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!root.join("accepted").exists());
+        let pid: i32 = fs::read_to_string(root.join("pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
         fs::remove_dir_all(root).unwrap();
     }
 }

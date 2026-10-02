@@ -64,8 +64,17 @@ impl QuestionRegistry {
             return;
         }
         if let Some(existing) = self.entries.values_mut().find(|old| {
-            old.thread_id == batch.thread_id
-                && (old.item_id == batch.item_id || old.questions == batch.questions)
+            if old.thread_id != batch.thread_id {
+                return false;
+            }
+            let same_request = match (&old.route, &batch.route) {
+                (ReplyRoute::Rpc { id: old, .. }, ReplyRoute::Rpc { id: new, .. }) => old == new,
+                _ => old.item_id == batch.item_id,
+            };
+            let transcript_echo = old.questions == batch.questions
+                && (matches!(batch.route, ReplyRoute::Observe)
+                    || (matches!(old.route, ReplyRoute::Observe) && !old.submitting));
+            same_request || transcript_echo
         }) {
             // A transcript echo cannot remove an already verified reply route.
             if !existing.submitting
@@ -709,6 +718,66 @@ mod tests {
         assert!(registry.claim(id, 102).is_some());
         registry.finish(id, false);
         assert!(registry.claim(id, 103).is_none());
+    }
+
+    #[test]
+    fn distinct_live_requests_with_identical_questions_resolve_independently() {
+        let mut registry = QuestionRegistry::default();
+        for (at, item, rpc) in [(100, "call-1", 10), (110, "call-2", 20)] {
+            let mut live = batch(at);
+            live.item_id = item.into();
+            live.can_answer = true;
+            live.route = ReplyRoute::Rpc {
+                id: json!(rpc),
+                question_ids: vec!["choice".into()],
+            };
+            registry.observe(live);
+        }
+
+        let pending = registry.snapshot(120);
+        assert_eq!(pending.len(), 2);
+        for (question, rpc) in pending.iter().zip([10, 20]) {
+            let claimed = registry.claim(question.id, 120).unwrap();
+            assert!(matches!(claimed.route, ReplyRoute::Rpc { id, .. } if id == json!(rpc)));
+            registry.finish(question.id, true);
+        }
+        assert!(registry.snapshot(130).is_empty());
+    }
+
+    #[test]
+    fn live_rpc_identity_and_transcript_echoes_keep_the_verified_route() {
+        let mut registry = QuestionRegistry::default();
+        let mut observation = batch(100);
+        observation.item_id = "transcript-item".into();
+        registry.observe(observation.clone());
+        let id = registry.snapshot(100)[0].id;
+
+        let mut live = batch(110);
+        live.can_answer = true;
+        live.route = ReplyRoute::Rpc {
+            id: json!(10),
+            question_ids: vec!["choice".into()],
+        };
+        registry.observe(live.clone());
+        registry.observe(observation.clone());
+        assert_eq!(registry.snapshot(110).len(), 1);
+        let claimed = registry.claim(id, 110).unwrap();
+        assert!(matches!(claimed.route, ReplyRoute::Rpc { id, .. } if id == json!(10)));
+        registry.observe(observation);
+        assert_eq!(registry.snapshot(110).len(), 1);
+
+        // A fresh reverse RPC is a separate request even if the provider reuses
+        // the item identifier and asks the same question.
+        live.route = ReplyRoute::Rpc {
+            id: json!(20),
+            question_ids: vec!["choice".into()],
+        };
+        registry.observe(live);
+        assert_eq!(registry.snapshot(120).len(), 2);
+        registry.resolve_rpc(&json!(10));
+        let pending = registry.snapshot(120);
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(&pending[0].route, ReplyRoute::Rpc { id, .. } if id == &json!(20)));
     }
 
     #[test]
