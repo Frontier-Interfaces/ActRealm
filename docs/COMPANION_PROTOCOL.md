@@ -347,21 +347,47 @@ or `user_prompt`). It is sanitized with the same line-level result sanitizer
 (credential lines removed, paths/URLs/hosts/emails replaced by placeholders),
 bounded to 2,000 characters, and `truncated` is true when text was cut or a
 line was removed. In addition, a line that names a credential is removed as a
-whole: `password`, `passwd`, `pwd`, `secret`, `token`, `api key`, `apikey`,
-`access key`, `private key`, `cookie`, `authorization`, `bearer`, `密码`,
-`口令`, `密钥`, `秘钥`, `令牌`, `凭证`, `凭据`, `授权码` or `验证码`, plus
-traditional forms such as `密碼` (case-insensitive, `_`/`-` matching a space,
-full-width forms folded), followed by a half- or full-width colon or equals
-sign, whitespace, or the end of the line. A Chinese label written straight
-against its value or followed by `是`/`为` is removed only when the value looks
+whole: `password`, `passwd`, `passphrase`, `pwd`, `secret`, `token`, `api key`,
+`apikey`, `access key`, `private key`, `cookie`, `authorization`, `bearer`,
+`密码`, `口令`, `密钥`, `秘钥`, `令牌`, `凭证`, `凭据`, `授权码` or `验证码`,
+plus traditional forms such as `密碼` (case-insensitive, `_`/`-` matching a
+space, full-width forms folded, Markdown `**`/backticks and quotes around the
+label ignored), followed by a half- or full-width colon or equals sign,
+whitespace, or the end of the line. A Chinese label written straight against
+its value, or followed by a predicate (`是`, `为`, `就是`, `改成`, `改为`,
+`设为`, `设置为`, `换成`, `更新为`, `重置为`, `如下` and similar, optionally
+with `已`/`已经` before and `了` after it), is removed only when the value looks
 like a credential: at least six printable ASCII characters without spaces,
-including a digit or a symbol (`我的密码是Abc123!`, `验证码884213`), so
-sentences such as `验证码为空时报错` are kept. When a label has no value on its
-own line (`密码：`, `token:`, `我的密码是`, or the label alone), the next
-non-empty line is removed as its value too. The known
-secret formats (`sk-`, `ghp_`, private key blocks and similar) are checked per
-line and once more over the whole bounded text; a hit there drops the prompt.
-Like result excerpts it is held only in Runtime memory, is replaced by the
+including a digit or a symbol (`我的密码是Abc123!`, `密码改成了 Qwer1234!`,
+`验证码884213`), so sentences such as `验证码为空时报错` are kept. A value in
+quotes (`「」`, `『』`, `【】`, `“”`, `‘’`, `《》` or ASCII quotes) needs only
+four characters (`口令「opensesame」`). The short keys `pass`, `pwd` and `pin`
+count only in an assignment: `db_pass=hunter2`, `PIN：884213`, `userPin=1234`
+(a value after a colon needs a digit or symbol, so `pin: string` is kept;
+`pinned`, `passing`, `bypass`, `pass_rate` and `--- PASS: TestName` are not
+keys). Command-line credentials are removed too: `mysql`/`mysqladmin`/
+`mysqldump` (and the other MySQL and MariaDB clients) with `-p<password>` or
+`--password=`, and `curl`/`wget` with `-u`/`--user` and `user:password`.
+
+When a label has no value on its own line (`密码：`, `token:`, `我的密码是`,
+`密码如下：`, `数据库密码（测试环境）：` with at most six Chinese characters
+between the label and the final colon, or the label alone), or it is followed
+only by the opening of a multi-line value (`password: |`, `password: >-`,
+`"passwords": [`, `token = (`, `secret: {`, `\`, a quote), the next non-empty
+line is removed as its value too, and so is every following line indented
+deeper than the label line, until the indentation returns (YAML block scalars,
+bracketed lists).
+
+The known secret formats (`sk-`, `ghp_`, `xoxb-`, private key blocks and
+similar; `AIza`, `glpat-`, `sk_live_`, `rk_live_`, `sk_test_`, `hf_`, `npm_`,
+`xapp-`, `gho_`, `ghs_`, `ghu_`, `ghr_` and Alibaba Cloud `LTAI` keys when
+they start a run of key characters and are long enough) and long
+high-entropy tokens are checked per line and once more over the whole bounded
+text; a hit there drops the prompt. Tokens are also split at every non-ASCII
+character (CJK text, CJK and full-width punctuation, Chinese quotes), so a
+key written straight against Chinese text (`用这个AIza…调一下`, `…FBWY。`) is
+found as well. Result excerpts (`summary`) go through the same line filter.
+Like result excerpts the prompt is held only in Runtime memory, is replaced by the
 next turn, is never written to SQLite, spool, exports or snapshots, and is lost
 when Runtime restarts. A prompt from an earlier turn is never returned for the
 current one.

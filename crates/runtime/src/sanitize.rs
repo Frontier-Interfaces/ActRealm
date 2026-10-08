@@ -55,13 +55,26 @@ fn sanitize_token(token: &str) -> Result<String, SanitizationError> {
         )
     });
     let lower = trimmed.to_ascii_lowercase();
-    if has_secret_prefix(&lower) || looks_high_entropy(trimmed) {
+    if has_secret_prefix(&lower) || has_strict_secret_prefix(trimmed) || looks_high_entropy(trimmed)
+    {
         return Err(SanitizationError::SensitiveContentDetected);
     }
     if let Some((key, _)) = trimmed.split_once('=') {
         if looks_environment_key(key) || is_sensitive_key(key) {
             return Err(SanitizationError::SensitiveContentDetected);
         }
+    }
+    // A secret written straight against CJK text or full-width punctuation
+    // (common with a Chinese input method) shares its whitespace token with
+    // them; check every ASCII fragment on its own as well.
+    if ascii_fragments(trimmed).any(|fragment| {
+        let fragment = trim_fragment(fragment);
+        looks_high_entropy(fragment)
+            || fragment
+                .split_once('=')
+                .is_some_and(|(key, _)| looks_environment_key(key) || is_sensitive_key(key))
+    }) {
+        return Err(SanitizationError::SensitiveContentDetected);
     }
     if lower.contains("://")
         || lower.starts_with("mailto:")
@@ -127,6 +140,19 @@ fn contains_high_confidence_secret(line: &str) -> bool {
                 '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
             )
         });
+        if !token.is_ascii()
+            && ascii_fragments(token).any(|fragment| {
+                let fragment = trim_fragment(fragment);
+                if let Some((key, _)) = fragment.split_once('=') {
+                    return looks_environment_key(key) || is_sensitive_key(key);
+                }
+                fragment
+                    .split_once(':')
+                    .is_some_and(|(key, _)| is_sensitive_key(key))
+            })
+        {
+            return true;
+        }
         if let Some((key, _)) = token.split_once('=') {
             return looks_environment_key(key) || is_sensitive_key(key);
         }
@@ -147,12 +173,84 @@ fn has_secret_prefix(value: &str) -> bool {
         "github_pat_",
         "xoxb-",
         "xoxp-",
+        "xoxa-",
+        "xoxs-",
         "ya29.",
         "eyjhb",
         "akia",
     ]
     .iter()
     .any(|prefix| value.starts_with(prefix) || value.contains(prefix))
+}
+
+/// Provider key formats whose prefix alone is too short or too common to
+/// match anywhere in a word (`hf_hub_download`, `npm_config_registry`). Each
+/// counts only at the start of a run of `[A-Za-z0-9_-]`, case-sensitively,
+/// followed by at least the given number of key characters.
+const STRICT_SECRET_PREFIXES: [(&str, usize); 14] = [
+    ("AIza", 30),     // Google API key
+    ("glpat-", 16),   // GitLab personal access token
+    ("sk_live_", 16), // Stripe secret key
+    ("rk_live_", 16), // Stripe restricted key
+    ("sk_test_", 16), // Stripe test secret key
+    ("rk_test_", 16), // Stripe test restricted key
+    ("hf_", 30),      // Hugging Face token
+    ("npm_", 30),     // npm access token
+    ("xapp-", 16),    // Slack app-level token
+    ("gho_", 30),     // GitHub OAuth token
+    ("ghs_", 30),     // GitHub server-to-server token
+    ("ghu_", 30),     // GitHub user-to-server token
+    ("ghr_", 30),     // GitHub refresh token
+    ("LTAI", 12),     // Alibaba Cloud AccessKey ID
+];
+
+fn has_strict_secret_prefix(value: &str) -> bool {
+    value
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        })
+        .any(|run| {
+            STRICT_SECRET_PREFIXES.iter().any(|(prefix, tail)| {
+                run.strip_prefix(prefix)
+                    .is_some_and(|rest| rest.len() >= *tail)
+            })
+        })
+}
+
+/// The ASCII runs of a token, split at every non-ASCII character: CJK text,
+/// CJK punctuation (U+3000-303F), full-width forms (U+FF00-FFEF) and Chinese
+/// quotation marks.
+fn ascii_fragments(token: &str) -> impl Iterator<Item = &str> {
+    token
+        .split(|character: char| !character.is_ascii())
+        .filter(|fragment| !fragment.is_empty())
+}
+
+/// Strips punctuation that surrounds a value in prose or Markdown (`(key)`,
+/// `key.`, `**key**`) but never belongs to a key format.
+fn trim_fragment(fragment: &str) -> &str {
+    fragment.trim_matches(|character: char| {
+        matches!(
+            character,
+            '"' | '\''
+                | '`'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '<'
+                | '>'
+                | ','
+                | ';'
+                | ':'
+                | '.'
+                | '!'
+                | '?'
+                | '*'
+        )
+    })
 }
 
 fn looks_high_entropy(value: &str) -> bool {

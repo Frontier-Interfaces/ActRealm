@@ -102,15 +102,12 @@ impl OutcomeRegistry {
             if fenced {
                 continue;
             }
-            let line = line
-                .trim()
-                .trim_start_matches(['#', '-', '*', '>', ' '])
-                .replace("**", "")
-                .replace('`', "");
+            let indent = leading_whitespace(line);
+            let line = strip_markdown(line.trim());
             if line.trim().is_empty() {
                 continue;
             }
-            if let Some(safe) = filter.filter(&line) {
+            if let Some(safe) = filter.filter(indent, &line) {
                 lines.push(safe);
             }
             if lines.len() >= 5 {
@@ -260,11 +257,12 @@ fn sanitize_prompt(text: &str) -> Option<(String, bool)> {
     let mut lines = Vec::new();
     let mut filter = CredentialLineFilter::default();
     for line in raw.lines() {
+        let indent = leading_whitespace(line);
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        if let Some(safe) = filter.filter(line) {
+        if let Some(safe) = filter.filter(indent, line) {
             lines.push(safe);
         }
     }
@@ -284,28 +282,48 @@ fn sanitize_prompt(text: &str) -> Option<(String, bool)> {
 
 /// The line filter shared by the turn prompt and result excerpts. On top of
 /// the known-format detection of the result sanitizer, a line that names a
-/// credential ([`SECRET_LABELS`]) is removed as a whole, and when such a label
-/// carries no value on its own line (a Chinese password label with a
-/// full-width colon, `token:`, or just `Password`), the next non-empty line is
-/// treated as its value and removed too.
+/// credential ([`SECRET_LABELS`], a short `pass` / `pwd` / `pin` key in an
+/// assignment, or a command-line credential such as `mysql -p<password>`) is
+/// removed as a whole. When such a label carries no value on its own line (a
+/// Chinese password label with a full-width colon, `token:`, `password: |`,
+/// or just `Password`), the next non-empty line is treated as its value and
+/// removed too, together with any following lines indented deeper than the
+/// label (a YAML block scalar or a bracketed list).
 #[derive(Default)]
 struct CredentialLineFilter {
     value_on_next_line: bool,
+    /// Indentation of the last bare label line: deeper-indented lines after
+    /// its value continue that value.
+    block_indent: Option<usize>,
     /// At least one line was removed.
     removed: bool,
 }
 
 impl CredentialLineFilter {
-    /// Filters one non-empty line. Returns the sanitized line to show, or
+    /// Filters one non-empty, trimmed line whose source was indented by
+    /// `indent` whitespace characters. Returns the sanitized line to show, or
     /// `None` when nothing of it may be shown.
-    fn filter(&mut self, line: &str) -> Option<String> {
-        let label = scan_secret_label(line);
+    fn filter(&mut self, indent: usize, line: &str) -> Option<String> {
+        if !self.value_on_next_line {
+            if let Some(block_indent) = self.block_indent {
+                if indent > block_indent {
+                    self.removed = true;
+                    return None;
+                }
+                self.block_indent = None;
+            }
+        }
+        // Markdown decoration never hides a label (`**Password**`, `` `token` ``).
+        let label = scan_secret_label(&strip_markdown(line));
         if self.value_on_next_line || label != SecretLabel::None {
             // Either this line holds the value of a bare label on the
             // previous line, or it names a credential itself. A dropped value
             // line that is itself a bare label keeps the next line pending.
             self.removed = true;
             self.value_on_next_line = label == SecretLabel::ValueOnNextLine;
+            if self.value_on_next_line {
+                self.block_indent = Some(indent);
+            }
             return None;
         }
         match sanitize_result_text(line) {
@@ -318,14 +336,29 @@ impl CredentialLineFilter {
     }
 }
 
+fn leading_whitespace(line: &str) -> usize {
+    line.chars()
+        .take_while(|character| character.is_whitespace())
+        .count()
+}
+
+/// Drops Markdown decoration: leading heading, list and quote markers, bold
+/// markers and backticks.
+fn strip_markdown(line: &str) -> String {
+    line.trim_start_matches(['#', '-', '*', '>', ' '])
+        .replace("**", "")
+        .replace('`', "")
+}
+
 /// Credential labels a user or Agent may write in front of a secret. Matching
 /// is case-insensitive, `_` and `-` match a space (`API_KEY`, `access-key`),
 /// and full-width letters and punctuation match their ASCII forms. Chinese
 /// labels are written as escapes because Runtime production source stays free
 /// of Han text; the comment gives each meaning.
-const SECRET_LABELS: [&str; 25] = [
+const SECRET_LABELS: [&str; 26] = [
     "password",
     "passwd",
+    "passphrase",
     "pwd",
     "secret",
     "token",
@@ -351,6 +384,42 @@ const SECRET_LABELS: [&str; 25] = [
     "\u{9a8c}\u{8bc1}\u{7801}", // verification code
 ];
 
+/// Chinese predicates between a label and its value: copulas ("the password
+/// is ..."), verbs that set it ("the password was changed to ...") and "as
+/// follows". The value must still look like a credential.
+const LABEL_PREDICATES: [&str; 30] = [
+    "\u{662f}",                         // is
+    "\u{4e3a}",                         // as
+    "\u{70ba}",                         // as, traditional
+    "\u{7232}",                         // as, variant
+    "\u{5c31}\u{662f}",                 // is just
+    "\u{90fd}\u{662f}",                 // are all
+    "\u{8fd8}\u{662f}",                 // is still
+    "\u{9084}\u{662f}",                 // is still, traditional
+    "\u{6539}\u{6210}",                 // changed to
+    "\u{6539}\u{4e3a}",                 // changed to
+    "\u{6539}\u{70ba}",                 // changed to, traditional
+    "\u{4fee}\u{6539}\u{4e3a}",         // modified to
+    "\u{4fee}\u{6539}\u{6210}",         // modified to
+    "\u{8bbe}\u{4e3a}",                 // set to
+    "\u{8bbe}\u{6210}",                 // set to
+    "\u{8a2d}\u{70ba}",                 // set to, traditional
+    "\u{8bbe}\u{7f6e}\u{4e3a}",         // set to
+    "\u{8bbe}\u{7f6e}\u{6210}",         // set to
+    "\u{8a2d}\u{7f6e}\u{70ba}",         // set to, traditional
+    "\u{8a2d}\u{5b9a}\u{70ba}",         // set to, traditional
+    "\u{6362}\u{6210}",                 // replaced with
+    "\u{6362}\u{4e3a}",                 // replaced with
+    "\u{63db}\u{6210}",                 // replaced with, traditional
+    "\u{66f4}\u{65b0}\u{4e3a}",         // updated to
+    "\u{66f4}\u{65b0}\u{6210}",         // updated to
+    "\u{66f4}\u{65b0}\u{70ba}",         // updated to, traditional
+    "\u{91cd}\u{7f6e}\u{4e3a}",         // reset to
+    "\u{91cd}\u{7f6e}\u{6210}",         // reset to
+    "\u{5982}\u{4e0b}",                 // as follows
+    "\u{5982}\u{4e0b}\u{6240}\u{793a}", // as shown below
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SecretLabel {
     /// The line names no credential.
@@ -358,7 +427,10 @@ enum SecretLabel {
     /// The line names a credential and may carry its value.
     OnLine,
     /// The line is a bare label: only the label, or the label followed by
-    /// nothing but a colon, equals sign (or, after a Chinese label, a copula).
+    /// nothing but separators and the opening of a multi-line value (`|`,
+    /// `>`, `[`, `{`, `(`, `\`, a quote), or a Chinese label followed by a
+    /// predicate such as "is" or "changed to", or a short Chinese phrase and
+    /// a final colon.
     /// The value is expected on the next line.
     ValueOnNextLine,
 }
@@ -369,32 +441,62 @@ fn is_label_separator(character: char) -> bool {
     matches!(character, ':' | '=') || character.is_whitespace()
 }
 
-/// The Chinese copulas "is" (U+662F) and "as" (U+4E3A, traditional U+70BA),
-/// as in "the password is ...".
-fn is_copula(character: char) -> bool {
-    matches!(character, '\u{662f}' | '\u{4e3a}' | '\u{70ba}')
+/// Quotation marks: ASCII quotes and backticks, and the Chinese corner
+/// brackets, lenticular brackets, curly quotes and title marks.
+fn is_quote(character: char) -> bool {
+    matches!(
+        character,
+        '"' | '\''
+            | '`'
+            | '\u{300c}'
+            | '\u{300d}'
+            | '\u{300e}'
+            | '\u{300f}'
+            | '\u{3010}'
+            | '\u{3011}'
+            | '\u{201c}'
+            | '\u{201d}'
+            | '\u{2018}'
+            | '\u{2019}'
+            | '\u{300a}'
+            | '\u{300b}'
+    )
+}
+
+/// Decoration around a label or a value: quotes and Markdown emphasis.
+fn is_decoration(character: char) -> bool {
+    character == '*' || is_quote(character)
+}
+
+/// Characters that open a value continuing on the next lines: YAML block
+/// scalar indicators, brackets, a line continuation, or an opening quote.
+fn is_continuation(character: char) -> bool {
+    matches!(character, '|' | '>' | '-' | '+' | '[' | '{' | '(' | '\\') || is_decoration(character)
+}
+
+/// The length of a printable ASCII run without spaces at `value`.
+fn ascii_run(value: &[char]) -> usize {
+    value
+        .iter()
+        .take_while(|character| character.is_ascii_graphic())
+        .count()
 }
 
 /// A run of at least six printable ASCII characters without spaces that
 /// contains a digit or a symbol, starting right at `value`. Ordinary Chinese
 /// words after a label (`... is empty`) never qualify.
 fn looks_like_credential(value: &[char]) -> bool {
-    let run = value
-        .iter()
-        .take_while(|character| character.is_ascii_graphic())
-        .collect::<Vec<_>>();
+    let run = &value[..ascii_run(value)];
     run.len() >= 6
         && run
             .iter()
             .any(|character| character.is_ascii_digit() || character.is_ascii_punctuation())
 }
 
-fn scan_secret_label(line: &str) -> SecretLabel {
-    // Fold full-width ASCII forms (`：`, `＝`, `ＡＰＩ`) and the ideographic
-    // space to ASCII and lowercase; for label matching, `_` / `-` also match
-    // a space. Both views have the same length.
-    let folded = line
-        .chars()
+/// Folds full-width ASCII forms (`：`, `＝`, `ＡＰＩ`) and the ideographic
+/// space to ASCII, keeping the case.
+fn fold_width(line: &str) -> String {
+    line.chars()
         .map(|character| match character {
             '\u{3000}' => ' ',
             '\u{FF01}'..='\u{FF5E}' => {
@@ -402,6 +504,15 @@ fn scan_secret_label(line: &str) -> SecretLabel {
             }
             other => other,
         })
+        .collect()
+}
+
+fn scan_secret_label(line: &str) -> SecretLabel {
+    // Fold full-width forms and lowercase; for label matching, `_` / `-` also
+    // match a space. Both views have the same length.
+    let plain = fold_width(line);
+    let folded = plain
+        .chars()
         .flat_map(char::to_lowercase)
         .collect::<Vec<_>>();
     let normalized = folded
@@ -424,15 +535,23 @@ fn scan_secret_label(line: &str) -> SecretLabel {
             if label_is_ascii && normalized.get(end) == Some(&'s') {
                 end += 1;
             }
-            let rest = &normalized[end..];
+            // Closing decoration of the label itself (`"password":`, `**token**`).
+            let after = end
+                + normalized[end..]
+                    .iter()
+                    .take_while(|character| is_decoration(**character))
+                    .count();
+            let rest = &normalized[after..];
             let bare_line = normalized[..start]
                 .iter()
-                .all(|character| character.is_whitespace());
+                .all(|character| character.is_whitespace() || is_decoration(*character));
             if rest
                 .first()
                 .is_none_or(|character| is_label_separator(*character))
             {
-                let value_missing = rest.iter().all(|character| is_label_separator(*character));
+                let value_missing = rest
+                    .iter()
+                    .all(|character| is_label_separator(*character) || is_continuation(*character));
                 let assigns = rest.iter().any(|character| !character.is_whitespace());
                 if value_missing && (bare_line || assigns) {
                     return SecretLabel::ValueOnNextLine;
@@ -443,33 +562,296 @@ fn scan_secret_label(line: &str) -> SecretLabel {
             if label_is_ascii {
                 continue;
             }
-            // A Chinese label written straight against its value, or
-            // followed by a copula: only a credential-looking value counts,
-            // so sentences such as "the code is empty" are kept.
-            let value = &folded[end..];
-            let (value, copula) = match value.first() {
-                Some(character) if is_copula(*character) => (&value[1..], true),
-                _ => (value, false),
-            };
-            let value = if copula {
-                let skip = value
-                    .iter()
-                    .take_while(|character| is_label_separator(**character))
-                    .count();
-                if skip == value.len() {
-                    // "The password is:" at the end of the line.
-                    return SecretLabel::ValueOnNextLine;
-                }
-                &value[skip..]
-            } else {
-                value
-            };
-            if looks_like_credential(value) {
-                result = SecretLabel::OnLine;
+            match scan_chinese_label_value(&folded, end) {
+                SecretLabel::ValueOnNextLine => return SecretLabel::ValueOnNextLine,
+                SecretLabel::OnLine => result = SecretLabel::OnLine,
+                SecretLabel::None => {}
             }
         }
     }
+    if result == SecretLabel::None
+        && (names_short_credential_key(&plain) || names_command_line_credential(&plain))
+    {
+        result = SecretLabel::OnLine;
+    }
     result
+}
+
+/// Matches one of `phrases` at the start of `value` (the longest one wins)
+/// and returns its length.
+fn starts_with_phrase(value: &[char], phrases: &[&str]) -> Option<usize> {
+    phrases
+        .iter()
+        .map(|phrase| phrase.chars().collect::<Vec<_>>())
+        .filter(|phrase| value.starts_with(phrase))
+        .map(|phrase| phrase.len())
+        .max()
+}
+
+/// A Chinese label written straight against its value, or followed by
+/// decoration, a predicate ([`LABEL_PREDICATES`], optionally preceded by
+/// "already" and followed by the perfective particle), separators or quotes.
+/// Only a credential-looking or quoted value counts, so sentences such as
+/// "the code is empty" are kept.
+fn scan_chinese_label_value(folded: &[char], end: usize) -> SecretLabel {
+    let mut index = end;
+    let mut quoted = false;
+    while let Some(character) = folded.get(index).filter(|c| is_decoration(**c)) {
+        quoted |= is_quote(*character);
+        index += 1;
+    }
+    let verb_start = index;
+    // "already" (U+5DF2, optionally followed by U+7ECF / U+7D93).
+    let mut adverb = 0;
+    if folded.get(index) == Some(&'\u{5df2}') {
+        adverb = 1;
+        if matches!(folded.get(index + 1), Some('\u{7ecf}' | '\u{7d93}')) {
+            adverb = 2;
+        }
+    }
+    let rest = &folded[index + adverb..];
+    let verb = starts_with_phrase(rest, &LABEL_PREDICATES).unwrap_or(0);
+    if verb > 0 {
+        index += adverb + verb;
+        // The perfective particle (U+4E86): "was changed to".
+        if folded.get(index) == Some(&'\u{4e86}') {
+            index += 1;
+        }
+    }
+    while let Some(character) = folded
+        .get(index)
+        .filter(|c| is_label_separator(**c) || is_decoration(**c))
+    {
+        quoted |= is_quote(*character);
+        index += 1;
+    }
+    let value = &folded[index..];
+    if value.is_empty() {
+        // "The password is:" or "the password is as follows:" at the end of
+        // the line. (A label followed by nothing but decoration and
+        // separators never reaches this function.)
+        return SecretLabel::ValueOnNextLine;
+    }
+    // A quoted value (`「opensesame」`) needs no digit or symbol.
+    if looks_like_credential(value) || (quoted && ascii_run(value) >= 4) {
+        return SecretLabel::OnLine;
+    }
+    if verb == 0 && ends_a_short_chinese_label(&folded[verb_start..]) {
+        return SecretLabel::ValueOnNextLine;
+    }
+    SecretLabel::None
+}
+
+/// A label followed only by a short Chinese phrase and a final colon
+/// ("password (test environment):"): the value follows on the next line.
+fn ends_a_short_chinese_label(tail: &[char]) -> bool {
+    let mut tail = tail;
+    while let Some((last, head)) = tail.split_last() {
+        if last.is_whitespace() {
+            tail = head;
+        } else {
+            break;
+        }
+    }
+    let Some((':', between)) = tail.split_last() else {
+        return false;
+    };
+    let between = between
+        .iter()
+        .filter(|character| !character.is_whitespace())
+        .collect::<Vec<_>>();
+    between.len() <= 6
+        && between
+            .iter()
+            .all(|character| !character.is_ascii() || matches!(character, '(' | ')' | '[' | ']'))
+}
+
+/// `pass`, `pwd` and `pin` keys count only in an assignment with a value of
+/// at least four characters: `db_pass=hunter2`, `PIN: 884213`,
+/// `userPin=1234`, `PIN` + "code" (U+7801) in Chinese. Words that merely
+/// contain them (`pinned`, `passing`, `bypass`, `pass_rate`), test-runner
+/// lines (`--- PASS: TestName`) and, after a colon, values without a digit or
+/// symbol (type annotations such as `pin: string`) are not credentials.
+fn names_short_credential_key(line: &str) -> bool {
+    let characters = line.chars().collect::<Vec<_>>();
+    for (index, separator) in characters.iter().enumerate() {
+        if !matches!(separator, ':' | '=') {
+            continue;
+        }
+        let mut key_end = index;
+        while key_end > 0 && characters[key_end - 1] == ' ' {
+            key_end -= 1;
+        }
+        if key_end > 0 && matches!(characters[key_end - 1], '"' | '\'' | '`') {
+            key_end -= 1;
+        }
+        // "PIN code" written in Chinese (simplified or traditional).
+        if key_end > 0 && matches!(characters[key_end - 1], '\u{7801}' | '\u{78bc}') {
+            key_end -= 1;
+        }
+        let mut key_start = key_end;
+        while key_start > 0
+            && (characters[key_start - 1].is_ascii_alphanumeric()
+                || matches!(characters[key_start - 1], '_' | '-' | '.'))
+        {
+            key_start -= 1;
+        }
+        let key = characters[key_start..key_end].iter().collect::<String>();
+        if !is_short_credential_key(&key, *separator) {
+            continue;
+        }
+        let mut value_start = index + 1;
+        while matches!(characters.get(value_start), Some(' ' | '"' | '\'' | '`')) {
+            value_start += 1;
+        }
+        let value = characters[value_start.min(characters.len())..]
+            .iter()
+            .take_while(|character| character.is_ascii_graphic())
+            .collect::<String>();
+        let value = value.trim_end_matches([',', ';', '.', ')', ']', '}', '"', '\'', '`']);
+        // After a colon the value must look like a secret, so that type
+        // annotations (`pin: string`, `pin: Pin<&mut Self>`) are kept.
+        let secret_like = *separator == '='
+            || value.chars().any(|character| {
+                character.is_ascii_digit()
+                    || matches!(
+                        character,
+                        '!' | '@' | '#' | '$' | '%' | '^' | '+' | '=' | '~' | '?'
+                    )
+            });
+        if value.len() >= 4
+            && secret_like
+            && !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "true" | "false" | "null" | "none"
+            )
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_short_credential_key(key: &str, separator: char) -> bool {
+    let key = key.trim_start_matches('-');
+    // Test runners report `PASS: TestName`.
+    if key.is_empty() || (key == "PASS" && separator == ':') {
+        return false;
+    }
+    // Split `db_pass`, `db.pass`, `user-pin` and `userPin` into lowercase words.
+    let mut segments = vec![String::new()];
+    let mut previous_lowercase = false;
+    for character in key.chars() {
+        if matches!(character, '_' | '-' | '.') {
+            segments.push(String::new());
+            previous_lowercase = false;
+            continue;
+        }
+        if character.is_ascii_uppercase() && previous_lowercase {
+            segments.push(String::new());
+        }
+        previous_lowercase = character.is_ascii_lowercase() || character.is_ascii_digit();
+        if let Some(segment) = segments.last_mut() {
+            segment.push(character.to_ascii_lowercase());
+        }
+    }
+    segments.retain(|segment| !segment.is_empty());
+    let Some(last) = segments.last() else {
+        return false;
+    };
+    const KEYS: [&str; 9] = [
+        "pass",
+        "passwd",
+        "password",
+        "passphrase",
+        "passcode",
+        "pwd",
+        "pin",
+        "pincode",
+        "pinnumber",
+    ];
+    let joined = segments
+        .len()
+        .checked_sub(2)
+        .map(|index| format!("{}{}", segments[index], last));
+    KEYS.contains(&last.as_str())
+        || joined.is_some_and(|joined| KEYS.contains(&joined.as_str()))
+        || (["pass", "passwd", "password", "pwd"]
+            .iter()
+            .any(|suffix| last.ends_with(suffix))
+            && ![
+                "bypass",
+                "compass",
+                "surpass",
+                "trespass",
+                "overpass",
+                "underpass",
+                "encompass",
+            ]
+            .contains(&last.as_str()))
+}
+
+/// Credentials written as command-line options: `mysql -p<password>` (and the
+/// other MySQL / MariaDB clients) or `--password=`, and `curl` / `wget` with
+/// `-u` / `--user` and `user:password`.
+fn names_command_line_credential(line: &str) -> bool {
+    #[derive(Clone, Copy)]
+    enum Tool {
+        Mysql,
+        Http,
+    }
+    let tokens = line
+        .split(|character: char| character.is_whitespace() || !character.is_ascii())
+        .map(|token| token.trim_matches(['"', '\'', '`', '(', ')']))
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let mut tool = None;
+    for (index, token) in tokens.iter().enumerate() {
+        let name = token.rsplit('/').next().unwrap_or(token);
+        match name {
+            "mysql" | "mysqladmin" | "mysqldump" | "mysqlimport" | "mysqlshow" | "mysqlcheck"
+            | "mysqlslap" | "mariadb" | "mariadb-dump" | "mariadb-admin" => {
+                tool = Some(Tool::Mysql);
+                continue;
+            }
+            "curl" | "wget" => {
+                tool = Some(Tool::Http);
+                continue;
+            }
+            _ => {}
+        }
+        match tool {
+            Some(Tool::Mysql) => {
+                let attached = token.starts_with("-p") && token.len() > 2;
+                let long = token
+                    .strip_prefix("--password=")
+                    .is_some_and(|value| !value.is_empty());
+                if attached || long {
+                    return true;
+                }
+            }
+            Some(Tool::Http) => {
+                let credentials = match *token {
+                    "-u" | "-U" | "--user" | "--proxy-user" => tokens.get(index + 1).copied(),
+                    _ => token
+                        .strip_prefix("--user=")
+                        .or_else(|| token.strip_prefix("--proxy-user="))
+                        .or_else(|| token.strip_prefix("-u"))
+                        .or_else(|| token.strip_prefix("-U"))
+                        .filter(|value| !value.is_empty() && !value.starts_with('-')),
+                };
+                if credentials.is_some_and(|value| {
+                    value
+                        .split_once(':')
+                        .is_some_and(|(_, secret)| !secret.is_empty())
+                }) {
+                    return true;
+                }
+            }
+            None => {}
+        }
+    }
+    false
 }
 
 fn extract_links(raw: &str) -> (String, Vec<String>) {
@@ -661,6 +1043,176 @@ mod tests {
             "hook:Stop",
         );
         assert_eq!(r.get("s", 0, 520).unwrap().observed_at, 400);
+
+        // The same setter verbs, quotes, unlabeled key formats, multi-line
+        // values and command-line credentials as in the prompt.
+        r.observe(
+            "s",
+            "服务器 root 密码设置为 P@ssw0rd2026\n签名密钥用 9f8e7d6c5b4a39281706f5e4d3c2b1a0。\n口令「opensesame」\n配置：\n  password: |\n    Abc123!\n  user: app\nmysql -uroot -pHunter2024 app 已连通\n其余完成",
+            None,
+            600,
+            "hook:Stop",
+        );
+        let result = r.get("s", 0, 620).unwrap();
+        assert_eq!(result.summary, "配置：\nuser: app\n其余完成");
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn prompts_drop_unlabeled_key_formats_next_to_chinese_text_or_full_width_punctuation() {
+        for line in [
+            "用这个AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY调一下地图接口",
+            "地图接口用这个：AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY",
+            "Google Maps key：AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY",
+            "地图 key：AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY，用它调一下",
+            "请用 AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY。",
+            "用glpat-abcdefghij1234567890推一下",
+            "用 glpat-AbCdEfGhIjKlMnOpQrSt，推送到仓库",
+            // Split so push protection does not mistake the samples for keys.
+            concat!("stripe 用sk_", "live_abcdefghij1234567890ABCD测一下"),
+            concat!("限制权限的用rk_", "live_abcdefghij1234567890ABCD"),
+            concat!("测试环境用sk_", "test_abcdefghij1234567890ABCD"),
+            "Webhook 签名用 9f8e7d6c5b4a39281706f5e4d3c2b1a0。",
+            "hf_AbCdEfGhIjKlMnOpQrStUvWxYz01234567（HuggingFace）",
+            "发布用npm_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+            "Slack 用xapp-1-A0123456789-1234567890123-abcdef，别外传",
+            "旧的xoxa-2-1234-abcd也停用",
+            "OAuth 用gho_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+            "服务端用ghs_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789，",
+            "用户态ghu_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789。",
+            "AK：LTAI5tAbCdEfGh12 SK：Xyz12345678abcdefghij",
+        ] {
+            let (text, truncated) = sanitize_prompt(&format!("开始\n{line}\n结束")).unwrap();
+            assert_eq!(text, "开始\n结束", "{line}");
+            assert!(truncated, "{line}");
+        }
+        // Identifiers that only start like a key format are kept.
+        for sentence in [
+            "调用hf_hub_download下载模型",
+            "检查npm_config_registry配置",
+            "用 altair 画图",
+            "flexapp-server 起不来",
+            "highs_count 统计不对",
+            "ghs_count 是多少",
+        ] {
+            assert_eq!(
+                sanitize_prompt(&format!("{sentence}\n然后跑测试")).unwrap(),
+                (format!("{sentence}\n然后跑测试"), false),
+                "{sentence}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompts_drop_command_line_and_short_key_credentials() {
+        for line in [
+            "mysql -h 10.0.0.5 -uroot -pHunter2024 app 连不上，帮我看看",
+            "mysqldump -uroot -pHunter2024 app 导出一下",
+            "mysqladmin --password=Hunter2024 status",
+            "用 curl -u admin:Hunter2024 测一下接口",
+            "用curl -uadmin:Hunter2024测一下",
+            "curl --user=admin:Hunter2024 看返回",
+            "wget --user admin:Hunter2024 下载",
+            "db_pass=hunter2",
+            "DB_PASS=hunter2",
+            "pass：Abc123!",
+            "Pass: hunter2",
+            "PIN：884213",
+            "pin: 1234",
+            "PIN码：884213",
+            "userPin=1234",
+            "sim_pin = 0000",
+            "rootpass=hunter2",
+            "\"db_pass\": \"hunter2\"",
+            "passphrase: correct horse battery staple",
+        ] {
+            let (text, truncated) = sanitize_prompt(&format!("开始\n{line}\n结束")).unwrap();
+            assert_eq!(text, "开始\n结束", "{line}");
+            assert!(truncated, "{line}");
+        }
+        for sentence in [
+            "pinned: yes",
+            "spinner: dots",
+            "mapping: none",
+            "passing tests 都过了",
+            "bypass=false",
+            "pass_rate: 95%",
+            "--- PASS: TestCheckout (0.01s)",
+            "Pass: 12",
+            "PIN 码长度 6 位",
+            "mysql -uroot -p app 连不上",
+            "mysql -P3306 app",
+            "curl -u admin 然后手动输入",
+            "compass: north",
+            "pin: string",
+            "userPin: number",
+            "pin: Pin<&mut Self>",
+        ] {
+            assert_eq!(
+                sanitize_prompt(&format!("{sentence}\n然后跑测试")).unwrap(),
+                (format!("{sentence}\n然后跑测试"), false),
+                "{sentence}"
+            );
+        }
+    }
+
+    #[test]
+    fn values_that_continue_on_the_next_lines_are_dropped() {
+        assert_eq!(
+            sanitize_prompt("db:\n  password: |\n    Abc123!\n    second line\n  user: app")
+                .unwrap(),
+            ("db:\nuser: app".to_owned(), true)
+        );
+        for (source, expected) in [
+            (
+                "先看配置\ntoken: |\n  abcDEF123\n然后部署",
+                "先看配置\n然后部署",
+            ),
+            (
+                "先看配置\npassword: >-\n  Abc123!\n  more\n然后部署",
+                "先看配置\n然后部署",
+            ),
+            (
+                "先看配置\n\"password\": [\n  \"Abc123!\",\n  \"Def456?\"\n]\n然后部署",
+                "先看配置\n]\n然后部署",
+            ),
+            (
+                "先看配置\npassword = (\n  \"Qwer1234!\"\n)\n然后部署",
+                "先看配置\n)\n然后部署",
+            ),
+            (
+                "先看配置\nsecret: {\n  a1b2c3\n}\n然后部署",
+                "先看配置\n}\n然后部署",
+            ),
+            (
+                "测试账号\n**密码**\nQwer1234!\n然后部署",
+                "测试账号\n然后部署",
+            ),
+            (
+                "先登录\n**Password**\nhunter2024\n然后部署",
+                "先登录\n然后部署",
+            ),
+            ("先登录\n`token`\nabcDEF123\n然后部署", "先登录\n然后部署"),
+            ("先登录\n「密码」\nopensesame\n然后部署", "先登录\n然后部署"),
+            (
+                "先登录\n测试账号的密码如下：\nAbc123!\n然后部署",
+                "先登录\n然后部署",
+            ),
+            (
+                "先登录\n数据库密码（测试环境）：\nAbc123!\n然后部署",
+                "先登录\n然后部署",
+            ),
+            ("先登录\n密码改成：\nAbc123!\n然后部署", "先登录\n然后部署"),
+        ] {
+            let (text, truncated) = sanitize_prompt(source).unwrap();
+            assert_eq!(text, expected, "{source}");
+            assert!(truncated, "{source}");
+        }
+        // Deeper-indented lines after an ordinary line are not values.
+        assert_eq!(
+            sanitize_prompt("步骤：\n  1. 打开设置\n  2. 保存").unwrap(),
+            ("步骤：\n1. 打开设置\n2. 保存".to_owned(), false)
+        );
     }
 
     #[test]
@@ -723,6 +1275,23 @@ mod tests {
             "凭据：x",
             "授權碼 884213",
             "令牌為 Abc-123",
+            // A predicate other than a single copula, or quotes.
+            "测试账号的密码改成了 Qwer1234!，你登录试试",
+            "服务器 root 密码设置为 P@ssw0rd2026",
+            "把数据库密码改为 Abc123!",
+            "数据库密码就是 Abc123!",
+            "密码设为Abc123!",
+            "令牌换成 9f8e7d6c5b4a",
+            "密码已经改成 Welcome2026",
+            "密码重置为 Welcome2026",
+            "令牌更新为：tok-2026-x",
+            "口令「opensesame」",
+            "密码“Abc123!”",
+            "密码【Abc123!】",
+            "密码『Abc123!』",
+            "密码：「Abc123!」",
+            "**密码**：Abc123!",
+            "`token`: abc",
         ] {
             let (text, truncated) =
                 sanitize_prompt(&format!("修改首页\n{secret_line}\n然后跑测试")).unwrap();
@@ -746,6 +1315,12 @@ mod tests {
             "验证码为6位数字",
             "密码是abcdef",
             "密钥ID是多少",
+            "密码改成 bcrypt 加密",
+            "把令牌有效期改成 30 分钟",
+            "密码已过期",
+            "密码重置页面改为新样式",
+            "点击“修改密码”按钮",
+            "验证码为空时报错：",
         ] {
             assert_eq!(
                 sanitize_prompt(&format!("{sentence}\n然后跑测试")).unwrap(),

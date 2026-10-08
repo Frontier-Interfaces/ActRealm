@@ -28,6 +28,15 @@ published a final v1 release; entries below describe development milestones on
   `superseded_by_prompt`; other activity keeps `superseded_by_activity`, which
   Companion history counts as unseen. Result excerpts use the same credential
   line filter as the turn prompt.
+- Second review round, prompt and result excerpt filter: keys written
+  straight against Chinese text or full-width punctuation are found (tokens
+  are split at every non-ASCII character); `AIza`, `glpat-`, `sk_live_`,
+  `rk_live_`, `sk_test_`, `hf_`, `npm_`, `xapp-`, `xoxa-`, `gho_`, `ghs_`,
+  `ghu_`, `ghr_` and `LTAI` keys are recognized; Chinese labels followed by
+  a predicate such as `改成`/`设置为`/`就是`/`如下` or by quotes, labels
+  in Markdown emphasis, multi-line values (`password: |`, `"passwords": [`,
+  deeper-indented continuation lines), `passphrase`, short `pass`/`pwd`/`pin`
+  assignments, `mysql -p<password>` and `curl -u user:password` are removed.
 
 ### Post-P0 - OUTBOX lifecycle and quota recovery
 
