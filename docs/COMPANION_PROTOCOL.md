@@ -404,10 +404,12 @@ bounded to 2,000 characters, and `truncated` is true when text was cut or a
 line was removed. In addition, a line that names a credential is removed as a
 whole: `password`, `passwd`, `passphrase`, `pwd`, `secret`, `token`, `api key`,
 `apikey`, `access key`, `private key`, `cookie`, `authorization`, `bearer`,
-`密码`, `口令`, `密钥`, `秘钥`, `私钥`, `令牌`, `凭证`, `凭据`, `授权码` or
-`验证码`, plus traditional forms such as `密碼` (case-insensitive, `_`/`-`
-matching a space, full-width forms folded, Markdown `**`/backticks and quotes
-around the label ignored), followed by a half- or full-width colon or equals
+`密码`, `口令`, `密钥`, `秘钥`, `私钥`, `令牌`, `凭证`, `凭据`, `授权码`,
+`验证码` or `账密`, plus traditional forms such as `密碼` (case-insensitive,
+`_`/`-` matching a space, full-width forms folded, up to two half- or
+full-width spaces between the characters of a Chinese label as in `密　码：`,
+Markdown `**`/backticks, quotes and list markers such as `1.`, `2)`, `3、`,
+`•` or `·` around the label ignored), followed by a half- or full-width colon or equals
 sign, whitespace, or the end of the line, or by a short bracketed note and then
 a colon and an ASCII value (`数据库密码（测试环境）：Abc123!`,
 `password(prod):…`; a Chinese value such as `密码（可选）：留空则不修改` is
@@ -452,25 +454,31 @@ So sentences such as `验证码为空时报错`, `密码是abcdef`, `密码改�
 加密`, `密码页面的 commit 是 3f2a9c1`, `验证码存 Redis 还是 MySQL？`,
 `已修复令牌刷新逻辑，提交 3f2a9c1。`, `令牌过期处理改好了，在 iPhone15
 上验证通过。`, `令牌桶限流已上线，QPS 上限 100000。` and
-`密钥轮换脚本跑完了，耗时 1234567 毫秒。` are kept. The short keys `pass`, `pwd` and
-`pin` count only in an assignment: `db_pass=hunter2`, `PIN：884213`,
-`userPin=1234` (a value after a colon needs a digit or symbol, so `pin:
-string` is kept; `pinned`, `passing`, `bypass`, `pass_rate` and `--- PASS:
+`密钥轮换脚本跑完了，耗时 1234567 毫秒。` are kept. The short keys `pass`,
+`pwd`, `pw`, `psw`, `pswd` and `pin` count only in an assignment:
+`db_pass=hunter2`, `PIN：884213`, `userPin=1234`, `PW: Abc123!` (a value
+after a colon needs a digit or symbol, so `pin: string` and `pw: string` are
+kept; `pinned`, `passing`, `bypass`, `pass_rate`, `upward` and `--- PASS:
 TestName` are not keys). A bare key name (`key`, `SK`, `AK`, or `app`,
 `secret`, `access`, `private`, `client`, `signing` and similar followed by
-`key`: `appKey`, `secret_key`) before a colon or equals sign counts when the
+`key`: `appKey`, `secret_key`) before a colon, an equals sign or a Chinese
+predicate (`高德的 key 是 …`, `appKey 改成了 …`) counts when the
 value looks like a key: at least ten characters with letters and digits, and
 mixed case, a password symbol or at least 20 characters, without `_`, `.`,
 `:` or `/` (`key：Abc123!xyz`, `SK：Xyz12345678abcdefghij`); `primary key: id`,
 `cache key: user:1234:profile`, `key: user_profile_2024` and `cacheKey: …` are
 kept. Command-line credentials are removed too: `mysql`/`mysqladmin`/
-`mysqldump` (and the other MySQL and MariaDB clients) with `-p<password>` or
-`--password=`, `curl`/`wget` with `-u`/`--user` and `user:password`,
-`sshpass -p`, `redis-cli -a`/`--pass`, `docker`/`podman`/`helm`/`nerdctl
-login -p`/`--password`, `mongo`/`mongosh`/`mongodump`/`mongorestore -p`/
-`--password`, `sqlcmd`/`bcp -P`, `ldapsearch` (and the other OpenLDAP
-clients) `-w`, `zip`/`unzip -P`, `7z -p<password>`, `keytool -storepass`/
-`-keypass`, `smbclient -U user%password` and `lftp -u user,password`. A tool's
+`mysqldump` (and the other MySQL and MariaDB clients) with `-p<password>`,
+`--password=`, or `-p` followed by a password-like word (`mysql -u root -p
+Hunter2024`; `mysql -uroot -p app` is kept), `curl`/`wget` with
+`-u`/`--user` and `user:password`, `sshpass -p` (also `-p<password>`),
+`redis-cli -a`/`--pass`, `docker`/`podman`/`helm`/`nerdctl login
+-p`/`--password`, `mongo`/`mongosh`/`mongodump`/`mongorestore -p`/
+`--password`, `sqlcmd`/`bcp -P` (also attached), `ldapsearch` (and the
+other OpenLDAP clients) `-w` (also attached), `zip`/`unzip -P`, `7z`/`unrar
+-p<password>`, `keytool`/`jarsigner -storepass`/`-keypass`,
+`mosquitto_pub`/`mosquitto_sub -P`, `openssl -k`/`-K`/`-pass`/`-passin`/
+`-passout`, `smbclient -U user%password` and `lftp -u user,password`. A tool's
 options end at a shell separator (`|`, `&&`, `||`, `;`, `&`) or the next
 command, so `docker run -p 8080:80`, `ssh -p 22`, `redis-cli -h` and `curl … &&
 docker run -u 1000:1000` are kept.
@@ -483,7 +491,29 @@ header cell that counts (`Token 数`, `输入 Token`, `Input Token`, `Token
 count`) is not a credential column. A column named only `Key`, `App Key`,
 `SK`, `AK` or a similar key name drops just the rows whose cell in that column
 looks like a key (as for a bare key name above), so a table of setting names
-keeps its rows.
+keeps its rows. A comma- or tab-separated header row (short cells; a
+comma-separated cell has no spaces) that names a credential column, such as
+`username,password` or a header copied from a spreadsheet, drops the
+following rows with as many separators and an ASCII value in that column,
+until another line or a blank line.
+
+A line that ends with a label after other words (`数据库密码`, `Redis 密码`,
+`MySQL root password`, `GitHub token`, `username,password`) is removed, and
+so is the next non-empty line when it looks like a value: at most three
+ASCII words, one of which looks like a password or a key (as above), or a
+single word of at least four characters with a digit or a symbol
+(`Abc123!`, `NewPass@2026`, `1234`, `admin / Abc123!`). A list item that only
+names a label (`2. 密码`, `- Password`, `· 密码`) stays, and the next line
+goes on the same condition, so a list of form fields (`1. 用户名`, `2. 密码`,
+`3. 验证码`) and ordinary sentences, versions and file names after such a
+line stay. After such a list item a single word of at least six letters or
+digits (`opensesame`) also counts as a value unless it is the next list
+item; after a line ending with a label it does not. Whenever a label's value is
+expected on the next line, here or as described below, a code block opening
+there (three backticks or tildes, optionally with a language, or `<pre>`) is
+the value and is removed up to its closing fence, and a line of punctuation
+only (a lone quote, `---`) is skipped so that the value is the line after
+it.
 
 When a label has no value on its own line (`密码：`, `token:`, `我的密码是`,
 `密码如下：`, `数据库密码（测试环境）：` with at most six Chinese characters
@@ -514,7 +544,9 @@ in a PostgreSQL connection URL) remove the line too. The prefixes `sk-`,
 `ghp_` and `akia` (any case), which are shorter than five characters, count
 only at the start of a run of key characters followed by at least 16 more,
 so `task-runner`, `flask-login` or `Slovakia` are not keys. Result excerpts (`summary`) go through the same line
-filter.
+filter; they leave out code blocks fenced with three backticks or tildes as a
+whole, and a value expected after a label before such a block is the block,
+not the line after it.
 Like result excerpts the prompt is held only in Runtime memory, is replaced by the
 next turn, is never written to SQLite, spool, exports or snapshots, and is lost
 when Runtime restarts. A prompt from an earlier turn is never returned for the

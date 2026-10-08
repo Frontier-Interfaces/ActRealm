@@ -93,6 +93,19 @@ published a final v1 release; entries below describe development milestones on
   the wording hands them over as a value (`是`, `改成`, `了`, a colon), and
   a number followed by a unit (`毫秒`, `次`, `QPS`) never does; an algorithm
   name right after a predicate is not a value (`密码改成 AES-256 加密`).
+- Fourth review round, values after a label line: a line that ends with a
+  label after other words (`数据库密码`, `MySQL root password`,
+  `username,password`) also removes the next line when it looks like a
+  value; a list item that only names a label (`2. 密码`) stays, so lists of
+  form fields are kept; comma- and tab-separated rows under a header naming
+  a password column are removed. A code block (backticks, tildes or
+  `<pre>`) after a label is removed as its value instead of its fence line,
+  and a lone quote or `---` line is skipped; result excerpts also skip `~~~`
+  blocks. Chinese labels may contain spaces (`密　码：`), `账密` is a label,
+  `pw`/`psw`/`pswd` are short keys, a key name before a Chinese predicate
+  (`高德的 key 是 …`) counts, and `sshpass -p<password>`, `mysql -p
+  <password>`, attached `sqlcmd -P` / `ldapsearch -w`, `unrar -p`,
+  `jarsigner`, `mosquitto_pub -P` and `openssl -k`/`-pass` are recognized.
 - The short key prefixes `sk-`, `ghp_` and `akia` now count only at the
   start of a run of key characters followed by at least 16 more: words such
   as `task-runner`, `flask-login`, `disk-usage`, `agent-desk-redesign` or
