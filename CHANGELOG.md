@@ -37,6 +37,14 @@ published a final v1 release; entries below describe development milestones on
   in Markdown emphasis, multi-line values (`password: |`, `"passwords": [`,
   deeper-indented continuation lines), `passphrase`, short `pass`/`pwd`/`pin`
   assignments, `mysql -p<password>` and `curl -u user:password` are removed.
+- Second review round, history and review state: a delayed or manual
+  completion the user acknowledged stays `seen` when later compaction,
+  resume or subagent activity closes it (resolution `ack_hidden`, the
+  acknowledgement time is kept); a session that ends while its turn is still
+  working ends that turn as `interrupted` instead of reporting `completed`
+  without an end time; the History center reads the latest turn's outcome
+  too, so an interruption followed by `SessionEnd` or `SessionStart` stays
+  `failed` there (its `completed`/`failed` vocabulary is unchanged).
 
 ### Post-P0 - OUTBOX lifecycle and quota recovery
 

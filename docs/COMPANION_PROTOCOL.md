@@ -311,7 +311,10 @@ subagent or task, a Codex turn continuing on its own, a session start) resolves
 them with `superseded_by_activity`. Both close the Attention as `resolved`, so
 clients that only look at the state are unaffected. The local History center (`GET /api/v1/history`)
 keeps its `completed` / `failed` vocabulary and still reports a
-user-interrupted task as `failed`, as before.
+user-interrupted task as `failed`, as before. It follows the Companion history
+status, including the latest turn's outcome: a task Companion history reports
+as `interrupted` (also after a later `SessionEnd` or `SessionStart`) or
+`failed` is `failed` there, and every other finished task is `completed`.
 
 `GET /api/v1/companion/history?since=<epoch ms>&limit=<1..200, default
 100>&includeSide=<true|false, default false>` returns `{schemaVersion: 1,
@@ -327,8 +330,13 @@ never falls back to the Runtime title derived from the prompt), `taskRole`,
 `branch`, `validationState`, `reviewState`, `latestAttentionKind`
 (`completion`, `error` or null), `jumpCapability` and `jumpLabel`. A session
 that ended (`SessionEnd`) after a failed or interrupted turn keeps that turn's
-`failed` or `interrupted` status. `reviewState` becomes `seen` only through the
-user or the user's next instruction: the latest completion/error Attention was
+`failed` or `interrupted` status. A session that ends while its latest turn is
+still working (Claude Code reports no Hook when the user presses Esc and then
+exits) ends that turn as `interrupted` at the `SessionEnd` time, so it is
+reported as `interrupted` with that `completedAt`, never as `completed`
+without an end time; an open turn on an already idle session simply ends.
+`reviewState` becomes `seen` only through the user or the user's next
+instruction: the latest completion/error Attention was
 acknowledged (including a reminder-only acknowledgement), dismissed, archived
 from the History center, or superseded by the user's next prompt (resolutions
 `ack`, `ack_hidden`, `user_dismissed`, `history_archived`,
@@ -337,8 +345,11 @@ it was raised. It stays `unseen` while that Attention is open or snoozed, and
 when it was closed without the user: `superseded_by_activity`, `auto_hidden` by
 the completion hide timer, or expired. `superseded_by_activity` rows written
 before `superseded_by_prompt` existed cannot tell a prompt apart and count as
-`unseen` unless a later prompt event exists. It is `none` when the session
-raised no completion/error Attention. No prompt, reply, command or file path is
+`unseen` unless a later prompt event exists. A delayed or manual completion
+whose reminder the user already acknowledged stays `seen` when later
+activity closes it: it is resolved as `ack_hidden` and keeps its
+`reminderAcknowledgedAt`. It is `none` when the session raised no
+completion/error Attention. No prompt, reply, command or file path is
 included.
 
 The result envelope adds `prompt: null | {text, truncated, observedAt}`: the

@@ -6530,6 +6530,30 @@ fn ingest_transaction(
                 .map_err(storage_error)?;
         }
     }
+    // `SessionEnd` carries no turn of its own, so the turn that is still open
+    // when the session ends never reached its `Stop`: Claude Code reports no
+    // Hook when the user presses Esc and then exits. When the session was
+    // still working, that turn ends as `interrupted`, so history reports it
+    // like a user interruption instead of a completion without an end time.
+    // An open turn on an already idle session was only opened implicitly by a
+    // late event and simply ends.
+    if parsed.kind == EventKind::SessionEnded && may_update {
+        let turn_state = if matches!(
+            current_state.as_str(),
+            "idle" | "response_finished" | "failed"
+        ) {
+            "idle"
+        } else {
+            "interrupted"
+        };
+        transaction
+            .execute(
+                "UPDATE turns SET state = ?2, ended_at = ?3
+                 WHERE session_id = ?1 AND ended_at IS NULL",
+                params![session_id, turn_state, occurred_at],
+            )
+            .map_err(storage_error)?;
+    }
 
     increment_ingest_metrics(
         &transaction,
@@ -6994,6 +7018,20 @@ fn act_attention_transaction(
     {
         return CommandState::parse(&state);
     }
+    apply_attention_action(&transaction, command_id, attention_id, action, now)?;
+    transaction.commit().map_err(storage_error)?;
+    Ok(CommandState::Confirmed)
+}
+
+/// Applies an acknowledge / snooze / dismiss command to a non-approval
+/// Attention item inside `transaction` and records the command.
+fn apply_attention_action(
+    transaction: &Transaction<'_>,
+    command_id: Uuid,
+    attention_id: &str,
+    action: AttentionAction,
+    now: u64,
+) -> Result<(), StoreError> {
     let (kind, state, session_id, auto_hide_at, reminder_acknowledged_at, retain_after_ack) =
         transaction
             .query_row(
@@ -7110,14 +7148,13 @@ fn act_attention_transaction(
         .map_err(storage_error)?;
     if matches!(action, AttentionAction::Ack | AttentionAction::Dismiss) && !reminder_only_ack {
         release_session_if_unblocked(
-            &transaction,
+            transaction,
             &session_id,
             "Attention item resolved; waiting for the Agent's next event",
             now,
         )?;
     }
-    transaction.commit().map_err(storage_error)?;
-    Ok(CommandState::Confirmed)
+    Ok(())
 }
 
 fn reconcile_transaction(
@@ -9770,7 +9807,10 @@ fn read_task_history(
                          'tool.failed', 'turn.failed'
                        )),
                     sessions.term_app, sessions.term_session_id, sessions.term_tty,
-                    sessions.term_bundle_id, sessions.term_surface, sessions.activity
+                    sessions.term_bundle_id, sessions.term_surface, sessions.activity,
+                    (SELECT state FROM turns
+                     WHERE turns.session_id = sessions.id
+                     ORDER BY ordinal DESC LIMIT 1)
              FROM sessions
              LEFT JOIN session_usage AS usage
                ON usage.provider = sessions.provider
@@ -9807,6 +9847,7 @@ fn read_task_history(
                 let term_bundle_id = row.get::<_, Option<String>>(19)?;
                 let term_surface = row.get::<_, Option<String>>(20)?;
                 let activity = row.get::<_, Option<String>>(21)?;
+                let latest_turn_state = row.get::<_, Option<String>>(22)?;
                 let (jump_capability, jump_label) = jump_descriptor(
                     &provider,
                     &provider_session_id,
@@ -9822,7 +9863,12 @@ fn read_task_history(
                     project: row.get(3)?,
                     title: row.get(4)?,
                     model: row.get(5)?,
-                    status: task_history_status(&exec_state, activity.as_deref()).to_owned(),
+                    status: task_history_status(
+                        &exec_state,
+                        activity.as_deref(),
+                        latest_turn_state.as_deref(),
+                    )
+                    .to_owned(),
                     started_at: from_i64(row.get(7)?),
                     last_event_at: from_i64(row.get(8)?),
                     completed_at: row.get::<_, Option<i64>>(9)?.map(from_i64),
@@ -9852,17 +9898,20 @@ fn read_task_history(
 }
 
 /// The History center (`/api/v1/history`) status. It only knows `completed`
-/// and `failed`. A user interruption used to leave the session `failed`;
-/// it now idles the session, so the History center keeps reporting such a
-/// task as `failed`, exactly as before, for its existing clients. Companion
-/// history reports it as `interrupted` instead (see [`recent_task_status`]).
-fn task_history_status(exec_state: &str, activity: Option<&str>) -> &'static str {
-    if exec_state == "failed"
-        || (exec_state == "idle" && activity == Some(TURN_INTERRUPTED_ACTIVITY))
-    {
-        "failed"
-    } else {
-        "completed"
+/// and `failed`, and follows the Companion status ([`recent_task_status`],
+/// which also reads the latest turn's outcome): a user interruption used to
+/// leave the session `failed`; it now idles the session, so the History
+/// center keeps reporting such a task as `failed`, exactly as before, also
+/// after a later `SessionEnd` or `SessionStart` rewrote the session activity.
+/// Companion history reports it as `interrupted` instead.
+fn task_history_status(
+    exec_state: &str,
+    activity: Option<&str>,
+    latest_turn_state: Option<&str>,
+) -> &'static str {
+    match recent_task_status(exec_state, activity, latest_turn_state) {
+        "failed" | "interrupted" => "failed",
+        _ => "completed",
     }
 }
 
@@ -11721,7 +11770,10 @@ fn reconcile_superseded_nonblocking_attention(
     // instruction. Any other activity (tool start, compaction, subagents, a
     // Codex turn continuing on its own, session start) supersedes the
     // reminder without implying that the user saw it. Both close the item as
-    // `resolved`; only the resolution differs.
+    // `resolved`; only the resolution differs. A reminder the user had
+    // already acknowledged (a delayed or manual completion keeps it open
+    // after the acknowledgement) keeps that evidence: it closes as
+    // `ack_hidden` and keeps its acknowledgement time, so it stays seen.
     let resolution = if kind == EventKind::PromptSubmitted {
         SUPERSEDED_BY_PROMPT
     } else {
@@ -11730,9 +11782,9 @@ fn reconcile_superseded_nonblocking_attention(
     transaction
         .execute(
             "UPDATE attention_items SET state = 'resolved', resolved_at = ?2,
-               resolution = ?3, expires_at = NULL,
-               auto_hide_at = NULL, reminder_acknowledged_at = NULL,
-               reminder_resolution = NULL
+               resolution = CASE WHEN reminder_acknowledged_at IS NOT NULL
+                                 THEN 'ack_hidden' ELSE ?3 END,
+               expires_at = NULL, auto_hide_at = NULL
              WHERE session_id = ?1 AND kind IN ('completion', 'error')
                AND state IN ('open', 'snoozed') AND created_at < ?2",
             params![session_id, occurred_at, resolution],
@@ -13865,16 +13917,39 @@ mod tests {
             recent_task_status("idle", Some("Session ended"), Some("response_finished")),
             "completed"
         );
+        // The History center only knows completed/failed and reports an
+        // interruption as failed, also after a later SessionEnd or
+        // SessionStart rewrote the session activity.
         assert_eq!(
-            task_history_status("idle", Some("Turn interrupted")),
+            task_history_status("idle", Some("Turn interrupted"), Some("interrupted")),
             "failed"
         );
-        assert_eq!(task_history_status("failed", Some("Run failed")), "failed");
         assert_eq!(
-            task_history_status("idle", Some("Session ended")),
+            task_history_status("failed", Some("Run failed"), Some("failed")),
+            "failed"
+        );
+        for activity in ["Session ended", "Waiting for a new task"] {
+            assert_eq!(
+                task_history_status("idle", Some(activity), Some("interrupted")),
+                "failed"
+            );
+            assert_eq!(
+                task_history_status("idle", Some(activity), Some("failed")),
+                "failed"
+            );
+            assert_eq!(
+                task_history_status("idle", Some(activity), Some("response_finished")),
+                "completed"
+            );
+            assert_eq!(
+                task_history_status("idle", Some(activity), Some("idle")),
+                "completed"
+            );
+        }
+        assert_eq!(
+            task_history_status("response_finished", None, Some("response_finished")),
             "completed"
         );
-        assert_eq!(task_history_status("response_finished", None), "completed");
     }
 
     #[test]
