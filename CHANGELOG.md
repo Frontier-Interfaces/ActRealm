@@ -55,6 +55,25 @@ published a final v1 release; entries below describe development milestones on
   tool ends as `interrupted`; an implicit turn opened while background work
   was running ends as `idle`, so a completed task is no longer reported
   `interrupted` (History center `failed`) after the user exits.
+- Third review round, prompt and result excerpt filter: after a Chinese
+  credential label the rest of the sentence (up to twelve Chinese characters
+  or words) is searched for a password-like ASCII word, so any wording
+  (`初始密码默认是 Admin@123`, `密码我改成了 …`, `用户名和密码分别是 admin 和 …`,
+  arrows and emoji) is removed while paths, versions, file names, dimensions,
+  colors, algorithm names and references after `commit`/`id`/`port` are
+  kept; a bracketed note before the colon (`数据库密码（测试环境）：…`) counts
+  as part of the label, and `私钥` is a label. Markdown tables whose header
+  names a credential column lose their separator and data rows (a `Key`/`SK`
+  column only rows with a key-like value; count columns such as `Token 数`
+  are not credential columns). Keys glued to ASCII punctuation in compact
+  JSON or code, Telegram and Discord bot tokens, and URLs with a password are
+  found. More command-line password options are recognized (`sshpass -p`,
+  `redis-cli -a`, `docker login -p`, `mongo -p`, `sqlcmd -P`, `ldapsearch -w`,
+  `zip -P`, `7z -p`, `keytool -storepass`, `smbclient -U user%password`,
+  `lftp -u user,password`); a tool's options end at a shell separator or the
+  next command, so `curl … && docker run -u 1000:1000` is kept. A bare
+  `key`/`SK`/`AK`/`appKey` label with a key-like value is removed. Long lines
+  of repeated labels no longer take quadratic time.
 - Companion snapshot Attention items add `handBackAvailable`: true only when
   `pass_through` returns a live approval to the original Agent UI (Hook
   waiters, Kimi/Grok Connector requests), false for the managed Codex

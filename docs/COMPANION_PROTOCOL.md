@@ -398,25 +398,66 @@ bounded to 2,000 characters, and `truncated` is true when text was cut or a
 line was removed. In addition, a line that names a credential is removed as a
 whole: `password`, `passwd`, `passphrase`, `pwd`, `secret`, `token`, `api key`,
 `apikey`, `access key`, `private key`, `cookie`, `authorization`, `bearer`,
-`密码`, `口令`, `密钥`, `秘钥`, `令牌`, `凭证`, `凭据`, `授权码` or `验证码`,
-plus traditional forms such as `密碼` (case-insensitive, `_`/`-` matching a
-space, full-width forms folded, Markdown `**`/backticks and quotes around the
-label ignored), followed by a half- or full-width colon or equals sign,
-whitespace, or the end of the line. A Chinese label written straight against
-its value, or followed by a predicate (`是`, `为`, `就是`, `改成`, `改为`,
-`设为`, `设置为`, `换成`, `更新为`, `重置为`, `如下` and similar, optionally
-with `已`/`已经` before and `了` after it), is removed only when the value looks
-like a credential: at least six printable ASCII characters without spaces,
-including a digit or a symbol (`我的密码是Abc123!`, `密码改成了 Qwer1234!`,
-`验证码884213`), so sentences such as `验证码为空时报错` are kept. A value in
+`密码`, `口令`, `密钥`, `秘钥`, `私钥`, `令牌`, `凭证`, `凭据`, `授权码` or
+`验证码`, plus traditional forms such as `密碼` (case-insensitive, `_`/`-`
+matching a space, full-width forms folded, Markdown `**`/backticks and quotes
+around the label ignored), followed by a half- or full-width colon or equals
+sign, whitespace, or the end of the line, or by a short bracketed note and then
+a colon and an ASCII value (`数据库密码（测试环境）：Abc123!`,
+`password(prod):…`; a Chinese value such as `密码（可选）：留空则不修改` is
+kept). A Chinese label written straight against its value, or followed by a
+predicate (`是`, `为`, `就是`, `改成`, `改为`, `设为`, `设置为`, `换成`,
+`更新为`, `重置为`, `如下` and similar, optionally with `已`/`已经` before and
+`了` after it), is removed when the value looks like a credential: at least six
+printable ASCII characters without spaces, including a digit or a symbol
+(`我的密码是Abc123!`, `密码改成了 Qwer1234!`, `验证码884213`). A value in
 quotes (`「」`, `『』`, `【】`, `“”`, `‘’`, `《》` or ASCII quotes) needs only
-four characters (`口令「opensesame」`). The short keys `pass`, `pwd` and `pin`
-count only in an assignment: `db_pass=hunter2`, `PIN：884213`, `userPin=1234`
-(a value after a colon needs a digit or symbol, so `pin: string` is kept;
-`pinned`, `passing`, `bypass`, `pass_rate` and `--- PASS: TestName` are not
-keys). Command-line credentials are removed too: `mysql`/`mysqladmin`/
+four characters (`口令「opensesame」`). With any other wording, the rest of
+the sentence after a Chinese label is searched as well: within twelve Chinese
+characters, symbols or ASCII words, and before a `。` or a standalone `!`, `?`
+or `;`, an ASCII word that looks like a password (six to 128 characters with
+letters and digits, only digits, or a password symbol such as `@`, `!`, `#`
+next to letters or digits), or a quoted ASCII word of at least six characters,
+removes the line: `初始密码默认是 Admin@123`, `用户名和密码分别是 admin 和
+Abc123!`, `密码我改成了 Abc123!`, `密码👉Abc123!`. Words that name something
+else are not values there: paths and URLs, emails, `package@1.2.3`, versions
+and IP addresses (also `Python3.11`), file and dotted names (`auth.rs`,
+`bcrypt.compare`), dimensions (`320px`, `1.5em`, `120x40`), hex colors,
+algorithm and encoding names (`AES-256`, `JWT-HS256`, `argon2id`, `base64`),
+and a word right after `commit`, `id`, `port`, `version` and similar. So
+sentences such as `验证码为空时报错`, `密码是abcdef`, `密码改成 bcrypt 加密`
+and `密码页面的 commit 是 3f2a9c1` are kept. The short keys `pass`, `pwd` and
+`pin` count only in an assignment: `db_pass=hunter2`, `PIN：884213`,
+`userPin=1234` (a value after a colon needs a digit or symbol, so `pin:
+string` is kept; `pinned`, `passing`, `bypass`, `pass_rate` and `--- PASS:
+TestName` are not keys). A bare key name (`key`, `SK`, `AK`, or `app`,
+`secret`, `access`, `private`, `client`, `signing` and similar followed by
+`key`: `appKey`, `secret_key`) before a colon or equals sign counts when the
+value looks like a key: at least ten characters with letters and digits, and
+mixed case, a password symbol or at least 20 characters, without `_`, `.`,
+`:` or `/` (`key：Abc123!xyz`, `SK：Xyz12345678abcdefghij`); `primary key: id`,
+`cache key: user:1234:profile`, `key: user_profile_2024` and `cacheKey: …` are
+kept. Command-line credentials are removed too: `mysql`/`mysqladmin`/
 `mysqldump` (and the other MySQL and MariaDB clients) with `-p<password>` or
-`--password=`, and `curl`/`wget` with `-u`/`--user` and `user:password`.
+`--password=`, `curl`/`wget` with `-u`/`--user` and `user:password`,
+`sshpass -p`, `redis-cli -a`/`--pass`, `docker`/`podman`/`helm`/`nerdctl
+login -p`/`--password`, `mongo`/`mongosh`/`mongodump`/`mongorestore -p`/
+`--password`, `sqlcmd`/`bcp -P`, `ldapsearch` (and the other OpenLDAP
+clients) `-w`, `zip`/`unzip -P`, `7z -p<password>`, `keytool -storepass`/
+`-keypass`, `smbclient -U user%password` and `lftp -u user,password`. A tool's
+options end at a shell separator (`|`, `&&`, `||`, `;`, `&`) or the next
+command, so `docker run -p 8080:80`, `ssh -p 22`, `redis-cli -h` and `curl … &&
+docker run -u 1000:1000` are kept.
+
+A Markdown table whose header row names a credential column (a header cell
+that ends with one of the labels above: `密码`, `初始密码`, `Password`, `API
+Key`, `AccessToken`, `Token (prod)`) loses its header, its separator row and
+every data row, until a line without `|` or a blank line ends the table. A
+header cell that counts (`Token 数`, `输入 Token`, `Input Token`, `Token
+count`) is not a credential column. A column named only `Key`, `App Key`,
+`SK`, `AK` or a similar key name drops just the rows whose cell in that column
+looks like a key (as for a bare key name above), so a table of setting names
+keeps its rows.
 
 When a label has no value on its own line (`密码：`, `token:`, `我的密码是`,
 `密码如下：`, `数据库密码（测试环境）：` with at most six Chinese characters
@@ -435,7 +476,16 @@ high-entropy tokens are checked per line and once more over the whole bounded
 text; a hit there drops the prompt. Tokens are also split at every non-ASCII
 character (CJK text, CJK and full-width punctuation, Chinese quotes), so a
 key written straight against Chinese text (`用这个AIza…调一下`, `…FBWY。`) is
-found as well. Result excerpts (`summary`) go through the same line filter.
+found as well. A token that is not a URL or path is also split at quotes,
+colons, commas, brackets, braces, `=`, `;`, `.` and other punctuation, and
+each run of key characters that is long and high-entropy and contains a digit
+removes the line, so keys in compact JSON or code (`{"appKey":"9f8e…"}`,
+`appKey="…"`, `key:…`, `Client("…")`) are found; long identifiers without a
+digit (`handleCompanionSnapshotRequest`) are kept. Telegram bot tokens
+(`<bot id>:<secret>`), Discord bot tokens (three dot-separated parts) and URLs
+or connection strings with a password (`user:password@` before the host, as
+in a PostgreSQL connection URL) remove the line too. Result excerpts (`summary`) go through the same line
+filter.
 Like result excerpts the prompt is held only in Runtime memory, is replaced by the
 next turn, is never written to SQLite, spool, exports or snapshots, and is lost
 when Runtime restarts. A prompt from an earlier turn is never returned for the

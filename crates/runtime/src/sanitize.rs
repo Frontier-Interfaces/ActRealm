@@ -76,6 +76,25 @@ fn sanitize_token(token: &str) -> Result<String, SanitizationError> {
     }) {
         return Err(SanitizationError::SensitiveContentDetected);
     }
+    // A key glued to ASCII punctuation in compact JSON or code
+    // (`{"appKey":"..."}`, `Client("...")`, `key:...`), or a Telegram or
+    // Discord bot token: every run of key characters is checked on its own.
+    // A run needs a digit here, so long identifiers between dots and quotes
+    // (`store.handleCompanionSnapshotRequest(`) are kept. URLs and paths are
+    // replaced by a placeholder as a whole below.
+    if !lower.contains("://")
+        && !looks_path(trimmed)
+        && (key_runs(trimmed)
+            .any(|run| looks_high_entropy(run) && run.bytes().any(|byte| byte.is_ascii_digit()))
+            || looks_bot_token(trimmed))
+    {
+        return Err(SanitizationError::SensitiveContentDetected);
+    }
+    // A connection string or URL with a password in it (`user:password@`
+    // before the host).
+    if url_has_password(&lower) {
+        return Err(SanitizationError::SensitiveContentDetected);
+    }
     if lower.contains("://")
         || lower.starts_with("mailto:")
         || lower.starts_with("git@")
@@ -224,6 +243,71 @@ fn ascii_fragments(token: &str) -> impl Iterator<Item = &str> {
     token
         .split(|character: char| !character.is_ascii())
         .filter(|fragment| !fragment.is_empty())
+}
+
+/// The runs of key characters (`[A-Za-z0-9_+/-]`) of a token, split at
+/// quotes, colons, commas, brackets, braces, `=`, `;`, `.`, `@` and every
+/// other character.
+fn key_runs(token: &str) -> impl Iterator<Item = &str> {
+    token
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '+' | '/'))
+        })
+        .filter(|run| !run.is_empty())
+}
+
+/// A Telegram bot token (`<bot id>:<secret>`: six to twelve digits, a colon
+/// and at least 30 key characters) or a Discord bot token (three
+/// dot-separated base64url parts of at least 23 characters with a digit, six
+/// or seven, and at least 27 characters).
+fn looks_bot_token(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    let telegram = bytes.iter().enumerate().any(|(colon, byte)| {
+        if *byte != b':' {
+            return false;
+        }
+        let digits = bytes[..colon]
+            .iter()
+            .rev()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        let starts_word = bytes[..colon - digits]
+            .last()
+            .is_none_or(|byte| !byte.is_ascii_alphanumeric());
+        let secret = bytes[colon + 1..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            .count();
+        (6..=12).contains(&digits) && starts_word && secret >= 30
+    });
+    let discord = token
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+        })
+        .any(|run| {
+            let parts = run.split('.').collect::<Vec<_>>();
+            parts.len() == 3
+                && parts[0].len() >= 23
+                && parts[0].bytes().any(|byte| byte.is_ascii_digit())
+                && (6..=7).contains(&parts[1].len())
+                && parts[2].len() >= 27
+        });
+    telegram || discord
+}
+
+/// A URL whose authority carries `user:password@`.
+fn url_has_password(lower: &str) -> bool {
+    let Some((_, after_scheme)) = lower.split_once("://") else {
+        return false;
+    };
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    authority
+        .rsplit_once('@')
+        .and_then(|(user_info, _)| user_info.split_once(':'))
+        .is_some_and(|(_, password)| !password.is_empty())
 }
 
 /// Strips punctuation that surrounds a value in prose or Markdown (`(key)`,
