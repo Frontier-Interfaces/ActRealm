@@ -384,6 +384,16 @@ pub enum TaskHistoryMutation {
     Active,
 }
 
+/// Result of marking a task as seen ([`RuntimeStore::mark_session_seen`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSeen {
+    /// The session's latest completion/error reminder is acknowledged.
+    Seen,
+    /// The session never raised a completion/error reminder.
+    NoReminder,
+    NotFound,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalReviewContext {
     pub session_id: String,
@@ -1104,6 +1114,11 @@ enum StoreMessage {
         now: u64,
         reply: mpsc::SyncSender<Result<TaskHistoryMutation, StoreError>>,
     },
+    MarkSessionSeen {
+        session_id: String,
+        now: u64,
+        reply: mpsc::SyncSender<Result<SessionSeen, StoreError>>,
+    },
     DeleteTaskHistory {
         session_id: String,
         now: u64,
@@ -1662,6 +1677,27 @@ impl RuntimeStore {
     ) -> Result<TaskHistoryMutation, StoreError> {
         let (reply, receiver) = mpsc::sync_channel(1);
         self.send(StoreMessage::ArchiveTask {
+            session_id: session_id.into(),
+            now,
+            reply,
+        })?;
+        receive(receiver)
+    }
+
+    /// Records that the user has seen a task, for example after opening it
+    /// from a Companion: the session's latest completion/error reminder is
+    /// acknowledged. A reminder that is still open or snoozed is closed
+    /// exactly like an `ack` command closes it (a delayed or manual
+    /// completion only acknowledges the reminder); a reminder that was
+    /// already closed or hidden stays closed and only records the
+    /// acknowledgement, so history reports the task as `seen`. Idempotent.
+    pub fn mark_session_seen(
+        &self,
+        session_id: impl Into<String>,
+        now: u64,
+    ) -> Result<SessionSeen, StoreError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send(StoreMessage::MarkSessionSeen {
             session_id: session_id.into(),
             now,
             reply,
@@ -2560,6 +2596,17 @@ fn writer_loop(
                     ui_snapshot_cache = None;
                 }
                 let _ = reply.send(result);
+            }
+            StoreMessage::MarkSessionSeen {
+                session_id,
+                now,
+                reply,
+            } => {
+                let _ = reply.send(mark_session_seen_transaction(
+                    &mut connection,
+                    &session_id,
+                    now,
+                ));
             }
             StoreMessage::DeleteTaskHistory {
                 session_id,
@@ -10223,6 +10270,63 @@ fn archive_task_transaction(
         .map_err(storage_error)?;
     transaction.commit().map_err(storage_error)?;
     Ok(TaskHistoryMutation::Applied)
+}
+
+fn mark_session_seen_transaction(
+    connection: &mut Connection,
+    session_id: &str,
+    now: u64,
+) -> Result<SessionSeen, StoreError> {
+    let transaction = connection.transaction().map_err(storage_error)?;
+    let found = transaction
+        .query_row("SELECT 1 FROM sessions WHERE id = ?1", [session_id], |_| {
+            Ok(())
+        })
+        .optional()
+        .map_err(storage_error)?
+        .is_some();
+    if !found {
+        return Ok(SessionSeen::NotFound);
+    }
+    // The same reminder Companion history reads its review state from.
+    let Some((attention_id, state)) = transaction
+        .query_row(
+            "SELECT id, state FROM attention_items
+             WHERE session_id = ?1 AND kind IN ('completion', 'error')
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            [session_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(storage_error)?
+    else {
+        return Ok(SessionSeen::NoReminder);
+    };
+    if matches!(state.as_str(), "open" | "snoozed") {
+        match apply_attention_action(
+            &transaction,
+            Uuid::now_v7(),
+            &attention_id,
+            AttentionAction::Ack,
+            now,
+        ) {
+            // A delayed or manual completion whose reminder was already
+            // acknowledged stays as it is.
+            Ok(()) | Err(StoreError::StaleApproval) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    transaction
+        .execute(
+            "UPDATE attention_items
+             SET reminder_acknowledged_at = ?2,
+                 reminder_resolution = COALESCE(reminder_resolution, 'reminder_acknowledged')
+             WHERE id = ?1 AND reminder_acknowledged_at IS NULL",
+            params![attention_id, to_i64(now)],
+        )
+        .map_err(storage_error)?;
+    transaction.commit().map_err(storage_error)?;
+    Ok(SessionSeen::Seen)
 }
 
 fn delete_task_history_transaction(

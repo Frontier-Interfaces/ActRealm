@@ -16,8 +16,8 @@ use actrealm_quota::{
 use actrealm_runtime::{
     ApprovalAction, AttentionAction, CommandState, MetricEvent, QuotaRecord,
     ReviewBaselineCandidate, ReviewBaselineInput, ReviewBaselineRecord, RuntimeStore,
-    SessionRecord, SessionUsageRecord, StoreError, TaskCheckpointInput, TaskCheckpointRecord,
-    TaskHistoryMutation, TimelineEventKind, WaiterError, WaiterRegistry,
+    SessionRecord, SessionSeen, SessionUsageRecord, StoreError, TaskCheckpointInput,
+    TaskCheckpointRecord, TaskHistoryMutation, TimelineEventKind, WaiterError, WaiterRegistry,
 };
 use actrealm_usage::{PricingStatus, UsageCollector, UsagePaths, UsageRecord};
 use axum::body::Body;
@@ -2722,6 +2722,10 @@ fn router(state: AppState) -> Router {
             "/api/v1/companion/sessions/{id}/jump",
             post(companion_jump_session),
         )
+        .route(
+            "/api/v1/companion/sessions/{id}/seen",
+            post(companion_mark_session_seen),
+        )
         .route("/api/v1/companion/commands", post(companion_command))
         .route("/api/v1/companion/commands/{id}/undo", post(companion_undo))
         .route(
@@ -4002,6 +4006,32 @@ async fn companion_jump_session(
         return api_error(StatusCode::FORBIDDEN, "COMPANION_SCOPE_REQUIRED");
     }
     process_jump_session(&state, &session_id)
+}
+
+/// Marks a task as seen after the user opened it from a Companion, typically
+/// after a successful jump from a history row, which carries no Attention ID.
+/// The session's latest completion/error reminder is acknowledged even when
+/// it was already auto-hidden and no longer appears in the snapshot.
+async fn companion_mark_session_seen(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(authorization) = companion_authorization(&state, &headers) else {
+        return api_error(StatusCode::UNAUTHORIZED, "COMPANION_UNAUTHORIZED");
+    };
+    if !authorization.has_scope(COMPANION_SCOPE_RESPOND) {
+        return api_error(StatusCode::FORBIDDEN, "COMPANION_SCOPE_REQUIRED");
+    }
+    if session_id.is_empty() || session_id.len() > 256 {
+        return api_error(StatusCode::BAD_REQUEST, "INVALID_SESSION_ID");
+    }
+    match state.store.mark_session_seen(&session_id, now_millis()) {
+        Ok(SessionSeen::Seen) => Json(json!({ "reviewState": "seen" })).into_response(),
+        Ok(SessionSeen::NoReminder) => Json(json!({ "reviewState": "none" })).into_response(),
+        Ok(SessionSeen::NotFound) => api_error(StatusCode::NOT_FOUND, "SESSION_NOT_FOUND"),
+        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "STORAGE_ERROR"),
+    }
 }
 
 async fn companion_command(
@@ -8746,6 +8776,25 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
                     Vec::new()
                 }),
             );
+            // `pass_through` returns a request to the original Agent UI only
+            // where the Provider still shows it there: a Hook waiter (Claude,
+            // Codex or Gemini Hooks) or a Kimi/Grok Connector request, which
+            // stays pending in the Provider until its own UI answers it. A
+            // request held by the managed Codex app-server channel has no such
+            // UI; passing it through answers Codex with an error instead.
+            let hand_back_available = reply_channel_active
+                && item.request_id.is_some_and(|request_id| {
+                    state
+                        .waiters
+                        .raw(request_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|raw| raw.get("_codex_server_request_method").is_none())
+                });
+            object.insert(
+                "handBackAvailable".to_owned(),
+                Value::Bool(hand_back_available),
+            );
         }
     }
     let quota_entries = quota_entries(state)?;
@@ -8973,6 +9022,7 @@ fn companion_snapshot_value(
             "interaction",
             "remoteActionable",
             "allowedActions",
+            "handBackAvailable",
         ],
     );
     if !can_respond {
@@ -8980,6 +9030,7 @@ fn companion_snapshot_value(
             if let Some(object) = item.as_object_mut() {
                 object.insert("remoteActionable".to_owned(), Value::Bool(false));
                 object.insert("allowedActions".to_owned(), Value::Array(Vec::new()));
+                object.insert("handBackAvailable".to_owned(), Value::Bool(false));
             }
         }
     }
@@ -10331,6 +10382,165 @@ mod tests {
             .unwrap()
             .success());
         repository
+    }
+
+    #[test]
+    fn companion_seen_acknowledges_the_latest_reminder_once() {
+        let root = std::env::temp_dir().join(format!("actrealm-seen-api-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).unwrap();
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        let token = "abababababababababababababababababababababababababababababababab";
+        let read_only = "bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc";
+        register_test_companion(
+            &state,
+            "seen-client",
+            token,
+            &[COMPANION_SCOPE_SNAPSHOT, COMPANION_SCOPE_RESPOND],
+        );
+        register_test_companion(&state, "read-only", read_only, &[COMPANION_SCOPE_SNAPSHOT]);
+        let finish = |session: &str, at: u64| {
+            store
+                .ingest(BridgeRequest::from_hook_at(
+                    Provider::Claude,
+                    json!({
+                        "hook_event_name":"UserPromptSubmit","session_id":session,"turn_id":"t1",
+                        "cwd":root,"prompt":"finish","session_title":"Seen task"
+                    }),
+                    at,
+                ))
+                .unwrap();
+            store
+                .ingest(BridgeRequest::from_hook_at(
+                    Provider::Claude,
+                    json!({"hook_event_name":"Stop","session_id":session,"turn_id":"t1"}),
+                    at + 10,
+                ))
+                .unwrap()
+                .session_id
+        };
+        let now = now_millis();
+        // An open completion reminder (after-confirmation retention).
+        let open = finish("seen-open", now);
+        // A completion reminder the five-minute timer has already hidden.
+        store
+            .write_ui_settings(
+                r#"{"completionTaskHideMode":"afterDelay","completionAutoHideMinutes":5}"#,
+                now,
+            )
+            .unwrap();
+        let hidden = finish("seen-hidden", now - 20 * 60_000);
+        assert!(store.snapshot().unwrap().attention.iter().any(|item| {
+            item.session_id == hidden && item.resolution.as_deref() == Some("auto_hidden")
+        }));
+        // An interrupted turn raises no reminder.
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                json!({
+                    "hook_event_name":"UserPromptSubmit","session_id":"seen-none","turn_id":"t1",
+                    "cwd":root,"prompt":"stop"
+                }),
+                now,
+            ))
+            .unwrap();
+        let none = store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                json!({"hook_event_name":"TurnInterrupted","session_id":"seen-none","turn_id":"t1"}),
+                now + 10,
+            ))
+            .unwrap()
+            .session_id;
+        let review = |session: &str| {
+            store
+                .recent_tasks(0, 100, true)
+                .unwrap()
+                .into_iter()
+                .find(|task| task.id == session)
+                .unwrap()
+                .review_state
+        };
+        assert_eq!(review(&open), "unseen");
+        assert_eq!(review(&hidden), "unseen");
+        assert_eq!(review(&none), "none");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let post = |session: String, token: &'static str| {
+                let state = state.clone();
+                async move {
+                    router(state)
+                        .oneshot(companion_request(
+                            "POST",
+                            &format!("/api/v1/companion/sessions/{session}/seen"),
+                            token,
+                            Value::Null,
+                        ))
+                        .await
+                        .unwrap()
+                }
+            };
+            assert_eq!(
+                post(open.clone(), "wrong").await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+            let forbidden = post(open.clone(), read_only).await;
+            assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+            assert_eq!(
+                json_body(forbidden).await["error"]["code"],
+                "COMPANION_SCOPE_REQUIRED"
+            );
+            let missing = post("missing-session".to_owned(), token).await;
+            assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+            assert_eq!(
+                json_body(missing).await["error"]["code"],
+                "SESSION_NOT_FOUND"
+            );
+            for (session, expected) in [(&open, "seen"), (&hidden, "seen"), (&none, "none")] {
+                // Repeating the request changes nothing.
+                for _ in 0..2 {
+                    let response = post(session.clone(), token).await;
+                    assert_eq!(response.status(), StatusCode::OK, "{session}");
+                    assert_eq!(
+                        json_body(response).await,
+                        json!({"reviewState": expected}),
+                        "{session}"
+                    );
+                }
+            }
+        });
+        assert_eq!(review(&open), "seen");
+        assert_eq!(review(&hidden), "seen");
+        assert_eq!(review(&none), "none");
+        let snapshot = store.snapshot().unwrap();
+        let reminder = |session: &str| {
+            snapshot
+                .attention
+                .iter()
+                .find(|item| item.session_id == session && item.kind == "completion")
+                .unwrap()
+        };
+        // The open reminder was closed like an `ack` command, once.
+        assert_eq!(reminder(&open).state, "resolved");
+        assert_eq!(reminder(&open).resolution.as_deref(), Some("ack_hidden"));
+        assert_eq!(
+            snapshot
+                .commands
+                .iter()
+                .filter(|command| command.attention_id == reminder(&open).id)
+                .count(),
+            1
+        );
+        // The hidden one stays hidden and only records the acknowledgement.
+        assert_eq!(reminder(&hidden).state, "resolved");
+        assert_eq!(reminder(&hidden).resolution.as_deref(), Some("auto_hidden"));
+        assert!(reminder(&hidden).reminder_acknowledged_at.is_some());
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -14572,6 +14782,10 @@ done
         assert_eq!(default_denied["allowedActions"], json!(["deny"]));
         assert_eq!(codex_declared["risk"], "high");
         assert_eq!(codex_declared["allowedActions"], json!(["approve", "deny"]));
+        // Every live Hook waiter can be handed back to the original Agent UI.
+        assert_eq!(declared["handBackAvailable"], true);
+        assert_eq!(default_denied["handBackAvailable"], true);
+        assert_eq!(codex_declared["handBackAvailable"], true);
 
         let companion = companion_snapshot_value(
             &state,
@@ -14594,6 +14808,7 @@ done
             companion_declared["allowedActions"],
             json!(["approve", "deny"])
         );
+        assert_eq!(companion_declared["handBackAvailable"], true);
 
         let read_only_companion = companion_snapshot_value(
             &state,
@@ -14627,7 +14842,7 @@ done
             .as_array()
             .unwrap()
             .iter()
-            .all(|item| item["allowedActions"] == json!([])));
+            .all(|item| item["allowedActions"] == json!([]) && item["handBackAvailable"] == false));
 
         state
             .waiters
@@ -14643,6 +14858,7 @@ done
             .unwrap();
         assert_eq!(declared["remoteActionable"], false);
         assert_eq!(declared["allowedActions"], json!([]));
+        assert_eq!(declared["handBackAvailable"], false);
 
         state
             .waiters
@@ -14659,6 +14875,96 @@ done
             .ticket
             .recv_timeout(Duration::from_secs(1));
 
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_codex_approvals_are_not_offered_for_hand_back() {
+        let root = std::env::temp_dir().join(format!("actrealm-hand-back-{}", Uuid::now_v7()));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        // A managed app-server approval: passing it through answers Codex with
+        // an RPC error instead of returning it to a Provider UI.
+        let managed = BridgeRequest::codex_approval_at(
+            "item/commandExecution/requestApproval",
+            json!({
+                "threadId":"managed-thread","turnId":"turn-1","itemId":"item-1",
+                "command":"cargo publish","cwd":"/tmp/project"
+            }),
+            now_millis(),
+        )
+        .unwrap();
+        let managed_id = managed.request_id.unwrap();
+        let managed_registration = state.waiters.register_at(&managed, now_millis()).unwrap();
+        store.ingest(managed).unwrap();
+        // A Hook approval in another session is handed back to its terminal.
+        let hook = BridgeRequest::from_hook_at(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"PermissionRequest","session_id":"hook-session",
+                "tool_name":"Bash","tool_input":{"command":"git push"}
+            }),
+            now_millis(),
+        );
+        let hook_id = hook.request_id.unwrap();
+        let hook_registration = state.waiters.register_at(&hook, now_millis()).unwrap();
+        store.ingest(hook).unwrap();
+        // A completion is never an approval.
+        for (event, at) in [("UserPromptSubmit", 0), ("Stop", 10)] {
+            store
+                .ingest(BridgeRequest::from_hook_at(
+                    Provider::Claude,
+                    json!({
+                        "hook_event_name":event,"session_id":"done-session","turn_id":"d1",
+                        "prompt":"done"
+                    }),
+                    now_millis() + at,
+                ))
+                .unwrap();
+        }
+
+        let companion = companion_snapshot_value(
+            &state,
+            &CompanionAuthorization {
+                id: "display".to_owned(),
+                scopes: vec![
+                    COMPANION_SCOPE_SNAPSHOT.to_owned(),
+                    COMPANION_SCOPE_RESPOND.to_owned(),
+                ],
+            },
+        )
+        .unwrap();
+        let attention = companion["attention"].as_array().unwrap();
+        let by_request = |request_id: Uuid| {
+            attention
+                .iter()
+                .find(|item| item["requestId"] == request_id.to_string())
+                .unwrap()
+        };
+        assert_eq!(
+            by_request(managed_id)["allowedActions"],
+            json!(["approve", "deny"])
+        );
+        assert_eq!(by_request(managed_id)["handBackAvailable"], false);
+        assert_eq!(by_request(hook_id)["handBackAvailable"], true);
+        let completion = attention
+            .iter()
+            .find(|item| item["kind"] == "completion")
+            .unwrap();
+        assert_eq!(completion["handBackAvailable"], false);
+
+        for (request_id, registration) in [
+            (managed_id, managed_registration),
+            (hook_id, hook_registration),
+        ] {
+            state
+                .waiters
+                .pass_through(request_id, "test_waiter_closed")
+                .unwrap();
+            let _ = registration.ticket.recv_timeout(Duration::from_secs(1));
+        }
         drop(state);
         drop(store);
         fs::remove_dir_all(root).unwrap();

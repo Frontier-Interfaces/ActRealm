@@ -23,7 +23,7 @@ pub use storage::{
     default_database_path, ApprovalAction, AttentionAction, AttentionRecord, ClaimResult,
     CommandRecord, CommandState, CommitResult, IngestResult, MetricEvent, MetricsSummary,
     NativeApprovalSyncResult, QuotaRecord, RecentTaskRecord, ReviewBaselineCandidate,
-    ReviewBaselineInput, ReviewBaselineRecord, RuntimeStore, SessionRecord,
+    ReviewBaselineInput, ReviewBaselineRecord, RuntimeStore, SessionRecord, SessionSeen,
     SessionUsageDailyRecord, SessionUsageRecord, StorageDiagnostics, StoreError, StoreSnapshot,
     TaskCheckpointInput, TaskCheckpointRecord, TaskHistoryMutation, TaskHistoryRecord,
     TimelineContextAvailability, TimelineEventKind, TimelineEventRecord, TimelinePage,

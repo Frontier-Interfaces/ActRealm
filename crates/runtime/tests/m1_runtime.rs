@@ -6,8 +6,8 @@ use actrealm_core::{
 };
 use actrealm_runtime::{
     ApprovalAction, AttentionAction, CommandState, EventSpool, InstanceError, ReviewBaselineInput,
-    RuntimeInstanceGuard, RuntimeStore, SessionUsageDailyRecord, SessionUsageRecord, SpoolError,
-    StoreError, TaskCheckpointInput, WaiterRegistry,
+    RuntimeInstanceGuard, RuntimeStore, SessionSeen, SessionUsageDailyRecord, SessionUsageRecord,
+    SpoolError, StoreError, TaskCheckpointInput, WaiterRegistry,
 };
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -6388,6 +6388,129 @@ fn history_center_keeps_an_interruption_failed_after_the_session_ends_or_resumes
             "failed"
         );
     }
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn marking_a_task_seen_acknowledges_its_latest_reminder() {
+    let root = temp_root("mark-session-seen");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let finish = |session: &str, at: u64| {
+        ingest_tool_turn(&store, Provider::Claude, session, "t1", at);
+        store
+            .ingest(hook(
+                Provider::Claude,
+                json!({"hook_event_name":"Stop","session_id":session,"turn_id":"t1"}),
+                at + 100,
+            ))
+            .unwrap()
+    };
+    let review = |session: &str| {
+        store
+            .recent_tasks(0, 100, true)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == session)
+            .map(|task| task.review_state)
+            .unwrap()
+    };
+    // After-confirmation retention: seen closes the reminder like `ack`.
+    let confirmation = finish("confirmation", now).session_id;
+    // Delayed retention: an open reminder is only acknowledged, and an
+    // auto-hidden one stays hidden.
+    store
+        .write_ui_settings(
+            r#"{"completionTaskHideMode":"afterDelay","completionAutoHideMinutes":5}"#,
+            now,
+        )
+        .unwrap();
+    let delayed = finish("delayed", now).session_id;
+    let hidden = finish("hidden", now - 20 * 60_000).session_id;
+    // Closed by the Agent's own activity.
+    let superseded = finish("superseded", now - 60_000);
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"PreToolUse","session_id":"superseded","turn_id":"t1",
+                "tool_name":"Bash","tool_input":{"command":"cargo test"}
+            }),
+            now - 50_000,
+        ))
+        .unwrap();
+    let superseded = superseded.session_id;
+    ingest_tool_turn(&store, Provider::Claude, "quiet", "t1", now);
+    let quiet = store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"TurnInterrupted","session_id":"quiet","turn_id":"t1"}),
+            now + 100,
+        ))
+        .unwrap()
+        .session_id;
+    let before = store.snapshot().unwrap();
+    for session in [&confirmation, &delayed, &hidden, &superseded] {
+        assert_eq!(review(session), "unseen", "{session}");
+    }
+
+    for _ in 0..2 {
+        for session in [&confirmation, &delayed, &hidden, &superseded] {
+            assert_eq!(
+                store.mark_session_seen(session, now + 1_000).unwrap(),
+                SessionSeen::Seen
+            );
+        }
+        assert_eq!(
+            store.mark_session_seen(&quiet, now + 1_000).unwrap(),
+            SessionSeen::NoReminder
+        );
+        assert_eq!(
+            store.mark_session_seen("missing", now + 1_000).unwrap(),
+            SessionSeen::NotFound
+        );
+    }
+    let snapshot = store.snapshot().unwrap();
+    let reminder = |session: &str| {
+        snapshot
+            .attention
+            .iter()
+            .find(|item| item.session_id == session && item.kind == "completion")
+            .unwrap()
+            .clone()
+    };
+    for session in [&confirmation, &delayed, &hidden, &superseded] {
+        assert_eq!(review(session), "seen", "{session}");
+        assert_eq!(
+            reminder(session).reminder_acknowledged_at,
+            Some(now + 1_000),
+            "{session}"
+        );
+    }
+    assert_eq!(review(&quiet), "none");
+    assert_eq!(
+        (
+            reminder(&confirmation).state.as_str(),
+            reminder(&confirmation).resolution.as_deref()
+        ),
+        ("resolved", Some("ack_hidden"))
+    );
+    assert_eq!(reminder(&delayed).state, "open");
+    assert_eq!(
+        reminder(&delayed).reminder_resolution.as_deref(),
+        Some("reminder_acknowledged")
+    );
+    assert_eq!(reminder(&hidden).resolution.as_deref(), Some("auto_hidden"));
+    assert_eq!(
+        reminder(&superseded).resolution.as_deref(),
+        Some("superseded_by_activity")
+    );
+    // Only the two open reminders were acknowledged through a command, once.
+    assert_eq!(snapshot.commands.len(), before.commands.len() + 2);
     drop(store);
     fs::remove_dir_all(root).unwrap();
 }

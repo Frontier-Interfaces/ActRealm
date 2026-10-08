@@ -106,6 +106,7 @@ All requests except enrollment use `Authorization: Bearer <token>`.
 | `GET /api/v1/companion/sessions/{id}/activity` | `snapshot.read` | Bounded, sanitized activity for the current turn; accepts `limit=1...100` and an optional `afterIngestSequence` cursor |
 | `GET /api/v1/companion/sessions/{id}/review` | `snapshot.read` | On-demand branch/worktree, bounded Diff counts, validation states and outcome evidence; never returns patches, commands or file contents |
 | `POST /api/v1/companion/sessions/{id}/jump` | `session.jump` | Ask ActRealm to perform its current safe jump behavior |
+| `POST /api/v1/companion/sessions/{id}/seen` | `attention.respond` | Mark a task as seen: acknowledge the session's latest completion/error reminder, even when it is already hidden; see "Task roles, history and turn context" |
 | `POST /api/v1/companion/commands` | `attention.respond` | Submit an action for a current Attention item; allow/deny may opt into the fixed three-second undo window or submit immediately |
 | `POST /api/v1/companion/commands/{id}/undo` | `attention.respond` | Undo an allow/deny command that opted into and remains inside the three-second pending window |
 | `POST /api/v1/companion/questions/{id}/answer` | `attention.respond` | Answer or hand a live question back to the Provider UI |
@@ -127,6 +128,18 @@ Provider waiting state, a missing request ID, a stale waiter, or a Companion
 without `attention.respond` exposes no approval actions. Consumers must render
 exactly the declared actions and must not infer control from Provider name or
 risk level.
+
+Each Attention item also carries `handBackAvailable`. It is true only for an
+open approval with a live reply channel whose `pass_through` really returns the
+request to the original Agent UI: a Hook waiter (Claude Code, Codex or Gemini
+Hooks), or a Kimi/Grok Connector request, which stays pending in the Provider
+until its own UI answers it. It is false for an approval held by the managed
+Codex app-server channel (session `controlCapability` `managed`): there
+`pass_through` answers Codex with an RPC error instead of showing the request
+in a Codex UI, so a consumer should offer only the declared allow/deny actions.
+It is also false without a live reply channel, for every non-approval item,
+and for a Companion without `attention.respond`. Question hand-back is
+described by `interaction.supportsNative`.
 
 Jump selection is source-first. Codex App sessions use the
 `codex://threads/{id}` deep link; iTerm and Terminal sessions return to their
@@ -351,6 +364,20 @@ activity closes it: it is resolved as `ack_hidden` and keeps its
 `reminderAcknowledgedAt`. It is `none` when the session raised no
 completion/error Attention. No prompt, reply, command or file path is
 included.
+
+`POST /api/v1/companion/sessions/{id}/seen` (scope `attention.respond`, no
+body) marks a task as seen after the user opened it, for example after a
+successful jump from a history row, which carries no Attention ID. It acts on
+the session's latest completion/error Attention, the one `reviewState` reads:
+an open or snoozed one is closed exactly like an `ack` command (an error or an
+after-confirmation completion is resolved; a delayed or manual completion only
+records the reminder acknowledgement); one that is already closed or hidden
+(`auto_hidden`, `superseded_by_activity`) stays closed and hidden. In every
+case `reminderAcknowledgedAt` keeps the first acknowledgement time, so
+`reviewState` becomes `seen`. The response is `200 {"reviewState": "seen"}`, or
+`{"reviewState": "none"}` when the session never raised a completion/error
+Attention. It is idempotent. An unknown session is `404 SESSION_NOT_FOUND`;
+an empty or longer than 256-byte ID is `400 INVALID_SESSION_ID`.
 
 The result envelope adds `prompt: null | {text, truncated, observedAt}`: the
 user's own prompt for the current turn, taken from the prompt Hook (`prompt`

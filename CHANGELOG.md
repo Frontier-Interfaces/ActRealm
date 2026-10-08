@@ -45,6 +45,14 @@ published a final v1 release; entries below describe development milestones on
   without an end time; the History center reads the latest turn's outcome
   too, so an interruption followed by `SessionEnd` or `SessionStart` stays
   `failed` there (its `completed`/`failed` vocabulary is unchanged).
+- Companion snapshot Attention items add `handBackAvailable`: true only when
+  `pass_through` returns a live approval to the original Agent UI (Hook
+  waiters, Kimi/Grok Connector requests), false for the managed Codex
+  app-server channel, where it would answer Codex with an error.
+  `POST /api/v1/companion/sessions/{id}/seen` (scope `attention.respond`)
+  marks a task as seen from a history row without an Attention ID: it
+  acknowledges the latest completion/error reminder like `ack`, also when it
+  was already auto-hidden, and returns `reviewState` `seen` or `none`.
 
 ### Post-P0 - OUTBOX lifecycle and quota recovery
 
