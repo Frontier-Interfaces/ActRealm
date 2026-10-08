@@ -9894,6 +9894,10 @@ fn recent_task_status(
     }
 }
 
+/// Resolution of a `completion` / `error` Attention closed by the user's next
+/// prompt in the same session.
+const SUPERSEDED_BY_PROMPT: &str = "superseded_by_prompt";
+
 /// Resolutions of a `completion` / `error` Attention that come from the user
 /// or from the user's next instruction, and therefore mean the result was
 /// seen:
@@ -9901,30 +9905,35 @@ fn recent_task_status(
 /// - `ack` / `ack_hidden`: the user acknowledged an error / completion;
 /// - `user_dismissed`: the user dismissed it;
 /// - `history_archived`: the user archived the task in the History center;
-/// - `superseded_by_activity`: new activity in the session (a new prompt,
-///   tool start, question, ...) replaced the reminder.
+/// - `superseded_by_prompt`: the user's next prompt replaced the reminder.
 ///
-/// Every other closure (`auto_hidden` by the completion hide timer, an
-/// expired or Provider-side closure) did not involve the user and leaves the
-/// result unseen.
+/// Every other closure did not involve the user and leaves the result unseen:
+/// `superseded_by_activity` (tool start, compaction, subagent, a Codex turn
+/// continuing on its own, session start; rows written before
+/// `superseded_by_prompt` existed cannot tell a prompt apart and also land
+/// here), `auto_hidden` by the completion hide timer, and any expired or
+/// Provider-side closure.
 const SEEN_ATTENTION_RESOLUTIONS: [&str; 5] = [
     "ack",
     "ack_hidden",
     "user_dismissed",
     "history_archived",
-    "superseded_by_activity",
+    SUPERSEDED_BY_PROMPT,
 ];
 
 /// `seen` only after a user action or a new instruction: the latest
-/// completion/error reminder was acknowledged (`reminder_acknowledged_at`)
-/// or closed with one of [`SEEN_ATTENTION_RESOLUTIONS`]. `unseen` while it is
-/// still open, snoozed, or was closed without the user (`auto_hidden`,
-/// expiry). `none` when the session never raised one.
+/// completion/error reminder was acknowledged (`reminder_acknowledged_at`),
+/// closed with one of [`SEEN_ATTENTION_RESOLUTIONS`], or the user submitted a
+/// prompt in the session after it was raised (`prompted_after`, which also
+/// covers a reminder that other activity had already closed). `unseen` while
+/// it is still open, snoozed, or was closed without the user. `none` when the
+/// session never raised one.
 fn recent_task_review_state(
     attention_kind: Option<&str>,
     attention_state: Option<&str>,
     attention_resolution: Option<&str>,
     acknowledged: bool,
+    prompted_after: bool,
 ) -> &'static str {
     if attention_kind.is_none() {
         return "none";
@@ -9933,7 +9942,7 @@ fn recent_task_review_state(
     let closed_by_user = closed
         && attention_resolution
             .is_some_and(|resolution| SEEN_ATTENTION_RESOLUTIONS.contains(&resolution));
-    if acknowledged || closed_by_user {
+    if acknowledged || closed_by_user || prompted_after {
         "seen"
     } else {
         "unseen"
@@ -9992,7 +10001,13 @@ fn read_recent_tasks(
                       sessions.term_tty AS term_tty,
                       sessions.term_bundle_id AS term_bundle_id,
                       sessions.term_surface AS term_surface,
-                      latest_attention.resolution AS attention_resolution
+                      latest_attention.resolution AS attention_resolution,
+                      EXISTS (
+                        SELECT 1 FROM events AS later_prompt
+                        WHERE later_prompt.session_id = sessions.id
+                          AND later_prompt.type = 'prompt.submitted'
+                          AND later_prompt.occurred_at > latest_attention.created_at
+                      ) AS prompted_after_attention
                FROM sessions
                LEFT JOIN turns AS latest_turn ON latest_turn.id = (
                  SELECT turns.id FROM turns WHERE turns.session_id = sessions.id
@@ -10045,6 +10060,7 @@ fn read_recent_tasks(
                 let term_bundle_id = row.get::<_, Option<String>>(22)?;
                 let term_surface = row.get::<_, Option<String>>(23)?;
                 let attention_resolution = row.get::<_, Option<String>>(24)?;
+                let prompted_after_attention = row.get::<_, bool>(25)?;
                 let (jump_capability, jump_label) = jump_descriptor(
                     &provider,
                     &provider_session_id,
@@ -10078,6 +10094,7 @@ fn read_recent_tasks(
                         attention_state.as_deref(),
                         attention_resolution.as_deref(),
                         attention_acknowledged,
+                        prompted_after_attention,
                     )
                     .to_owned(),
                     latest_attention_kind: attention_kind,
@@ -11699,15 +11716,26 @@ fn reconcile_superseded_nonblocking_attention(
     ) {
         return Ok(());
     }
+    // A user prompt (`UserPromptSubmit`, `BeforeAgent`, or a Connector
+    // `turn/started`, all stored as `prompt.submitted`) is the user's next
+    // instruction. Any other activity (tool start, compaction, subagents, a
+    // Codex turn continuing on its own, session start) supersedes the
+    // reminder without implying that the user saw it. Both close the item as
+    // `resolved`; only the resolution differs.
+    let resolution = if kind == EventKind::PromptSubmitted {
+        SUPERSEDED_BY_PROMPT
+    } else {
+        "superseded_by_activity"
+    };
     transaction
         .execute(
             "UPDATE attention_items SET state = 'resolved', resolved_at = ?2,
-               resolution = 'superseded_by_activity', expires_at = NULL,
+               resolution = ?3, expires_at = NULL,
                auto_hide_at = NULL, reminder_acknowledged_at = NULL,
                reminder_resolution = NULL
              WHERE session_id = ?1 AND kind IN ('completion', 'error')
                AND state IN ('open', 'snoozed') AND created_at < ?2",
-            params![session_id, occurred_at],
+            params![session_id, occurred_at, resolution],
         )
         .map_err(storage_error)?;
     Ok(())
@@ -13773,17 +13801,36 @@ mod tests {
     fn review_state_classifies_every_completion_and_error_closure() {
         use super::{recent_task_review_state, recent_task_status, task_history_status};
         let review = |state, resolution, acknowledged| {
-            recent_task_review_state(Some("completion"), Some(state), resolution, acknowledged)
+            recent_task_review_state(
+                Some("completion"),
+                Some(state),
+                resolution,
+                acknowledged,
+                false,
+            )
         };
-        assert_eq!(recent_task_review_state(None, None, None, false), "none");
+        assert_eq!(
+            recent_task_review_state(None, None, None, false, false),
+            "none"
+        );
         // User actions and new instructions.
         for resolution in [
             "ack",
             "ack_hidden",
             "history_archived",
-            "superseded_by_activity",
+            "superseded_by_prompt",
         ] {
             assert_eq!(review("resolved", Some(resolution), false), "seen");
+        }
+        // Any closure followed by a later user prompt.
+        for (state, resolution) in [
+            ("resolved", Some("superseded_by_activity")),
+            ("resolved", Some("auto_hidden")),
+        ] {
+            assert_eq!(
+                recent_task_review_state(Some("error"), Some(state), resolution, false, true),
+                "seen"
+            );
         }
         assert_eq!(review("dismissed", Some("user_dismissed"), false), "seen");
         assert_eq!(review("open", None, true), "seen");
@@ -13792,6 +13839,10 @@ mod tests {
         assert_eq!(review("open", None, false), "unseen");
         assert_eq!(review("snoozed", None, false), "unseen");
         assert_eq!(review("resolved", Some("auto_hidden"), false), "unseen");
+        assert_eq!(
+            review("resolved", Some("superseded_by_activity"), false),
+            "unseen"
+        );
         assert_eq!(review("expired", Some("runtime_restart"), false), "unseen");
         assert_eq!(review("expired", Some("deadline"), false), "unseen");
         assert_eq!(

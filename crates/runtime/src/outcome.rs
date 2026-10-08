@@ -93,6 +93,7 @@ impl OutcomeRegistry {
         let (plain, paths) = extract_links(&raw);
         let mut fenced = false;
         let mut lines = Vec::new();
+        let mut filter = CredentialLineFilter::default();
         for line in plain.lines() {
             if line.trim_start().starts_with("```") {
                 fenced = !fenced;
@@ -106,17 +107,25 @@ impl OutcomeRegistry {
                 .trim_start_matches(['#', '-', '*', '>', ' '])
                 .replace("**", "")
                 .replace('`', "");
-            if let Ok(safe) = sanitize_result_text(&line) {
-                if !safe.is_empty() {
-                    lines.push(safe);
-                }
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Some(safe) = filter.filter(&line) {
+                lines.push(safe);
             }
             if lines.len() >= 5 {
                 break;
             }
         }
         let joined = lines.join("\n");
-        let summary: String = joined.chars().take(600).collect();
+        let mut summary: String = joined.chars().take(600).collect();
+        let mut truncated =
+            filter.removed || joined.chars().count() > 600 || raw.len() < text.len();
+        // The known-format detection runs once more over the whole excerpt.
+        if sanitize_result_text(&summary).is_err() {
+            summary.clear();
+            truncated = true;
+        }
         let artifacts = paths
             .into_iter()
             .filter_map(|p| resolve_artifact(&p, cwd))
@@ -131,7 +140,7 @@ impl OutcomeRegistry {
                 session_id: session.to_owned(),
                 observed_at: at,
                 source: source.to_owned(),
-                truncated: joined.chars().count() > 600 || raw.len() < text.len(),
+                truncated,
                 summary,
                 artifacts,
             },
@@ -237,17 +246,11 @@ impl OutcomeRegistry {
     }
 }
 
-/// Applies the Runtime result sanitizer line by line: lines carrying
-/// credentials are dropped, paths/URLs/hosts/emails are replaced by
-/// placeholders, and the result is bounded to [`MAX_PROMPT_CHARS`].
-///
-/// On top of the known-format detection of the result sanitizer, a line that
-/// names a credential ([`PROMPT_SECRET_LABELS`], English or Chinese, followed
-/// by a half- or full-width colon or equals sign, whitespace, or the end of
-/// the line) is removed as a whole. When such a label carries no value on its
-/// own line (a Chinese password label with a full-width colon, `token:`, or
-/// just `Password`), the next non-empty line is treated as the value and
-/// removed too. Any removal marks the prompt `truncated`.
+/// Applies the Runtime result sanitizer line by line through
+/// [`CredentialLineFilter`]: credential lines are dropped, paths, URLs, hosts
+/// and emails are replaced by placeholders, and the result is bounded to
+/// [`MAX_PROMPT_CHARS`]. Any removal marks the prompt `truncated`; a known
+/// secret format found in the bounded text as a whole drops the prompt.
 fn sanitize_prompt(text: &str) -> Option<(String, bool)> {
     let raw: String = text.chars().take(MAX_SOURCE).collect();
     let mut truncated = raw.len() < text.len();
@@ -255,27 +258,17 @@ fn sanitize_prompt(text: &str) -> Option<(String, bool)> {
         return None;
     }
     let mut lines = Vec::new();
-    let mut value_on_next_line = false;
+    let mut filter = CredentialLineFilter::default();
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let label = scan_secret_label(line);
-        if value_on_next_line || label != SecretLabel::None {
-            // Either this line holds the value of a bare label on the
-            // previous line, or it names a credential itself. A dropped value
-            // line that is itself a bare label keeps the next line pending.
-            truncated = true;
-            value_on_next_line = label == SecretLabel::ValueOnNextLine;
-            continue;
-        }
-        match sanitize_result_text(line) {
-            Ok(safe) if !safe.is_empty() => lines.push(safe),
-            Ok(_) => {}
-            Err(_) => truncated = true,
+        if let Some(safe) = filter.filter(line) {
+            lines.push(safe);
         }
     }
+    truncated |= filter.removed;
     let joined = lines.join("\n");
     if joined.chars().count() > MAX_PROMPT_CHARS {
         truncated = true;
@@ -289,12 +282,48 @@ fn sanitize_prompt(text: &str) -> Option<(String, bool)> {
     (!bounded.is_empty()).then_some((bounded, truncated))
 }
 
-/// Credential labels a user may type in front of a secret. Matching is
-/// case-insensitive, `_` and `-` match a space (`API_KEY`, `access-key`), and
-/// full-width letters and punctuation match their ASCII forms. Chinese labels
-/// are written as escapes because Runtime production source stays free of Han
-/// text; the comment gives each meaning.
-const PROMPT_SECRET_LABELS: [&str; 25] = [
+/// The line filter shared by the turn prompt and result excerpts. On top of
+/// the known-format detection of the result sanitizer, a line that names a
+/// credential ([`SECRET_LABELS`]) is removed as a whole, and when such a label
+/// carries no value on its own line (a Chinese password label with a
+/// full-width colon, `token:`, or just `Password`), the next non-empty line is
+/// treated as its value and removed too.
+#[derive(Default)]
+struct CredentialLineFilter {
+    value_on_next_line: bool,
+    /// At least one line was removed.
+    removed: bool,
+}
+
+impl CredentialLineFilter {
+    /// Filters one non-empty line. Returns the sanitized line to show, or
+    /// `None` when nothing of it may be shown.
+    fn filter(&mut self, line: &str) -> Option<String> {
+        let label = scan_secret_label(line);
+        if self.value_on_next_line || label != SecretLabel::None {
+            // Either this line holds the value of a bare label on the
+            // previous line, or it names a credential itself. A dropped value
+            // line that is itself a bare label keeps the next line pending.
+            self.removed = true;
+            self.value_on_next_line = label == SecretLabel::ValueOnNextLine;
+            return None;
+        }
+        match sanitize_result_text(line) {
+            Ok(safe) => (!safe.is_empty()).then_some(safe),
+            Err(_) => {
+                self.removed = true;
+                None
+            }
+        }
+    }
+}
+
+/// Credential labels a user or Agent may write in front of a secret. Matching
+/// is case-insensitive, `_` and `-` match a space (`API_KEY`, `access-key`),
+/// and full-width letters and punctuation match their ASCII forms. Chinese
+/// labels are written as escapes because Runtime production source stays free
+/// of Han text; the comment gives each meaning.
+const SECRET_LABELS: [&str; 25] = [
     "password",
     "passwd",
     "pwd",
@@ -329,25 +358,42 @@ enum SecretLabel {
     /// The line names a credential and may carry its value.
     OnLine,
     /// The line is a bare label: only the label, or the label followed by
-    /// nothing but a colon, equals sign or copula. The value is expected on
-    /// the next line.
+    /// nothing but a colon, equals sign (or, after a Chinese label, a copula).
+    /// The value is expected on the next line.
     ValueOnNextLine,
 }
 
 /// Separators that turn a credential word into a label: a colon or equals
-/// sign (after full-width folding), any whitespace, and, after a Chinese
-/// label, the copulas "is" (U+662F) and "as" (U+4E3A, traditional U+70BA),
+/// sign (after full-width folding) or any whitespace.
+fn is_label_separator(character: char) -> bool {
+    matches!(character, ':' | '=') || character.is_whitespace()
+}
+
+/// The Chinese copulas "is" (U+662F) and "as" (U+4E3A, traditional U+70BA),
 /// as in "the password is ...".
-fn is_label_separator(character: char, label_is_ascii: bool) -> bool {
-    matches!(character, ':' | '=')
-        || character.is_whitespace()
-        || (!label_is_ascii && matches!(character, '\u{662f}' | '\u{4e3a}' | '\u{70ba}'))
+fn is_copula(character: char) -> bool {
+    matches!(character, '\u{662f}' | '\u{4e3a}' | '\u{70ba}')
+}
+
+/// A run of at least six printable ASCII characters without spaces that
+/// contains a digit or a symbol, starting right at `value`. Ordinary Chinese
+/// words after a label (`... is empty`) never qualify.
+fn looks_like_credential(value: &[char]) -> bool {
+    let run = value
+        .iter()
+        .take_while(|character| character.is_ascii_graphic())
+        .collect::<Vec<_>>();
+    run.len() >= 6
+        && run
+            .iter()
+            .any(|character| character.is_ascii_digit() || character.is_ascii_punctuation())
 }
 
 fn scan_secret_label(line: &str) -> SecretLabel {
     // Fold full-width ASCII forms (`：`, `＝`, `ＡＰＩ`) and the ideographic
-    // space to ASCII, lowercase, and let `_` / `-` match a space.
-    let normalized = line
+    // space to ASCII and lowercase; for label matching, `_` / `-` also match
+    // a space. Both views have the same length.
+    let folded = line
         .chars()
         .map(|character| match character {
             '\u{3000}' => ' ',
@@ -357,13 +403,16 @@ fn scan_secret_label(line: &str) -> SecretLabel {
             other => other,
         })
         .flat_map(char::to_lowercase)
+        .collect::<Vec<_>>();
+    let normalized = folded
+        .iter()
         .map(|character| match character {
             '_' | '-' => ' ',
-            other => other,
+            other => *other,
         })
         .collect::<Vec<_>>();
     let mut result = SecretLabel::None;
-    for label in PROMPT_SECRET_LABELS {
+    for label in SECRET_LABELS {
         let label = label.chars().collect::<Vec<_>>();
         let label_is_ascii = label.iter().all(char::is_ascii);
         for start in 0..normalized.len() {
@@ -376,23 +425,48 @@ fn scan_secret_label(line: &str) -> SecretLabel {
                 end += 1;
             }
             let rest = &normalized[end..];
-            if !rest
-                .first()
-                .is_none_or(|character| is_label_separator(*character, label_is_ascii))
-            {
-                continue;
-            }
-            let value_missing = rest
-                .iter()
-                .all(|character| is_label_separator(*character, label_is_ascii));
             let bare_line = normalized[..start]
                 .iter()
                 .all(|character| character.is_whitespace());
-            let assigns = rest.iter().any(|character| !character.is_whitespace());
-            if value_missing && (bare_line || assigns) {
-                return SecretLabel::ValueOnNextLine;
+            if rest
+                .first()
+                .is_none_or(|character| is_label_separator(*character))
+            {
+                let value_missing = rest.iter().all(|character| is_label_separator(*character));
+                let assigns = rest.iter().any(|character| !character.is_whitespace());
+                if value_missing && (bare_line || assigns) {
+                    return SecretLabel::ValueOnNextLine;
+                }
+                result = SecretLabel::OnLine;
+                continue;
             }
-            result = SecretLabel::OnLine;
+            if label_is_ascii {
+                continue;
+            }
+            // A Chinese label written straight against its value, or
+            // followed by a copula: only a credential-looking value counts,
+            // so sentences such as "the code is empty" are kept.
+            let value = &folded[end..];
+            let (value, copula) = match value.first() {
+                Some(character) if is_copula(*character) => (&value[1..], true),
+                _ => (value, false),
+            };
+            let value = if copula {
+                let skip = value
+                    .iter()
+                    .take_while(|character| is_label_separator(**character))
+                    .count();
+                if skip == value.len() {
+                    // "The password is:" at the end of the line.
+                    return SecretLabel::ValueOnNextLine;
+                }
+                &value[skip..]
+            } else {
+                value
+            };
+            if looks_like_credential(value) {
+                result = SecretLabel::OnLine;
+            }
         }
     }
     result
@@ -536,6 +610,60 @@ mod tests {
         assert!(r.get("s", 300, 400).is_none());
     }
     #[test]
+    fn result_excerpts_use_the_same_credential_line_filter() {
+        let mut r = OutcomeRegistry::default();
+        r.observe(
+            "s",
+            "已创建测试账号\n**密码**：Abc123!\n令牌：\ntok-live-1234\n修改密码重置页面已完成\n令牌桶限流已改成 10",
+            None,
+            200,
+            "hook:Stop",
+        );
+        let result = r.get("s", 0, 220).unwrap();
+        assert_eq!(
+            result.summary,
+            "已创建测试账号\n修改密码重置页面已完成\n令牌桶限流已改成 10"
+        );
+        assert!(result.truncated);
+
+        // A copula followed by an ordinary word is a normal sentence.
+        r.observe(
+            "s",
+            "验证码为空时报错，已修复\n检查密码是否正确的逻辑也补了测试",
+            None,
+            300,
+            "hook:Stop",
+        );
+        let result = r.get("s", 0, 320).unwrap();
+        assert_eq!(
+            result.summary,
+            "验证码为空时报错，已修复\n检查密码是否正确的逻辑也补了测试"
+        );
+        assert!(!result.truncated);
+
+        r.observe(
+            "s",
+            "我的密码是Abc123!\n- Password\n\nhunter2\n其余完成",
+            None,
+            400,
+            "hook:Stop",
+        );
+        let result = r.get("s", 0, 420).unwrap();
+        assert_eq!(result.summary, "其余完成");
+        assert!(result.truncated);
+
+        // A result that is only a credential leaves no excerpt.
+        r.observe(
+            "s",
+            "API key：sk-live-abcdefghijklmnop",
+            None,
+            500,
+            "hook:Stop",
+        );
+        assert_eq!(r.get("s", 0, 520).unwrap().observed_at, 400);
+    }
+
+    #[test]
     fn prompts_are_sanitized_bounded_and_never_regress_to_an_older_turn() {
         let mut r = OutcomeRegistry::default();
         r.observe_prompt("s", Some("第一行\n\n  第二行  \ntoken=abc123"), 100);
@@ -568,7 +696,11 @@ mod tests {
             "API_KEY：abc",
             "口令 opensesame",
             "我的密码是Abc123!",
-            "令牌为 abc",
+            "我的密码是 hunter2",
+            "密码是：Abc123!",
+            "令牌为 abc123",
+            "密码Abc123!",
+            "验证码884213已发送",
             "ＴＯＫＥＮ＝abc",
             "授权码 884213",
             "验证码：884213",
@@ -590,7 +722,7 @@ mod tests {
             "憑證：x",
             "凭据：x",
             "授權碼 884213",
-            "令牌為 abc",
+            "令牌為 Abc-123",
         ] {
             let (text, truncated) =
                 sanitize_prompt(&format!("修改首页\n{secret_line}\n然后跑测试")).unwrap();
@@ -603,14 +735,24 @@ mod tests {
             sanitize_prompt("请重置密码\n然后跑测试").unwrap(),
             ("然后跑测试".to_owned(), true)
         );
-        // Words that merely contain a label are not credentials.
-        assert_eq!(
-            sanitize_prompt("修改密码重置页面的按钮\n把令牌桶限流改成 10").unwrap(),
-            (
-                "修改密码重置页面的按钮\n把令牌桶限流改成 10".to_owned(),
-                false
-            )
-        );
+        // Words that merely contain a label, or a label followed by a copula
+        // and ordinary words, are not credentials.
+        for sentence in [
+            "修改密码重置页面的按钮",
+            "把令牌桶限流改成 10",
+            "验证码为空时报错",
+            "检查密码是否正确",
+            "令牌为 abc",
+            "验证码为6位数字",
+            "密码是abcdef",
+            "密钥ID是多少",
+        ] {
+            assert_eq!(
+                sanitize_prompt(&format!("{sentence}\n然后跑测试")).unwrap(),
+                (format!("{sentence}\n然后跑测试"), false),
+                "{sentence}"
+            );
+        }
         assert!(sanitize_prompt("密码：Abc123!").is_none());
     }
 

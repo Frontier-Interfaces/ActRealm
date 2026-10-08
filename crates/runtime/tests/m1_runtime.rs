@@ -3967,7 +3967,7 @@ fn new_activity_resolves_stale_completion_and_error_without_hiding_running_state
     assert_eq!(completion.state, "resolved");
     assert_eq!(
         completion.resolution.as_deref(),
-        Some("superseded_by_activity")
+        Some("superseded_by_prompt")
     );
     assert_eq!(resumed.sessions[0].exec_state, "thinking");
 
@@ -4025,7 +4025,7 @@ fn new_activity_resolves_stale_completion_and_error_without_hiding_running_state
         .find(|item| item.kind == "error")
         .unwrap();
     assert_eq!(error.state, "resolved");
-    assert_eq!(error.resolution.as_deref(), Some("superseded_by_activity"));
+    assert_eq!(error.resolution.as_deref(), Some("superseded_by_prompt"));
     assert_eq!(recovered.sessions[0].exec_state, "tool_running");
 
     drop(store);
@@ -4089,6 +4089,11 @@ fn a_tool_start_reopens_an_automatically_continued_codex_turn() {
             && item.state == "resolved"
             && item.resolution.as_deref() == Some("superseded_by_activity")
     }));
+    // The turn continued on its own; the user has not seen its result.
+    assert_eq!(
+        store.recent_tasks(0, 10, true).unwrap()[0].review_state,
+        "unseen"
+    );
 
     drop(store);
     fs::remove_dir_all(root).unwrap();
@@ -5567,7 +5572,7 @@ fn a_new_prompt_alone_closes_open_completion_and_error_reminders() {
         assert_eq!(item.state, "resolved", "{kind}");
         assert_eq!(
             item.resolution.as_deref(),
-            Some("superseded_by_activity"),
+            Some("superseded_by_prompt"),
             "{kind}"
         );
     }
@@ -5879,6 +5884,59 @@ fn recent_task_review_state_is_seen_only_after_a_user_action_or_new_instruction(
             14_300,
         ))
         .unwrap();
+    // Only the Agent's own activity follows: a new tool start in the same
+    // session closes the reminder without the user.
+    let (tool_only, _) = finish("tool-only", 14_500);
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"PreToolUse","session_id":"tool-only","turn_id":"t1",
+                "cwd":"/tmp/example-project","tool_name":"Bash",
+                "tool_input":{"command":"cargo test"}
+            }),
+            14_700,
+        ))
+        .unwrap();
+    // Other activity closes it first, and the user's next prompt follows.
+    let (resumed_then_prompted, _) = finish("resumed-then-prompted", 14_800);
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"SessionStart","session_id":"resumed-then-prompted","source":"resume"}),
+            14_920,
+        ))
+        .unwrap();
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"UserPromptSubmit","session_id":"resumed-then-prompted",
+                "turn_id":"t2","cwd":"/tmp/example-project","prompt":"next"
+            }),
+            14_940,
+        ))
+        .unwrap();
+    // A Codex Connector `turn/started` is the user's next instruction too.
+    ingest_tool_turn(&store, Provider::Codex, "connector", "t1", 17_000);
+    let connector = store
+        .ingest(hook(
+            Provider::Codex,
+            json!({"hook_event_name":"Stop","session_id":"connector","turn_id":"t1"}),
+            17_100,
+        ))
+        .unwrap()
+        .session_id;
+    store
+        .ingest(BridgeRequest::from_provider_event_at(
+            Provider::Codex,
+            "UserPromptSubmit",
+            "connector",
+            Some("t2"),
+            json!({"threadId":"connector","turn":{"id":"t2","status":"inProgress","items":[]}}),
+            17_200,
+        ))
+        .unwrap();
     let (snoozed, snooze_id) = finish("snoozed", now);
     store
         .act_on_attention(
@@ -5935,7 +5993,30 @@ fn recent_task_review_state_is_seen_only_after_a_user_action_or_new_instruction(
             .map(|task| task.review_state.as_str())
             .unwrap()
     };
+    let resolution_of = |session: &str| {
+        attention
+            .iter()
+            .find(|item| item.session_id == session && item.kind == "completion")
+            .and_then(|item| item.resolution.clone())
+    };
+    assert_eq!(
+        resolution_of(&superseded).as_deref(),
+        Some("superseded_by_prompt")
+    );
+    assert_eq!(
+        resolution_of(&connector).as_deref(),
+        Some("superseded_by_prompt")
+    );
+    assert_eq!(
+        resolution_of(&tool_only).as_deref(),
+        Some("superseded_by_activity")
+    );
+    assert_eq!(
+        resolution_of(&resumed_then_prompted).as_deref(),
+        Some("superseded_by_activity")
+    );
     // Closed without the user: still unseen.
+    assert_eq!(review(&tool_only), "unseen");
     assert_eq!(review(&auto_hidden), "unseen");
     assert_eq!(review(&snoozed), "unseen");
     assert_eq!(review(&open), "unseen");
@@ -5945,6 +6026,8 @@ fn recent_task_review_state_is_seen_only_after_a_user_action_or_new_instruction(
     assert_eq!(review(&dismissed), "seen");
     assert_eq!(review(&archived), "seen");
     assert_eq!(review(&superseded), "seen");
+    assert_eq!(review(&connector), "seen");
+    assert_eq!(review(&resumed_then_prompted), "seen");
     // No completion/error reminder at all.
     assert_eq!(review(&quiet), "none");
     drop(store);

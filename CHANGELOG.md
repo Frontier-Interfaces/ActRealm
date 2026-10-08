@@ -24,6 +24,10 @@ published a final v1 release; entries below describe development milestones on
   new instruction, keeps `failed` after the session ends, and never falls back
   to a prompt-derived title; the Companion review runs git off the API thread,
   reuses the resolved repository, and briefly caches unchanged repositories.
+- A new prompt now closes earlier completion/error reminders with resolution
+  `superseded_by_prompt`; other activity keeps `superseded_by_activity`, which
+  Companion history counts as unseen. Result excerpts use the same credential
+  line filter as the turn prompt.
 
 ### Post-P0 - OUTBOX lifecycle and quota recovery
 

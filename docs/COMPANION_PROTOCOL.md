@@ -202,6 +202,10 @@ summary, truncated, artifacts}}`. It is available only for the latest ended or
 failed turn. A new turn invalidates old results. `source` identifies Stop Hook
 text or a final Codex response; the text is Provider-reported, not independent
 verification of the claims inside it. Each excerpt has at most 600 characters.
+The excerpt goes through the same credential line filter as the turn prompt
+(see the `prompt` field below): credential lines and the value line after a
+bare label are removed, the known secret formats are checked per line and over
+the whole excerpt, and `truncated` is true whenever a line was removed.
 
 Results are held only in bounded Runtime memory (up to 128 sessions, 24-hour
 retention). They are excluded from generic snapshots, SQLite, exports, Cloud,
@@ -299,9 +303,13 @@ A user interruption (`TurnInterrupted`) ends the turn without counting as a
 failure: the session becomes `idle` with `activityMessage`
 `session.activity.interrupted`, no `error` Attention is raised, and the turn is
 recorded as `interrupted`. `StopFailure` still produces `failed` and an `error`
-Attention. A new prompt in the same session resolves that session's earlier
+Attention. A new prompt in the same session (`UserPromptSubmit`,
+`BeforeAgent` or a Connector `turn/started`) resolves that session's earlier
 open or snoozed `completion` and `error` Attention with resolution
-`superseded_by_activity`. The local History center (`GET /api/v1/history`)
+`superseded_by_prompt`; other new activity (a tool start, compaction, a
+subagent or task, a Codex turn continuing on its own, a session start) resolves
+them with `superseded_by_activity`. Both close the Attention as `resolved`, so
+clients that only look at the state are unaffected. The local History center (`GET /api/v1/history`)
 keeps its `completed` / `failed` vocabulary and still reports a
 user-interrupted task as `failed`, as before.
 
@@ -322,12 +330,15 @@ that ended (`SessionEnd`) after a failed or interrupted turn keeps that turn's
 `failed` or `interrupted` status. `reviewState` becomes `seen` only through the
 user or the user's next instruction: the latest completion/error Attention was
 acknowledged (including a reminder-only acknowledgement), dismissed, archived
-from the History center, or superseded by new activity in the session
-(resolutions `ack`, `ack_hidden`, `user_dismissed`, `history_archived`,
-`superseded_by_activity`). It stays `unseen` while that Attention is open or
-snoozed, and when it was closed without the user (for example `auto_hidden` by
-the completion hide timer, or expired). It is `none` when the session raised no
-completion/error Attention. No prompt, reply, command or file path is
+from the History center, or superseded by the user's next prompt (resolutions
+`ack`, `ack_hidden`, `user_dismissed`, `history_archived`,
+`superseded_by_prompt`), or the user submitted a prompt in the session after
+it was raised. It stays `unseen` while that Attention is open or snoozed, and
+when it was closed without the user: `superseded_by_activity`, `auto_hidden` by
+the completion hide timer, or expired. `superseded_by_activity` rows written
+before `superseded_by_prompt` existed cannot tell a prompt apart and count as
+`unseen` unless a later prompt event exists. It is `none` when the session
+raised no completion/error Attention. No prompt, reply, command or file path is
 included.
 
 The result envelope adds `prompt: null | {text, truncated, observedAt}`: the
@@ -341,9 +352,13 @@ whole: `password`, `passwd`, `pwd`, `secret`, `token`, `api key`, `apikey`,
 `口令`, `密钥`, `秘钥`, `令牌`, `凭证`, `凭据`, `授权码` or `验证码`, plus
 traditional forms such as `密碼` (case-insensitive, `_`/`-` matching a space,
 full-width forms folded), followed by a half- or full-width colon or equals
-sign, whitespace, `是`/`为` after a Chinese label, or the end of the line.
-When such a label has no value on its own line (`密码：`, `token:`, or the
-label alone), the next non-empty line is removed as its value too. The known
+sign, whitespace, or the end of the line. A Chinese label written straight
+against its value or followed by `是`/`为` is removed only when the value looks
+like a credential: at least six printable ASCII characters without spaces,
+including a digit or a symbol (`我的密码是Abc123!`, `验证码884213`), so
+sentences such as `验证码为空时报错` are kept. When a label has no value on its
+own line (`密码：`, `token:`, `我的密码是`, or the label alone), the next
+non-empty line is removed as its value too. The known
 secret formats (`sk-`, `ghp_`, private key blocks and similar) are checked per
 line and once more over the whole bounded text; a hit there drops the prompt.
 Like result excerpts it is held only in Runtime memory, is replaced by the
