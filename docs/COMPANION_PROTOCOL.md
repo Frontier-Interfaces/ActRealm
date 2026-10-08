@@ -416,23 +416,43 @@ predicate (`是`, `为`, `就是`, `改成`, `改为`, `设为`, `设置为`, `�
 `更新为`, `重置为`, `如下` and similar, optionally with `已`/`已经` before and
 `了` after it), is removed when the value looks like a credential: at least six
 printable ASCII characters without spaces, including a digit or a symbol
-(`我的密码是Abc123!`, `密码改成了 Qwer1234!`, `验证码884213`). A value in
+(`我的密码是Abc123!`, `密码改成了 Qwer1234!`, `验证码884213`); a `?`, `.`,
+`,` or `;` that ends it ends the sentence instead (`令牌还是 cookie？` is
+kept), and an algorithm name is not a value (`密码改成 AES-256 加密`). A value in
 quotes (`「」`, `『』`, `【】`, `“”`, `‘’`, `《》` or ASCII quotes) needs only
 four characters (`口令「opensesame」`). With any other wording, the rest of
 the sentence after a Chinese label is searched as well: within twelve Chinese
-characters, symbols or ASCII words, and before a `。` or a standalone `!`, `?`
-or `;`, an ASCII word that looks like a password (six to 128 characters with
-letters and digits, only digits, or a password symbol such as `@`, `!`, `#`
-next to letters or digits), or a quoted ASCII word of at least six characters,
-removes the line: `初始密码默认是 Admin@123`, `用户名和密码分别是 admin 和
-Abc123!`, `密码我改成了 Abc123!`, `密码👉Abc123!`. Words that name something
-else are not values there: paths and URLs, emails, `package@1.2.3`, versions
-and IP addresses (also `Python3.11`), file and dotted names (`auth.rs`,
-`bcrypt.compare`), dimensions (`320px`, `1.5em`, `120x40`), hex colors,
-algorithm and encoding names (`AES-256`, `JWT-HS256`, `argon2id`, `base64`),
-and a word right after `commit`, `id`, `port`, `version` and similar. So
-sentences such as `验证码为空时报错`, `密码是abcdef`, `密码改成 bcrypt 加密`
-and `密码页面的 commit 是 3f2a9c1` are kept. The short keys `pass`, `pwd` and
+characters, symbols or ASCII words, and before a `。` or a `!`, `?` or `;`
+(full-width ones included) that stands alone or ends a word, an ASCII word
+that looks like a password, or a quoted ASCII word of at least six
+characters, removes the line. Punctuation that ends a word is not part of it
+(`MySQL？`, `Codex！`), except that `!` after letters and digits still counts
+as a symbol (`Abc123!`). A password symbol such as `@` or `#` next to letters
+or digits, and letters with digits (`hunter2`, `admin2024`), always count:
+`初始密码默认是 Admin@123`, `用户名和密码分别是 admin 和 Abc123!`,
+`密码我改成了 Abc123!`, `密码👉Abc123!`. Shapes that usually name something
+else count only when the wording hands the word over as a value (a copula
+or setter such as `是`, `为`, `成`, `用`, `填`, `叫`, `了`, `和`, `默认`,
+`就`, a colon, an arrow or an emoji right before it): only digits, and not
+followed by a unit such as `毫秒`, `秒`, `次`, `个` or `QPS` (`WiFi
+默认密码统一是 12345678` is removed, `令牌桶容量 100000` is kept), a hex run
+whose letters and digits alternate like a commit hash (`a1b2c3d`), an
+identifier with `_` or `-`, and a product or standard with a version number
+(`iPhone15`, `Node20`, `RTX4090`, `RFC7519`, `iPhone16Pro`; for these `用`
+and `和` do not count). Words that name something else are never values
+there: paths and URLs, emails, `package@1.2.3`, versions and IP addresses
+(also `Python3.11`), file and dotted names (`auth.rs`, `bcrypt.compare`),
+dimensions (`320px`, `1.5em`, `120x40`), hex colors, algorithm and encoding
+names (`AES-256`, `JWT-HS256`, `argon2id`, `HKDF-SHA256`, `base64`), a word
+right after `commit`, `id`, `port`, `version`, `traceId`, `trace_id` and
+similar, and a word right after (optionally with a colon, `是` or a setter
+such as `改成` in between) `提交`, `版本`, `分支`, `端口`, `错误码`, `编号`,
+`工单`, `型号`, `上限`, `耗时`, `次数`, `超时`, `模板`, `参考` and similar.
+So sentences such as `验证码为空时报错`, `密码是abcdef`, `密码改成 bcrypt
+加密`, `密码页面的 commit 是 3f2a9c1`, `验证码存 Redis 还是 MySQL？`,
+`已修复令牌刷新逻辑，提交 3f2a9c1。`, `令牌过期处理改好了，在 iPhone15
+上验证通过。`, `令牌桶限流已上线，QPS 上限 100000。` and
+`密钥轮换脚本跑完了，耗时 1234567 毫秒。` are kept. The short keys `pass`, `pwd` and
 `pin` count only in an assignment: `db_pass=hunter2`, `PIN：884213`,
 `userPin=1234` (a value after a colon needs a digit or symbol, so `pin:
 string` is kept; `pinned`, `passing`, `bypass`, `pass_rate` and `--- PASS:

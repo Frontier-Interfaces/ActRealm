@@ -691,13 +691,28 @@ fn ascii_run(value: &[char]) -> usize {
 
 /// A run of at least six printable ASCII characters without spaces that
 /// contains a digit or a symbol, starting right at `value`. Ordinary Chinese
-/// words after a label (`... is empty`) never qualify.
+/// words after a label (`... is empty`) never qualify, and a question mark,
+/// full stop, comma or semicolon that ends the run ends the sentence instead
+/// ("token or cookie?" in Chinese, with a full-width question mark).
 fn looks_like_credential(value: &[char]) -> bool {
-    let run = &value[..ascii_run(value)];
+    let run = credential_run(value);
     run.len() >= 6
         && run
             .iter()
             .any(|character| character.is_ascii_digit() || character.is_ascii_punctuation())
+}
+
+/// The printable ASCII run at `value` without the sentence punctuation that
+/// may end it (`?`, `.`, `,`, `;`).
+fn credential_run(value: &[char]) -> &[char] {
+    let mut run = &value[..ascii_run(value)];
+    while let Some((last, head)) = run.split_last() {
+        if !matches!(last, '?' | '.' | ',' | ';') {
+            break;
+        }
+        run = head;
+    }
+    run
 }
 
 /// Folds full-width ASCII forms (`：`, `＝`, `ＡＰＩ`) and the ideographic
@@ -840,9 +855,16 @@ fn names_value_after_note(rest: &[char]) -> bool {
 fn starts_with_phrase(value: &[char], phrases: &[&str]) -> Option<usize> {
     phrases
         .iter()
-        .map(|phrase| phrase.chars().collect::<Vec<_>>())
-        .filter(|phrase| value.starts_with(phrase))
-        .map(|phrase| phrase.len())
+        .filter_map(|phrase| {
+            let mut length = 0;
+            for character in phrase.chars() {
+                if value.get(length) != Some(&character) {
+                    return None;
+                }
+                length += 1;
+            }
+            Some(length)
+        })
         .max()
 }
 
@@ -891,7 +913,10 @@ fn scan_chinese_label_value(folded: &[char], end: usize) -> SecretLabel {
         return SecretLabel::ValueOnNextLine;
     }
     // A quoted value (`「opensesame」`) needs no digit or symbol.
-    if looks_like_credential(value) || (quoted && ascii_run(value) >= 4) {
+    // An algorithm is not a value ("the password is changed to AES-256
+    // encryption").
+    let algorithm = names_an_algorithm(credential_run(value));
+    if (looks_like_credential(value) && !algorithm) || (quoted && ascii_run(value) >= 4) {
         return SecretLabel::OnLine;
     }
     if verb == 0 && ends_a_short_chinese_label(&folded[verb_start..]) {
@@ -923,10 +948,12 @@ fn is_value_boundary(character: char) -> bool {
 /// Searches the rest of the sentence after a Chinese label (`end` is the
 /// label end in `folded`) for its value: within [`LABEL_VALUE_WINDOW`]
 /// Chinese characters, symbols or ASCII words, an ASCII word that looks like
-/// a password ([`looks_like_secret_value`]), or a quoted ASCII word of at
-/// least six characters. The search stops at the end of the sentence (a
-/// Chinese full stop, or `!`, `?`, `;` standing alone) once anything
-/// separated the label from it.
+/// a password ([`looks_like_window_value`]), or a quoted ASCII word of at
+/// least six characters. A word right after a reference (`commit`, `port`,
+/// or [`CHINESE_REFERENCE_WORDS`] such as "commit" or "upper limit" in
+/// Chinese) names that instead. The search stops at the end of the sentence:
+/// a Chinese full stop, or `!`, `?`, `;` (full-width ones folded) standing
+/// alone or ending a word, once anything separated the label from it.
 fn finds_value_after_label(folded: &[char], end: usize) -> bool {
     let mut index = end;
     let mut units = 0;
@@ -957,38 +984,336 @@ fn finds_value_after_label(folded: &[char], end: usize) -> bool {
         {
             index += 1;
         }
-        let word = &folded[start..index];
-        if word
-            .iter()
-            .all(|character| matches!(character, '.' | '!' | '?' | ';'))
-        {
+        // Sentence punctuation glued to the word (`MySQL?`, `Codex!`) is not
+        // part of it; `!` after letters and digits still is (`Abc123!`).
+        let mut word_end = index;
+        while word_end > start && matches!(folded[word_end - 1], '.' | '!' | '?' | ';') {
+            word_end -= 1;
+        }
+        if word_end == start {
             if units > 0 {
                 break;
             }
             continue;
         }
+        let word = &folded[start..word_end];
+        let exclaimed = folded[word_end..index].contains(&'!');
         let closed = folded
             .get(index)
             .is_some_and(|character| is_quote(*character));
         if !reference_next
-            && (looks_like_secret_value(word) || (quoted && closed && word.len() >= 6))
+            && !follows_chinese_reference(folded, end, start)
+            && (looks_like_window_value(folded, end, start, index, word, exclaimed)
+                || (quoted && closed && word.len() >= 6))
         {
             return true;
         }
         let word = word.iter().collect::<String>();
-        reference_next = REFERENCE_WORDS.contains(&word.as_str());
+        // `commit`, `port`, and identifiers such as `traceId` or `requestId`.
+        reference_next = REFERENCE_WORDS.contains(&word.as_str())
+            || ID_WORDS.contains(&word.as_str())
+            || word.ends_with("_id")
+            || word.ends_with("-id");
         units += 1;
         quoted = false;
+        if word_end < index {
+            break;
+        }
     }
     false
 }
 
 /// ASCII words after which a value names something other than the
-/// credential (`commit 3f2a9c1`, `port 50051`).
+/// credential (`commit 3f2a9c1`, `port 50051`); [`ID_WORDS`] and words
+/// ending in `_id` or `-id` count too.
 const REFERENCE_WORDS: [&str; 15] = [
     "branch", "build", "commit", "hash", "id", "issue", "line", "pid", "port", "pr", "sha", "tag",
     "ticket", "uuid", "version",
 ];
+
+/// Lowercase names of identifiers written as one word (`traceId=...`,
+/// `requestId` followed by "is" in Chinese). Session IDs are left out: they
+/// may be credentials themselves.
+const ID_WORDS: [&str; 16] = [
+    "appid",
+    "clientid",
+    "deviceid",
+    "eventid",
+    "jobid",
+    "messageid",
+    "msgid",
+    "openid",
+    "orderid",
+    "requestid",
+    "spanid",
+    "taskid",
+    "tenantid",
+    "traceid",
+    "unionid",
+    "userid",
+];
+
+/// Chinese words after which a value (optionally after a colon or "is")
+/// names something other than the credential: "commit 3f2a9c1", "error code
+/// E40301", "upper limit 100000", "took 1234567".
+const CHINESE_REFERENCE_WORDS: [&str; 22] = [
+    "\u{63d0}\u{4ea4}",         // commit
+    "\u{7248}\u{672c}",         // version
+    "\u{7248}\u{672c}\u{53f7}", // version number
+    "\u{5206}\u{652f}",         // branch
+    "\u{7aef}\u{53e3}",         // port
+    "\u{9519}\u{8bef}\u{7801}", // error code
+    "\u{72b6}\u{6001}\u{7801}", // status code
+    "\u{7f16}\u{53f7}",         // number
+    "\u{5de5}\u{5355}",         // ticket
+    "\u{578b}\u{53f7}",         // model
+    "\u{673a}\u{578b}",         // device model
+    "\u{4e0a}\u{9650}",         // upper limit
+    "\u{4e0b}\u{9650}",         // lower limit
+    "\u{8017}\u{65f6}",         // took
+    "\u{6b21}\u{6570}",         // count
+    "\u{8d85}\u{65f6}",         // timeout
+    "\u{6a21}\u{677f}",         // template
+    "\u{53c2}\u{8003}",         // see
+    "\u{624b}\u{673a}\u{53f7}", // phone number
+    "\u{8ba2}\u{5355}\u{53f7}", // order number
+    "\u{65f6}\u{95f4}\u{6233}", // timestamp
+    "\u{8fdb}\u{7a0b}",         // process
+];
+
+/// Copulas skipped between a reference word and its value ("the template is
+/// SMS_123456789"): "is" and "as".
+fn is_copula(character: char) -> bool {
+    matches!(character, '\u{662f}' | '\u{4e3a}' | '\u{70ba}')
+}
+
+/// The word at `start` comes right after one of [`CHINESE_REFERENCE_WORDS`]
+/// that follows the label (`end`), optionally with spaces, a colon, a copula
+/// or a predicate ([`LABEL_PREDICATES`], "the count was changed to") in
+/// between.
+fn follows_chinese_reference(folded: &[char], end: usize, start: usize) -> bool {
+    let mut before = start;
+    while before > end && matches!(folded[before - 1], ':' | '=' | ' ' | '\t') {
+        before -= 1;
+    }
+    // The perfective particle after a predicate.
+    if before > end && folded[before - 1] == '\u{4e86}' {
+        before -= 1;
+    }
+    let predicate = LABEL_PREDICATES
+        .iter()
+        .filter_map(|phrase| ends_with_phrase(&folded[end..before], phrase))
+        .max();
+    if let Some(length) = predicate {
+        before -= length;
+        while before > end && folded[before - 1].is_whitespace() {
+            before -= 1;
+        }
+    } else if before > end && is_copula(folded[before - 1]) {
+        before -= 1;
+        while before > end && folded[before - 1].is_whitespace() {
+            before -= 1;
+        }
+    }
+    CHINESE_REFERENCE_WORDS
+        .iter()
+        .any(|word| ends_with_phrase(&folded[end..before], word).is_some())
+}
+
+/// The length of `phrase` when `text` ends with it.
+fn ends_with_phrase(text: &[char], phrase: &str) -> Option<usize> {
+    let length = phrase.chars().count();
+    (text.len() >= length
+        && text[text.len() - length..]
+            .iter()
+            .copied()
+            .eq(phrase.chars()))
+    .then_some(length)
+}
+
+/// Chinese characters that hand over a value ("is", "as", "into", "use",
+/// "fill in", "called", "enter", "you", the perfective particle, "and",
+/// "set", "change", "replace", "default", "just"), simplified and
+/// traditional.
+const VALUE_INTRODUCERS: [char; 23] = [
+    '\u{662f}', '\u{4e3a}', '\u{70ba}', '\u{7232}', '\u{6210}', '\u{7528}', '\u{586b}', '\u{53eb}',
+    '\u{5165}', '\u{4f60}', '\u{4e86}', '\u{548c}', '\u{8ddf}', '\u{4e0e}', '\u{8207}', '\u{53ca}',
+    '\u{8bbe}', '\u{8a2d}', '\u{6539}', '\u{6362}', '\u{63db}', '\u{8ba4}', '\u{5c31}',
+];
+
+/// Of [`VALUE_INTRODUCERS`], "use" and "and" (simplified and traditional),
+/// which also come before tools, devices and lists of names.
+const LOOSE_INTRODUCERS: [char; 6] = [
+    '\u{7528}', '\u{548c}', '\u{8ddf}', '\u{4e0e}', '\u{8207}', '\u{53ca}',
+];
+
+/// How a word whose shape usually names something else must be handed over
+/// to count as a value ([`is_introduced`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Handover {
+    /// Only digits: also after a comma ("sent it to you, 884213").
+    Number,
+    /// A hash-like hex run or an identifier with `_` or `-`.
+    Word,
+    /// A product with a version number: not after "use" or "and"
+    /// ([`LOOSE_INTRODUCERS`]), since devices are "used" and standards are
+    /// listed with "and".
+    Product,
+}
+
+/// The word at `start` is handed over as a value: right after the label, or
+/// after a [`VALUE_INTRODUCERS`] character, a colon, an arrow, an emoji or
+/// other punctuation (not a bracket, an enumeration comma, or a comma except
+/// before a number), as `handover` allows.
+fn is_introduced(folded: &[char], end: usize, start: usize, handover: Handover) -> bool {
+    let mut before = start;
+    while before > end && folded[before - 1].is_whitespace() {
+        before -= 1;
+    }
+    if before == end {
+        return true;
+    }
+    let character = folded[before - 1];
+    if LOOSE_INTRODUCERS.contains(&character) {
+        return handover != Handover::Product;
+    }
+    if character == ',' {
+        return handover == Handover::Number;
+    }
+    VALUE_INTRODUCERS.contains(&character)
+        || (!character.is_alphanumeric()
+            && !matches!(
+                character,
+                '(' | ')' | '[' | ']' | '{' | '}' | '<' | '|' | '\u{3001}' | '-' | '_'
+            ))
+}
+
+/// Units after a number that make it a measurement ("milliseconds",
+/// "seconds", "minutes", "hours", "days", "times", "items", "digits",
+/// "lines", "bytes", "yuan", "ten thousand", and `ms`, `qps`).
+const NUMBER_UNITS: [&str; 18] = [
+    "\u{6beb}\u{79d2}",
+    "\u{79d2}",
+    "\u{5206}\u{949f}",
+    "\u{5c0f}\u{65f6}",
+    "\u{5929}",
+    "\u{6b21}",
+    "\u{4e2a}",
+    "\u{6761}",
+    "\u{4f4d}",
+    "\u{884c}",
+    "\u{5b57}\u{8282}",
+    "\u{5143}",
+    "\u{4e07}",
+    "\u{4ebf}",
+    "ms",
+    "qps",
+    "tps",
+    "rps",
+];
+
+/// The text after a number (`word_end`) starts with one of [`NUMBER_UNITS`].
+fn followed_by_unit(folded: &[char], word_end: usize) -> bool {
+    let mut index = word_end;
+    while folded
+        .get(index)
+        .is_some_and(|character| character.is_whitespace())
+    {
+        index += 1;
+    }
+    let rest = &folded[index.min(folded.len())..];
+    NUMBER_UNITS.iter().any(|unit| {
+        starts_with_phrase(rest, &[unit]).is_some_and(|length| {
+            !rest
+                .get(length)
+                .is_some_and(|character| character.is_ascii_alphanumeric())
+        })
+    })
+}
+
+/// Product, platform and standard names that a version number follows
+/// (`iPhone15`, `Node20`, `RTX4090`, `RFC7519`), lowercase.
+const PRODUCT_NAMES: [&str; 44] = [
+    "android", "angular", "centos", "chrome", "claude", "debian", "deepseek", "es", "firefox",
+    "galaxy", "gemini", "glm", "gpt", "gtx", "ios", "ipad", "iphone", "iso", "java", "jdk",
+    "kotlin", "llama", "macos", "mate", "mysql", "node", "php", "pixel", "postgres", "python",
+    "qwen", "react", "redis", "redmi", "rfc", "rtx", "ruby", "swift", "ubuntu", "vue", "watchos",
+    "windows", "xcode", "yolov",
+];
+
+/// A [`PRODUCT_NAMES`] entry followed by a version number of one to four
+/// digits and optionally a model suffix (`iPhone16Pro`, `Node20lts`).
+fn names_a_product_version(word: &[char]) -> bool {
+    let letters = word
+        .iter()
+        .take_while(|character| character.is_ascii_alphabetic())
+        .count();
+    let digits = word[letters..]
+        .iter()
+        .take_while(|character| character.is_ascii_digit())
+        .count();
+    (1..=4).contains(&digits)
+        && word[letters + digits..]
+            .iter()
+            .all(char::is_ascii_alphabetic)
+        && PRODUCT_NAMES.contains(&word[..letters].iter().collect::<String>().as_str())
+}
+
+/// A word after a Chinese label that looks like a password, judged more
+/// strictly than right after a predicate because any wording may come in
+/// between. A password symbol next to letters or digits (`Admin@123`), or
+/// letters and digits followed by `!` (`Abc123!`), always counts; so do
+/// letters with digits (`hunter2`, `admin2024`). Shapes that usually name
+/// something else count only when the word is handed over as a value
+/// ([`is_introduced`]): only digits (and not a measurement), a hex run like
+/// a short commit hash ([`looks_like_short_hash`]), an identifier with `_` or
+/// `-`, and a product with a version number (`iPhone15`, `RTX4090`,
+/// `iPhone16Pro`).
+fn looks_like_window_value(
+    folded: &[char],
+    end: usize,
+    start: usize,
+    word_end: usize,
+    word: &[char],
+    exclaimed: bool,
+) -> bool {
+    if !looks_like_secret_value(word) {
+        return false;
+    }
+    if word.iter().any(|character| is_password_symbol(*character)) {
+        return true;
+    }
+    if !word.iter().any(char::is_ascii_alphabetic) {
+        // Only digits.
+        return is_introduced(folded, end, start, Handover::Number)
+            && !followed_by_unit(folded, word_end);
+    }
+    if exclaimed {
+        return true;
+    }
+    if names_a_product_version(word) {
+        return is_introduced(folded, end, start, Handover::Product);
+    }
+    if looks_like_short_hash(word) || word.iter().any(|character| matches!(character, '_' | '-')) {
+        return is_introduced(folded, end, start, Handover::Word);
+    }
+    true
+}
+
+/// Seven to 40 lowercase hex characters whose letters and digits alternate
+/// at least three times, like a commit hash (`3f2a9c1`), unlike a password
+/// such as `abc12345`.
+fn looks_like_short_hash(word: &[char]) -> bool {
+    (7..=40).contains(&word.len())
+        && word
+            .iter()
+            .all(|character| matches!(character, '0'..='9' | 'a'..='f'))
+        && word
+            .windows(2)
+            .filter(|pair| pair[0].is_ascii_digit() != pair[1].is_ascii_digit())
+            .count()
+            >= 3
+}
 
 /// Symbols that make a word look like a password.
 fn is_password_symbol(character: char) -> bool {
@@ -1043,7 +1368,7 @@ fn looks_like_key_value(value: &[char]) -> bool {
 
 /// Algorithm, encoding and protocol names, without digits and `-` / `_` /
 /// `.` (`SHA-256`, `AES-256-GCM`, `argon2id`, `OAuth2.0`, `HS256`, `base64`).
-const ALGORITHM_WORDS: [&str; 49] = [
+const ALGORITHM_WORDS: [&str; 53] = [
     "aes",
     "aescbc",
     "aesctr",
@@ -1064,9 +1389,12 @@ const ALGORITHM_WORDS: [&str; 49] = [
     "des",
     "ecdh",
     "ecdsa",
+    "ecdsap",
     "ed",
     "es",
     "gcm",
+    "hkdf",
+    "hkdfsha",
     "hmac",
     "hmacsha",
     "hotp",
@@ -1079,6 +1407,7 @@ const ALGORITHM_WORDS: [&str; 49] = [
     "md",
     "oauth",
     "pbkdf",
+    "pbkdfhmacsha",
     "pbkdfsha",
     "pkcs",
     "ps",
@@ -1168,9 +1497,16 @@ fn looks_like_reference(word: &[char]) -> bool {
             return true;
         }
     }
-    let letters = text
-        .chars()
+    names_an_algorithm(word)
+}
+
+/// An algorithm, encoding or protocol name ([`ALGORITHM_WORDS`]), digits and
+/// `-` / `_` / `.` aside (`AES-256-GCM`, `HKDF-SHA256`).
+fn names_an_algorithm(word: &[char]) -> bool {
+    let letters = word
+        .iter()
         .filter(|character| !character.is_ascii_digit() && !matches!(character, '-' | '_' | '.'))
+        .map(char::to_ascii_lowercase)
         .collect::<String>();
     ALGORITHM_WORDS.contains(&letters.as_str())
 }
@@ -2409,6 +2745,76 @@ mod tests {
             "task: build2024release",
         ] {
             assert_line_kept(sentence);
+        }
+    }
+
+    #[test]
+    fn the_sentence_after_a_chinese_label_keeps_questions_references_and_product_names() {
+        for sentence in [
+            // Full-width and ASCII question and exclamation marks end the
+            // sentence; they are not password symbols.
+            "验证码存 Redis 还是 MySQL？",
+            "验证码存 Redis 还是 MySQL?",
+            "密码重置做完了吗，能上 staging？",
+            "验证码倒计时修好了，要不要发 TestFlight？",
+            "令牌签名用 HS256 还是 RS256？",
+            "密码登录要不要也支持 Passkey？",
+            "密码这块交给 Codex！",
+            "令牌还是 cookie？",
+            // References: commits, error codes, limits, durations, templates.
+            "已修复令牌刷新逻辑，提交 3f2a9c1，测试全部通过。",
+            "令牌那块逻辑在 a1b2c3d 里",
+            "令牌刷新逻辑已修复（3f2a9c1），测试全部通过。",
+            "密码修改接口已加限流，错误码 E40301。",
+            "令牌桶限流已上线，QPS 上限 100000。",
+            "密钥轮换脚本跑完了，耗时 1234567 毫秒。",
+            "验证码有效期改成 300000 毫秒",
+            "密码哈希迭代次数改成 310000",
+            "验证码短信模板是 SMS_123456789",
+            "验证码服务挂了，traceId=abc123def456",
+            "密码强度校验加好了，新增 test_strength_v2 用例，128 项测试全部通过。",
+            // Products and standards with a version number, and algorithms.
+            "令牌过期处理改好了，在 iPhone15 上验证通过。",
+            "验证码模块升级完成，从 Node16 迁到 Node20。",
+            "令牌失效时跳转登录，已在 Android14 上验证。",
+            "密码页 snapshot 测试更新了，iPhone16Pro 截图已替换。",
+            "密钥破解测试用 RTX4090 跑了一晚",
+            "密钥管理模块重构，参考 RFC7519 和 RFC8725",
+            "密钥派生用 HKDF-SHA256",
+            "密钥算法用 ECDSA-P256",
+            "密码存储改用 PBKDF2-HMAC-SHA256 迭代 600000 次",
+            "密码改成 AES-256 加密",
+            "密钥换成 RSA-2048",
+            "令牌改成 OAuth2.0 方式",
+        ] {
+            assert_line_kept(sentence);
+            let mut r = OutcomeRegistry::default();
+            r.observe("s", sentence, None, 200, "hook:Stop");
+            let result = r.get("s", 0, 220).unwrap();
+            assert_eq!(result.summary, sentence, "{sentence}");
+            assert!(!result.truncated, "{sentence}");
+        }
+        assert_eq!(
+            sanitize_prompt("已修复令牌刷新逻辑，提交 3f2a9c1。\n要我顺便升级依赖吗？").unwrap(),
+            (
+                "已修复令牌刷新逻辑，提交 3f2a9c1。\n要我顺便升级依赖吗？".to_owned(),
+                false
+            )
+        );
+        // Values handed over by the wording before them still go.
+        for line in [
+            "初始密码默认是 Admin@123",
+            "密码我改成了 Abc123!",
+            "密码我改成了 Abc123",
+            "密码我改成了 abc12345",
+            "密码我改成了 mysql123",
+            "密码统一用 12345678",
+            "WiFi 默认密码统一是 12345678",
+            "令牌我换成了 tok-2026-x9",
+            "密码是 Abc123?",
+            "密码改成 Rsa2048!",
+        ] {
+            assert_line_removed(line);
         }
     }
 

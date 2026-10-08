@@ -83,6 +83,16 @@ published a final v1 release; entries below describe development milestones on
   turn's end time, and a woken turn that completes later reports its own
   `Stop` time. A session that never had a prompt keeps a failure or an
   interruption at exit after a resume and an idle notification.
+- Fourth review round, prompt and result excerpt filter: the sentence
+  search after a Chinese label no longer removes ordinary questions and
+  reports. Punctuation that ends a word (`MySQL？`, `Codex！`) is not a
+  password symbol; words after `提交`, `错误码`, `上限`, `耗时`, `模板`,
+  `参考` and similar Chinese references, or after `traceId`/`trace_id`, are
+  kept; numbers, commit-like hex runs, identifiers with `_`/`-` and products
+  with a version number (`iPhone15`, `Node20`, `RTX4090`) count only when
+  the wording hands them over as a value (`是`, `改成`, `了`, a colon), and
+  a number followed by a unit (`毫秒`, `次`, `QPS`) never does; an algorithm
+  name right after a predicate is not a value (`密码改成 AES-256 加密`).
 - The short key prefixes `sk-`, `ghp_` and `akia` now count only at the
   start of a run of key characters followed by at least 16 more: words such
   as `task-runner`, `flask-login`, `disk-usage`, `agent-desk-redesign` or
