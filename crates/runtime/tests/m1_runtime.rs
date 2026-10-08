@@ -5807,6 +5807,263 @@ fn recent_tasks_cover_active_and_finished_work_with_review_state() {
     ] {
         assert!(first.get(key).is_some(), "missing {key}");
     }
+
+    // A side task without a Provider title has no history title, even though
+    // the snapshot keeps its Runtime title derived from the prompt.
+    assert_eq!(with_side[0].title, None);
+    let script = store
+        .snapshot()
+        .unwrap()
+        .sessions
+        .into_iter()
+        .find(|session| session.provider_session_id == "script")
+        .unwrap();
+    assert_eq!(script.title.as_deref(), Some("batch"));
+    assert_eq!(with_side[0].id, script.id);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn recent_task_review_state_is_seen_only_after_a_user_action_or_new_instruction() {
+    let root = temp_root("recent-review-state");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    store
+        .write_ui_settings(
+            r#"{"completionTaskHideMode":"afterDelay","completionAutoHideMinutes":5}"#,
+            1_000,
+        )
+        .unwrap();
+    // Each session finishes one turn and raises a completion reminder. Old
+    // timestamps let the five-minute auto-hide deadline pass by the time the
+    // snapshot refreshes time-driven Attention; recent ones keep it pending.
+    let finish = |session: &str, at: u64| -> (String, String) {
+        ingest_tool_turn(&store, Provider::Claude, session, "t1", at);
+        let stop = store
+            .ingest(hook(
+                Provider::Claude,
+                json!({"hook_event_name":"Stop","session_id":session,"turn_id":"t1"}),
+                at + 100,
+            ))
+            .unwrap();
+        (stop.session_id, stop.attention_id.unwrap())
+    };
+    let (auto_hidden, _) = finish("auto-hidden", 10_000);
+    let (acknowledged, ack_id) = finish("acknowledged", 11_000);
+    store
+        .act_on_attention(Uuid::now_v7(), &ack_id, AttentionAction::Ack, 11_200)
+        .unwrap();
+    let (dismissed, dismiss_id) = finish("dismissed", 12_000);
+    store
+        .act_on_attention(
+            Uuid::now_v7(),
+            &dismiss_id,
+            AttentionAction::Dismiss,
+            12_200,
+        )
+        .unwrap();
+    let (archived, _) = finish("archived", 13_000);
+    store.archive_task(&archived, 13_200).unwrap();
+    let (superseded, _) = finish("superseded", 14_000);
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"UserPromptSubmit","session_id":"superseded","turn_id":"t2",
+                "cwd":"/tmp/example-project","prompt":"next"
+            }),
+            14_300,
+        ))
+        .unwrap();
+    let (snoozed, snooze_id) = finish("snoozed", now);
+    store
+        .act_on_attention(
+            Uuid::now_v7(),
+            &snooze_id,
+            AttentionAction::Snooze,
+            now + 200,
+        )
+        .unwrap();
+    let (open, _) = finish("open", now + 1_000);
+    ingest_tool_turn(&store, Provider::Claude, "failed", "t1", 15_000);
+    let failed = store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"StopFailure","session_id":"failed","turn_id":"t1","error":"boom"}),
+            15_100,
+        ))
+        .unwrap()
+        .session_id;
+    ingest_tool_turn(&store, Provider::Claude, "quiet", "t1", 16_000);
+    let quiet = store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"TurnInterrupted","session_id":"quiet","turn_id":"t1"}),
+            16_100,
+        ))
+        .unwrap()
+        .session_id;
+
+    // Refresh time-driven Attention: the old, untouched and the acknowledged
+    // completion reminders are auto-hidden now.
+    let attention = store.snapshot().unwrap().attention;
+    let resolution = |session: &str| {
+        attention
+            .iter()
+            .filter(|item| item.session_id == session)
+            .map(|item| (item.state.clone(), item.resolution.clone()))
+            .next()
+    };
+    assert_eq!(
+        resolution(&auto_hidden),
+        Some(("resolved".to_owned(), Some("auto_hidden".to_owned())))
+    );
+    assert_eq!(
+        resolution(&acknowledged),
+        Some(("resolved".to_owned(), Some("auto_hidden".to_owned())))
+    );
+
+    let tasks = store.recent_tasks(0, 100, true).unwrap();
+    let review = |session: &str| {
+        tasks
+            .iter()
+            .find(|task| task.id == session)
+            .map(|task| task.review_state.as_str())
+            .unwrap()
+    };
+    // Closed without the user: still unseen.
+    assert_eq!(review(&auto_hidden), "unseen");
+    assert_eq!(review(&snoozed), "unseen");
+    assert_eq!(review(&open), "unseen");
+    assert_eq!(review(&failed), "unseen");
+    // A user action or a new instruction: seen.
+    assert_eq!(review(&acknowledged), "seen");
+    assert_eq!(review(&dismissed), "seen");
+    assert_eq!(review(&archived), "seen");
+    assert_eq!(review(&superseded), "seen");
+    // No completion/error reminder at all.
+    assert_eq!(review(&quiet), "none");
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn history_status_keeps_the_last_turn_outcome_after_the_session_ends() {
+    let root = temp_root("history-status-session-end");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let session_end = |session: &str, at: u64| {
+        store
+            .ingest(hook(
+                Provider::Claude,
+                json!({"hook_event_name":"SessionEnd","session_id":session,"reason":"exit"}),
+                at,
+            ))
+            .unwrap()
+            .session_id
+    };
+    ingest_tool_turn(&store, Provider::Claude, "failed", "t1", 1_000);
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"StopFailure","session_id":"failed","turn_id":"t1","error":"boom"}),
+            1_100,
+        ))
+        .unwrap();
+    let failed = session_end("failed", 1_200);
+    ingest_tool_turn(&store, Provider::Claude, "interrupted", "t1", 2_000);
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"TurnInterrupted","session_id":"interrupted","turn_id":"t1"}),
+            2_100,
+        ))
+        .unwrap();
+    let interrupted = session_end("interrupted", 2_200);
+    ingest_tool_turn(&store, Provider::Claude, "completed", "t1", 3_000);
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"Stop","session_id":"completed","turn_id":"t1"}),
+            3_100,
+        ))
+        .unwrap();
+    let completed = session_end("completed", 3_200);
+
+    let snapshot = store.snapshot().unwrap();
+    assert!(snapshot
+        .sessions
+        .iter()
+        .all(|session| session.exec_state == "idle"));
+    let tasks = store.recent_tasks(0, 100, true).unwrap();
+    let status = |session: &str| {
+        tasks
+            .iter()
+            .find(|task| task.id == session)
+            .map(|task| task.status.as_str())
+            .unwrap()
+    };
+    assert_eq!(status(&failed), "failed");
+    assert_eq!(status(&interrupted), "interrupted");
+    assert_eq!(status(&completed), "completed");
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn history_center_keeps_reporting_user_interrupted_tasks_as_failed() {
+    let root = temp_root("history-center-interrupted");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    ingest_tool_turn(&store, Provider::Codex, "interrupted", "t1", 1_000);
+    let interrupted = store
+        .ingest(hook(
+            Provider::Codex,
+            json!({"hook_event_name":"TurnInterrupted","session_id":"interrupted","turn_id":"t1"}),
+            1_100,
+        ))
+        .unwrap()
+        .session_id;
+    ingest_tool_turn(&store, Provider::Codex, "completed", "t1", 2_000);
+    let stop = store
+        .ingest(hook(
+            Provider::Codex,
+            json!({"hook_event_name":"Stop","session_id":"completed","turn_id":"t1"}),
+            2_100,
+        ))
+        .unwrap();
+    store
+        .act_on_attention(
+            Uuid::now_v7(),
+            stop.attention_id.unwrap(),
+            AttentionAction::Ack,
+            2_200,
+        )
+        .unwrap();
+
+    let history = store.task_history(u64::MAX / 2, 100).unwrap();
+    let status = |session: &str| {
+        history
+            .iter()
+            .find(|task| task.id == session)
+            .map(|task| task.status.as_str())
+            .unwrap()
+    };
+    // The History center only knows completed/failed and keeps its previous
+    // answer for a user interruption; Companion history says interrupted.
+    assert_eq!(status(&interrupted), "failed");
+    assert_eq!(status(&stop.session_id), "completed");
+    let recent = store.recent_tasks(0, 100, true).unwrap();
+    assert_eq!(
+        recent
+            .iter()
+            .find(|task| task.id == interrupted)
+            .unwrap()
+            .status,
+        "interrupted"
+    );
     drop(store);
     fs::remove_dir_all(root).unwrap();
 }

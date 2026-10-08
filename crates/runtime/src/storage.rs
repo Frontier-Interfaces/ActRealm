@@ -330,6 +330,8 @@ pub struct RecentTaskRecord {
     pub id: String,
     pub provider: String,
     pub project: Option<String>,
+    /// The Provider's own title, or null. Unlike snapshot sessions it never
+    /// falls back to the Runtime title, which may be derived from prompt text.
     pub title: Option<String>,
     pub task_role: String,
     pub user_turn_count: u32,
@@ -341,7 +343,8 @@ pub struct RecentTaskRecord {
     pub branch: Option<String>,
     pub validation_state: Option<String>,
     /// `unseen`, `seen`, or `none`, derived from the latest completion/error
-    /// attention of the session.
+    /// attention of the session. Only a user action or a new instruction
+    /// makes it `seen`.
     pub review_state: String,
     /// `completion`, `error`, or null.
     pub latest_attention_kind: Option<String>,
@@ -9767,7 +9770,7 @@ fn read_task_history(
                          'tool.failed', 'turn.failed'
                        )),
                     sessions.term_app, sessions.term_session_id, sessions.term_tty,
-                    sessions.term_bundle_id, sessions.term_surface
+                    sessions.term_bundle_id, sessions.term_surface, sessions.activity
              FROM sessions
              LEFT JOIN session_usage AS usage
                ON usage.provider = sessions.provider
@@ -9803,6 +9806,7 @@ fn read_task_history(
                 let term_tty = row.get::<_, Option<String>>(18)?;
                 let term_bundle_id = row.get::<_, Option<String>>(19)?;
                 let term_surface = row.get::<_, Option<String>>(20)?;
+                let activity = row.get::<_, Option<String>>(21)?;
                 let (jump_capability, jump_label) = jump_descriptor(
                     &provider,
                     &provider_session_id,
@@ -9818,11 +9822,7 @@ fn read_task_history(
                     project: row.get(3)?,
                     title: row.get(4)?,
                     model: row.get(5)?,
-                    status: if exec_state == "failed" {
-                        "failed".to_owned()
-                    } else {
-                        "completed".to_owned()
-                    },
+                    status: task_history_status(&exec_state, activity.as_deref()).to_owned(),
                     started_at: from_i64(row.get(7)?),
                     last_event_at: from_i64(row.get(8)?),
                     completed_at: row.get::<_, Option<i64>>(9)?.map(from_i64),
@@ -9851,9 +9851,26 @@ fn read_task_history(
     Ok(rows)
 }
 
+/// The History center (`/api/v1/history`) status. It only knows `completed`
+/// and `failed`. A user interruption used to leave the session `failed`;
+/// it now idles the session, so the History center keeps reporting such a
+/// task as `failed`, exactly as before, for its existing clients. Companion
+/// history reports it as `interrupted` instead (see [`recent_task_status`]).
+fn task_history_status(exec_state: &str, activity: Option<&str>) -> &'static str {
+    if exec_state == "failed"
+        || (exec_state == "idle" && activity == Some(TURN_INTERRUPTED_ACTIVITY))
+    {
+        "failed"
+    } else {
+        "completed"
+    }
+}
+
 /// Companion-facing status vocabulary. It extends the History center's
 /// `completed` / `failed` with the states a still-active or user-interrupted
-/// task can be in.
+/// task can be in. A session that ended (`SessionEnd`, which idles the
+/// session without touching the turn) after a failed or interrupted turn
+/// keeps that turn's outcome.
 fn recent_task_status(
     exec_state: &str,
     activity: Option<&str>,
@@ -9870,24 +9887,56 @@ fn recent_task_status(
         {
             "interrupted"
         }
+        "idle" if latest_turn_state == Some("failed") => "failed",
         "idle" => "completed",
         "awaiting_approval" => "waiting",
         _ => "running",
     }
 }
 
-/// `unseen` while the latest completion/error reminder is still open and not
-/// acknowledged; `seen` once it was acknowledged, snoozed, dismissed, or
-/// otherwise closed; `none` when the session never raised one.
+/// Resolutions of a `completion` / `error` Attention that come from the user
+/// or from the user's next instruction, and therefore mean the result was
+/// seen:
+///
+/// - `ack` / `ack_hidden`: the user acknowledged an error / completion;
+/// - `user_dismissed`: the user dismissed it;
+/// - `history_archived`: the user archived the task in the History center;
+/// - `superseded_by_activity`: new activity in the session (a new prompt,
+///   tool start, question, ...) replaced the reminder.
+///
+/// Every other closure (`auto_hidden` by the completion hide timer, an
+/// expired or Provider-side closure) did not involve the user and leaves the
+/// result unseen.
+const SEEN_ATTENTION_RESOLUTIONS: [&str; 5] = [
+    "ack",
+    "ack_hidden",
+    "user_dismissed",
+    "history_archived",
+    "superseded_by_activity",
+];
+
+/// `seen` only after a user action or a new instruction: the latest
+/// completion/error reminder was acknowledged (`reminder_acknowledged_at`)
+/// or closed with one of [`SEEN_ATTENTION_RESOLUTIONS`]. `unseen` while it is
+/// still open, snoozed, or was closed without the user (`auto_hidden`,
+/// expiry). `none` when the session never raised one.
 fn recent_task_review_state(
     attention_kind: Option<&str>,
     attention_state: Option<&str>,
+    attention_resolution: Option<&str>,
     acknowledged: bool,
 ) -> &'static str {
-    match (attention_kind, attention_state) {
-        (None, _) => "none",
-        (Some(_), Some("open")) if !acknowledged => "unseen",
-        _ => "seen",
+    if attention_kind.is_none() {
+        return "none";
+    }
+    let closed = !matches!(attention_state, Some("open" | "snoozed"));
+    let closed_by_user = closed
+        && attention_resolution
+            .is_some_and(|resolution| SEEN_ATTENTION_RESOLUTIONS.contains(&resolution));
+    if acknowledged || closed_by_user {
+        "seen"
+    } else {
+        "unseen"
     }
 }
 
@@ -9903,8 +9952,7 @@ fn read_recent_tasks(
                SELECT sessions.id AS id, sessions.provider AS provider,
                       sessions.provider_session_id AS provider_session_id,
                       sessions.project AS project,
-                      COALESCE(NULLIF(TRIM(sessions.provider_title), ''), sessions.title)
-                        AS title,
+                      NULLIF(TRIM(sessions.provider_title), '') AS title,
                       sessions.provider_title AS provider_title,
                       sessions.exec_state AS exec_state,
                       sessions.activity AS activity,
@@ -9943,7 +9991,8 @@ fn read_recent_tasks(
                       sessions.term_session_id AS term_session_id,
                       sessions.term_tty AS term_tty,
                       sessions.term_bundle_id AS term_bundle_id,
-                      sessions.term_surface AS term_surface
+                      sessions.term_surface AS term_surface,
+                      latest_attention.resolution AS attention_resolution
                FROM sessions
                LEFT JOIN turns AS latest_turn ON latest_turn.id = (
                  SELECT turns.id FROM turns WHERE turns.session_id = sessions.id
@@ -9995,6 +10044,7 @@ fn read_recent_tasks(
                 let term_tty = row.get::<_, Option<String>>(21)?;
                 let term_bundle_id = row.get::<_, Option<String>>(22)?;
                 let term_surface = row.get::<_, Option<String>>(23)?;
+                let attention_resolution = row.get::<_, Option<String>>(24)?;
                 let (jump_capability, jump_label) = jump_descriptor(
                     &provider,
                     &provider_session_id,
@@ -10026,6 +10076,7 @@ fn read_recent_tasks(
                     review_state: recent_task_review_state(
                         attention_kind.as_deref(),
                         attention_state.as_deref(),
+                        attention_resolution.as_deref(),
                         attention_acknowledged,
                     )
                     .to_owned(),
@@ -13717,6 +13768,63 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    #[test]
+    fn review_state_classifies_every_completion_and_error_closure() {
+        use super::{recent_task_review_state, recent_task_status, task_history_status};
+        let review = |state, resolution, acknowledged| {
+            recent_task_review_state(Some("completion"), Some(state), resolution, acknowledged)
+        };
+        assert_eq!(recent_task_review_state(None, None, None, false), "none");
+        // User actions and new instructions.
+        for resolution in [
+            "ack",
+            "ack_hidden",
+            "history_archived",
+            "superseded_by_activity",
+        ] {
+            assert_eq!(review("resolved", Some(resolution), false), "seen");
+        }
+        assert_eq!(review("dismissed", Some("user_dismissed"), false), "seen");
+        assert_eq!(review("open", None, true), "seen");
+        assert_eq!(review("resolved", Some("auto_hidden"), true), "seen");
+        // Not the user.
+        assert_eq!(review("open", None, false), "unseen");
+        assert_eq!(review("snoozed", None, false), "unseen");
+        assert_eq!(review("resolved", Some("auto_hidden"), false), "unseen");
+        assert_eq!(review("expired", Some("runtime_restart"), false), "unseen");
+        assert_eq!(review("expired", Some("deadline"), false), "unseen");
+        assert_eq!(
+            review("resolved", Some("provider_handled"), false),
+            "unseen"
+        );
+        assert_eq!(review("resolved", None, false), "unseen");
+        // A stale resolution on a reopened reminder does not count.
+        assert_eq!(review("open", Some("ack"), false), "unseen");
+
+        assert_eq!(
+            recent_task_status("idle", Some("Session ended"), Some("failed")),
+            "failed"
+        );
+        assert_eq!(
+            recent_task_status("idle", Some("Session ended"), Some("interrupted")),
+            "interrupted"
+        );
+        assert_eq!(
+            recent_task_status("idle", Some("Session ended"), Some("response_finished")),
+            "completed"
+        );
+        assert_eq!(
+            task_history_status("idle", Some("Turn interrupted")),
+            "failed"
+        );
+        assert_eq!(task_history_status("failed", Some("Run failed")), "failed");
+        assert_eq!(
+            task_history_status("idle", Some("Session ended")),
+            "completed"
+        );
+        assert_eq!(task_history_status("response_finished", None), "completed");
+    }
 
     #[test]
     fn client_source_survives_internal_events_and_changes_as_one_identity() {

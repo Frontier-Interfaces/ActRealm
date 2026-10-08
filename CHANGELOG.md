@@ -16,7 +16,14 @@ published a final v1 release; entries below describe development milestones on
   to 20 changed files with line counts and no content.
 - A user interruption no longer counts as a failure: the session idles with
   the existing `session.activity.interrupted` message and no `error`
-  Attention. `StopFailure` is unchanged.
+  Attention. `StopFailure` is unchanged. The local History center keeps
+  reporting such a task as `failed`.
+- Review fixes: the turn prompt also drops lines that name a credential in
+  English or Chinese (full-width colons included) and the value line after a
+  bare label; Companion history reports `seen` only after a user action or a
+  new instruction, keeps `failed` after the session ends, and never falls back
+  to a prompt-derived title; the Companion review runs git off the API thread,
+  reuses the resolved repository, and briefly caches unchanged repositories.
 
 ### Post-P0 - OUTBOX lifecycle and quota recovery
 

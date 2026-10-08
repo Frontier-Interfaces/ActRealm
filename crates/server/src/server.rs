@@ -589,6 +589,7 @@ impl ApiServer {
             review_collection_ready: Arc::new(AtomicBool::new(false)),
             review_consecutive_failures: Arc::new(AtomicUsize::new(0)),
             review_last_success_at: Arc::new(AtomicU64::new(0)),
+            companion_review_cache: CompanionReviewCache::default(),
             #[cfg(test)]
             usage_test_control: None,
             data_paths,
@@ -798,6 +799,7 @@ struct AppState {
     review_collection_ready: Arc<AtomicBool>,
     review_consecutive_failures: Arc<AtomicUsize>,
     review_last_success_at: Arc<AtomicU64>,
+    companion_review_cache: CompanionReviewCache,
     #[cfg(test)]
     usage_test_control: Option<UsageRefreshTestControl>,
     data_paths: DataPaths,
@@ -3770,69 +3772,33 @@ async fn companion_session_review(
         .latest_current_local_timeline(&session_id, 100)
         .ok()
         .flatten();
-    let mut limitations = Vec::new();
     let baseline = context
         .turn_id
         .as_deref()
         .and_then(|turn_id| state.store.review_baseline(turn_id).ok().flatten());
-    let mut repository = if let Some(baseline) = baseline.as_ref() {
-        inspect_resolved_git_repository(
-            &baseline.repository_root,
-            context.concurrent_active_sessions,
-            &mut limitations,
-        )
-    } else {
-        match context.working_directory.as_deref() {
-            Some(working_directory) => inspect_git_repository(
-                working_directory,
-                context.concurrent_active_sessions,
-                &mut limitations,
-            ),
-            None => {
-                limitations.push("working_directory_unavailable".to_owned());
-                unavailable_review_repository("working_directory_unavailable")
-            }
-        }
+    let inputs = CompanionReviewInputs {
+        turn_id: context.turn_id.clone(),
+        working_directory: context.working_directory.clone(),
+        baseline,
+        concurrent_active_sessions: context.concurrent_active_sessions,
     };
-    if let Some(baseline) = baseline.as_ref() {
-        apply_review_baseline(
-            &mut repository,
-            baseline,
-            context.concurrent_active_sessions,
-            &mut limitations,
-        );
-    }
-    // Same repository and base as the local review/diff route, reduced to
-    // relative paths and line counts. A baseline whose repository identity
-    // changed yields no file list, exactly like review/diff.
-    let files_root = if repository.state != "available" {
-        None
-    } else {
-        match baseline.as_ref() {
-            Some(baseline) if repository.baseline_state != "invalid" => {
-                Some(baseline.repository_root.clone())
+    // The API runtime is a current-thread Tokio runtime: every git child
+    // process runs on the blocking pool so it never stalls other requests.
+    let cache = state.companion_review_cache.clone();
+    let cache_session = session_id.clone();
+    let CompanionReviewGit {
+        repository,
+        limitations,
+    } = tokio::task::spawn_blocking(move || cache.review(&cache_session, inputs, Instant::now()))
+        .await
+        .unwrap_or_else(|_| {
+            let mut repository = unavailable_review_repository("git_unavailable");
+            repository.files = Some(Vec::new());
+            CompanionReviewGit {
+                repository,
+                limitations: vec!["git_unavailable".to_owned()],
             }
-            Some(_) => None,
-            None => context
-                .working_directory
-                .as_deref()
-                .and_then(|working_directory| {
-                    resolve_review_repository_root(working_directory, &mut Vec::new())
-                }),
-        }
-    };
-    repository.files = Some(
-        files_root
-            .as_deref()
-            .map(|root| {
-                let base = baseline
-                    .as_ref()
-                    .and_then(|baseline| baseline.head.clone())
-                    .or_else(|| full_git_head(root));
-                review_changed_files(root, base.as_deref())
-            })
-            .unwrap_or_default(),
-    );
+        });
     let validations = timeline
         .as_ref()
         .map(|page| review_validations(&page.events))
@@ -4733,8 +4699,14 @@ fn parse_untracked_review_paths(output: &[u8]) -> Vec<String> {
 /// Lists changed files between `base` and the working tree plus untracked
 /// paths, ordered by changed line count. Only repository-relative paths and
 /// numeric statistics leave Runtime; untracked file contents are never read,
-/// so their line counts are reported as zero.
-fn review_changed_files(repository_root: &FilePath, base: Option<&str>) -> Vec<ReviewChangedFile> {
+/// so their line counts are reported as zero. `status_output` is a
+/// `git status --porcelain=v2 -z` output the caller already holds for the
+/// same repository; without it the status is read here.
+fn review_changed_files(
+    repository_root: &FilePath,
+    base: Option<&str>,
+    status_output: Option<&[u8]>,
+) -> Vec<ReviewChangedFile> {
     let mut files = Vec::new();
     let mut seen = HashSet::new();
     if let Some(base) = base {
@@ -4769,10 +4741,11 @@ fn review_changed_files(repository_root: &FilePath, base: Option<&str>) -> Vec<R
             }
         }
     }
-    if let Ok(output) = run_git(
-        repository_root,
-        &["status", "--porcelain=v2", "-z", "--untracked-files=normal"],
-    ) {
+    let status_output = match status_output {
+        Some(output) => Ok(output.to_vec()),
+        None => run_git(repository_root, &REVIEW_STATUS_ARGS),
+    };
+    if let Ok(output) = status_output {
         for path in parse_untracked_review_paths(&output) {
             if seen.insert(path.clone()) {
                 files.push(ReviewChangedFile {
@@ -4989,6 +4962,212 @@ fn git_commit_count_since(repository_root: &FilePath, baseline_head: &str) -> Op
     value.trim().parse::<u64>().ok()
 }
 
+/// `git status` as the review routes run it.
+const REVIEW_STATUS_ARGS: [&str; 4] =
+    ["status", "--porcelain=v2", "-z", "--untracked-files=normal"];
+/// `git status` for the Companion review. `--branch` adds the HEAD commit and
+/// branch name as header records, so one call both feeds the review and
+/// fingerprints HEAD, branch and working tree state for the review cache.
+const COMPANION_REVIEW_STATUS_ARGS: [&str; 6] = [
+    "status",
+    "--porcelain=v2",
+    "-z",
+    "--branch",
+    "--no-ahead-behind",
+    "--untracked-files=normal",
+];
+/// How long a Companion review may reuse its git observations for the same
+/// session while HEAD, branch and working tree status stay unchanged. It only
+/// absorbs bursts of Display requests; anything older is recomputed.
+const COMPANION_REVIEW_CACHE_TTL: Duration = Duration::from_millis(2_500);
+const COMPANION_REVIEW_CACHE_LIMIT: usize = 32;
+
+/// Raw git observations from one repository inspection, reused by the
+/// Companion review instead of asking git again for the same answer.
+#[derive(Debug)]
+struct GitInspection {
+    repository_root: PathBuf,
+    full_head: Option<String>,
+    status_output: Vec<u8>,
+}
+
+/// The git-derived part of a Companion review.
+#[derive(Debug, Clone)]
+struct CompanionReviewGit {
+    repository: ReviewRepository,
+    limitations: Vec<String>,
+}
+
+/// Everything besides the git state itself that a Companion review depends
+/// on. A cached review is reused only for identical inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompanionReviewInputs {
+    turn_id: Option<String>,
+    working_directory: Option<PathBuf>,
+    baseline: Option<ReviewBaselineRecord>,
+    concurrent_active_sessions: u32,
+}
+
+struct CompanionReviewCacheEntry {
+    inputs: CompanionReviewInputs,
+    repository_root: PathBuf,
+    fingerprint: Vec<u8>,
+    computed_at: Instant,
+    review: CompanionReviewGit,
+}
+
+/// A short per-session cache for the Companion review, so a Display that
+/// polls or retries does not start a burst of git child processes. A hit
+/// costs one `git status` that must match the cached fingerprint exactly.
+#[derive(Clone, Default)]
+struct CompanionReviewCache {
+    entries: Arc<Mutex<HashMap<String, CompanionReviewCacheEntry>>>,
+}
+
+impl CompanionReviewCache {
+    /// Blocking: runs git. Call it from the blocking pool.
+    fn review(
+        &self,
+        session_id: &str,
+        inputs: CompanionReviewInputs,
+        now: Instant,
+    ) -> CompanionReviewGit {
+        let cached = self.entries.lock().ok().and_then(|entries| {
+            entries
+                .get(session_id)
+                .filter(|entry| {
+                    entry.inputs == inputs
+                        && now.saturating_duration_since(entry.computed_at)
+                            < COMPANION_REVIEW_CACHE_TTL
+                })
+                .map(|entry| {
+                    (
+                        entry.repository_root.clone(),
+                        entry.fingerprint.clone(),
+                        entry.review.clone(),
+                    )
+                })
+        });
+        if let Some((repository_root, fingerprint, review)) = cached {
+            if companion_review_fingerprint(&repository_root).as_deref()
+                == Some(fingerprint.as_slice())
+            {
+                return review;
+            }
+        }
+        let (review, inspection) = compute_companion_review_git(&inputs);
+        let Ok(mut entries) = self.entries.lock() else {
+            return review;
+        };
+        entries.retain(|_, entry| {
+            now.saturating_duration_since(entry.computed_at) < COMPANION_REVIEW_CACHE_TTL
+        });
+        let Some(inspection) = inspection else {
+            entries.remove(session_id);
+            return review;
+        };
+        if entries.len() >= COMPANION_REVIEW_CACHE_LIMIT && !entries.contains_key(session_id) {
+            let oldest = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.computed_at)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(
+            session_id.to_owned(),
+            CompanionReviewCacheEntry {
+                inputs,
+                fingerprint: status_fingerprint(&inspection.status_output),
+                repository_root: inspection.repository_root,
+                computed_at: now,
+                review: review.clone(),
+            },
+        );
+        review
+    }
+}
+
+fn status_fingerprint(status_output: &[u8]) -> Vec<u8> {
+    digest(&SHA256, status_output).as_ref().to_vec()
+}
+
+fn companion_review_fingerprint(repository_root: &FilePath) -> Option<Vec<u8>> {
+    run_git(repository_root, &COMPANION_REVIEW_STATUS_ARGS)
+        .ok()
+        .map(|output| status_fingerprint(&output))
+}
+
+/// The repository part of the Companion review: the same repository, base
+/// and attribution as the local review, plus `files`. The repository root,
+/// HEAD and status resolved by the inspection are reused for the file list,
+/// so no `rev-parse` or `status` runs twice. Also returns the inspection the
+/// cache fingerprints, when the repository was available.
+fn compute_companion_review_git(
+    inputs: &CompanionReviewInputs,
+) -> (CompanionReviewGit, Option<GitInspection>) {
+    let mut limitations = Vec::new();
+    let baseline = inputs.baseline.as_ref();
+    let (mut repository, inspection) = match (baseline, inputs.working_directory.as_deref()) {
+        (Some(baseline), _) => inspect_resolved_git_repository_with(
+            &baseline.repository_root,
+            inputs.concurrent_active_sessions,
+            &mut limitations,
+            &COMPANION_REVIEW_STATUS_ARGS,
+        ),
+        (None, Some(working_directory)) => inspect_git_repository_with(
+            working_directory,
+            inputs.concurrent_active_sessions,
+            &mut limitations,
+            &COMPANION_REVIEW_STATUS_ARGS,
+        ),
+        (None, None) => {
+            limitations.push("working_directory_unavailable".to_owned());
+            (
+                unavailable_review_repository("working_directory_unavailable"),
+                None,
+            )
+        }
+    };
+    if let Some(baseline) = baseline {
+        apply_review_baseline(
+            &mut repository,
+            baseline,
+            inputs.concurrent_active_sessions,
+            &mut limitations,
+        );
+    }
+    // Same repository and base as the local review/diff route, reduced to
+    // relative paths and line counts. A baseline whose repository identity
+    // changed yields no file list, exactly like review/diff.
+    let files = inspection
+        .as_ref()
+        .filter(|_| {
+            repository.state == "available"
+                && (baseline.is_none() || repository.baseline_state != "invalid")
+        })
+        .map(|inspection| {
+            let base = baseline
+                .and_then(|baseline| baseline.head.clone())
+                .or_else(|| inspection.full_head.clone());
+            review_changed_files(
+                &inspection.repository_root,
+                base.as_deref(),
+                Some(&inspection.status_output),
+            )
+        })
+        .unwrap_or_default();
+    repository.files = Some(files);
+    (
+        CompanionReviewGit {
+            repository,
+            limitations,
+        },
+        inspection,
+    )
+}
+
 fn unavailable_review_repository(reason: &str) -> ReviewRepository {
     ReviewRepository {
         state: "unavailable".to_owned(),
@@ -5018,9 +5197,27 @@ fn inspect_git_repository(
     concurrent_active_sessions: u32,
     limitations: &mut Vec<String>,
 ) -> ReviewRepository {
+    inspect_git_repository_with(
+        working_directory,
+        concurrent_active_sessions,
+        limitations,
+        &REVIEW_STATUS_ARGS,
+    )
+    .0
+}
+
+/// Resolves the repository of `working_directory` once and inspects it,
+/// returning the git observations a caller may reuse instead of asking git
+/// again (the resolved root, the full HEAD and the status output).
+fn inspect_git_repository_with(
+    working_directory: &FilePath,
+    concurrent_active_sessions: u32,
+    limitations: &mut Vec<String>,
+    status_arguments: &[&str],
+) -> (ReviewRepository, Option<GitInspection>) {
     let Some(repository_root) = resolve_review_repository_root(working_directory, limitations)
     else {
-        return ReviewRepository {
+        let repository = ReviewRepository {
             state: "not_git".to_owned(),
             attribution_reason: limitations
                 .last()
@@ -5028,8 +5225,14 @@ fn inspect_git_repository(
                 .unwrap_or_else(|| "not_git_repository".to_owned()),
             ..unavailable_review_repository("repository_unavailable")
         };
+        return (repository, None);
     };
-    inspect_resolved_git_repository(&repository_root, concurrent_active_sessions, limitations)
+    inspect_resolved_git_repository_with(
+        &repository_root,
+        concurrent_active_sessions,
+        limitations,
+        status_arguments,
+    )
 }
 
 fn resolve_review_repository_root(
@@ -5073,18 +5276,39 @@ fn inspect_resolved_git_repository(
     concurrent_active_sessions: u32,
     limitations: &mut Vec<String>,
 ) -> ReviewRepository {
+    inspect_resolved_git_repository_with(
+        repository_root,
+        concurrent_active_sessions,
+        limitations,
+        &REVIEW_STATUS_ARGS,
+    )
+    .0
+}
+
+/// Inspects an already resolved repository. `status_arguments` is a
+/// `git status --porcelain=v2 -z` invocation; header records it may add
+/// (`--branch`) are ignored by the parsers.
+fn inspect_resolved_git_repository_with(
+    repository_root: &FilePath,
+    concurrent_active_sessions: u32,
+    limitations: &mut Vec<String>,
+    status_arguments: &[&str],
+) -> (ReviewRepository, Option<GitInspection>) {
     if !repository_root.is_dir() {
         limitations.push("working_directory_unavailable".to_owned());
-        return unavailable_review_repository("working_directory_unavailable");
+        return (
+            unavailable_review_repository("working_directory_unavailable"),
+            None,
+        );
     }
-    let status_output = match run_git(
-        repository_root,
-        &["status", "--porcelain=v2", "-z", "--untracked-files=normal"],
-    ) {
+    let status_output = match run_git(repository_root, status_arguments) {
         Ok(output) => output,
         Err(error) => {
             limitations.push(git_review_error_code(&error).to_owned());
-            return unavailable_review_repository(git_review_error_code(&error));
+            return (
+                unavailable_review_repository(git_review_error_code(&error)),
+                None,
+            );
         }
     };
     let status = parse_git_status(&status_output);
@@ -5127,7 +5351,7 @@ fn inspect_resolved_git_repository(
     if attribution != "no_changes" {
         limitations.push(attribution_reason.to_owned());
     }
-    ReviewRepository {
+    let repository = ReviewRepository {
         state: "available".to_owned(),
         baseline_state: "unavailable".to_owned(),
         baseline_captured_at: None,
@@ -5147,7 +5371,13 @@ fn inspect_resolved_git_repository(
         attribution: attribution.to_owned(),
         attribution_reason: attribution_reason.to_owned(),
         files: None,
-    }
+    };
+    let inspection = GitInspection {
+        repository_root: repository_root.to_path_buf(),
+        full_head,
+        status_output,
+    };
+    (repository, Some(inspection))
 }
 
 fn full_git_head(repository_root: &FilePath) -> Option<String> {
@@ -5285,7 +5515,17 @@ fn git_review_error_code(error: &GitReviewError) -> &'static str {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Arguments of every review `git` invocation on this thread, so tests
+    /// can count child processes.
+    static REVIEW_GIT_TEST_LOG: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn run_git(working_directory: &FilePath, arguments: &[&str]) -> Result<Vec<u8>, GitReviewError> {
+    #[cfg(test)]
+    REVIEW_GIT_TEST_LOG.with(|log| log.borrow_mut().push(arguments.join(" ")));
     let mut child = ProcessCommand::new("/usr/bin/git")
         .arg("-C")
         .arg(working_directory)
@@ -10200,6 +10440,10 @@ mod tests {
                 .map(|task| task["taskRole"].as_str().unwrap().to_owned())
                 .collect::<Vec<_>>();
             assert_eq!(roles, vec!["side", "main"]);
+            // The side task has no Provider title; its prompt-derived Runtime
+            // title never reaches Companion history.
+            assert!(all["tasks"][0]["title"].is_null());
+            assert!(!all.to_string().contains("scripted batch"));
             let later = json_body(
                 get(
                     format!(
@@ -10436,6 +10680,118 @@ mod tests {
     }
 
     #[test]
+    fn companion_review_reuses_its_inspection_and_caches_unchanged_repositories() {
+        let root = std::env::temp_dir().join(format!("actrealm-review-cache-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).unwrap();
+        let repository = test_git_repository(&root);
+        fs::write(repository.join("app.txt"), "one\n").unwrap();
+        test_git(&repository, &["add", "."]);
+        test_git(&repository, &["commit", "-q", "-m", "baseline"]);
+        fs::write(repository.join("app.txt"), "one\ntwo\n").unwrap();
+        let inputs = CompanionReviewInputs {
+            turn_id: Some("turn-1".to_owned()),
+            working_directory: Some(repository.clone()),
+            baseline: None,
+            concurrent_active_sessions: 0,
+        };
+        let git_calls = || REVIEW_GIT_TEST_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()));
+        let files = |review: &CompanionReviewGit| {
+            review
+                .repository
+                .files
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|file| (file.path.clone(), file.insertions, file.status))
+                .collect::<Vec<_>>()
+        };
+        let status_probe = COMPANION_REVIEW_STATUS_ARGS.join(" ");
+        let cache = CompanionReviewCache::default();
+        let start = Instant::now();
+        git_calls();
+
+        // One review resolves the root, HEAD and status once and reuses them
+        // for the file list.
+        let first = cache.review("session", inputs.clone(), start);
+        let calls = git_calls();
+        let count = |prefix: &str| calls.iter().filter(|call| call.starts_with(prefix)).count();
+        assert_eq!(count("rev-parse --show-toplevel"), 1, "{calls:?}");
+        assert_eq!(count("rev-parse --verify HEAD"), 1, "{calls:?}");
+        assert_eq!(count("status"), 1, "{calls:?}");
+        assert_eq!(calls.len(), 8, "{calls:?}");
+        assert_eq!(first.repository.state, "available");
+        assert_eq!(files(&first), vec![("app.txt".to_owned(), 1, "modified")]);
+
+        // More lines in the already modified file leave HEAD, branch and the
+        // status unchanged: within the TTL the review is reused after a single
+        // status probe.
+        fs::write(repository.join("app.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        let reused = cache.review("session", inputs.clone(), start + Duration::from_secs(1));
+        assert_eq!(git_calls(), vec![status_probe.clone()]);
+        assert_eq!(files(&reused), files(&first));
+
+        // Past the TTL the review is recomputed.
+        let expired = cache.review("session", inputs.clone(), start + Duration::from_secs(4));
+        assert!(git_calls().len() > 1);
+        assert_eq!(files(&expired), vec![("app.txt".to_owned(), 3, "modified")]);
+
+        // A working tree change or a new HEAD invalidates it within the TTL.
+        fs::write(repository.join("notes.txt"), "draft").unwrap();
+        let untracked = cache.review(
+            "session",
+            inputs.clone(),
+            start + Duration::from_millis(4_500),
+        );
+        assert!(git_calls().len() > 1);
+        assert!(files(&untracked).contains(&("notes.txt".to_owned(), 0, "untracked")));
+        test_git(
+            &repository,
+            &["commit", "-q", "--allow-empty", "-m", "empty"],
+        );
+        let committed = cache.review("session", inputs.clone(), start + Duration::from_secs(5));
+        assert!(git_calls().len() > 1);
+        assert_ne!(committed.repository.head, untracked.repository.head);
+        let stable = cache.review(
+            "session",
+            inputs.clone(),
+            start + Duration::from_millis(5_500),
+        );
+        assert_eq!(git_calls(), vec![status_probe]);
+        assert_eq!(stable.repository.head, committed.repository.head);
+
+        // Another session or different inputs never share the entry.
+        cache.review(
+            "other-session",
+            inputs.clone(),
+            start + Duration::from_millis(5_500),
+        );
+        assert!(git_calls().len() > 1);
+        let concurrent = cache.review(
+            "session",
+            CompanionReviewInputs {
+                concurrent_active_sessions: 1,
+                ..inputs.clone()
+            },
+            start + Duration::from_millis(5_500),
+        );
+        assert!(git_calls().len() > 1);
+        assert_eq!(concurrent.repository.attribution, "concurrent_changes");
+
+        // A working directory outside git is not cached.
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let plain = CompanionReviewInputs {
+            working_directory: Some(outside),
+            ..inputs
+        };
+        let not_git = cache.review("plain", plain.clone(), start + Duration::from_secs(5));
+        assert_eq!(not_git.repository.state, "not_git");
+        assert_eq!(not_git.repository.files.as_deref(), Some(&[][..]));
+        assert!(!cache.entries.lock().unwrap().contains_key("plain"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn review_changed_files_are_ranked_by_changed_lines_and_bounded() {
         let root = std::env::temp_dir().join(format!("actrealm-review-rank-{}", Uuid::now_v7()));
         fs::create_dir_all(&root).unwrap();
@@ -10453,13 +10809,13 @@ mod tests {
             .unwrap();
         }
         let head = full_git_head(&repository).unwrap();
-        let files = review_changed_files(&repository, Some(&head));
+        let files = review_changed_files(&repository, Some(&head), None);
         assert_eq!(files.len(), REVIEW_CHANGED_FILE_LIMIT);
         assert_eq!(files[0].path, "file-24.txt");
         assert_eq!(files[0].insertions, 25);
         assert_eq!(files[19].path, "file-05.txt");
         assert!(files.iter().all(|file| file.status == "modified"));
-        assert!(review_changed_files(&root.join("missing"), Some(&head)).is_empty());
+        assert!(review_changed_files(&root.join("missing"), Some(&head), None).is_empty());
 
         let numstat =
             parse_git_numstat_z(b"3\t1\tapp.txt\0-\t-\tlogo.png\x000\t0\t\0old.txt\0new.txt\0");
@@ -10611,6 +10967,7 @@ mod tests {
         assert_eq!(history[1]["reviewState"], "unseen");
         assert_eq!(history[1]["latestAttentionKind"], "completion");
         assert_eq!(history[0]["taskRole"], "side");
+        assert!(history[0]["title"].is_null());
         assert_eq!(
             sample("result.json")["prompt"]["text"],
             "把结算页按钮改成 12 圆角，并补一个测试"
@@ -11410,6 +11767,7 @@ done
             review_collection_ready: Arc::new(AtomicBool::new(false)),
             review_consecutive_failures: Arc::new(AtomicUsize::new(0)),
             review_last_success_at: Arc::new(AtomicU64::new(0)),
+            companion_review_cache: CompanionReviewCache::default(),
             usage_test_control: None,
             data_paths: DataPaths {
                 cache: root.join("actrealm-home/cache"),

@@ -240,6 +240,14 @@ impl OutcomeRegistry {
 /// Applies the Runtime result sanitizer line by line: lines carrying
 /// credentials are dropped, paths/URLs/hosts/emails are replaced by
 /// placeholders, and the result is bounded to [`MAX_PROMPT_CHARS`].
+///
+/// On top of the known-format detection of the result sanitizer, a line that
+/// names a credential ([`PROMPT_SECRET_LABELS`], English or Chinese, followed
+/// by a half- or full-width colon or equals sign, whitespace, or the end of
+/// the line) is removed as a whole. When such a label carries no value on its
+/// own line (a Chinese password label with a full-width colon, `token:`, or
+/// just `Password`), the next non-empty line is treated as the value and
+/// removed too. Any removal marks the prompt `truncated`.
 fn sanitize_prompt(text: &str) -> Option<(String, bool)> {
     let raw: String = text.chars().take(MAX_SOURCE).collect();
     let mut truncated = raw.len() < text.len();
@@ -247,9 +255,19 @@ fn sanitize_prompt(text: &str) -> Option<(String, bool)> {
         return None;
     }
     let mut lines = Vec::new();
+    let mut value_on_next_line = false;
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() {
+            continue;
+        }
+        let label = scan_secret_label(line);
+        if value_on_next_line || label != SecretLabel::None {
+            // Either this line holds the value of a bare label on the
+            // previous line, or it names a credential itself. A dropped value
+            // line that is itself a bare label keeps the next line pending.
+            truncated = true;
+            value_on_next_line = label == SecretLabel::ValueOnNextLine;
             continue;
         }
         match sanitize_result_text(line) {
@@ -263,7 +281,121 @@ fn sanitize_prompt(text: &str) -> Option<(String, bool)> {
         truncated = true;
     }
     let bounded: String = joined.chars().take(MAX_PROMPT_CHARS).collect();
+    // Run the known-format detection once more over the whole bounded text so
+    // nothing the per-line pass let through can leave Runtime.
+    if sanitize_result_text(&bounded).is_err() {
+        return None;
+    }
     (!bounded.is_empty()).then_some((bounded, truncated))
+}
+
+/// Credential labels a user may type in front of a secret. Matching is
+/// case-insensitive, `_` and `-` match a space (`API_KEY`, `access-key`), and
+/// full-width letters and punctuation match their ASCII forms. Chinese labels
+/// are written as escapes because Runtime production source stays free of Han
+/// text; the comment gives each meaning.
+const PROMPT_SECRET_LABELS: [&str; 25] = [
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "api key",
+    "apikey",
+    "access key",
+    "private key",
+    "cookie",
+    "authorization",
+    "bearer",
+    "\u{5bc6}\u{7801}",         // password
+    "\u{5bc6}\u{78bc}",         // password, traditional
+    "\u{53e3}\u{4ee4}",         // passphrase
+    "\u{5bc6}\u{94a5}",         // secret key
+    "\u{5bc6}\u{9470}",         // secret key, traditional
+    "\u{79d8}\u{94a5}",         // secret key, variant
+    "\u{4ee4}\u{724c}",         // token
+    "\u{51ed}\u{8bc1}",         // credential
+    "\u{6191}\u{8b49}",         // credential, traditional
+    "\u{51ed}\u{636e}",         // credential, variant
+    "\u{6388}\u{6743}\u{7801}", // authorization code
+    "\u{6388}\u{6b0a}\u{78bc}", // authorization code, traditional
+    "\u{9a8c}\u{8bc1}\u{7801}", // verification code
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretLabel {
+    /// The line names no credential.
+    None,
+    /// The line names a credential and may carry its value.
+    OnLine,
+    /// The line is a bare label: only the label, or the label followed by
+    /// nothing but a colon, equals sign or copula. The value is expected on
+    /// the next line.
+    ValueOnNextLine,
+}
+
+/// Separators that turn a credential word into a label: a colon or equals
+/// sign (after full-width folding), any whitespace, and, after a Chinese
+/// label, the copulas "is" (U+662F) and "as" (U+4E3A, traditional U+70BA),
+/// as in "the password is ...".
+fn is_label_separator(character: char, label_is_ascii: bool) -> bool {
+    matches!(character, ':' | '=')
+        || character.is_whitespace()
+        || (!label_is_ascii && matches!(character, '\u{662f}' | '\u{4e3a}' | '\u{70ba}'))
+}
+
+fn scan_secret_label(line: &str) -> SecretLabel {
+    // Fold full-width ASCII forms (`：`, `＝`, `ＡＰＩ`) and the ideographic
+    // space to ASCII, lowercase, and let `_` / `-` match a space.
+    let normalized = line
+        .chars()
+        .map(|character| match character {
+            '\u{3000}' => ' ',
+            '\u{FF01}'..='\u{FF5E}' => {
+                char::from_u32(u32::from(character) - 0xFEE0).unwrap_or(character)
+            }
+            other => other,
+        })
+        .flat_map(char::to_lowercase)
+        .map(|character| match character {
+            '_' | '-' => ' ',
+            other => other,
+        })
+        .collect::<Vec<_>>();
+    let mut result = SecretLabel::None;
+    for label in PROMPT_SECRET_LABELS {
+        let label = label.chars().collect::<Vec<_>>();
+        let label_is_ascii = label.iter().all(char::is_ascii);
+        for start in 0..normalized.len() {
+            if !normalized[start..].starts_with(&label) {
+                continue;
+            }
+            let mut end = start + label.len();
+            // English plurals (`passwords:`, `tokens =`) are labels too.
+            if label_is_ascii && normalized.get(end) == Some(&'s') {
+                end += 1;
+            }
+            let rest = &normalized[end..];
+            if !rest
+                .first()
+                .is_none_or(|character| is_label_separator(*character, label_is_ascii))
+            {
+                continue;
+            }
+            let value_missing = rest
+                .iter()
+                .all(|character| is_label_separator(*character, label_is_ascii));
+            let bare_line = normalized[..start]
+                .iter()
+                .all(|character| character.is_whitespace());
+            let assigns = rest.iter().any(|character| !character.is_whitespace());
+            if value_missing && (bare_line || assigns) {
+                return SecretLabel::ValueOnNextLine;
+            }
+            result = SecretLabel::OnLine;
+        }
+    }
+    result
 }
 
 fn extract_links(raw: &str) -> (String, Vec<String>) {
@@ -423,6 +555,140 @@ mod tests {
         assert_eq!(prompt.text, "短句");
         assert!(!prompt.truncated);
         assert!(r.get_prompt("s", 0, 300 + TTL + 1).is_none());
+    }
+
+    #[test]
+    fn prompts_drop_whole_lines_that_name_a_credential_in_any_language() {
+        for secret_line in [
+            "密码：Abc123!",
+            "密码:Abc123!",
+            "密码 = Abc123!",
+            "令牌：tok-live-1234",
+            "API key：sk-live-abcdefghijklmnop",
+            "API_KEY：abc",
+            "口令 opensesame",
+            "我的密码是Abc123!",
+            "令牌为 abc",
+            "ＴＯＫＥＮ＝abc",
+            "授权码 884213",
+            "验证码：884213",
+            "凭证：x",
+            "秘钥：x",
+            "密钥：x",
+            "Passwords: hunter2",
+            "access-key：AK123",
+            "private key：x",
+            "Cookie：sid=1",
+            "authorization：x",
+            "Bearer abc",
+            "pwd：x",
+            "passwd x",
+            "apikey：x",
+            "secret：x",
+            "密碼：Abc123!",
+            "密鑰：x",
+            "憑證：x",
+            "凭据：x",
+            "授權碼 884213",
+            "令牌為 abc",
+        ] {
+            let (text, truncated) =
+                sanitize_prompt(&format!("修改首页\n{secret_line}\n然后跑测试")).unwrap();
+            assert_eq!(text, "修改首页\n然后跑测试", "{secret_line}");
+            assert!(truncated, "{secret_line}");
+        }
+        // A line that only ends with a label is removed, but the next line is
+        // not assumed to hold its value.
+        assert_eq!(
+            sanitize_prompt("请重置密码\n然后跑测试").unwrap(),
+            ("然后跑测试".to_owned(), true)
+        );
+        // Words that merely contain a label are not credentials.
+        assert_eq!(
+            sanitize_prompt("修改密码重置页面的按钮\n把令牌桶限流改成 10").unwrap(),
+            (
+                "修改密码重置页面的按钮\n把令牌桶限流改成 10".to_owned(),
+                false
+            )
+        );
+        assert!(sanitize_prompt("密码：Abc123!").is_none());
+    }
+
+    #[test]
+    fn bare_credential_labels_also_drop_the_value_on_the_next_line() {
+        for label in [
+            "密码:",
+            "密码：",
+            "token：",
+            "Token =",
+            "密码",
+            "Password",
+            "- 口令：",
+            "请输入密码：",
+            "我的令牌是",
+            "API_KEY ＝",
+        ] {
+            let (text, truncated) =
+                sanitize_prompt(&format!("先登录\n{label}\n\n  Abc123!\n再部署")).unwrap();
+            assert_eq!(text, "先登录\n再部署", "{label}");
+            assert!(truncated, "{label}");
+        }
+        // A bare label whose "value" line is another bare label keeps the
+        // following line pending as well.
+        assert_eq!(
+            sanitize_prompt("密码：\n令牌：\nAbc123!\n继续").unwrap(),
+            ("继续".to_owned(), true)
+        );
+        assert!(sanitize_prompt("token:\nabc").is_none());
+    }
+
+    #[test]
+    fn prompt_bounds_cut_on_character_boundaries() {
+        let long = "汉".repeat(MAX_PROMPT_CHARS + 50);
+        let (text, truncated) = sanitize_prompt(&long).unwrap();
+        assert_eq!(text.chars().count(), MAX_PROMPT_CHARS);
+        assert!(text.chars().all(|character| character == '汉'));
+        assert!(truncated);
+
+        let emoji = "😀".repeat(MAX_SOURCE + 1);
+        let (text, truncated) = sanitize_prompt(&emoji).unwrap();
+        assert_eq!(text.chars().count(), MAX_PROMPT_CHARS);
+        assert!(truncated);
+
+        // The source bound cuts the credential line to `密码：Ab`; the cut
+        // line is still recognized and removed.
+        let source = format!("{}\n密码：Abc123!", "字".repeat(MAX_SOURCE - 6));
+        let (text, truncated) = sanitize_prompt(&source).unwrap();
+        assert!(truncated);
+        assert!(!text.contains("Ab"));
+        assert!(!text.contains('密'));
+        assert_eq!(text.chars().count(), MAX_PROMPT_CHARS);
+
+        // A credential line inside the bound is removed before bounding.
+        let near_bound = format!(
+            "{}\n密码：Abc123!\n{}",
+            "前".repeat(MAX_PROMPT_CHARS - 10),
+            "后".repeat(20)
+        );
+        let (text, truncated) = sanitize_prompt(&near_bound).unwrap();
+        assert!(truncated);
+        assert!(!text.contains("Abc"));
+        assert_eq!(text.chars().count(), MAX_PROMPT_CHARS);
+        assert!(text.ends_with(&"后".repeat(9)));
+    }
+
+    #[test]
+    fn prompts_still_drop_known_secret_formats_without_labels() {
+        for line in [
+            "用这个 sk-live-abcdefghijklmnopqrstuv",
+            "ghp_abcdefghijklmnopqrstuvwxyz0123",
+            "export GITHUB_TOKEN=abc",
+            "xoxb-1234-abcd",
+        ] {
+            let (text, truncated) = sanitize_prompt(&format!("开始\n{line}\n结束")).unwrap();
+            assert_eq!(text, "开始\n结束", "{line}");
+            assert!(truncated, "{line}");
+        }
     }
 
     #[test]

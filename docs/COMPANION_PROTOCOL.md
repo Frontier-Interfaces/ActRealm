@@ -301,7 +301,9 @@ failure: the session becomes `idle` with `activityMessage`
 recorded as `interrupted`. `StopFailure` still produces `failed` and an `error`
 Attention. A new prompt in the same session resolves that session's earlier
 open or snoozed `completion` and `error` Attention with resolution
-`superseded_by_activity`.
+`superseded_by_activity`. The local History center (`GET /api/v1/history`)
+keeps its `completed` / `failed` vocabulary and still reports a
+user-interrupted task as `failed`, as before.
 
 `GET /api/v1/companion/history?since=<epoch ms>&limit=<1..200, default
 100>&includeSide=<true|false, default false>` returns `{schemaVersion: 1,
@@ -309,25 +311,45 @@ generatedAt, tasks}` ordered by `lastEventAt` descending, limited to sessions
 whose `lastEventAt >= since`, including active ones. A missing or malformed
 `since`, `limit` or `includeSide` is rejected with HTTP 400
 `INVALID_HISTORY_LIMIT`. Without `includeSide=true` only `main` tasks are
-returned. Each task contains `id`, `provider`, `project`, `title` (Provider
-title first), `taskRole`, `userTurnCount`, `status` (`running`, `waiting`,
-`completed`, `interrupted` or `failed`), `startedAt`, `lastEventAt`,
-`completedAt` (end of the latest turn), `branch`, `validationState`,
-`reviewState`, `latestAttentionKind` (`completion`, `error` or null),
-`jumpCapability` and `jumpLabel`. `reviewState` is `unseen` while the latest
-completion/error Attention is open and unacknowledged, `seen` once it was
-acknowledged, snoozed or closed, and `none` when there was none. No prompt,
-reply, command or file path is included.
+returned. Each task contains `id`, `provider`, `project`, `title` (the
+Provider title, or null when the Provider gave none; unlike snapshot sessions it
+never falls back to the Runtime title derived from the prompt), `taskRole`,
+`userTurnCount`, `status` (`running`, `waiting`, `completed`, `interrupted` or
+`failed`), `startedAt`, `lastEventAt`, `completedAt` (end of the latest turn),
+`branch`, `validationState`, `reviewState`, `latestAttentionKind`
+(`completion`, `error` or null), `jumpCapability` and `jumpLabel`. A session
+that ended (`SessionEnd`) after a failed or interrupted turn keeps that turn's
+`failed` or `interrupted` status. `reviewState` becomes `seen` only through the
+user or the user's next instruction: the latest completion/error Attention was
+acknowledged (including a reminder-only acknowledgement), dismissed, archived
+from the History center, or superseded by new activity in the session
+(resolutions `ack`, `ack_hidden`, `user_dismissed`, `history_archived`,
+`superseded_by_activity`). It stays `unseen` while that Attention is open or
+snoozed, and when it was closed without the user (for example `auto_hidden` by
+the completion hide timer, or expired). It is `none` when the session raised no
+completion/error Attention. No prompt, reply, command or file path is
+included.
 
 The result envelope adds `prompt: null | {text, truncated, observedAt}`: the
 user's own prompt for the current turn, taken from the prompt Hook (`prompt`
 or `user_prompt`). It is sanitized with the same line-level result sanitizer
 (credential lines removed, paths/URLs/hosts/emails replaced by placeholders),
 bounded to 2,000 characters, and `truncated` is true when text was cut or a
-line was removed. Like result excerpts it is held only in Runtime memory, is
-replaced by the next turn, is never written to SQLite, spool, exports or
-snapshots, and is lost when Runtime restarts. A prompt from an earlier turn is
-never returned for the current one.
+line was removed. In addition, a line that names a credential is removed as a
+whole: `password`, `passwd`, `pwd`, `secret`, `token`, `api key`, `apikey`,
+`access key`, `private key`, `cookie`, `authorization`, `bearer`, `密码`,
+`口令`, `密钥`, `秘钥`, `令牌`, `凭证`, `凭据`, `授权码` or `验证码`, plus
+traditional forms such as `密碼` (case-insensitive, `_`/`-` matching a space,
+full-width forms folded), followed by a half- or full-width colon or equals
+sign, whitespace, `是`/`为` after a Chinese label, or the end of the line.
+When such a label has no value on its own line (`密码：`, `token:`, or the
+label alone), the next non-empty line is removed as its value too. The known
+secret formats (`sk-`, `ghp_`, private key blocks and similar) are checked per
+line and once more over the whole bounded text; a hit there drops the prompt.
+Like result excerpts it is held only in Runtime memory, is replaced by the
+next turn, is never written to SQLite, spool, exports or snapshots, and is lost
+when Runtime restarts. A prompt from an earlier turn is never returned for the
+current one.
 
 The Companion review adds `repository.files`: at most 20 changed files from
 the same repository and base as the local review/diff route, ordered by changed
@@ -335,4 +357,10 @@ lines (`insertions + deletions`) descending. Each entry is `{path, insertions,
 deletions, status}` with a repository-relative path and status `modified`,
 `added`, `deleted`, `renamed` or `untracked`. Untracked file contents are never
 read, so their line counts are zero. File contents and patches are never
-returned; the local `/api/v1/sessions/{id}/review` response is unchanged.
+returned; the local `/api/v1/sessions/{id}/review` response is unchanged. Git
+runs on Runtime's blocking pool, never on the API thread, and the repository
+root, HEAD and status resolved for the review summary are reused for the file
+list. For 2.5 seconds a session's review is reused when its inputs (turn,
+working directory, baseline, concurrent sessions) are the same and one
+`git status --branch` probe still matches HEAD, branch and working tree status
+exactly; otherwise it is recomputed.
