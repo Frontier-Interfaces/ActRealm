@@ -9868,11 +9868,17 @@ fn read_task_history(
               AND usage.provider_session_id = sessions.provider_session_id
              LEFT JOIN turns AS outcome_turn ON outcome_turn.id = (
                SELECT turns.id FROM turns WHERE turns.session_id = sessions.id
-               ORDER BY EXISTS (
-                 SELECT 1 FROM events AS turn_prompt
-                 WHERE turn_prompt.turn_id = turns.id
-                   AND turn_prompt.type = 'prompt.submitted'
-               ) DESC, turns.ordinal DESC
+               ORDER BY CASE
+                 WHEN EXISTS (
+                   SELECT 1 FROM events AS turn_outcome
+                   WHERE turn_outcome.turn_id = turns.id
+                     AND turn_outcome.type IN (
+                       'prompt.submitted', 'turn.stopped', 'turn.failed', 'turn.interrupted'
+                     )
+                 ) THEN 2
+                 WHEN turns.state = 'interrupted' THEN 1
+                 ELSE 0
+               END DESC, turns.ordinal DESC
                LIMIT 1
              )
              WHERE sessions.last_meaningful_activity_at IS NOT NULL
@@ -9978,13 +9984,17 @@ fn task_history_status(
 /// Companion-facing status vocabulary. It extends the History center's
 /// `completed` / `failed` with the states a still-active or user-interrupted
 /// task can be in. Once the session is idle, the outcome comes from the
-/// outcome turn: the latest turn the user started with a prompt (the latest
-/// turn of any kind only when the session has no prompt at all). Turns that
-/// a non-prompt event opened implicitly after it (an idle notification after
-/// a resume, a background subagent finishing, a compaction) never replace
-/// that outcome, so a session that ended or resumed after a failed or
+/// outcome turn: the latest turn the user started with a prompt or the
+/// provider ended itself (`Stop`, `StopFailure`, `TurnInterrupted`), so a
+/// turn a background task woke up that then failed, stopped or was
+/// interrupted counts, prompt or not. Turns that a non-prompt event opened
+/// implicitly and that only the session's end closed (an idle notification
+/// after a resume, a background subagent finishing, a compaction) never
+/// replace that outcome, so a session that ended or resumed after a failed or
 /// interrupted turn keeps that turn's outcome, and a completed turn keeps its
-/// own completion time.
+/// own completion time. Only a session with no such turn at all (Hooks
+/// installed mid-turn) falls back to its latest turn that the session's end
+/// interrupted, then to its latest turn of any kind.
 fn recent_task_status(
     exec_state: &str,
     activity: Option<&str>,
@@ -10125,11 +10135,17 @@ fn read_recent_tasks(
                FROM sessions
                LEFT JOIN turns AS outcome_turn ON outcome_turn.id = (
                  SELECT turns.id FROM turns WHERE turns.session_id = sessions.id
-                 ORDER BY EXISTS (
-                   SELECT 1 FROM events AS turn_prompt
-                   WHERE turn_prompt.turn_id = turns.id
-                     AND turn_prompt.type = 'prompt.submitted'
-                 ) DESC, turns.ordinal DESC
+                 ORDER BY CASE
+                   WHEN EXISTS (
+                     SELECT 1 FROM events AS turn_outcome
+                     WHERE turn_outcome.turn_id = turns.id
+                       AND turn_outcome.type IN (
+                         'prompt.submitted', 'turn.stopped', 'turn.failed', 'turn.interrupted'
+                       )
+                   ) THEN 2
+                   WHEN turns.state = 'interrupted' THEN 1
+                   ELSE 0
+                 END DESC, turns.ordinal DESC
                  LIMIT 1
                )
                LEFT JOIN attention_items AS latest_attention ON latest_attention.id = (

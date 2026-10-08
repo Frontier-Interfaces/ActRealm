@@ -6533,6 +6533,186 @@ fn a_session_without_a_prompt_ends_its_working_turn_as_interrupted() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// Ingests a Hook event and acknowledges the completion or error Attention
+/// it raised, so the History center lists the task once it is idle.
+fn seen_event(store: &RuntimeStore, provider: Provider, session: &str, mut raw: Value, at: u64) {
+    raw["session_id"] = json!(session);
+    raw["cwd"] = json!("/tmp/example-project");
+    let result = store.ingest(hook(provider, raw, at)).unwrap();
+    if let Some(attention_id) = result.attention_id {
+        store
+            .act_on_attention(Uuid::now_v7(), attention_id, AttentionAction::Ack, at + 10)
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_turn_a_background_task_woke_keeps_its_own_outcome_after_exit_and_resume() {
+    let root = temp_root("woken-turn-outcome");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let end = || json!({"hook_event_name":"SessionEnd","reason":"prompt_input_exit"});
+    let resume = || json!({"hook_event_name":"SessionStart","source":"resume"});
+    let read = |id: &str, agent: bool| {
+        let mut raw = json!({
+            "hook_event_name":"PreToolUse","tool_name":"Read","tool_use_id":id,
+            "tool_input":{"file_path":"/tmp/example-project/file.rs"}
+        });
+        if agent {
+            raw["agent_id"] = json!("agent-1");
+            raw["agent_type"] = json!("general-purpose");
+        }
+        raw
+    };
+    // A prompt whose Stop leaves a background subagent running; the subagent
+    // works, finishes and wakes the main Agent, which works on without a
+    // prompt and then ends that woken turn itself.
+    let woken_turn = |session: &str, outcome: Value, at: u64| {
+        ingest_tool_turn(&store, Provider::Claude, session, "t1", 1_000);
+        seen_event(
+            &store,
+            Provider::Claude,
+            session,
+            json!({
+                "hook_event_name":"Stop","turn_id":"t1",
+                "background_tasks":[{"id":"job-1","type":"agent","status":"running"}],
+                "session_crons":[]
+            }),
+            1_100,
+        );
+        let id = claude_event(&store, session, read("sub-read", true), 2_000);
+        claude_event(
+            &store,
+            session,
+            json!({"hook_event_name":"SubagentStop","agent_id":"agent-1","agent_type":"general-purpose"}),
+            3_000,
+        );
+        claude_event(&store, session, read("main-read", false), 3_100);
+        seen_event(&store, Provider::Claude, session, outcome, at);
+        id
+    };
+    let failed = |at: u64| ("failed".to_owned(), Some(at), Some("failed".to_owned()));
+
+    // The woken turn fails (an API rate limit), then the user exits, runs
+    // `claude --continue`, gets an idle notification and exits again.
+    let session = woken_turn(
+        "fail-exit",
+        json!({"hook_event_name":"StopFailure","error":"rate_limit"}),
+        3_200,
+    );
+    let (status, completed_at, _) = task_outcome(&store, &session);
+    assert_eq!((status.as_str(), completed_at), ("failed", Some(3_200)));
+    claude_event(&store, "fail-exit", end(), 4_000);
+    assert_eq!(task_outcome(&store, &session), failed(3_200));
+    claude_event(&store, "fail-exit", resume(), 5_000);
+    assert_eq!(task_outcome(&store, &session), failed(3_200));
+    claude_event(&store, "fail-exit", idle_prompt_notification(), 65_000);
+    claude_event(&store, "fail-exit", end(), 66_000);
+    assert_eq!(task_outcome(&store, &session), failed(3_200));
+
+    // The same failure, then only `claude --continue`.
+    let session = woken_turn(
+        "fail-resume",
+        json!({"hook_event_name":"StopFailure","error":"rate_limit"}),
+        3_200,
+    );
+    claude_event(&store, "fail-resume", resume(), 5_000);
+    assert_eq!(task_outcome(&store, &session), failed(3_200));
+
+    // The woken turn completes a day later: the task completed then.
+    let session = woken_turn("late-stop", json!({"hook_event_name":"Stop"}), 90_000_000);
+    claude_event(&store, "late-stop", end(), 90_000_100);
+    assert_eq!(
+        task_outcome(&store, &session),
+        (
+            "completed".to_owned(),
+            Some(90_000_000),
+            Some("completed".to_owned())
+        )
+    );
+
+    // Codex: a completed prompt, a resume, a turn without a prompt that the
+    // user interrupts, then another resume.
+    let codex = |raw: Value, at: u64| seen_event(&store, Provider::Codex, "codex-woken", raw, at);
+    ingest_tool_turn(&store, Provider::Codex, "codex-woken", "t1", 1_000);
+    codex(json!({"hook_event_name":"Stop","turn_id":"t1"}), 1_100);
+    codex(resume(), 2_000);
+    codex(
+        json!({
+            "hook_event_name":"PreToolUse","turn_id":"t2","tool_name":"Bash",
+            "tool_use_id":"t2-bash","tool_input":{"command":"ls"}
+        }),
+        2_100,
+    );
+    codex(
+        json!({"hook_event_name":"TurnInterrupted","turn_id":"t2"}),
+        2_200,
+    );
+    let mut second_resume = resume();
+    second_resume["session_id"] = json!("codex-woken");
+    let session = store
+        .ingest(hook(Provider::Codex, second_resume, 3_000))
+        .unwrap()
+        .session_id;
+    assert_eq!(
+        task_outcome(&store, &session),
+        (
+            "interrupted".to_owned(),
+            Some(2_200),
+            Some("failed".to_owned())
+        )
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_session_without_a_prompt_keeps_its_outcome_after_exit_resume_and_an_idle_notification() {
+    let root = temp_root("promptless-resume");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let end = || json!({"hook_event_name":"SessionEnd","reason":"prompt_input_exit"});
+    let resume = || json!({"hook_event_name":"SessionStart","source":"resume"});
+    let tool = json!({
+        "hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"tool-1",
+        "tool_input":{"command":"cargo test"}
+    });
+    // Hooks installed mid-turn: Runtime sees the Agent's tool, never a prompt.
+    // The turn fails, the user exits, resumes, idles and exits again.
+    let failed = claude_event(&store, "promptless-fail", tool.clone(), 1_000);
+    seen_event(
+        &store,
+        Provider::Claude,
+        "promptless-fail",
+        json!({"hook_event_name":"StopFailure","error":"rate_limit"}),
+        1_100,
+    );
+    // The same without a Hook for the turn's end: Esc, then /exit.
+    let interrupted = claude_event(&store, "promptless-esc", tool, 1_000);
+    for session in ["promptless-fail", "promptless-esc"] {
+        claude_event(&store, session, end(), 2_000);
+        claude_event(&store, session, resume(), 3_000);
+        claude_event(&store, session, idle_prompt_notification(), 63_000);
+    }
+    let outcome = |session: &str| {
+        let (status, completed_at, _) = task_outcome(&store, session);
+        (status, completed_at)
+    };
+    assert_eq!(outcome(&failed), ("failed".to_owned(), Some(1_100)));
+    assert_eq!(
+        outcome(&interrupted),
+        ("interrupted".to_owned(), Some(2_000))
+    );
+    for session in ["promptless-fail", "promptless-esc"] {
+        claude_event(&store, session, end(), 64_000);
+    }
+    assert_eq!(outcome(&failed), ("failed".to_owned(), Some(1_100)));
+    assert_eq!(
+        outcome(&interrupted),
+        ("interrupted".to_owned(), Some(2_000))
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn history_center_keeps_an_interruption_failed_after_the_session_ends_or_resumes() {
     let root = temp_root("history-center-interrupted-lifecycle");

@@ -74,6 +74,15 @@ published a final v1 release; entries below describe development milestones on
   next command, so `curl … && docker run -u 1000:1000` is kept. A bare
   `key`/`SK`/`AK`/`appKey` label with a key-like value is removed. Long lines
   of repeated labels no longer take quadratic time.
+- Fourth review round, history: the outcome turn is the latest turn that
+  the user started with a prompt or that the Provider ended itself (`Stop`,
+  `StopFailure`, `TurnInterrupted`). A turn a background task woke up that
+  then fails (or a Codex turn without a prompt that the user interrupts) is
+  no longer replaced by the earlier prompted turn after `SessionEnd` or
+  `SessionStart(resume)`: the task stays `failed`/`interrupted` with that
+  turn's end time, and a woken turn that completes later reports its own
+  `Stop` time. A session that never had a prompt keeps a failure or an
+  interruption at exit after a resume and an idle notification.
 - The short key prefixes `sk-`, `ghp_` and `akia` now count only at the
   start of a run of key characters followed by at least 16 more: words such
   as `task-runner`, `flask-login`, `disk-usage`, `agent-desk-redesign` or

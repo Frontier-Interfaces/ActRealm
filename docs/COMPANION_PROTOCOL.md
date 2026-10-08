@@ -343,10 +343,16 @@ never falls back to the Runtime title derived from the prompt), `taskRole`,
 turn), `branch`, `validationState`, `reviewState`, `latestAttentionKind`
 (`completion`, `error` or null), `jumpCapability` and `jumpLabel`. Once the
 session is idle, `status` and `completedAt` come from its outcome turn: the
-latest turn the user started with a prompt (the latest turn of any kind only
-when the session never had a prompt). Turns that Runtime opened implicitly for
-a later non-prompt event (an idle notification after `claude --continue`, a
-background subagent finishing, a compaction) never replace that outcome. A
+latest turn that the user started with a prompt or that the Provider ended
+itself (`Stop`, `StopFailure`, `TurnInterrupted`). A turn without a prompt
+that a background task woke up and that then completed, failed or was
+interrupted is therefore the outcome turn, with its own status and end time.
+Turns that Runtime opened implicitly for a later non-prompt event and that
+only the session's end closed (an idle notification after `claude
+--continue`, a background subagent finishing, a compaction) never replace that
+outcome. A session that never had such a turn (Hooks installed in the middle
+of a turn) uses its latest turn that `SessionEnd` ended as `interrupted`, and
+otherwise its latest turn of any kind. A
 session that ended (`SessionEnd`) or resumed after a failed or interrupted
 turn keeps that turn's `failed` or `interrupted` status and its `completedAt`,
 also after such implicit turns and a second `SessionEnd`; a completed turn
