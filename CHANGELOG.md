@@ -45,6 +45,16 @@ published a final v1 release; entries below describe development milestones on
   without an end time; the History center reads the latest turn's outcome
   too, so an interruption followed by `SessionEnd` or `SessionStart` stays
   `failed` there (its `completed`/`failed` vocabulary is unchanged).
+- Third review round, history: a task's finished status and `completedAt`
+  come from its outcome turn, the latest turn the user started with a prompt.
+  Implicit turns that a non-prompt event opens later (an idle notification
+  after `claude --continue`, a background subagent finishing, a compaction)
+  no longer turn an interrupted task `completed` with no end time, and the
+  exit time no longer replaces a completed turn's `Stop` time. On
+  `SessionEnd` only a working turn that holds the user's prompt or a started
+  tool ends as `interrupted`; an implicit turn opened while background work
+  was running ends as `idle`, so a completed task is no longer reported
+  `interrupted` (History center `failed`) after the user exits.
 - Companion snapshot Attention items add `handBackAvailable`: true only when
   `pass_through` returns a live approval to the original Agent UI (Hook
   waiters, Kimi/Grok Connector requests), false for the managed Codex

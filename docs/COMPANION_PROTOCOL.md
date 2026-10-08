@@ -325,9 +325,9 @@ them with `superseded_by_activity`. Both close the Attention as `resolved`, so
 clients that only look at the state are unaffected. The local History center (`GET /api/v1/history`)
 keeps its `completed` / `failed` vocabulary and still reports a
 user-interrupted task as `failed`, as before. It follows the Companion history
-status, including the latest turn's outcome: a task Companion history reports
-as `interrupted` (also after a later `SessionEnd` or `SessionStart`) or
-`failed` is `failed` there, and every other finished task is `completed`.
+status, including the outcome turn described below: a task Companion history
+reports as `interrupted` (also after a later `SessionEnd` or `SessionStart`)
+or `failed` is `failed` there, and every other finished task is `completed`.
 
 `GET /api/v1/companion/history?since=<epoch ms>&limit=<1..200, default
 100>&includeSide=<true|false, default false>` returns `{schemaVersion: 1,
@@ -339,15 +339,26 @@ returned. Each task contains `id`, `provider`, `project`, `title` (the
 Provider title, or null when the Provider gave none; unlike snapshot sessions it
 never falls back to the Runtime title derived from the prompt), `taskRole`,
 `userTurnCount`, `status` (`running`, `waiting`, `completed`, `interrupted` or
-`failed`), `startedAt`, `lastEventAt`, `completedAt` (end of the latest turn),
-`branch`, `validationState`, `reviewState`, `latestAttentionKind`
-(`completion`, `error` or null), `jumpCapability` and `jumpLabel`. A session
-that ended (`SessionEnd`) after a failed or interrupted turn keeps that turn's
-`failed` or `interrupted` status. A session that ends while its latest turn is
-still working (Claude Code reports no Hook when the user presses Esc and then
-exits) ends that turn as `interrupted` at the `SessionEnd` time, so it is
-reported as `interrupted` with that `completedAt`, never as `completed`
-without an end time; an open turn on an already idle session simply ends.
+`failed`), `startedAt`, `lastEventAt`, `completedAt` (end of the outcome
+turn), `branch`, `validationState`, `reviewState`, `latestAttentionKind`
+(`completion`, `error` or null), `jumpCapability` and `jumpLabel`. Once the
+session is idle, `status` and `completedAt` come from its outcome turn: the
+latest turn the user started with a prompt (the latest turn of any kind only
+when the session never had a prompt). Turns that Runtime opened implicitly for
+a later non-prompt event (an idle notification after `claude --continue`, a
+background subagent finishing, a compaction) never replace that outcome. A
+session that ended (`SessionEnd`) or resumed after a failed or interrupted
+turn keeps that turn's `failed` or `interrupted` status and its `completedAt`,
+also after such implicit turns and a second `SessionEnd`; a completed turn
+stays `completed` with the time of its `Stop`, not the exit time. A session
+that ends while it is still working on a turn that holds the user's prompt or
+a tool the Agent started (Claude Code reports no Hook when the user presses
+Esc and then exits) ends that turn as `interrupted` at the `SessionEnd` time,
+so it is reported as `interrupted` with that `completedAt`, never as
+`completed` without an end time. Any other open turn (one opened implicitly
+while the session was idle, or only waiting for background work after its
+`Stop`) simply ends and never makes a completed task `interrupted`. A
+`SessionEnd` delivered after newer activity changes nothing.
 `reviewState` becomes `seen` only through the user or the user's next
 instruction: the latest completion/error Attention was
 acknowledged (including a reminder-only acknowledgement), dismissed, archived

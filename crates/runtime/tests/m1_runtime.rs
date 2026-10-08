@@ -6310,7 +6310,8 @@ fn a_session_that_ends_mid_turn_reports_the_turn_as_interrupted() {
     assert_eq!(task(&mid_turn).status, "interrupted");
     assert_eq!(task(&mid_turn).completed_at, Some(1_100));
     assert_eq!(task(&finished).status, "completed");
-    assert!(task(&finished).completed_at.is_some());
+    // The completion time stays the time of the Stop, not of the exit.
+    assert_eq!(task(&finished).completed_at, Some(2_100));
     assert_eq!(task(&late_end).status, "running");
     assert_eq!(task(&late_end).completed_at, None);
     // The History center reports the interrupted turn as failed, like any
@@ -6323,6 +6324,210 @@ fn a_session_that_ends_mid_turn_reports_the_turn_as_interrupted() {
             .unwrap()
             .status,
         "failed"
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// The Companion status and completion time of a task, and its History
+/// center status (`None` while the History center does not list it yet).
+fn task_outcome(store: &RuntimeStore, session: &str) -> (String, Option<u64>, Option<String>) {
+    let recent = store
+        .recent_tasks(0, 100, true)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == session)
+        .unwrap();
+    let history = store
+        .task_history(u64::MAX / 2, 100)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == session)
+        .map(|task| task.status);
+    (recent.status, recent.completed_at, history)
+}
+
+fn claude_event(store: &RuntimeStore, session: &str, mut raw: Value, at: u64) -> String {
+    raw["session_id"] = json!(session);
+    raw["cwd"] = json!("/tmp/example-project");
+    store
+        .ingest(hook(Provider::Claude, raw, at))
+        .unwrap()
+        .session_id
+}
+
+fn idle_prompt_notification() -> Value {
+    json!({
+        "hook_event_name":"Notification",
+        "notification_type":"idle_prompt",
+        "message":"Claude is waiting for your input"
+    })
+}
+
+#[test]
+fn an_interrupted_turn_stays_interrupted_after_exit_resume_and_an_idle_notification() {
+    let root = temp_root("interrupted-resume-idle");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let end = json!({"hook_event_name":"SessionEnd","reason":"prompt_input_exit"});
+    let interrupted = || {
+        (
+            "interrupted".to_owned(),
+            Some(1_100),
+            Some("failed".to_owned()),
+        )
+    };
+    // Esc in Claude Code reports no Hook; the user then runs /exit.
+    ingest_tool_turn(&store, Provider::Claude, "esc", "t1", 1_000);
+    let session = claude_event(&store, "esc", end.clone(), 1_100);
+    assert_eq!(task_outcome(&store, &session), interrupted());
+    // `claude --continue`, then an idle notification a minute later opens an
+    // implicit turn without a prompt; it does not replace the interrupted one.
+    claude_event(
+        &store,
+        "esc",
+        json!({"hook_event_name":"SessionStart","source":"resume"}),
+        2_000,
+    );
+    assert_eq!(task_outcome(&store, &session), interrupted());
+    claude_event(&store, "esc", idle_prompt_notification(), 62_000);
+    assert_eq!(task_outcome(&store, &session), interrupted());
+    // A SessionEnd delivered late, before the notification, changes nothing.
+    claude_event(&store, "esc", end.clone(), 61_000);
+    assert_eq!(task_outcome(&store, &session), interrupted());
+    // The second /exit ends the implicit turn only.
+    claude_event(&store, "esc", end.clone(), 63_000);
+    assert_eq!(task_outcome(&store, &session), interrupted());
+    // The next prompt starts a new task outcome.
+    ingest_tool_turn(&store, Provider::Claude, "esc", "t2", 70_000);
+    claude_event(
+        &store,
+        "esc",
+        json!({"hook_event_name":"Stop","turn_id":"t2"}),
+        70_100,
+    );
+    let (status, completed_at, _) = task_outcome(&store, &session);
+    assert_eq!((status.as_str(), completed_at), ("completed", Some(70_100)));
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_completed_turn_stays_completed_after_later_exits_resumes_and_implicit_turns() {
+    let root = temp_root("completed-after-exit");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let end = || json!({"hook_event_name":"SessionEnd","reason":"prompt_input_exit"});
+    let resume = || json!({"hook_event_name":"SessionStart","source":"resume"});
+    let stop = || json!({"hook_event_name":"Stop","turn_id":"t1"});
+    let background_stop = |kind: &str| {
+        json!({
+            "hook_event_name":"Stop","turn_id":"t1",
+            "background_tasks":[{"id":"job-1","type":kind,"status":"running"}],
+            "session_crons":[]
+        })
+    };
+    let mut sessions = Vec::new();
+    let mut run = |session: &str, mut stop: Value, after_stop: Vec<(Value, u64)>| {
+        ingest_tool_turn(&store, Provider::Claude, session, "t1", 1_000);
+        stop["session_id"] = json!(session);
+        let stopped = store.ingest(hook(Provider::Claude, stop, 1_100)).unwrap();
+        // The user saw the completion, so the History center lists the task.
+        if let Some(attention_id) = stopped.attention_id {
+            store
+                .act_on_attention(Uuid::now_v7(), attention_id, AttentionAction::Ack, 1_150)
+                .unwrap();
+        }
+        let id = stopped.session_id;
+        for (raw, at) in after_stop {
+            claude_event(&store, session, raw, at);
+        }
+        sessions.push((session.to_owned(), id));
+    };
+    // Normal completion, then /exit.
+    run("exit", stop(), vec![(end(), 1_200)]);
+    // Completion, /exit, `claude --continue`, an idle notification, /exit.
+    run(
+        "resume-idle",
+        stop(),
+        vec![
+            (end(), 1_200),
+            (resume(), 2_000),
+            (idle_prompt_notification(), 62_000),
+            (end(), 63_000),
+        ],
+    );
+    // Completion while a background shell keeps running (the session stays
+    // busy), an idle notification a minute later, then /exit.
+    run(
+        "background-idle",
+        background_stop("shell"),
+        vec![(idle_prompt_notification(), 61_100), (end(), 70_000)],
+    );
+    // A background subagent finishes after the completion, then /exit.
+    run(
+        "background-subagent",
+        background_stop("agent"),
+        vec![
+            (
+                json!({"hook_event_name":"SubagentStop","agent_id":"agent-1","agent_type":"general-purpose"}),
+                5_000,
+            ),
+            (end(), 6_000),
+        ],
+    );
+    // Completion, /exit, `claude --continue`, /compact, /exit.
+    run(
+        "resume-compact",
+        stop(),
+        vec![
+            (end(), 1_200),
+            (resume(), 2_000),
+            (
+                json!({"hook_event_name":"PreCompact","trigger":"manual"}),
+                2_100,
+            ),
+            (
+                json!({"hook_event_name":"SessionStart","source":"compact"}),
+                2_200,
+            ),
+            (end(), 2_300),
+        ],
+    );
+    // A SessionEnd delivered late, before the Stop.
+    run("late-end", stop(), vec![(end(), 1_050)]);
+    for (name, session) in &sessions {
+        let (status, completed_at, history) = task_outcome(&store, session);
+        assert_eq!(status, "completed", "{name}");
+        assert_eq!(completed_at, Some(1_100), "{name}");
+        assert_eq!(history.as_deref(), Some("completed"), "{name}");
+    }
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_session_without_a_prompt_ends_its_working_turn_as_interrupted() {
+    let root = temp_root("promptless-session-end");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    // Hooks installed mid-turn: Runtime sees the Agent's tool, never a prompt.
+    let session = claude_event(
+        &store,
+        "promptless",
+        json!({
+            "hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"tool-1",
+            "tool_input":{"command":"cargo test"}
+        }),
+        1_000,
+    );
+    claude_event(
+        &store,
+        "promptless",
+        json!({"hook_event_name":"SessionEnd","reason":"prompt_input_exit"}),
+        1_100,
+    );
+    let (status, completed_at, _) = task_outcome(&store, &session);
+    assert_eq!(
+        (status.as_str(), completed_at),
+        ("interrupted", Some(1_100))
     );
     drop(store);
     fs::remove_dir_all(root).unwrap();

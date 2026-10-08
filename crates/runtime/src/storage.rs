@@ -6580,24 +6580,32 @@ fn ingest_transaction(
     // `SessionEnd` carries no turn of its own, so the turn that is still open
     // when the session ends never reached its `Stop`: Claude Code reports no
     // Hook when the user presses Esc and then exits. When the session was
-    // still working, that turn ends as `interrupted`, so history reports it
-    // like a user interruption instead of a completion without an end time.
-    // An open turn on an already idle session was only opened implicitly by a
-    // late event and simply ends.
+    // still working on a turn that holds real work (the user's prompt or a
+    // tool the Agent started), that turn ends as `interrupted`, so history
+    // reports it like a user interruption instead of a completion without an
+    // end time. Any other open turn was only opened implicitly by a
+    // non-prompt event after the previous turn ended (an idle notification
+    // while background work runs, a background subagent finishing, a
+    // compaction after a resume) and simply ends as `idle`; it never turns a
+    // completed task into an interrupted one.
     if parsed.kind == EventKind::SessionEnded && may_update {
-        let turn_state = if matches!(
+        let working = !matches!(
             current_state.as_str(),
             "idle" | "response_finished" | "failed"
-        ) {
-            "idle"
-        } else {
-            "interrupted"
-        };
+        );
         transaction
             .execute(
-                "UPDATE turns SET state = ?2, ended_at = ?3
+                "UPDATE turns SET state = CASE
+                   WHEN ?2 = 1 AND EXISTS (
+                     SELECT 1 FROM events AS turn_work
+                     WHERE turn_work.turn_id = turns.id
+                       AND turn_work.type IN ('prompt.submitted', 'tool.started')
+                   ) THEN 'interrupted'
+                   ELSE 'idle'
+                 END,
+                 ended_at = ?3
                  WHERE session_id = ?1 AND ended_at IS NULL",
-                params![session_id, turn_state, occurred_at],
+                params![session_id, i64::from(working), occurred_at],
             )
             .map_err(storage_error)?;
     }
@@ -9829,9 +9837,7 @@ fn read_task_history(
                       THEN usage.model END,
                       sessions.model, usage.model), sessions.exec_state,
                     sessions.started_at, sessions.last_event_at,
-                    (SELECT ended_at FROM turns
-                     WHERE turns.session_id = sessions.id
-                     ORDER BY ordinal DESC LIMIT 1),
+                    outcome_turn.ended_at,
                     sessions.task_hidden_at, sessions.task_hidden_reason,
                     COALESCE(
                       (SELECT branch FROM task_review_baselines
@@ -9855,13 +9861,20 @@ fn read_task_history(
                        )),
                     sessions.term_app, sessions.term_session_id, sessions.term_tty,
                     sessions.term_bundle_id, sessions.term_surface, sessions.activity,
-                    (SELECT state FROM turns
-                     WHERE turns.session_id = sessions.id
-                     ORDER BY ordinal DESC LIMIT 1)
+                    outcome_turn.state
              FROM sessions
              LEFT JOIN session_usage AS usage
                ON usage.provider = sessions.provider
               AND usage.provider_session_id = sessions.provider_session_id
+             LEFT JOIN turns AS outcome_turn ON outcome_turn.id = (
+               SELECT turns.id FROM turns WHERE turns.session_id = sessions.id
+               ORDER BY EXISTS (
+                 SELECT 1 FROM events AS turn_prompt
+                 WHERE turn_prompt.turn_id = turns.id
+                   AND turn_prompt.type = 'prompt.submitted'
+               ) DESC, turns.ordinal DESC
+               LIMIT 1
+             )
              WHERE sessions.last_meaningful_activity_at IS NOT NULL
                AND (
                  sessions.task_hidden_at IS NOT NULL
@@ -9894,7 +9907,7 @@ fn read_task_history(
                 let term_bundle_id = row.get::<_, Option<String>>(19)?;
                 let term_surface = row.get::<_, Option<String>>(20)?;
                 let activity = row.get::<_, Option<String>>(21)?;
-                let latest_turn_state = row.get::<_, Option<String>>(22)?;
+                let outcome_turn_state = row.get::<_, Option<String>>(22)?;
                 let (jump_capability, jump_label) = jump_descriptor(
                     &provider,
                     &provider_session_id,
@@ -9913,7 +9926,7 @@ fn read_task_history(
                     status: task_history_status(
                         &exec_state,
                         activity.as_deref(),
-                        latest_turn_state.as_deref(),
+                        outcome_turn_state.as_deref(),
                     )
                     .to_owned(),
                     started_at: from_i64(row.get(7)?),
@@ -9946,17 +9959,17 @@ fn read_task_history(
 
 /// The History center (`/api/v1/history`) status. It only knows `completed`
 /// and `failed`, and follows the Companion status ([`recent_task_status`],
-/// which also reads the latest turn's outcome): a user interruption used to
-/// leave the session `failed`; it now idles the session, so the History
-/// center keeps reporting such a task as `failed`, exactly as before, also
-/// after a later `SessionEnd` or `SessionStart` rewrote the session activity.
-/// Companion history reports it as `interrupted` instead.
+/// which also reads the outcome turn): a user interruption used to leave the
+/// session `failed`; it now idles the session, so the History center keeps
+/// reporting such a task as `failed`, exactly as before, also after a later
+/// `SessionEnd` or `SessionStart` rewrote the session activity. Companion
+/// history reports it as `interrupted` instead.
 fn task_history_status(
     exec_state: &str,
     activity: Option<&str>,
-    latest_turn_state: Option<&str>,
+    outcome_turn_state: Option<&str>,
 ) -> &'static str {
-    match recent_task_status(exec_state, activity, latest_turn_state) {
+    match recent_task_status(exec_state, activity, outcome_turn_state) {
         "failed" | "interrupted" => "failed",
         _ => "completed",
     }
@@ -9964,13 +9977,18 @@ fn task_history_status(
 
 /// Companion-facing status vocabulary. It extends the History center's
 /// `completed` / `failed` with the states a still-active or user-interrupted
-/// task can be in. A session that ended (`SessionEnd`, which idles the
-/// session without touching the turn) after a failed or interrupted turn
-/// keeps that turn's outcome.
+/// task can be in. Once the session is idle, the outcome comes from the
+/// outcome turn: the latest turn the user started with a prompt (the latest
+/// turn of any kind only when the session has no prompt at all). Turns that
+/// a non-prompt event opened implicitly after it (an idle notification after
+/// a resume, a background subagent finishing, a compaction) never replace
+/// that outcome, so a session that ended or resumed after a failed or
+/// interrupted turn keeps that turn's outcome, and a completed turn keeps its
+/// own completion time.
 fn recent_task_status(
     exec_state: &str,
     activity: Option<&str>,
-    latest_turn_state: Option<&str>,
+    outcome_turn_state: Option<&str>,
 ) -> &'static str {
     match exec_state {
         "response_finished" => "completed",
@@ -9978,12 +9996,12 @@ fn recent_task_status(
         "failed" if activity == Some(TURN_INTERRUPTED_ACTIVITY) => "interrupted",
         "failed" => "failed",
         "idle"
-            if latest_turn_state == Some("interrupted")
+            if outcome_turn_state == Some("interrupted")
                 || activity == Some(TURN_INTERRUPTED_ACTIVITY) =>
         {
             "interrupted"
         }
-        "idle" if latest_turn_state == Some("failed") => "failed",
+        "idle" if outcome_turn_state == Some("failed") => "failed",
         "idle" => "completed",
         "awaiting_approval" => "waiting",
         _ => "running",
@@ -10061,10 +10079,10 @@ fn read_recent_tasks(
                       sessions.provider_title AS provider_title,
                       sessions.exec_state AS exec_state,
                       sessions.activity AS activity,
-                      latest_turn.state AS turn_state,
+                      outcome_turn.state AS turn_state,
                       sessions.started_at AS started_at,
                       sessions.last_event_at AS last_event_at,
-                      latest_turn.ended_at AS completed_at,
+                      outcome_turn.ended_at AS completed_at,
                       COALESCE(
                         (SELECT branch FROM task_review_baselines
                          WHERE task_review_baselines.session_id = sessions.id
@@ -10105,9 +10123,14 @@ fn read_recent_tasks(
                           AND later_prompt.occurred_at > latest_attention.created_at
                       ) AS prompted_after_attention
                FROM sessions
-               LEFT JOIN turns AS latest_turn ON latest_turn.id = (
+               LEFT JOIN turns AS outcome_turn ON outcome_turn.id = (
                  SELECT turns.id FROM turns WHERE turns.session_id = sessions.id
-                 ORDER BY turns.ordinal DESC LIMIT 1
+                 ORDER BY EXISTS (
+                   SELECT 1 FROM events AS turn_prompt
+                   WHERE turn_prompt.turn_id = turns.id
+                     AND turn_prompt.type = 'prompt.submitted'
+                 ) DESC, turns.ordinal DESC
+                 LIMIT 1
                )
                LEFT JOIN attention_items AS latest_attention ON latest_attention.id = (
                  SELECT candidate.id FROM attention_items AS candidate
