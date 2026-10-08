@@ -1503,12 +1503,12 @@ fn ends_with_phrase(text: &[char], phrase: &str) -> Option<usize> {
 
 /// Chinese characters that hand over a value ("is", "as", "into", "use",
 /// "fill in", "called", "enter", "you", the perfective particle, "and",
-/// "set", "change", "replace", "default", "just"), simplified and
-/// traditional.
-const VALUE_INTRODUCERS: [char; 23] = [
+/// "set", "change", "replace", "default", "just", "uniformly"), simplified
+/// and traditional.
+const VALUE_INTRODUCERS: [char; 24] = [
     '\u{662f}', '\u{4e3a}', '\u{70ba}', '\u{7232}', '\u{6210}', '\u{7528}', '\u{586b}', '\u{53eb}',
     '\u{5165}', '\u{4f60}', '\u{4e86}', '\u{548c}', '\u{8ddf}', '\u{4e0e}', '\u{8207}', '\u{53ca}',
-    '\u{8bbe}', '\u{8a2d}', '\u{6539}', '\u{6362}', '\u{63db}', '\u{8ba4}', '\u{5c31}',
+    '\u{8bbe}', '\u{8a2d}', '\u{6539}', '\u{6362}', '\u{63db}', '\u{8ba4}', '\u{5c31}', '\u{4e00}',
 ];
 
 /// Of [`VALUE_INTRODUCERS`], "use" and "and" (simplified and traditional),
@@ -3224,6 +3224,8 @@ mod tests {
             "密码我改成了 abc12345",
             "密码我改成了 mysql123",
             "密码统一用 12345678",
+            "密码统一 12345678",
+            "密码统一 my_pass_123",
             "WiFi 默认密码统一是 12345678",
             "令牌我换成了 tok-2026-x9",
             "密码是 Abc123?",

@@ -435,7 +435,7 @@ or digits, and letters with digits (`hunter2`, `admin2024`), always count:
 `密码我改成了 Abc123!`, `密码👉Abc123!`. Shapes that usually name something
 else count only when the wording hands the word over as a value (a copula
 or setter such as `是`, `为`, `成`, `用`, `填`, `叫`, `了`, `和`, `默认`,
-`就`, a colon, an arrow or an emoji right before it): only digits, and not
+`就`, `统一`, a colon, an arrow or an emoji right before it): only digits, and not
 followed by a unit such as `毫秒`, `秒`, `次`, `个` or `QPS` (`WiFi
 默认密码统一是 12345678` is removed, `令牌桶容量 100000` is kept), a hex run
 whose letters and digits alternate like a commit hash (`a1b2c3d`), an
