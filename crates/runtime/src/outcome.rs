@@ -2100,6 +2100,31 @@ mod tests {
             assert_eq!(text, "开始\n结束", "{line}");
             assert!(truncated, "{line}");
         }
+        // Short prefixes count at the start of a key, also after a colon or
+        // Chinese text.
+        for line in [
+            "用sk-proj-abcdefghij1234567890调一下".to_owned(),
+            "OPENAI_KEY:sk-proj-abcdefghij1234567890".to_owned(),
+            // Split so push protection does not mistake the sample for a key.
+            format!("AWS 用 {}{}", "AKIA", "ABCDEFGHIJ012345"),
+        ] {
+            assert_line_removed(&line);
+        }
+        // Words that merely contain `sk-` or `akia` are not keys.
+        for sentence in [
+            "task-runner 起不来，帮我看看",
+            "用 flask-login 做登录",
+            "disk-usage 报警阈值改成 80%",
+            "切到 agent-desk-redesign 分支跑一下测试",
+            "sk-learn 的版本",
+            "Slovakia 的时区不对",
+        ] {
+            assert_eq!(
+                sanitize_prompt(&format!("{sentence}\n然后跑测试")).unwrap(),
+                (format!("{sentence}\n然后跑测试"), false),
+                "{sentence}"
+            );
+        }
     }
 
     /// Asserts that `line` is removed between two ordinary lines.

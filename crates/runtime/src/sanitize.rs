@@ -199,7 +199,29 @@ fn has_secret_prefix(value: &str) -> bool {
         "akia",
     ]
     .iter()
-    .any(|prefix| value.starts_with(prefix) || value.contains(prefix))
+    .any(|prefix| {
+        // A prefix shorter than five characters also occurs inside ordinary
+        // words (`task-runner`, `flask-login`, `Slovakia`): it counts only at
+        // the start of a run of key characters followed by at least 16 more.
+        if prefix.len() < 5 {
+            starts_a_key_run(value, prefix, 16)
+        } else {
+            value.contains(prefix)
+        }
+    })
+}
+
+/// `prefix` starts a run of `[a-z0-9_-]` in the lowercase `value` and is
+/// followed by at least `tail` more key characters.
+fn starts_a_key_run(value: &str, prefix: &str, tail: usize) -> bool {
+    value
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        })
+        .any(|run| {
+            run.strip_prefix(prefix)
+                .is_some_and(|rest| rest.len() >= tail)
+        })
 }
 
 /// Provider key formats whose prefix alone is too short or too common to

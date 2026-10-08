@@ -74,6 +74,10 @@ published a final v1 release; entries below describe development milestones on
   next command, so `curl … && docker run -u 1000:1000` is kept. A bare
   `key`/`SK`/`AK`/`appKey` label with a key-like value is removed. Long lines
   of repeated labels no longer take quadratic time.
+- The short key prefixes `sk-`, `ghp_` and `akia` now count only at the
+  start of a run of key characters followed by at least 16 more: words such
+  as `task-runner`, `flask-login`, `disk-usage`, `agent-desk-redesign` or
+  `Slovakia` no longer drop the whole prompt line.
 - Companion snapshot Attention items add `handBackAvailable`: true only when
   `pass_through` returns a live approval to the original Agent UI (Hook
   waiters, Kimi/Grok Connector requests), false for the managed Codex

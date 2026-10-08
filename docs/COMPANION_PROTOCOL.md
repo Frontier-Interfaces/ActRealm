@@ -484,7 +484,10 @@ removes the line, so keys in compact JSON or code (`{"appKey":"9f8e…"}`,
 digit (`handleCompanionSnapshotRequest`) are kept. Telegram bot tokens
 (`<bot id>:<secret>`), Discord bot tokens (three dot-separated parts) and URLs
 or connection strings with a password (`user:password@` before the host, as
-in a PostgreSQL connection URL) remove the line too. Result excerpts (`summary`) go through the same line
+in a PostgreSQL connection URL) remove the line too. The prefixes `sk-`,
+`ghp_` and `akia` (any case), which are shorter than five characters, count
+only at the start of a run of key characters followed by at least 16 more,
+so `task-runner`, `flask-login` or `Slovakia` are not keys. Result excerpts (`summary`) go through the same line
 filter.
 Like result excerpts the prompt is held only in Runtime memory, is replaced by the
 next turn, is never written to SQLite, spool, exports or snapshots, and is lost
