@@ -5386,3 +5386,571 @@ fn codex_internal_memory_maintenance_is_not_a_user_task() {
     drop(store);
     fs::remove_dir_all(root).unwrap();
 }
+
+fn hook(provider: Provider, raw: Value, at: u64) -> BridgeRequest {
+    BridgeRequest::from_hook_at(provider, raw, at)
+}
+
+fn ingest_tool_turn(store: &RuntimeStore, provider: Provider, session: &str, turn: &str, at: u64) {
+    for (offset, event) in [
+        (0, "UserPromptSubmit"),
+        (10, "PreToolUse"),
+        (20, "PostToolUse"),
+    ] {
+        let mut raw = json!({
+            "hook_event_name": event,
+            "session_id": session,
+            "turn_id": turn,
+            "cwd": "/tmp/example-project",
+        });
+        if event != "UserPromptSubmit" {
+            raw["tool_name"] = json!("Read");
+            raw["tool_use_id"] = json!(format!("{turn}-read"));
+            raw["tool_input"] = json!({ "file_path": "/tmp/example-project/file.rs" });
+        } else {
+            raw["prompt"] = json!("检查项目");
+        }
+        store.ingest(hook(provider, raw, at + offset)).unwrap();
+    }
+}
+
+#[test]
+fn user_interruption_idles_the_turn_without_an_error_attention() {
+    let root = temp_root("interrupt-idle");
+    let path = root.join("data.sqlite");
+    let store = RuntimeStore::open(&path).unwrap();
+    ingest_tool_turn(
+        &store,
+        Provider::Codex,
+        "interrupted-session",
+        "turn-1",
+        1_000,
+    );
+    store
+        .ingest(hook(
+            Provider::Codex,
+            json!({
+                "hook_event_name": "TurnInterrupted",
+                "session_id": "interrupted-session",
+                "turn_id": "turn-1",
+                "reason": "user pressed escape"
+            }),
+            1_100,
+        ))
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let session = &snapshot.sessions[0];
+    assert_eq!(session.exec_state, "idle");
+    assert_eq!(session.activity.as_deref(), Some("Turn interrupted"));
+    assert_eq!(session.turn_ended_at, Some(1_100));
+    assert!(
+        snapshot.attention.iter().all(|item| item.kind != "error"),
+        "an interruption must not raise an error attention"
+    );
+
+    // A late tool event from the interrupted turn neither reopens it nor
+    // opens a new implicit turn.
+    store
+        .ingest(hook(
+            Provider::Codex,
+            json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "interrupted-session",
+                "turn_id": "turn-1",
+                "tool_name": "Read",
+                "tool_use_id": "late-read",
+                "tool_input": { "file_path": "/tmp/example-project/file.rs" }
+            }),
+            1_200,
+        ))
+        .unwrap();
+    let late = store.snapshot().unwrap();
+    assert_eq!(late.sessions[0].exec_state, "idle");
+    assert_eq!(late.sessions[0].user_turn_count, 1);
+    let connection = Connection::open(&path).unwrap();
+    let (turns, state): (i64, String) = connection
+        .query_row("SELECT COUNT(*), MAX(state) FROM turns", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(turns, 1);
+    assert_eq!(state, "interrupted");
+
+    // Real failures still raise an error attention.
+    ingest_tool_turn(
+        &store,
+        Provider::Codex,
+        "interrupted-session",
+        "turn-2",
+        2_000,
+    );
+    store
+        .ingest(hook(
+            Provider::Codex,
+            json!({
+                "hook_event_name": "StopFailure",
+                "session_id": "interrupted-session",
+                "turn_id": "turn-2",
+                "error": "provider failed"
+            }),
+            2_100,
+        ))
+        .unwrap();
+    let failed = store.snapshot().unwrap();
+    assert_eq!(failed.sessions[0].exec_state, "failed");
+    assert!(failed
+        .attention
+        .iter()
+        .any(|item| item.kind == "error" && item.state == "open"));
+    assert_eq!(store.recent_tasks(0, 10, true).unwrap()[0].status, "failed");
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_new_prompt_alone_closes_open_completion_and_error_reminders() {
+    let root = temp_root("prompt-supersedes-reminders");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    ingest_tool_turn(
+        &store,
+        Provider::Claude,
+        "reminder-session",
+        "turn-1",
+        1_000,
+    );
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"Stop","session_id":"reminder-session","turn_id":"turn-1"}),
+            1_100,
+        ))
+        .unwrap();
+    assert!(store
+        .snapshot()
+        .unwrap()
+        .attention
+        .iter()
+        .any(|item| item.kind == "completion" && item.state == "open"));
+    ingest_tool_turn(
+        &store,
+        Provider::Claude,
+        "reminder-session",
+        "turn-2",
+        2_000,
+    );
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"StopFailure","session_id":"reminder-session","turn_id":"turn-2","error":"x"}),
+            2_100,
+        ))
+        .unwrap();
+    // Only the prompt arrives; no tool activity follows yet.
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"UserPromptSubmit","session_id":"reminder-session",
+                "turn_id":"turn-3","prompt":"继续"
+            }),
+            3_000,
+        ))
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    for kind in ["completion", "error"] {
+        let item = snapshot
+            .attention
+            .iter()
+            .find(|item| item.kind == kind)
+            .unwrap();
+        assert_eq!(item.state, "resolved", "{kind}");
+        assert_eq!(
+            item.resolution.as_deref(),
+            Some("superseded_by_activity"),
+            "{kind}"
+        );
+    }
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn sessions_report_user_turns_and_main_or_side_task_role() {
+    let root = temp_root("task-role");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    // Titled and driven by two user prompts: main.
+    for (turn, at) in [("t1", 1_000), ("t2", 2_000)] {
+        store
+            .ingest(hook(
+                Provider::Claude,
+                json!({
+                    "hook_event_name":"UserPromptSubmit","session_id":"titled-main",
+                    "turn_id":turn,"cwd":"/tmp/example-project","prompt":"做任务",
+                    "session_title":"Refactor the review page"
+                }),
+                at,
+            ))
+            .unwrap();
+    }
+    // A scripted Codex run: user prompt but no Provider title.
+    store
+        .ingest(hook(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"UserPromptSubmit","session_id":"untitled-script",
+                "turn_id":"s1","cwd":"/tmp/example-project","prompt":"run batch"
+            }),
+            1_500,
+        ))
+        .unwrap();
+    // A titled fork that never received a prompt; a tool event opens an
+    // implicit turn that is not a user turn.
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"SessionStart","session_id":"titled-fork",
+                "cwd":"/tmp/example-project","session_title":"Refactor (fork)"
+            }),
+            1_600,
+        ))
+        .unwrap();
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"PreToolUse","session_id":"titled-fork",
+                "cwd":"/tmp/example-project","tool_name":"Read","tool_use_id":"f1",
+                "tool_input":{"file_path":"/tmp/example-project/a.rs"}
+            }),
+            1_700,
+        ))
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let by_provider_session = |id: &str| {
+        snapshot
+            .sessions
+            .iter()
+            .find(|session| session.provider_session_id == id)
+            .unwrap()
+            .clone()
+    };
+    let main = by_provider_session("titled-main");
+    assert_eq!(main.user_turn_count, 2);
+    assert_eq!(main.task_role, "main");
+    let script = by_provider_session("untitled-script");
+    assert_eq!(script.user_turn_count, 1);
+    assert_eq!(script.task_role, "side");
+    let fork = by_provider_session("titled-fork");
+    assert_eq!(fork.user_turn_count, 0);
+    assert_eq!(fork.task_role, "side");
+    let encoded = serde_json::to_value(&main).unwrap();
+    assert_eq!(encoded["userTurnCount"], 2);
+    assert_eq!(encoded["taskRole"], "main");
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn recent_tasks_cover_active_and_finished_work_with_review_state() {
+    let root = temp_root("recent-tasks");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let titled = |session: &str, turn: &str, at: u64| {
+        hook(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"UserPromptSubmit","session_id":session,"turn_id":turn,
+                "cwd":"/tmp/example-project","prompt":"PRIVATE PROMPT TEXT",
+                "session_title":format!("Task {session}")
+            }),
+            at,
+        )
+    };
+    // completed + unseen completion reminder
+    store.ingest(titled("done", "d1", 10_000)).unwrap();
+    ingest_tool_turn(&store, Provider::Claude, "done", "d1", 10_001);
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"Stop","session_id":"done","turn_id":"d1"}),
+            10_100,
+        ))
+        .unwrap();
+    // interrupted by the user: no reminder at all
+    store.ingest(titled("stopped", "s1", 11_000)).unwrap();
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"TurnInterrupted","session_id":"stopped","turn_id":"s1"}),
+            11_100,
+        ))
+        .unwrap();
+    // still running
+    store.ingest(titled("running", "r1", 12_000)).unwrap();
+    // waiting for approval
+    store.ingest(titled("waiting", "w1", 13_000)).unwrap();
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"PermissionRequest","session_id":"waiting","turn_id":"w1",
+                "cwd":"/tmp/example-project","tool_name":"Bash",
+                "tool_input":{"command":"rm -rf build"}
+            }),
+            13_100,
+        ))
+        .unwrap();
+    // failed, and the error reminder was acknowledged
+    store.ingest(titled("broken", "b1", 14_000)).unwrap();
+    let failure = store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"StopFailure","session_id":"broken","turn_id":"b1","error":"boom"}),
+            14_100,
+        ))
+        .unwrap();
+    store
+        .act_on_attention(
+            Uuid::now_v7(),
+            failure.attention_id.unwrap(),
+            AttentionAction::Ack,
+            14_200,
+        )
+        .unwrap();
+    // side task: untitled scripted run
+    store
+        .ingest(hook(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"UserPromptSubmit","session_id":"script","turn_id":"x1",
+                "cwd":"/tmp/example-project","prompt":"batch"
+            }),
+            15_000,
+        ))
+        .unwrap();
+    // older than `since`
+    store.ingest(titled("yesterday", "y1", 5_000)).unwrap();
+
+    let tasks = store.recent_tasks(9_000, 100, false).unwrap();
+    let ids = tasks
+        .iter()
+        .map(|task| task.title.clone().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        vec![
+            "Task broken",
+            "Task waiting",
+            "Task running",
+            "Task stopped",
+            "Task done"
+        ]
+    );
+    let find = |title: &str| {
+        tasks
+            .iter()
+            .find(|task| task.title.as_deref() == Some(title))
+            .unwrap()
+    };
+    let done = find("Task done");
+    assert_eq!(done.status, "completed");
+    assert_eq!(done.review_state, "unseen");
+    assert_eq!(done.latest_attention_kind.as_deref(), Some("completion"));
+    assert_eq!(done.completed_at, Some(10_100));
+    assert_eq!(done.task_role, "main");
+    assert_eq!(done.user_turn_count, 1);
+    let stopped = find("Task stopped");
+    assert_eq!(stopped.status, "interrupted");
+    assert_eq!(stopped.review_state, "none");
+    assert_eq!(stopped.latest_attention_kind, None);
+    assert_eq!(stopped.completed_at, Some(11_100));
+    let running = find("Task running");
+    assert_eq!(running.status, "running");
+    assert_eq!(running.completed_at, None);
+    assert_eq!(find("Task waiting").status, "waiting");
+    let broken = find("Task broken");
+    assert_eq!(broken.status, "failed");
+    assert_eq!(broken.review_state, "seen");
+    assert_eq!(broken.latest_attention_kind.as_deref(), Some("error"));
+
+    let with_side = store.recent_tasks(9_000, 100, true).unwrap();
+    assert_eq!(with_side.len(), 6);
+    assert_eq!(with_side[0].task_role, "side");
+    assert_eq!(with_side[0].status, "running");
+    assert_eq!(store.recent_tasks(9_000, 2, false).unwrap().len(), 2);
+    assert_eq!(store.recent_tasks(0, 100, false).unwrap().len(), 6);
+    assert!(store.recent_tasks(0, 0, false).is_err());
+
+    let encoded = serde_json::to_string(&with_side).unwrap();
+    assert!(!encoded.contains("PRIVATE PROMPT TEXT"));
+    assert!(!encoded.contains("rm -rf"));
+    assert!(!encoded.contains("/tmp/example-project"));
+    let first = serde_json::to_value(&tasks[0]).unwrap();
+    for key in [
+        "id",
+        "provider",
+        "project",
+        "title",
+        "taskRole",
+        "userTurnCount",
+        "status",
+        "startedAt",
+        "lastEventAt",
+        "completedAt",
+        "branch",
+        "validationState",
+        "reviewState",
+        "latestAttentionKind",
+        "jumpCapability",
+        "jumpLabel",
+    ] {
+        assert!(first.get(key).is_some(), "missing {key}");
+    }
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn turn_prompts_are_transient_sanitized_bounded_and_replaced_each_turn() {
+    for provider in [Provider::Claude, Provider::Codex] {
+        let root = temp_root("transient-prompt");
+        let path = root.join("data.sqlite");
+        let store = RuntimeStore::open(&path).unwrap();
+        let first = hook(
+            provider,
+            json!({
+                "hook_event_name":"UserPromptSubmit","session_id":"prompt-session","turn_id":"t1",
+                "cwd":"/tmp/example-project",
+                "prompt":"改首页。\n独立提示标记：把首页标题改成蓝色\npassword=hunter2-secret\n顺便看看 /Users/someone/private/notes.md"
+            }),
+            100,
+        );
+        let session = store.ingest(first.clone()).unwrap().session_id;
+        let prompt = store.session_prompt(&session, 100, 150).unwrap();
+        assert!(prompt.text.contains("独立提示标记：把首页标题改成蓝色"));
+        assert!(!prompt.text.contains("hunter2"));
+        assert!(!prompt.text.contains("/Users/someone"));
+        assert!(prompt.text.contains("<path>"));
+        assert!(
+            prompt.truncated,
+            "a removed credential line marks the prompt as partial"
+        );
+        assert_eq!(prompt.observed_at, 100);
+        assert!(store.session_prompt(&session, 101, 150).is_none());
+
+        // Only the pre-existing first-sentence task title ("改首页。") is
+        // persisted; the rest of the prompt stays in memory.
+        let export = store.export_json(150).unwrap().to_string();
+        assert!(!export.contains("独立提示标记"));
+        let spool = EventSpool::new(root.join("spool"));
+        spool.append(&first).unwrap();
+        spool
+            .drain(|request| {
+                assert!(request.raw.get("prompt").is_none());
+                true
+            })
+            .unwrap();
+        for file in [path.clone(), root.join("data.sqlite-wal")] {
+            if let Ok(bytes) = fs::read(&file) {
+                assert!(!String::from_utf8_lossy(&bytes).contains("首页标题改成蓝色"));
+            }
+        }
+
+        let long = "很".repeat(2_500);
+        store
+            .ingest(hook(
+                provider,
+                json!({
+                    "hook_event_name":"UserPromptSubmit","session_id":"prompt-session",
+                    "turn_id":"t2","prompt":long
+                }),
+                200,
+            ))
+            .unwrap();
+        let prompt = store.session_prompt(&session, 200, 250).unwrap();
+        assert_eq!(prompt.text.chars().count(), 2_000);
+        assert!(prompt.truncated);
+
+        // A new turn without prompt text leaves no stale prompt behind.
+        store
+            .ingest(hook(
+                provider,
+                json!({"hook_event_name":"UserPromptSubmit","session_id":"prompt-session","turn_id":"t3"}),
+                300,
+            ))
+            .unwrap();
+        assert!(store.session_prompt(&session, 0, 350).is_none());
+
+        store
+            .ingest(hook(
+                provider,
+                json!({
+                    "hook_event_name":"UserPromptSubmit","session_id":"prompt-session",
+                    "turn_id":"t4","prompt":"最后一轮"
+                }),
+                400,
+            ))
+            .unwrap();
+        assert_eq!(
+            store.session_prompt(&session, 400, 450).unwrap().text,
+            "最后一轮"
+        );
+        drop(store);
+        let store = RuntimeStore::open(&path).unwrap();
+        assert!(store.session_prompt(&session, 0, 500).is_none());
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn a_duplicate_prompt_report_supplies_text_for_the_same_turn() {
+    let root = temp_root("duplicate-prompt");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    // Connector `turn/started` arrives first without prompt text.
+    let started = store
+        .ingest(hook(
+            Provider::Codex,
+            json!({"hook_event_name":"UserPromptSubmit","session_id":"dup-thread","turn_id":"c1"}),
+            1_000,
+        ))
+        .unwrap();
+    assert!(started.inserted);
+    assert!(store
+        .session_prompt(&started.session_id, 1_000, 1_010)
+        .is_none());
+    // The prompt Hook for the same turn is a stored duplicate but carries text.
+    let hooked = store
+        .ingest(hook(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"UserPromptSubmit","session_id":"dup-thread","turn_id":"c1",
+                "prompt":"整理发布说明"
+            }),
+            1_005,
+        ))
+        .unwrap();
+    assert!(!hooked.inserted);
+    assert_eq!(
+        store
+            .session_prompt(&started.session_id, 1_000, 1_010)
+            .unwrap()
+            .text,
+        "整理发布说明"
+    );
+    assert_eq!(store.snapshot().unwrap().sessions[0].user_turn_count, 1);
+    // A later duplicate without text does not erase it.
+    store
+        .ingest(hook(
+            Provider::Codex,
+            json!({"hook_event_name":"UserPromptSubmit","session_id":"dup-thread","turn_id":"c1"}),
+            1_006,
+        ))
+        .unwrap();
+    assert!(store
+        .session_prompt(&started.session_id, 1_000, 1_010)
+        .is_some());
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}

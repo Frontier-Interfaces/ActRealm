@@ -2695,6 +2695,7 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/companions/{id}", delete(revoke_companion))
         .route("/api/v1/companion/enroll", post(enroll_companion))
         .route("/api/v1/companion/snapshot", get(companion_snapshot))
+        .route("/api/v1/companion/history", get(companion_history))
         .route(
             "/api/v1/companion/settings/completion",
             get(companion_completion_settings).put(update_companion_completion_settings),
@@ -3573,6 +3574,77 @@ async fn companion_snapshot(State(state): State<AppState>, headers: HeaderMap) -
         .unwrap_or_else(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "STORAGE_ERROR"))
 }
 
+const COMPANION_HISTORY_DEFAULT_LIMIT: usize = 100;
+const COMPANION_HISTORY_MAX_LIMIT: usize = 200;
+
+#[derive(Debug, PartialEq, Eq)]
+struct CompanionHistoryQuery {
+    since: u64,
+    limit: usize,
+    include_side: bool,
+}
+
+/// Parses the history query by hand so that a missing or malformed value is
+/// reported as a stable API error code instead of a framework rejection.
+fn parse_companion_history_query(
+    params: &HashMap<String, String>,
+) -> Option<CompanionHistoryQuery> {
+    let since = params
+        .get("since")
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))?
+        .parse::<u64>()
+        .ok()?;
+    let limit = match params.get("limit") {
+        None => COMPANION_HISTORY_DEFAULT_LIMIT,
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|limit| (1..=COMPANION_HISTORY_MAX_LIMIT).contains(limit))?,
+    };
+    let include_side = match params.get("includeSide").map(String::as_str) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return None,
+    };
+    Some(CompanionHistoryQuery {
+        since,
+        limit,
+        include_side,
+    })
+}
+
+/// Today's tasks for a Companion: newest first, active ones included. Only
+/// bounded metadata is returned; never prompts, commands, tool input/output,
+/// transcript text, or file paths.
+async fn companion_history(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(authorization) = companion_authorization(&state, &headers) else {
+        return api_error(StatusCode::UNAUTHORIZED, "COMPANION_UNAUTHORIZED");
+    };
+    if !authorization.has_scope(COMPANION_SCOPE_SNAPSHOT) {
+        return api_error(StatusCode::FORBIDDEN, "COMPANION_SCOPE_REQUIRED");
+    }
+    let Some(query) = parse_companion_history_query(&params) else {
+        return api_error(StatusCode::BAD_REQUEST, "INVALID_HISTORY_LIMIT");
+    };
+    let now = now_millis();
+    match state
+        .store
+        .recent_tasks(query.since, query.limit, query.include_side)
+    {
+        Ok(tasks) => Json(json!({
+            "schemaVersion": 1,
+            "generatedAt": now,
+            "tasks": tasks,
+        }))
+        .into_response(),
+        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "STORAGE_ERROR"),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CompanionCompletionSettingsRequest {
@@ -3730,6 +3802,37 @@ async fn companion_session_review(
             &mut limitations,
         );
     }
+    // Same repository and base as the local review/diff route, reduced to
+    // relative paths and line counts. A baseline whose repository identity
+    // changed yields no file list, exactly like review/diff.
+    let files_root = if repository.state != "available" {
+        None
+    } else {
+        match baseline.as_ref() {
+            Some(baseline) if repository.baseline_state != "invalid" => {
+                Some(baseline.repository_root.clone())
+            }
+            Some(_) => None,
+            None => context
+                .working_directory
+                .as_deref()
+                .and_then(|working_directory| {
+                    resolve_review_repository_root(working_directory, &mut Vec::new())
+                }),
+        }
+    };
+    repository.files = Some(
+        files_root
+            .as_deref()
+            .map(|root| {
+                let base = baseline
+                    .as_ref()
+                    .and_then(|baseline| baseline.head.clone())
+                    .or_else(|| full_git_head(root));
+                review_changed_files(root, base.as_deref())
+            })
+            .unwrap_or_default(),
+    );
     let validations = timeline
         .as_ref()
         .map(|page| review_validations(&page.events))
@@ -3814,7 +3917,22 @@ async fn companion_session_result(
         .into_iter()
         .filter(|e| e.started_at >= context.turn_started_at.unwrap_or(0))
         .collect::<Vec<_>>();
-    Json(json!({ "schemaVersion": 1, "sessionId": session_id, "result": result, "activities": activities })).into_response()
+    // "What you said" for the current turn: the user's own sanitized prompt,
+    // held only in Runtime memory. A prompt from an earlier turn is never
+    // returned for the current one.
+    let prompt = context.turn_started_at.and_then(|turn_started_at| {
+        state
+            .store
+            .session_prompt(&session_id, turn_started_at, now_millis())
+    });
+    Json(json!({
+        "schemaVersion": 1,
+        "sessionId": session_id,
+        "result": result,
+        "activities": activities,
+        "prompt": prompt,
+    }))
+    .into_response()
 }
 
 #[derive(Default, Deserialize)]
@@ -4271,6 +4389,22 @@ struct ReviewRepository {
     binary_files: Option<u64>,
     attribution: String,
     attribution_reason: String,
+    /// Companion review only: up to [`REVIEW_CHANGED_FILE_LIMIT`] changed
+    /// repository-relative paths with line statistics, never file content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    files: Option<Vec<ReviewChangedFile>>,
+}
+
+const REVIEW_CHANGED_FILE_LIMIT: usize = 20;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewChangedFile {
+    path: String,
+    insertions: u64,
+    deletions: u64,
+    /// `modified`, `added`, `deleted`, `renamed`, or `untracked`.
+    status: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4596,6 +4730,139 @@ fn parse_untracked_review_paths(output: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// Lists changed files between `base` and the working tree plus untracked
+/// paths, ordered by changed line count. Only repository-relative paths and
+/// numeric statistics leave Runtime; untracked file contents are never read,
+/// so their line counts are reported as zero.
+fn review_changed_files(repository_root: &FilePath, base: Option<&str>) -> Vec<ReviewChangedFile> {
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(base) = base {
+        let statuses = run_git(
+            repository_root,
+            &[
+                "diff",
+                "--name-status",
+                "-z",
+                "-M",
+                "--no-ext-diff",
+                base,
+                "--",
+            ],
+        )
+        .map(|output| parse_git_name_status_z(&output))
+        .unwrap_or_default();
+        if let Ok(output) = run_git(
+            repository_root,
+            &["diff", "--numstat", "-z", "-M", "--no-ext-diff", base, "--"],
+        ) {
+            for (path, insertions, deletions) in parse_git_numstat_z(&output) {
+                if seen.insert(path.clone()) {
+                    let status = statuses.get(&path).copied().unwrap_or("modified");
+                    files.push(ReviewChangedFile {
+                        path,
+                        insertions,
+                        deletions,
+                        status,
+                    });
+                }
+            }
+        }
+    }
+    if let Ok(output) = run_git(
+        repository_root,
+        &["status", "--porcelain=v2", "-z", "--untracked-files=normal"],
+    ) {
+        for path in parse_untracked_review_paths(&output) {
+            if seen.insert(path.clone()) {
+                files.push(ReviewChangedFile {
+                    path,
+                    insertions: 0,
+                    deletions: 0,
+                    status: "untracked",
+                });
+            }
+        }
+    }
+    files.sort_by(|left, right| {
+        right
+            .insertions
+            .saturating_add(right.deletions)
+            .cmp(&left.insertions.saturating_add(left.deletions))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    files.truncate(REVIEW_CHANGED_FILE_LIMIT);
+    files
+}
+
+/// Parses `git diff --numstat -z`. A rename is emitted as an empty path
+/// followed by the old and new paths; the new path is reported. Binary files
+/// (`-`) count as zero lines.
+fn parse_git_numstat_z(output: &[u8]) -> Vec<(String, u64, u64)> {
+    let mut records = Vec::new();
+    let mut tokens = output.split(|byte| *byte == 0);
+    while let Some(token) = tokens.next() {
+        if token.is_empty() {
+            continue;
+        }
+        let mut fields = token.splitn(3, |byte| *byte == b'\t');
+        let (Some(insertions), Some(deletions), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let path = if path.is_empty() {
+            let _previous = tokens.next();
+            match tokens.next() {
+                Some(path) => path,
+                None => break,
+            }
+        } else {
+            path
+        };
+        if let Some(path) = safe_review_relative_path(path) {
+            records.push((
+                path,
+                parse_ascii_u64(insertions),
+                parse_ascii_u64(deletions),
+            ));
+        }
+    }
+    records
+}
+
+/// Parses `git diff --name-status -z` into the Companion status vocabulary.
+fn parse_git_name_status_z(output: &[u8]) -> HashMap<String, &'static str> {
+    let mut statuses = HashMap::new();
+    let mut tokens = output.split(|byte| *byte == 0);
+    while let Some(code) = tokens.next() {
+        let Some(&letter) = code.first() else {
+            continue;
+        };
+        let Some(first) = tokens.next() else {
+            break;
+        };
+        let path = if matches!(letter, b'R' | b'C') {
+            match tokens.next() {
+                Some(path) => path,
+                None => break,
+            }
+        } else {
+            first
+        };
+        let status = match letter {
+            b'A' | b'C' => "added",
+            b'D' => "deleted",
+            b'R' => "renamed",
+            _ => "modified",
+        };
+        if let Some(path) = safe_review_relative_path(path) {
+            statuses.insert(path, status);
+        }
+    }
+    statuses
+}
+
 fn safe_review_relative_path(value: &[u8]) -> Option<String> {
     let value = std::str::from_utf8(value).ok()?;
     if value.is_empty() || value.len() > 1_024 || value.chars().any(char::is_control) {
@@ -4742,6 +5009,7 @@ fn unavailable_review_repository(reason: &str) -> ReviewRepository {
         binary_files: None,
         attribution: "unavailable".to_owned(),
         attribution_reason: reason.to_owned(),
+        files: None,
     }
 }
 
@@ -4878,6 +5146,7 @@ fn inspect_resolved_git_repository(
         binary_files: numstat.as_ref().map(|value| value.binary_files),
         attribution: attribution.to_owned(),
         attribution_reason: attribution_reason.to_owned(),
+        files: None,
     }
 }
 
@@ -8400,6 +8669,8 @@ fn companion_snapshot_value(
             "connectorThreadStatus",
             "facts",
             "lastEventAt",
+            "userTurnCount",
+            "taskRole",
         ],
     );
     let mut sessions = sessions;
@@ -9767,6 +10038,605 @@ mod tests {
             let response = router(state.clone()).oneshot(companion_request("GET", &uri, token, Value::Null)).await.unwrap();
             assert!(json_body(response).await["result"].is_null());
         });
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn register_test_companion(state: &AppState, id: &str, token: &str, scopes: &[&str]) {
+        state
+            .companions
+            .lock()
+            .unwrap()
+            .registrations
+            .push(CompanionRegistration {
+                id: id.into(),
+                client_name: format!("{id} test"),
+                token_hash: secret_hash(token),
+                scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+                created_at: now_millis(),
+            });
+    }
+
+    fn test_git(repository: &FilePath, arguments: &[&str]) {
+        assert!(
+            ProcessCommand::new("/usr/bin/git")
+                .arg("-C")
+                .arg(repository)
+                .args([
+                    "-c",
+                    "user.name=ActRealm Test",
+                    "-c",
+                    "user.email=actrealm@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(arguments)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success(),
+            "git {arguments:?}"
+        );
+    }
+
+    fn test_git_repository(root: &FilePath) -> PathBuf {
+        let repository = root.join("repository");
+        fs::create_dir_all(&repository).unwrap();
+        assert!(ProcessCommand::new("/usr/bin/git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&repository)
+            .status()
+            .unwrap()
+            .success());
+        repository
+    }
+
+    #[test]
+    fn companion_history_is_scoped_validated_and_main_only_by_default() {
+        let root = std::env::temp_dir().join(format!("actrealm-history-api-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).unwrap();
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        let token = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let jump_only = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        register_test_companion(&state, "history-client", token, &[COMPANION_SCOPE_SNAPSHOT]);
+        register_test_companion(&state, "jump-client", jump_only, &[COMPANION_SCOPE_JUMP]);
+        let at = now_millis();
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                json!({
+                    "hook_event_name":"UserPromptSubmit","session_id":"history-main","turn_id":"h1",
+                    "cwd":root,"prompt":"PRIVATE HISTORY PROMPT","session_title":"History main task"
+                }),
+                at,
+            ))
+            .unwrap();
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                json!({"hook_event_name":"TurnInterrupted","session_id":"history-main","turn_id":"h1"}),
+                at + 1,
+            ))
+            .unwrap();
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Codex,
+                json!({
+                    "hook_event_name":"UserPromptSubmit","session_id":"history-side","turn_id":"x1",
+                    "cwd":root,"prompt":"scripted batch"
+                }),
+                at + 2,
+            ))
+            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let get = |uri: String, token: &'static str| {
+                let state = state.clone();
+                async move {
+                    router(state)
+                        .oneshot(companion_request("GET", &uri, token, Value::Null))
+                        .await
+                        .unwrap()
+                }
+            };
+            let since = at.saturating_sub(60_000);
+            let uri = format!("/api/v1/companion/history?since={since}");
+            assert_eq!(
+                get(uri.clone(), "wrong").await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+            let forbidden = get(uri.clone(), jump_only).await;
+            assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+            assert_eq!(
+                json_body(forbidden).await["error"]["code"],
+                "COMPANION_SCOPE_REQUIRED"
+            );
+            for invalid in [
+                "/api/v1/companion/history".to_owned(),
+                "/api/v1/companion/history?since=".to_owned(),
+                "/api/v1/companion/history?since=yesterday".to_owned(),
+                "/api/v1/companion/history?since=-1".to_owned(),
+                format!("/api/v1/companion/history?since={since}&limit=0"),
+                format!("/api/v1/companion/history?since={since}&limit=201"),
+                format!("/api/v1/companion/history?since={since}&includeSide=yes"),
+            ] {
+                let response = get(invalid.clone(), token).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{invalid}");
+                assert_eq!(
+                    json_body(response).await["error"]["code"],
+                    "INVALID_HISTORY_LIMIT",
+                    "{invalid}"
+                );
+            }
+
+            let response = get(uri.clone(), token).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_body(response).await;
+            assert_eq!(body["schemaVersion"], 1);
+            assert!(body["generatedAt"].as_u64().unwrap() >= at);
+            let tasks = body["tasks"].as_array().unwrap();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0]["title"], "History main task");
+            assert_eq!(tasks[0]["taskRole"], "main");
+            assert_eq!(tasks[0]["userTurnCount"], 1);
+            assert_eq!(tasks[0]["status"], "interrupted");
+            assert_eq!(tasks[0]["reviewState"], "none");
+            assert!(tasks[0]["latestAttentionKind"].is_null());
+            assert!(!body.to_string().contains("PRIVATE HISTORY PROMPT"));
+            assert!(!body.to_string().contains(root.to_string_lossy().as_ref()));
+
+            let all =
+                json_body(get(format!("{uri}&includeSide=true&limit=200"), token).await).await;
+            let roles = all["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|task| task["taskRole"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(roles, vec!["side", "main"]);
+            let later = json_body(
+                get(
+                    format!(
+                        "/api/v1/companion/history?since={}&includeSide=true",
+                        at + 2
+                    ),
+                    token,
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(later["tasks"].as_array().unwrap().len(), 1);
+
+            let snapshot =
+                json_body(get("/api/v1/companion/snapshot".to_owned(), token).await).await;
+            let sessions = snapshot["sessions"].as_array().unwrap();
+            let main = sessions
+                .iter()
+                .find(|session| session["providerTitle"] == "History main task")
+                .unwrap();
+            assert_eq!(main["userTurnCount"], 1);
+            assert_eq!(main["taskRole"], "main");
+            assert_eq!(main["execState"], "idle");
+            assert_eq!(
+                main["activityMessage"]["code"],
+                "session.activity.interrupted"
+            );
+            let side = sessions
+                .iter()
+                .find(|session| session["provider"] == "codex")
+                .unwrap();
+            assert_eq!(side["userTurnCount"], 1);
+            assert_eq!(side["taskRole"], "side");
+            assert!(snapshot["attention"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["kind"] != "error"));
+        });
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn companion_result_returns_only_the_current_turn_prompt() {
+        let root = std::env::temp_dir().join(format!("actrealm-prompt-api-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).unwrap();
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        let token = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        register_test_companion(&state, "prompt-client", token, &[COMPANION_SCOPE_SNAPSHOT]);
+        let at = now_millis();
+        let session = store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                json!({
+                    "hook_event_name":"UserPromptSubmit","session_id":"prompt-api","turn_id":"p1",
+                    "cwd":root,"prompt":"改按钮。\n把结算页的按钮改成圆角\napi_key=sk-live-should-never-leave"
+                }),
+                at,
+            ))
+            .unwrap()
+            .session_id;
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                json!({
+                    "hook_event_name":"Stop","session_id":"prompt-api","turn_id":"p1",
+                    "last_assistant_message":"按钮已改成圆角。"
+                }),
+                at + 1,
+            ))
+            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let uri = format!("/api/v1/companion/sessions/{session}/result");
+            let response = router(state.clone())
+                .oneshot(companion_request("GET", &uri, token, Value::Null))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_body(response).await;
+            assert_eq!(body["prompt"]["text"], "改按钮。\n把结算页的按钮改成圆角");
+            assert_eq!(body["prompt"]["truncated"], true);
+            assert_eq!(body["prompt"]["observedAt"], at);
+            assert!(!body.to_string().contains("sk-live"));
+            assert!(body["result"]["summary"].as_str().unwrap().contains("圆角"));
+
+            let snapshot = router(state.clone())
+                .oneshot(companion_request("GET", "/api/v1/companion/snapshot", token, Value::Null))
+                .await
+                .unwrap();
+            // Only the pre-existing first-sentence task title reaches the
+            // snapshot; the rest of the prompt does not.
+            let snapshot = json_body(snapshot).await.to_string();
+            assert!(!snapshot.contains("结算页"));
+            assert!(!snapshot.contains("sk-live"));
+
+            // A later turn without prompt text never shows the earlier prompt.
+            store
+                .ingest(BridgeRequest::from_hook_at(
+                    Provider::Claude,
+                    json!({"hook_event_name":"UserPromptSubmit","session_id":"prompt-api","turn_id":"p2"}),
+                    at + 2,
+                ))
+                .unwrap();
+            let body = json_body(
+                router(state.clone())
+                    .oneshot(companion_request("GET", &uri, token, Value::Null))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert!(body["prompt"].is_null());
+            assert!(body.get("prompt").is_some());
+        });
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn companion_review_lists_changed_files_without_content() {
+        let root = std::env::temp_dir().join(format!("actrealm-review-files-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).unwrap();
+        let repository = test_git_repository(&root);
+        fs::write(repository.join("app.txt"), "one\ntwo\nthree\n").unwrap();
+        fs::write(repository.join("obsolete.txt"), "gone\n").unwrap();
+        fs::write(
+            repository.join("old-name.txt"),
+            "stable line 1\nstable line 2\nstable line 3\nstable line 4\n",
+        )
+        .unwrap();
+        test_git(&repository, &["add", "."]);
+        test_git(&repository, &["commit", "-q", "-m", "baseline"]);
+        fs::write(
+            repository.join("app.txt"),
+            "one\nSECRET FILE CONTENT\nthree\nfour\nfive\n",
+        )
+        .unwrap();
+        fs::remove_file(repository.join("obsolete.txt")).unwrap();
+        test_git(&repository, &["mv", "old-name.txt", "new-name.txt"]);
+        fs::write(repository.join("added.txt"), "fresh\n").unwrap();
+        test_git(&repository, &["add", "added.txt"]);
+        fs::write(repository.join("scratch.txt"), "UNTRACKED CONTENT\n").unwrap();
+        fs::write(root.join("outside.txt"), "outside").unwrap();
+
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        let token = "abababababababababababababababababababababababababababababababab";
+        register_test_companion(&state, "review-client", token, &[COMPANION_SCOPE_SNAPSHOT]);
+        let session = store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Codex,
+                json!({
+                    "hook_event_name":"UserPromptSubmit","session_id":"review-files","turn_id":"r1",
+                    "cwd":repository,"prompt":"edit"
+                }),
+                now_millis(),
+            ))
+            .unwrap()
+            .session_id;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let response = router(state.clone())
+                .oneshot(companion_request(
+                    "GET",
+                    &format!("/api/v1/companion/sessions/{session}/review"),
+                    token,
+                    Value::Null,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let review = json_body(response).await;
+            let files = review["repository"]["files"].as_array().unwrap();
+            let summary = files
+                .iter()
+                .map(|file| {
+                    (
+                        file["path"].as_str().unwrap().to_owned(),
+                        file["insertions"].as_u64().unwrap(),
+                        file["deletions"].as_u64().unwrap(),
+                        file["status"].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                summary,
+                vec![
+                    ("app.txt".to_owned(), 3, 1, "modified".to_owned()),
+                    ("added.txt".to_owned(), 1, 0, "added".to_owned()),
+                    ("obsolete.txt".to_owned(), 0, 1, "deleted".to_owned()),
+                    ("new-name.txt".to_owned(), 0, 0, "renamed".to_owned()),
+                    ("scratch.txt".to_owned(), 0, 0, "untracked".to_owned()),
+                ]
+            );
+            let encoded = review.to_string();
+            assert!(!encoded.contains("SECRET FILE CONTENT"));
+            assert!(!encoded.contains("UNTRACKED CONTENT"));
+            assert!(!encoded.contains("outside"));
+            assert!(!encoded.contains(repository.to_string_lossy().as_ref()));
+        });
+
+        // The local review route keeps its existing shape.
+        {
+            let mut auth = state.auth.lock().unwrap();
+            auth.bootstrap_token = None;
+            auth.session_token = Some("test-session".to_owned());
+            auth.csrf_token = Some("test-csrf".to_owned());
+        }
+        rt.block_on(async {
+            let local = router(state.clone())
+                .oneshot(authorized_request(
+                    "GET",
+                    &format!("/api/v1/sessions/{session}/review"),
+                    Value::Null,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(local.status(), StatusCode::OK);
+            assert!(json_body(local).await["repository"].get("files").is_none());
+        });
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn review_changed_files_are_ranked_by_changed_lines_and_bounded() {
+        let root = std::env::temp_dir().join(format!("actrealm-review-rank-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).unwrap();
+        let repository = test_git_repository(&root);
+        for index in 0..25 {
+            fs::write(repository.join(format!("file-{index:02}.txt")), "base\n").unwrap();
+        }
+        test_git(&repository, &["add", "."]);
+        test_git(&repository, &["commit", "-q", "-m", "baseline"]);
+        for index in 0..25 {
+            fs::write(
+                repository.join(format!("file-{index:02}.txt")),
+                "base\n".to_owned() + &"line\n".repeat(index + 1),
+            )
+            .unwrap();
+        }
+        let head = full_git_head(&repository).unwrap();
+        let files = review_changed_files(&repository, Some(&head));
+        assert_eq!(files.len(), REVIEW_CHANGED_FILE_LIMIT);
+        assert_eq!(files[0].path, "file-24.txt");
+        assert_eq!(files[0].insertions, 25);
+        assert_eq!(files[19].path, "file-05.txt");
+        assert!(files.iter().all(|file| file.status == "modified"));
+        assert!(review_changed_files(&root.join("missing"), Some(&head)).is_empty());
+
+        let numstat =
+            parse_git_numstat_z(b"3\t1\tapp.txt\0-\t-\tlogo.png\x000\t0\t\0old.txt\0new.txt\0");
+        assert_eq!(
+            numstat,
+            vec![
+                ("app.txt".to_owned(), 3, 1),
+                ("logo.png".to_owned(), 0, 0),
+                ("new.txt".to_owned(), 0, 0),
+            ]
+        );
+        assert!(parse_git_numstat_z(b"1\t0\t../escape.txt\0").is_empty());
+        let statuses = parse_git_name_status_z(
+            b"M\0app.txt\0R090\0old.txt\0new.txt\0A\0a.txt\0D\0d.txt\0C075\0x\0y\0",
+        );
+        assert_eq!(statuses["app.txt"], "modified");
+        assert_eq!(statuses["new.txt"], "renamed");
+        assert_eq!(statuses["a.txt"], "added");
+        assert_eq!(statuses["d.txt"], "deleted");
+        assert_eq!(statuses["y"], "added");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Writes the real Companion responses that Display decodes in its own
+    /// tests. Set ACTREALM_CONTRACT_SAMPLE_DIR to export them; otherwise the
+    /// test only verifies the combined shape.
+    #[test]
+    fn companion_contract_samples_cover_display_agent_fields() {
+        let root = std::env::temp_dir().join(format!("actrealm-contract-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).unwrap();
+        let repository = test_git_repository(&root);
+        fs::write(
+            repository.join("Checkout.swift"),
+            "let radius = 4\nlet color = .blue\n",
+        )
+        .unwrap();
+        fs::write(repository.join("Legacy.swift"), "// legacy\n").unwrap();
+        test_git(&repository, &["add", "."]);
+        test_git(&repository, &["commit", "-q", "-m", "baseline"]);
+        fs::write(
+            repository.join("Checkout.swift"),
+            "let radius = 12\nlet color = .blue\nlet shadow = true\n",
+        )
+        .unwrap();
+        fs::remove_file(repository.join("Legacy.swift")).unwrap();
+        fs::write(repository.join("CheckoutTests.swift"), "// new test\n").unwrap();
+
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        let token = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        register_test_companion(
+            &state,
+            "display-contract",
+            token,
+            &[COMPANION_SCOPE_SNAPSHOT, COMPANION_SCOPE_JUMP],
+        );
+        let at = now_millis();
+        let main_session = store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                json!({
+                    "hook_event_name":"UserPromptSubmit","session_id":"contract-main","turn_id":"m1",
+                    "cwd":repository,"prompt":"把结算页按钮改成 12 圆角，并补一个测试",
+                    "session_title":"Checkout button polish"
+                }),
+                at,
+            ))
+            .unwrap()
+            .session_id;
+        for (offset, event) in [(10, "PreToolUse"), (20, "PostToolUse")] {
+            store
+                .ingest(BridgeRequest::from_hook_at(
+                    Provider::Claude,
+                    json!({
+                        "hook_event_name":event,"session_id":"contract-main","turn_id":"m1",
+                        "cwd":repository,"tool_name":"Edit","tool_use_id":"edit-1",
+                        "tool_input":{"file_path":repository.join("Checkout.swift")}
+                    }),
+                    at + offset,
+                ))
+                .unwrap();
+        }
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                json!({
+                    "hook_event_name":"Stop","session_id":"contract-main","turn_id":"m1",
+                    "cwd":repository,
+                    "last_assistant_message":"按钮圆角已改为 12，并新增 CheckoutTests。"
+                }),
+                at + 30,
+            ))
+            .unwrap();
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Codex,
+                json!({
+                    "hook_event_name":"UserPromptSubmit","session_id":"contract-side","turn_id":"s1",
+                    "cwd":repository,"prompt":"scripted lint batch"
+                }),
+                at + 40,
+            ))
+            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let samples = rt.block_on(async {
+            let mut samples = Vec::new();
+            for (name, uri) in [
+                ("snapshot.json", "/api/v1/companion/snapshot".to_owned()),
+                (
+                    "history.json",
+                    format!(
+                        "/api/v1/companion/history?since={}&limit=100&includeSide=true",
+                        at.saturating_sub(60_000)
+                    ),
+                ),
+                (
+                    "result.json",
+                    format!("/api/v1/companion/sessions/{main_session}/result"),
+                ),
+                (
+                    "review.json",
+                    format!("/api/v1/companion/sessions/{main_session}/review"),
+                ),
+            ] {
+                let response = router(state.clone())
+                    .oneshot(companion_request("GET", &uri, token, Value::Null))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{name}");
+                samples.push((name, json_body(response).await));
+            }
+            samples
+        });
+        let sample = |name: &str| &samples.iter().find(|(file, _)| *file == name).unwrap().1;
+        let main = sample("snapshot.json")["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == main_session.as_str())
+            .unwrap()
+            .clone();
+        assert_eq!(main["taskRole"], "main");
+        assert_eq!(main["userTurnCount"], 1);
+        let history = sample("history.json")["tasks"].as_array().unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1]["reviewState"], "unseen");
+        assert_eq!(history[1]["latestAttentionKind"], "completion");
+        assert_eq!(history[0]["taskRole"], "side");
+        assert_eq!(
+            sample("result.json")["prompt"]["text"],
+            "把结算页按钮改成 12 圆角，并补一个测试"
+        );
+        let files = sample("review.json")["repository"]["files"]
+            .as_array()
+            .unwrap();
+        assert_eq!(files[0]["path"], "Checkout.swift");
+        assert!(files.iter().any(|file| file["status"] == "deleted"));
+        assert!(files.iter().any(|file| file["status"] == "untracked"));
+        for (_, body) in &samples {
+            assert!(!body
+                .to_string()
+                .contains(repository.to_string_lossy().as_ref()));
+        }
+        if let Some(directory) = std::env::var_os("ACTREALM_CONTRACT_SAMPLE_DIR") {
+            let directory = PathBuf::from(directory);
+            fs::create_dir_all(&directory).unwrap();
+            for (name, body) in &samples {
+                fs::write(
+                    directory.join(name),
+                    serde_json::to_string_pretty(body).unwrap() + "\n",
+                )
+                .unwrap();
+            }
+        }
         drop(state);
         drop(store);
         fs::remove_dir_all(root).unwrap();

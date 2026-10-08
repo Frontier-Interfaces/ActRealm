@@ -10,6 +10,7 @@ use uuid::Uuid;
 const TTL: u64 = 24 * 60 * 60 * 1000;
 const MAX_RESULTS: usize = 128;
 const MAX_SOURCE: usize = 32 * 1024;
+const MAX_PROMPT_CHARS: usize = 2_000;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,10 +36,23 @@ pub struct SessionResult {
     pub artifacts: Vec<ResultArtifact>,
 }
 
+/// The user's own prompt for the current turn, sanitized and bounded. Like
+/// [`SessionResult`], it lives only in Runtime memory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPrompt {
+    pub text: String,
+    /// The Provider prompt was longer than the bound, or lines that looked
+    /// like credentials were removed.
+    pub truncated: bool,
+    pub observed_at: u64,
+}
+
 #[derive(Default)]
 pub(crate) struct OutcomeRegistry {
     entries: HashMap<String, SessionResult>,
     started_at: HashMap<String, u64>,
+    prompts: HashMap<String, SessionPrompt>,
 }
 
 impl OutcomeRegistry {
@@ -137,6 +151,43 @@ impl OutcomeRegistry {
         Some(result)
     }
 
+    /// Replaces the prompt of the session's previous turn. A turn whose
+    /// Provider did not expose prompt text (or whose text was entirely
+    /// redacted) leaves no prompt behind.
+    pub fn observe_prompt(&mut self, session: &str, text: Option<&str>, at: u64) {
+        self.prune(at);
+        if self
+            .prompts
+            .get(session)
+            .is_some_and(|prompt| prompt.observed_at > at)
+        {
+            return;
+        }
+        match text.and_then(sanitize_prompt) {
+            Some((text, truncated)) => {
+                self.prompts.insert(
+                    session.to_owned(),
+                    SessionPrompt {
+                        text,
+                        truncated,
+                        observed_at: at,
+                    },
+                );
+            }
+            None => {
+                self.prompts.remove(session);
+            }
+        }
+    }
+
+    pub fn get_prompt(&mut self, session: &str, start: u64, now: u64) -> Option<SessionPrompt> {
+        self.prune(now);
+        self.prompts
+            .get(session)
+            .filter(|prompt| prompt.observed_at >= start)
+            .cloned()
+    }
+
     pub fn reveal_path(
         &mut self,
         session: &str,
@@ -154,6 +205,19 @@ impl OutcomeRegistry {
     fn prune(&mut self, now: u64) {
         self.entries
             .retain(|_, r| now.saturating_sub(r.observed_at) <= TTL);
+        self.prompts
+            .retain(|_, p| now.saturating_sub(p.observed_at) <= TTL);
+        while self.prompts.len() >= MAX_RESULTS {
+            let Some(key) = self
+                .prompts
+                .iter()
+                .min_by_key(|(_, p)| p.observed_at)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            self.prompts.remove(&key);
+        }
         self.started_at
             .retain(|_, at| now.saturating_sub(*at) <= TTL);
         while self.entries.len() >= MAX_RESULTS {
@@ -171,6 +235,35 @@ impl OutcomeRegistry {
             self.started_at.clear();
         }
     }
+}
+
+/// Applies the Runtime result sanitizer line by line: lines carrying
+/// credentials are dropped, paths/URLs/hosts/emails are replaced by
+/// placeholders, and the result is bounded to [`MAX_PROMPT_CHARS`].
+fn sanitize_prompt(text: &str) -> Option<(String, bool)> {
+    let raw: String = text.chars().take(MAX_SOURCE).collect();
+    let mut truncated = raw.len() < text.len();
+    if raw.to_ascii_lowercase().contains("private key-----") {
+        return None;
+    }
+    let mut lines = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match sanitize_result_text(line) {
+            Ok(safe) if !safe.is_empty() => lines.push(safe),
+            Ok(_) => {}
+            Err(_) => truncated = true,
+        }
+    }
+    let joined = lines.join("\n");
+    if joined.chars().count() > MAX_PROMPT_CHARS {
+        truncated = true;
+    }
+    let bounded: String = joined.chars().take(MAX_PROMPT_CHARS).collect();
+    (!bounded.is_empty()).then_some((bounded, truncated))
 }
 
 fn extract_links(raw: &str) -> (String, Vec<String>) {
@@ -310,6 +403,28 @@ mod tests {
         r.observe("s", "Old result", None, 250, "hook:Stop");
         assert!(r.get("s", 300, 400).is_none());
     }
+    #[test]
+    fn prompts_are_sanitized_bounded_and_never_regress_to_an_older_turn() {
+        let mut r = OutcomeRegistry::default();
+        r.observe_prompt("s", Some("第一行\n\n  第二行  \ntoken=abc123"), 100);
+        let prompt = r.get_prompt("s", 100, 110).unwrap();
+        assert_eq!(prompt.text, "第一行\n第二行");
+        assert!(prompt.truncated);
+        r.observe_prompt("s", Some("较早的一轮"), 50);
+        assert_eq!(r.get_prompt("s", 0, 110).unwrap().text, "第一行\n第二行");
+        r.observe_prompt(
+            "s",
+            Some("-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----"),
+            200,
+        );
+        assert!(r.get_prompt("s", 0, 210).is_none());
+        r.observe_prompt("s", Some("短句"), 300);
+        let prompt = r.get_prompt("s", 300, 310).unwrap();
+        assert_eq!(prompt.text, "短句");
+        assert!(!prompt.truncated);
+        assert!(r.get_prompt("s", 0, 300 + TTL + 1).is_none());
+    }
+
     #[test]
     fn files_require_existing_local_targets_and_revalidate_identity() {
         let root = std::env::temp_dir().join(format!("actrealm-result-{}", Uuid::now_v7()));
