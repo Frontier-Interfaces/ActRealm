@@ -6,6 +6,18 @@ published a final v1 release; entries below describe development milestones on
 
 ## Unreleased - M14 accepted candidate
 
+### Post-P0 - Companion task roles, history and turn context
+
+- Adds additive Companion fields for the Display Agent page without changing
+  `protocolVersion` 7: snapshot sessions report `userTurnCount` and a
+  `main`/`side` `taskRole`; `GET /api/v1/companion/history` lists recently
+  active tasks with status and review state; the result envelope carries the
+  current turn's sanitized, memory-only `prompt`; the Companion review lists up
+  to 20 changed files with line counts and no content.
+- A user interruption no longer counts as a failure: the session idles with
+  the existing `session.activity.interrupted` message and no `error`
+  Attention. `StopFailure` is unchanged.
+
 ### Post-P0 - OUTBOX lifecycle and quota recovery
 
 - Keeps Codex Desktop native permission requests in OUTBOX across the

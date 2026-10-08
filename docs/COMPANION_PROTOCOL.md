@@ -100,6 +100,7 @@ All requests except enrollment use `Authorization: Bearer <token>`.
 | Endpoint | Required scope | Meaning |
 | --- | --- | --- |
 | `GET /api/v1/companion/snapshot` | `snapshot.read` | Sanitized sessions, attention, quota, stats and effective capabilities |
+| `GET /api/v1/companion/history` | `snapshot.read` | Recently active tasks (bounded metadata only); see "Task roles, history and turn context" |
 | `GET /api/v1/companion/settings/completion` | `snapshot.read` | Read the completion-task retention mode and configured delay |
 | `PUT /api/v1/companion/settings/completion` | `attention.respond` | Update only the completion-task retention mode and delay; all other settings remain unchanged |
 | `GET /api/v1/companion/sessions/{id}/activity` | `snapshot.read` | Bounded, sanitized activity for the current turn; accepts `limit=1...100` and an optional `afterIngestSequence` cursor |
@@ -280,3 +281,58 @@ Session `managedConnectionState` carries the Runtime automatic-connection status
 versions and non-Codex providers. This observation never grants response scope
 or substitutes for a live request channel. `tokenUsage` remains the Runtime
 aggregation; partial history must not be presented as complete account usage.
+
+## Task roles, history and turn context
+
+These are additive v7 fields; `protocolVersion` and every schema version stay
+unchanged, and existing fields keep their meaning.
+
+Each snapshot session carries `userTurnCount` and `taskRole`. `userTurnCount`
+counts turns opened by a user prompt submission (`UserPromptSubmit`,
+`BeforeAgent` or a Connector `turn/started`, stored as `prompt.submitted`);
+turns that Runtime opened implicitly for a late tool or lifecycle event are not
+counted. `taskRole` is `main` when the session has a non-empty Provider title,
+at least one user turn, and is not an ignored internal session; otherwise it is
+`side` (script-launched runs, untitled sessions, forks without user turns).
+
+A user interruption (`TurnInterrupted`) ends the turn without counting as a
+failure: the session becomes `idle` with `activityMessage`
+`session.activity.interrupted`, no `error` Attention is raised, and the turn is
+recorded as `interrupted`. `StopFailure` still produces `failed` and an `error`
+Attention. A new prompt in the same session resolves that session's earlier
+open or snoozed `completion` and `error` Attention with resolution
+`superseded_by_activity`.
+
+`GET /api/v1/companion/history?since=<epoch ms>&limit=<1..200, default
+100>&includeSide=<true|false, default false>` returns `{schemaVersion: 1,
+generatedAt, tasks}` ordered by `lastEventAt` descending, limited to sessions
+whose `lastEventAt >= since`, including active ones. A missing or malformed
+`since`, `limit` or `includeSide` is rejected with HTTP 400
+`INVALID_HISTORY_LIMIT`. Without `includeSide=true` only `main` tasks are
+returned. Each task contains `id`, `provider`, `project`, `title` (Provider
+title first), `taskRole`, `userTurnCount`, `status` (`running`, `waiting`,
+`completed`, `interrupted` or `failed`), `startedAt`, `lastEventAt`,
+`completedAt` (end of the latest turn), `branch`, `validationState`,
+`reviewState`, `latestAttentionKind` (`completion`, `error` or null),
+`jumpCapability` and `jumpLabel`. `reviewState` is `unseen` while the latest
+completion/error Attention is open and unacknowledged, `seen` once it was
+acknowledged, snoozed or closed, and `none` when there was none. No prompt,
+reply, command or file path is included.
+
+The result envelope adds `prompt: null | {text, truncated, observedAt}`: the
+user's own prompt for the current turn, taken from the prompt Hook (`prompt`
+or `user_prompt`). It is sanitized with the same line-level result sanitizer
+(credential lines removed, paths/URLs/hosts/emails replaced by placeholders),
+bounded to 2,000 characters, and `truncated` is true when text was cut or a
+line was removed. Like result excerpts it is held only in Runtime memory, is
+replaced by the next turn, is never written to SQLite, spool, exports or
+snapshots, and is lost when Runtime restarts. A prompt from an earlier turn is
+never returned for the current one.
+
+The Companion review adds `repository.files`: at most 20 changed files from
+the same repository and base as the local review/diff route, ordered by changed
+lines (`insertions + deletions`) descending. Each entry is `{path, insertions,
+deletions, status}` with a repository-relative path and status `modified`,
+`added`, `deleted`, `renamed` or `untracked`. Untracked file contents are never
+read, so their line counts are zero. File contents and patches are never
+returned; the local `/api/v1/sessions/{id}/review` response is unchanged.
