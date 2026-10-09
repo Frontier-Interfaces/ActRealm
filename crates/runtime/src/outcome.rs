@@ -99,11 +99,15 @@ impl OutcomeRegistry {
         let mut fenced: Option<&str> = None;
         let mut lines = Vec::new();
         let mut filter = CredentialLineFilter::default();
+        // Anything not shown (a skipped code block, lines past the limit)
+        // marks the excerpt truncated, so the reader knows to look further.
+        let mut omitted = false;
         for line in plain.lines() {
             if let Some(fence) = code_fence(line.trim_start()) {
                 match fenced {
                     None => {
                         fenced = Some(fence);
+                        omitted = true;
                         filter.skipped_code_block();
                     }
                     Some(open) if open == fence => fenced = None,
@@ -122,16 +126,19 @@ impl OutcomeRegistry {
                 continue;
             }
             if let Some(safe) = filter.filter_line(indent, &line, list_item) {
+                if lines.len() >= MAX_RESULT_LINES {
+                    omitted = true;
+                    break;
+                }
                 lines.push(safe);
-            }
-            if lines.len() >= MAX_RESULT_LINES {
-                break;
             }
         }
         let joined = lines.join("\n");
         let mut summary: String = joined.chars().take(MAX_RESULT_CHARS).collect();
-        let mut truncated =
-            filter.removed || joined.chars().count() > MAX_RESULT_CHARS || raw.len() < text.len();
+        let mut truncated = filter.removed
+            || omitted
+            || joined.chars().count() > MAX_RESULT_CHARS
+            || raw.len() < text.len();
         // The known-format detection runs once more over the whole excerpt.
         if sanitize_result_text(&summary).is_err() {
             summary.clear();
@@ -2527,6 +2534,18 @@ mod tests {
         let result = r.get("t", 0, 220).unwrap();
         assert_eq!(result.summary.lines().count(), MAX_RESULT_LINES);
         assert!(result.summary.chars().count() <= MAX_RESULT_CHARS);
+        assert!(result.truncated, "lines past the limit are not shown");
+
+        r.observe(
+            "u",
+            "改好了\n```\nlet x = 1;\n```\n跑过测试",
+            None,
+            300,
+            "hook:Stop",
+        );
+        let result = r.get("u", 0, 320).unwrap();
+        assert_eq!(result.summary, "改好了\n跑过测试");
+        assert!(result.truncated, "a skipped code block is not shown");
     }
 
     #[test]
