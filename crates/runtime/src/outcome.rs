@@ -11,6 +11,10 @@ const TTL: u64 = 24 * 60 * 60 * 1000;
 const MAX_RESULTS: usize = 128;
 const MAX_SOURCE: usize = 32 * 1024;
 const MAX_PROMPT_CHARS: usize = 2_000;
+/// Enough for a short answer to be read in full on the desk screen, which
+/// scrolls; a long report still sends the reader back to the conversation.
+const MAX_RESULT_LINES: usize = 60;
+const MAX_RESULT_CHARS: usize = 4_000;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -120,14 +124,14 @@ impl OutcomeRegistry {
             if let Some(safe) = filter.filter_line(indent, &line, list_item) {
                 lines.push(safe);
             }
-            if lines.len() >= 5 {
+            if lines.len() >= MAX_RESULT_LINES {
                 break;
             }
         }
         let joined = lines.join("\n");
-        let mut summary: String = joined.chars().take(600).collect();
+        let mut summary: String = joined.chars().take(MAX_RESULT_CHARS).collect();
         let mut truncated =
-            filter.removed || joined.chars().count() > 600 || raw.len() < text.len();
+            filter.removed || joined.chars().count() > MAX_RESULT_CHARS || raw.len() < text.len();
         // The known-format detection runs once more over the whole excerpt.
         if sanitize_result_text(&summary).is_err() {
             summary.clear();
@@ -2501,6 +2505,28 @@ mod tests {
         let result = r.get("s", 0, 620).unwrap();
         assert_eq!(result.summary, "配置：\nuser: app\n其余完成");
         assert!(result.truncated);
+    }
+
+    #[test]
+    fn result_excerpts_keep_a_short_answer_in_full() {
+        let mut r = OutcomeRegistry::default();
+        let answer = (1..=12)
+            .map(|n| format!("第 {n} 步：检查配置并记录结果"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        r.observe("s", &answer, None, 100, "hook:Stop");
+        let result = r.get("s", 0, 120).unwrap();
+        assert_eq!(result.summary, answer);
+        assert!(!result.truncated);
+
+        let long = (1..=80)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        r.observe("t", &long, None, 200, "hook:Stop");
+        let result = r.get("t", 0, 220).unwrap();
+        assert_eq!(result.summary.lines().count(), MAX_RESULT_LINES);
+        assert!(result.summary.chars().count() <= MAX_RESULT_CHARS);
     }
 
     #[test]

@@ -8,6 +8,10 @@ published a final v1 release; entries below describe development milestones on
 
 ### Post-P0 - Companion task roles, history and turn context
 
+- Companion result excerpts keep up to the first 60 non-empty lines and 4,000
+  characters (was 5 lines and 600 characters), so a short answer can be read
+  in full on the Display desk screen. Code blocks are still skipped and every
+  line still passes the credential filter.
 - Adds additive Companion fields for the Display Agent page without changing
   `protocolVersion` 7: snapshot sessions report `userTurnCount` and a
   `main`/`side` `taskRole`; `GET /api/v1/companion/history` lists recently

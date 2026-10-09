@@ -214,7 +214,9 @@ endpoint is exactly loopback HTTP. Tokens are never written to discovery.
 summary, truncated, artifacts}}`. It is available only for the latest ended or
 failed turn. A new turn invalidates old results. `source` identifies Stop Hook
 text or a final Codex response; the text is Provider-reported, not independent
-verification of the claims inside it. Each excerpt has at most 600 characters.
+verification of the claims inside it. Each excerpt keeps at most the first 60
+non-empty lines and 4,000 characters (code blocks are skipped), so a short
+answer can be read in full on a scrolling desk screen.
 The excerpt goes through the same credential line filter as the turn prompt
 (see the `prompt` field below): credential lines and the value line after a
 bare label are removed, the known secret formats are checked per line and over
