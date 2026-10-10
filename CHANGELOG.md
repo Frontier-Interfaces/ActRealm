@@ -8,6 +8,14 @@ published a final v1 release; entries below describe development milestones on
 
 ### Post-P0 - Companion task roles, history and turn context
 
+- Session project labels name the repository: a directory inside a worktree
+  folder `<Repo>.worktrees/<name>` (or `<Repo>/.worktrees/<name>`) is
+  labelled `<Repo>`, and a generic last folder (`main`, `master`, `trunk`,
+  `develop`, `dev`, `src`, `app`, `repo`, `workspace`, `worktree`, `code`) is
+  replaced by its parent's name, never climbing to the home directory or
+  above. Existing sessions and their Attention items are relabelled when the
+  Runtime opens its database. See `docs/COMPANION_PROTOCOL.md`, "Project
+  labels".
 - A Claude Code `Stop` keeps a session running only for background work that
   is still active: a `background_tasks` or `session_crons` item counts when
   its `status` is `running`, `pending`, `queued`, `in_progress` or `started`

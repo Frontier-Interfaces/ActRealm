@@ -4893,6 +4893,7 @@ fn initialize(connection: &mut Connection) -> Result<(), StoreError> {
     suppress_existing_codex_internal_sessions(connection)?;
     remove_internal_context_task_titles(connection)?;
     normalize_existing_task_title_whitespace(connection)?;
+    refresh_session_project_labels(connection)?;
     connection
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(storage_error)?;
@@ -14047,8 +14048,63 @@ fn jump_descriptor(
     ("unsupported".to_owned(), "Jump is not supported".to_owned())
 }
 
-fn project_name(path: &str) -> Option<&str> {
-    Path::new(path).file_name().and_then(|value| value.to_str())
+/// The project label for a working directory; see [`crate::project`].
+fn project_name(path: &str) -> Option<String> {
+    crate::project::project_label(path, home_directory().as_deref())
+}
+
+fn home_directory() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Re-derives every session's project label from its working directory, so
+/// sessions recorded under an older rule (a worktree shown as `main`) show
+/// the current label, and updates their Attention items to match. Only rows
+/// whose label changes are written.
+fn refresh_session_project_labels(connection: &mut Connection) -> Result<(), StoreError> {
+    let changed = {
+        let mut statement = connection
+            .prepare("SELECT id, cwd, project FROM sessions WHERE cwd IS NOT NULL")
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+        rows.into_iter()
+            .filter_map(|(id, cwd, project)| {
+                let label = project_name(&cwd);
+                (label != project).then_some((id, label))
+            })
+            .collect::<Vec<_>>()
+    };
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let transaction = connection.transaction().map_err(storage_error)?;
+    for (id, project) in &changed {
+        transaction
+            .execute(
+                "UPDATE sessions SET project = ?2 WHERE id = ?1",
+                params![id, project],
+            )
+            .map_err(storage_error)?;
+        transaction
+            .execute(
+                "UPDATE attention_items SET project = ?2 WHERE session_id = ?1",
+                params![id, project],
+            )
+            .map_err(storage_error)?;
+    }
+    transaction.commit().map_err(storage_error)
 }
 
 fn storage_error(error: rusqlite::Error) -> StoreError {
@@ -15101,6 +15157,49 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn opening_relabels_worktree_sessions_and_their_attention() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO sessions(
+                   id, provider, provider_session_id, cwd, project, exec_state,
+                   started_at, last_event_at
+                 ) VALUES
+                   ('worktree', 'claude', 'a', '/srv/ActRealm/Display.worktrees/main',
+                    'main', 'thinking', 1, 1),
+                   ('plain', 'claude', 'b', '/srv/ActRealm', 'ActRealm', 'idle', 1, 1),
+                   ('no-cwd', 'claude', 'c', NULL, 'kept', 'idle', 1, 1);
+                 INSERT INTO attention_items(
+                   id, session_id, provider, project, kind, title, risk, risk_notes,
+                   dedupe_key, state, created_at
+                 ) VALUES (
+                   'completion', 'worktree', 'claude', 'main', 'completion', 'Done',
+                   'unknown', '[]', 'completion-key', 'open', 1
+                 );",
+            )
+            .unwrap();
+
+        initialize(&mut connection).unwrap();
+        let project = |table: &str, id: &str| {
+            connection
+                .query_row(
+                    &format!("SELECT project FROM {table} WHERE id = ?1"),
+                    [id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(project("sessions", "worktree").as_deref(), Some("Display"));
+        assert_eq!(
+            project("attention_items", "completion").as_deref(),
+            Some("Display")
+        );
+        assert_eq!(project("sessions", "plain").as_deref(), Some("ActRealm"));
+        assert_eq!(project("sessions", "no-cwd").as_deref(), Some("kept"));
     }
 
     #[test]

@@ -182,6 +182,26 @@ It excludes raw prompts, complete commands, tool input/output, file contents,
 transcripts, answers, secrets, Hook payloads, Provider reply channels, private
 jump locators, Web credentials, Cloud credentials, and Provider cookies.
 
+## Project labels
+
+The `project` of a session (and of its Attention items and history task) is a
+label derived from the session's working directory so that the user can
+recognise the repository; it is a label, never a path. A directory inside a
+git worktree folder `<Repo>.worktrees/<name>`, or inside
+`<Repo>/.worktrees/<name>`, at any depth, is labelled `<Repo>`
+(`~/ActRealm/Display.worktrees/main` is `Display`). Otherwise the label is the
+last folder name, except that a generic folder or branch name (`main`,
+`master`, `trunk`, `develop`, `dev`, `src`, `app`, `repo`, `workspace`,
+`worktree`, `code`, any case) is replaced by its parent folder's name, again
+while that name is generic: `~/code/foo/main` is `foo`, `~/proj/app/src` is
+`proj`, `~/work/ActRealm` stays `ActRealm`. The label never climbs to the home
+directory or above it (`~/code` and `~/main` keep their names, and the home
+directory keeps its own), and outside the home directory never to a top-level
+folder (`/tmp/main` stays `main`). Runtime re-derives the label of every
+recorded session when it opens its database, so sessions recorded under the
+earlier last-folder rule, including a live one, show the new label after the
+Runtime restarts.
+
 ## Runtime restart discovery
 
 At startup the Runtime atomically writes:

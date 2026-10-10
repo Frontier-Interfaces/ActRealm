@@ -3999,6 +3999,30 @@ fn a_codex_turn_end_from_the_session_file_carries_the_reply_judgement() {
 }
 
 #[test]
+fn a_worktree_session_is_labelled_with_its_repository() {
+    let root = temp_root("worktree-project");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let mut raw = json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "worktree-session",
+        "cwd": "/tmp/ActRealm/Display.worktrees/main",
+        "prompt": "check"
+    });
+    store
+        .ingest(hook(Provider::Claude, raw.clone(), 1_000))
+        .unwrap();
+    raw["hook_event_name"] = json!("PermissionRequest");
+    raw["tool_name"] = json!("Bash");
+    raw["tool_input"] = json!({"command": "git push"});
+    store.ingest(hook(Provider::Claude, raw, 1_100)).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.sessions[0].project.as_deref(), Some("Display"));
+    assert_eq!(snapshot.attention[0].project.as_deref(), Some("Display"));
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn factual_error_question_and_completion_attention_support_local_actions() {
     let root = temp_root("attention-kinds");
     let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
