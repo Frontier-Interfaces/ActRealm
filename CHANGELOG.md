@@ -8,6 +8,11 @@ published a final v1 release; entries below describe development milestones on
 
 ### Post-P0 - Companion task roles, history and turn context
 
+- Prompts Claude Code injects for a subagent report (`<agent-message>`), a
+  background task event (`<task-notification>`) or a system note
+  (`<system-reminder>`) no longer become the session's task title or the
+  turn's "you said" text; titles already stored that way are cleared when the
+  Runtime opens its database.
 - Session project labels name the repository: a directory inside a worktree
   folder `<Repo>.worktrees/<name>` (or `<Repo>/.worktrees/<name>`) is
   labelled `<Repo>`, and a generic last folder (`main`, `master`, `trunk`,

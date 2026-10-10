@@ -1310,6 +1310,7 @@ impl RuntimeStore {
                 .or_else(|| request.raw.get("user_prompt"))
                 .and_then(Value::as_str)
                 .map(user_visible_prompt)
+                .filter(|prompt| !prompt.is_empty())
         })
         .flatten();
         let (reply, receiver) = mpsc::sync_channel(1);
@@ -12859,12 +12860,17 @@ fn first_task_title_sentence(normalized: &str) -> &str {
 /// summary. These envelopes are transport metadata rather than user-authored
 /// prompt content and must never become the visible task title.
 fn user_visible_prompt(prompt: &str) -> String {
-    const INTERNAL_ENVELOPES: [(&str, &str); 5] = [
+    const INTERNAL_ENVELOPES: [(&str, &str); 8] = [
         ("<in-app-browser-context", "</in-app-browser-context>"),
         ("<environment_context", "</environment_context>"),
         ("<app-context", "</app-context>"),
         ("<source_thread_id", "</source_thread_id>"),
         ("<source_turn_id", "</source_turn_id>"),
+        // Claude Code delivers subagent reports, background task events and
+        // system notes as prompts; none of them is the user's request.
+        ("<agent-message", "</agent-message>"),
+        ("<task-notification", "</task-notification>"),
+        ("<system-reminder", "</system-reminder>"),
     ];
     const REQUEST_MARKER: &str = "## My request:";
 
@@ -12926,7 +12932,10 @@ fn remove_internal_context_task_titles(connection: &Connection) -> Result<(), St
                 OR title LIKE '<codex_delegation%'
                 OR title LIKE '<source_thread_id%'
                 OR title LIKE '<environment_context%'
-                OR title LIKE '<app-context%'",
+                OR title LIKE '<app-context%'
+                OR title LIKE '<agent-message%'
+                OR title LIKE '<task-notification%'
+                OR title LIKE '<system-reminder%'",
             [],
         )
         .map(|_| ())
@@ -15578,6 +15587,28 @@ mod tests {
             ),
             None
         );
+        for injected in [
+            "<agent-message from=\"a60b\">\n[Subagent hand-back] Report.\n</agent-message>",
+            "<task-notification>\n<task-id>b1</task-id>\n</task-notification>",
+            "<system-reminder>\nnote\n</system-reminder>",
+        ] {
+            assert_eq!(
+                super::task_title(
+                    &json!({ "prompt": injected }),
+                    actrealm_core::EventKind::PromptSubmitted
+                ),
+                None,
+                "{injected}"
+            );
+        }
+        assert_eq!(
+            super::task_title(
+                &json!({"prompt":"<system-reminder>note</system-reminder>\n整理发布说明。然后提交"}),
+                actrealm_core::EventKind::PromptSubmitted
+            )
+            .as_deref(),
+            Some("整理发布说明。")
+        );
     }
 
     #[test]
@@ -15601,6 +15632,12 @@ mod tests {
                  INSERT INTO sessions(
                    id, provider, provider_session_id, title, exec_state,
                    started_at, last_event_at
+                 ) VALUES ('agent-message-title', 'claude', 'agent-message-title',
+                           '<agent-message from=a60b> [Subagent hand-back] Th…',
+                           'idle', 1, 1);
+                 INSERT INTO sessions(
+                   id, provider, provider_session_id, title, exec_state,
+                   started_at, last_event_at
                  ) VALUES ('safe-title', 'codex', 'safe-title',
                            'ActRealm H2.4 真实验收', 'idle', 1, 1);
                  INSERT INTO sessions(
@@ -15615,12 +15652,13 @@ mod tests {
         let removed = connection
             .query_row(
                 "SELECT COUNT(*) FROM sessions
-                 WHERE id IN ('context-title', 'delegation-title') AND title IS NULL",
+                 WHERE id IN ('context-title', 'delegation-title', 'agent-message-title')
+                   AND title IS NULL",
                 [],
                 |row| row.get::<_, i64>(0),
             )
             .unwrap();
-        assert_eq!(removed, 2);
+        assert_eq!(removed, 3);
         let safe = connection
             .query_row(
                 "SELECT title FROM sessions WHERE id = 'safe-title'",
