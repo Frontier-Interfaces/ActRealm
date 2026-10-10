@@ -18,6 +18,7 @@ use actrealm_runtime::{
     ReviewBaselineCandidate, ReviewBaselineInput, ReviewBaselineRecord, RuntimeStore,
     SessionRecord, SessionSeen, SessionUsageRecord, StoreError, TaskCheckpointInput,
     TaskCheckpointRecord, TaskHistoryMutation, TimelineEventKind, WaiterError, WaiterRegistry,
+    CODEX_FINAL_ANSWER_AWAITS_REPLY,
 };
 use actrealm_usage::{PricingStatus, UsageCollector, UsagePaths, UsageRecord};
 use axum::body::Body;
@@ -945,6 +946,10 @@ struct CodexManagerState {
     rate_limits_captured_at: Option<u64>,
     rate_limits_error: Option<String>,
     credential_change_handled: bool,
+    /// Per thread, from the last `item/completed` final answer until its
+    /// turn ends: the turn ID and whether that answer awaits a reply. The
+    /// answer text itself is not kept here.
+    final_answer_awaits_reply: HashMap<String, (Option<String>, bool)>,
 }
 
 fn begin_codex_credential_reconnect(state: &mut CodexManagerState) -> bool {
@@ -1977,9 +1982,50 @@ fn rpc_id_key(id: &Value) -> String {
         .unwrap_or_else(|| id.to_string())
 }
 
-fn ingest_codex_provider_events(store: &RuntimeStore, notification: &ServerNotification) {
-    for request in codex_notification_events(notification, now_millis()) {
+fn ingest_codex_provider_events(
+    store: &RuntimeStore,
+    state: &Arc<Mutex<CodexManagerState>>,
+    notification: &ServerNotification,
+) {
+    let mut requests = codex_notification_events(notification, now_millis());
+    if notification.method == "turn/completed" {
+        attach_final_answer_judgement(state, notification, &mut requests);
+    }
+    for request in requests {
         let _ = store.ingest(request);
+    }
+}
+
+/// A Connector `turn/completed` carries no answer text (its `turn.items` is
+/// empty), so the `Stop` built from it takes the judgement recorded for the
+/// turn's final answer when that answer arrived (`item/completed`).
+fn attach_final_answer_judgement(
+    state: &Arc<Mutex<CodexManagerState>>,
+    notification: &ServerNotification,
+    requests: &mut [BridgeRequest],
+) {
+    let Some(thread_id) = notification.params.get("threadId").and_then(Value::as_str) else {
+        return;
+    };
+    let Some((answer_turn, awaits_reply)) = state
+        .lock()
+        .ok()
+        .and_then(|mut current| current.final_answer_awaits_reply.remove(thread_id))
+    else {
+        return;
+    };
+    let turn = notification
+        .params
+        .pointer("/turn/id")
+        .and_then(Value::as_str);
+    if answer_turn.is_some() && turn.is_some() && answer_turn.as_deref() != turn {
+        return;
+    }
+    for request in requests
+        .iter_mut()
+        .filter(|request| request.event_name() == Some("Stop"))
+    {
+        request.raw[CODEX_FINAL_ANSWER_AWAITS_REPLY] = Value::Bool(awaits_reply);
     }
 }
 
@@ -2225,7 +2271,7 @@ fn update_codex_notification(
         update_codex_rate_limits(state, &notification.params, observed_at);
         return;
     }
-    ingest_codex_provider_events(store, &notification);
+    ingest_codex_provider_events(store, state, &notification);
     if notification.method == "serverRequest/resolved" {
         if let Some(id) = notification.params.get("requestId") {
             if let Ok(mut current) = state.lock() {
@@ -2268,6 +2314,15 @@ fn update_codex_notification(
         let item = &notification.params["item"];
         if item["type"] == "agentMessage" && item["phase"] == "final_answer" {
             if let Some(text) = item["text"].as_str() {
+                let awaits_reply = actrealm_runtime::message_awaits_reply(text);
+                if let Ok(mut current) = state.lock() {
+                    let turn = notification.params["turnId"]
+                        .as_str()
+                        .map(ToOwned::to_owned);
+                    current
+                        .final_answer_awaits_reply
+                        .insert(thread_id.clone(), (turn, awaits_reply));
+                }
                 if let Ok(snapshot) = store.snapshot() {
                     if let Some(session) = snapshot
                         .sessions
@@ -2335,6 +2390,12 @@ fn update_codex_notification(
             current
                 .async_questions
                 .clear_thread(&thread_id, observed_at);
+            current.final_answer_awaits_reply.remove(&thread_id);
+        }
+    }
+    if notification.method == "thread/closed" {
+        if let Ok(mut current) = state.lock() {
+            current.final_answer_awaits_reply.remove(&thread_id);
         }
     }
 
@@ -9017,6 +9078,7 @@ fn companion_snapshot_value(
             "reminderAcknowledgedAt",
             "reminderResolution",
             "retainAfterAck",
+            "awaitsReply",
             "createdAt",
             "resolution",
             "interaction",
@@ -9357,10 +9419,11 @@ fn observe_codex_questions(state: &AppState, scanner: &mut QuestionScanner) {
                     turn_id,
                     event,
                     at,
+                    awaits_reply,
                 } => {
                     if state
                         .store
-                        .observe_codex_turn_end(&thread_id, &turn_id, event, at)
+                        .observe_codex_turn_end(&thread_id, &turn_id, event, at, awaits_reply)
                         .unwrap_or(false)
                     {
                         current.async_questions.clear_thread(&thread_id, at);
@@ -11114,7 +11177,7 @@ mod tests {
                 json!({
                     "hook_event_name":"Stop","session_id":"contract-main","turn_id":"m1",
                     "cwd":repository,
-                    "last_assistant_message":"按钮圆角已改为 12，并新增 CheckoutTests。"
+                    "last_assistant_message":"按钮圆角已改为 12，并新增 CheckoutTests。\n\n要提交的话说一声。"
                 }),
                 at + 30,
             ))
@@ -11172,6 +11235,14 @@ mod tests {
             .clone();
         assert_eq!(main["taskRole"], "main");
         assert_eq!(main["userTurnCount"], 1);
+        let completion = sample("snapshot.json")["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["sessionId"] == main_session.as_str() && item["kind"] == "completion")
+            .unwrap()
+            .clone();
+        assert_eq!(completion["awaitsReply"], true);
         let history = sample("history.json")["tasks"].as_array().unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(history[1]["reviewState"], "unseen");
@@ -15646,6 +15717,79 @@ done
         assert_eq!(resolved.sessions[0].exec_state, "thinking");
         assert_eq!(resolved.sessions[0].approval_owner, None);
 
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_connector_turn_end_takes_the_final_answer_reply_judgement() {
+        let root = std::env::temp_dir().join(format!(
+            "actrealm-server-connector-awaits-reply-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = Arc::new(Mutex::new(CodexManagerState::default()));
+        let waiters = WaiterRegistry::default();
+        let notify = |method: &str, params: Value| {
+            update_codex_notification(
+                &state,
+                &store,
+                &waiters,
+                ServerNotification {
+                    method: method.to_owned(),
+                    params,
+                },
+            );
+        };
+        for (thread, answer_turn, answer, expected) in [
+            ("asks", "turn-1", "Tests pass. Should I push?", true),
+            ("asks-zh", "turn-1", "测试都过了。要提交的话说一声。", true),
+            ("reports", "turn-1", "Done, all tests pass.", false),
+            // A final answer recorded for another turn is not this turn's.
+            ("stale", "turn-0", "Should I push?", false),
+        ] {
+            notify(
+                "turn/started",
+                json!({"threadId": thread, "turn": {"id": "turn-1"}}),
+            );
+            notify(
+                "item/completed",
+                json!({
+                    "threadId": thread, "turnId": answer_turn,
+                    "item": {"type": "agentMessage", "id": "answer", "phase": "final_answer", "text": answer}
+                }),
+            );
+            notify(
+                "turn/completed",
+                json!({"threadId": thread, "turn": {"id": "turn-1", "status": "completed", "items": []}}),
+            );
+            let snapshot = store.snapshot().unwrap();
+            let session = snapshot
+                .sessions
+                .iter()
+                .find(|session| session.provider_session_id == thread)
+                .unwrap();
+            assert_eq!(session.exec_state, "response_finished", "{thread}");
+            let completion = snapshot
+                .attention
+                .iter()
+                .find(|item| item.session_id == session.id && item.kind == "completion")
+                .unwrap();
+            assert_eq!(completion.awaits_reply, expected, "{thread}");
+            // The answer stays the Codex final response; the Stop built from
+            // `turn/completed` does not observe it again as Hook text.
+            if answer_turn == "turn-1" {
+                assert_eq!(
+                    store
+                        .session_result(&session.id, 0, now_millis())
+                        .unwrap()
+                        .source,
+                    "codex:app_server_final"
+                );
+            }
+        }
+        assert!(state.lock().unwrap().final_answer_awaits_reply.is_empty());
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }

@@ -199,6 +199,9 @@ pub(crate) enum Observation {
         turn_id: String,
         event: &'static str,
         at: u64,
+        /// Whether the turn's final answer asks the user something. Only
+        /// this judgement leaves the scanner, never the answer text.
+        awaits_reply: bool,
     },
     Activity(ObservedActivity),
     Question(QuestionBatch),
@@ -389,11 +392,16 @@ impl QuestionScanner {
             Some("turn_aborted" | "task_aborted") => "TurnInterrupted",
             _ => return,
         };
+        let awaits_reply = event == "Stop"
+            && payload["last_agent_message"]
+                .as_str()
+                .is_some_and(actrealm_runtime::message_awaits_reply);
         out.push(Observation::TurnEnded {
             thread_id: thread.to_owned(),
             turn_id: turn_id.to_owned(),
             event,
             at,
+            awaits_reply,
         });
     }
 
@@ -877,7 +885,7 @@ mod lifecycle_tests {
             &mut out,
         );
         assert!(
-            matches!(&out[0], Observation::TurnEnded { thread_id, turn_id, event: "StopFailure", at: 1000 } if thread_id == "thread" && turn_id == "turn")
+            matches!(&out[0], Observation::TurnEnded { thread_id, turn_id, event: "StopFailure", at: 1000, awaits_reply: false } if thread_id == "thread" && turn_id == "turn")
         );
         QuestionScanner::record_lifecycle(
             &json!({"type":"event_msg","payload":{
@@ -901,5 +909,42 @@ mod lifecycle_tests {
             &mut out,
         );
         assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn a_completed_turn_reports_whether_its_final_answer_awaits_a_reply() {
+        let mut out = Vec::new();
+        for (turn, message) in [
+            ("asks", Some("测试都过了。要不要我顺便提交？")),
+            ("reports", Some("All tests pass.")),
+            ("silent", None),
+        ] {
+            let mut payload = json!({"type":"task_complete","turn_id":turn});
+            if let Some(message) = message {
+                payload["last_agent_message"] = json!(message);
+            }
+            QuestionScanner::record_lifecycle(
+                &json!({"type":"event_msg","payload":payload}),
+                "thread",
+                1000,
+                &mut out,
+            );
+        }
+        let flags = out
+            .iter()
+            .map(|observation| match observation {
+                Observation::TurnEnded {
+                    turn_id,
+                    event: "Stop",
+                    awaits_reply,
+                    ..
+                } => (turn_id.as_str(), *awaits_reply),
+                _ => panic!("unexpected observation"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            flags,
+            [("asks", true), ("reports", false), ("silent", false)]
+        );
     }
 }

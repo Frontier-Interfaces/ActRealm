@@ -3779,13 +3779,13 @@ fn subagent_counts_and_background_stop_state_are_fact_based() {
 }
 
 /// Ends a Claude turn that read a file with `stop` and returns the session's
-/// execution state and activity, whether it raised a completion Attention, and
-/// the state the turn ended in.
+/// execution state and activity, its completion Attention (and whether that
+/// awaits a reply), and the state the turn ended in.
 fn stop_after_work(
     root: &std::path::Path,
     session: &str,
     stop: Value,
-) -> (String, Option<String>, bool, String) {
+) -> (String, Option<String>, Option<bool>, String) {
     let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
     ingest_tool_turn(&store, Provider::Claude, session, "t1", 1_000);
     let mut stop = stop;
@@ -3803,7 +3803,8 @@ fn stop_after_work(
     let completion = snapshot
         .attention
         .iter()
-        .any(|item| item.session_id == stopped.session_id && item.kind == "completion");
+        .find(|item| item.session_id == stopped.session_id && item.kind == "completion")
+        .map(|item| item.awaits_reply);
     let (exec_state, activity) = (state.exec_state.clone(), state.activity.clone());
     drop(store);
     let turn_state = Connection::open(root.join("data.sqlite"))
@@ -3844,7 +3845,7 @@ fn only_running_background_work_keeps_a_stopped_turn_running() {
     );
     assert_eq!(state, "response_finished");
     assert_eq!(activity.as_deref(), Some("Turn completed"));
-    assert!(completion);
+    assert_eq!(completion, Some(false));
     assert_eq!(turn, "response_finished");
 
     // One running task still holds the completion back.
@@ -3868,7 +3869,7 @@ fn only_running_background_work_keeps_a_stopped_turn_running() {
             Some("1 background tasks still running"),
             "{status}"
         );
-        assert!(!completion, "{status}");
+        assert_eq!(completion, None, "{status}");
     }
 
     // A mixed list counts only the running ones; an item without a status
@@ -3892,7 +3893,7 @@ fn only_running_background_work_keeps_a_stopped_turn_running() {
         activity.as_deref(),
         Some("3 background tasks still running")
     );
-    assert!(!completion);
+    assert_eq!(completion, None);
 
     // A cron job alone keeps the old behaviour.
     let (state, _, completion, _) = stop_after_work(
@@ -3903,7 +3904,97 @@ fn only_running_background_work_keeps_a_stopped_turn_running() {
             "session_crons": [{"id": "cron", "schedule": "*/5 * * * *", "recurring": true, "prompt": "loop"}]
         }),
     );
-    assert_eq!((state.as_str(), completion), ("tool_running", false));
+    assert_eq!((state.as_str(), completion), ("tool_running", None));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_final_question_marks_the_completion_as_awaiting_a_reply() {
+    let root = temp_root("awaits-reply");
+    // A question with nothing left running.
+    let (state, _, completion, turn) = stop_after_work(
+        &root,
+        "question",
+        json!({"last_assistant_message": "测试都过了。\n\n要提交的话说一声。"}),
+    );
+    assert_eq!(
+        (state.as_str(), completion, turn.as_str()),
+        ("response_finished", Some(true), "response_finished")
+    );
+
+    // A plain report.
+    let (_, _, completion, _) = stop_after_work(
+        &root,
+        "report",
+        json!({"last_assistant_message": "已完成，测试全部通过。"}),
+    );
+    assert_eq!(completion, Some(false));
+
+    // A question while a background task still runs: the user is needed, so
+    // the completion is raised; the session keeps reporting the running work.
+    let (state, activity, completion, _) = stop_after_work(
+        &root,
+        "question-background",
+        json!({
+            "last_assistant_message": "Build is still running in the background. Should I push once it is green?",
+            "background_tasks": [{"id": "bg", "type": "shell", "status": "running"}],
+            "session_crons": []
+        }),
+    );
+    assert_eq!(state, "tool_running");
+    assert_eq!(
+        activity.as_deref(),
+        Some("1 background tasks still running")
+    );
+    assert_eq!(completion, Some(true));
+
+    // Without a question the running task still holds the completion back.
+    let (_, _, completion, _) = stop_after_work(
+        &root,
+        "report-background",
+        json!({
+            "last_assistant_message": "Started the build in the background.",
+            "background_tasks": [{"id": "bg", "type": "shell", "status": "running"}]
+        }),
+    );
+    assert_eq!(completion, None);
+
+    // A question inside a code block is not addressed to the user.
+    let (_, _, completion, _) = stop_after_work(
+        &root,
+        "code-question",
+        json!({"last_assistant_message": "已完成。\n\n```\nfoo?\n```"}),
+    );
+    assert_eq!(completion, Some(false));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_codex_turn_end_from_the_session_file_carries_the_reply_judgement() {
+    let root = temp_root("codex-file-awaits-reply");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    for (thread, awaits_reply) in [("asks", true), ("reports", false)] {
+        ingest_tool_turn(&store, Provider::Codex, thread, "turn-1", 1_000);
+        assert!(store
+            .observe_codex_turn_end(thread, "turn-1", "Stop", 2_000, awaits_reply)
+            .unwrap());
+    }
+    let snapshot = store.snapshot().unwrap();
+    for (thread, awaits_reply) in [("asks", true), ("reports", false)] {
+        let session = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.provider_session_id == thread)
+            .unwrap();
+        assert_eq!(session.exec_state, "response_finished");
+        let completion = snapshot
+            .attention
+            .iter()
+            .find(|item| item.session_id == session.id && item.kind == "completion")
+            .unwrap();
+        assert_eq!(completion.awaits_reply, awaits_reply, "{thread}");
+    }
+    drop(store);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -5386,19 +5477,19 @@ fn codex_rollout_terminal_events_repair_only_the_matching_current_turn() {
         ))
         .unwrap();
     assert!(!store
-        .observe_codex_turn_end("thread", "older-turn", "StopFailure", 2000)
+        .observe_codex_turn_end("thread", "older-turn", "StopFailure", 2000, false)
         .unwrap());
     assert!(!store
-        .observe_codex_turn_end("thread", "turn-1", "StopFailure", 999)
+        .observe_codex_turn_end("thread", "turn-1", "StopFailure", 999, false)
         .unwrap());
     assert!(store
-        .observe_codex_turn_end("thread", "turn-1", "StopFailure", 2000)
+        .observe_codex_turn_end("thread", "turn-1", "StopFailure", 2000, false)
         .unwrap());
     let failed = &store.snapshot().unwrap().sessions[0];
     assert_eq!(failed.exec_state, "failed");
     assert_eq!(failed.turn_ended_at, Some(2000));
     assert!(!store
-        .observe_codex_turn_end("thread", "turn-1", "StopFailure", 2000)
+        .observe_codex_turn_end("thread", "turn-1", "StopFailure", 2000, false)
         .unwrap());
     store
         .ingest(request_at(
@@ -5411,11 +5502,11 @@ fn codex_rollout_terminal_events_repair_only_the_matching_current_turn() {
         ))
         .unwrap();
     assert!(!store
-        .observe_codex_turn_end("thread", "turn-1", "Stop", 4000)
+        .observe_codex_turn_end("thread", "turn-1", "Stop", 4000, false)
         .unwrap());
     assert_eq!(store.snapshot().unwrap().sessions[0].exec_state, "thinking");
     assert!(store
-        .observe_codex_turn_end("thread", "turn-2", "Stop", 4000)
+        .observe_codex_turn_end("thread", "turn-2", "Stop", 4000, false)
         .unwrap());
     assert_eq!(
         store.snapshot().unwrap().sessions[0].exec_state,

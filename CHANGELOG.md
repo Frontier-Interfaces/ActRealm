@@ -14,6 +14,16 @@ published a final v1 release; entries below describe development milestones on
   (any case) or when it has no status; finished items (`completed`, `failed`,
   `killed`, `stopped`, `cancelled`, `done`, ...) no longer hold back the
   completion, and "N background tasks still running" counts active items only.
+- Companion snapshot Attention items gain `awaitsReply`: `true` on a
+  completion whose turn ended with a final Agent message that asks the user
+  something (a final `?`/`？`, the particles `吗`/`呢`, phrases such as
+  `要不要`, `说一声`, `告诉我`, `should I`, `let me know`), judged
+  conservatively on the last sentence of the last prose paragraph with code
+  blocks, quotes and inline code ignored. Such a completion is raised even
+  while background work keeps running. The judgement comes from the Claude
+  Code and Codex `Stop` Hooks, the Codex Connector's final answer and the
+  Codex session file; only the flag is stored (new `attention_items.awaits_reply`
+  column, added on open). See `docs/COMPANION_PROTOCOL.md`, "Turn end".
 - Companion result excerpts keep up to the first 60 non-empty lines and 4,000
   characters (was 5 lines and 600 characters), so a short answer can be read
   in full on the Display desk screen. Code blocks are still skipped and every

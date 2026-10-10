@@ -6,6 +6,7 @@ pub use agent_connection::{handle_agent_connection_event, wait_for_agent_reply};
 mod fsutil;
 mod instance;
 mod outcome;
+mod reply;
 mod sanitize;
 mod spool;
 mod storage;
@@ -18,6 +19,7 @@ pub use diagnostics::{
 };
 pub use instance::{InstanceError, RuntimeInstanceGuard};
 pub use outcome::{ResultArtifact, SessionPrompt, SessionResult};
+pub use reply::message_awaits_reply;
 pub use spool::{default_spool_path, EventSpool, SpoolError};
 pub use storage::{
     default_database_path, ApprovalAction, AttentionAction, AttentionRecord, ClaimResult,
@@ -28,7 +30,7 @@ pub use storage::{
     TaskCheckpointInput, TaskCheckpointRecord, TaskHistoryMutation, TaskHistoryRecord,
     TimelineContextAvailability, TimelineEventKind, TimelineEventRecord, TimelinePage,
     TimelineRiskLevel, TokenUsageBurnRate, TokenUsageDecisionSummary, TokenUsageProjectTotal,
-    TokenUsageTaskTotal,
+    TokenUsageTaskTotal, CODEX_FINAL_ANSWER_AWAITS_REPLY,
 };
 pub use waiter::{
     InteractiveOption, InteractivePrompt, InteractiveQuestion, RegisterResult, WaiterError,

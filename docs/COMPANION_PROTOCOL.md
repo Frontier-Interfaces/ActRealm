@@ -569,7 +569,10 @@ working directory, baseline, concurrent sessions) are the same and one
 `git status --branch` probe still matches HEAD, branch and working tree status
 exactly; otherwise it is recomputed.
 
-## Turn end: background work
+## Turn end: background work and awaiting a reply
+
+These are additive v7 fields; `protocolVersion` and every schema version stay
+unchanged, and existing fields keep their meaning.
 
 A Provider `Stop` ends the turn as `response_finished` and, when the turn held
 real work, raises a `completion` Attention. Claude Code also reports the
@@ -585,3 +588,56 @@ session stays `tool_running` with `activityMessage`
 active items only, no completion is raised, and active subagents stay active.
 The turn itself is still recorded as `response_finished`.
 
+Snapshot Attention items carry `awaitsReply` (boolean, `false` by default). It
+is `true` on a `completion` whose turn ended with a final Agent message that
+asks the user something: the Agent has stopped and waits for the user's
+answer. Such a completion is raised even while active background work remains,
+because the user is needed either way; the session then keeps reporting the
+running work (`tool_running`, `background_tasks_running`), and `awaitsReply` is
+what tells the client the next move is the user's. Without a question the
+background rule above applies unchanged. Every other Attention kind, and a
+completion raised without a final message (a Codex native approval that ends a
+turn, a `Stop` replayed from the offline spool, which never keeps message
+text), is `false`. Only the judgement is stored; the message text stays where
+result excerpts keep it (Runtime memory) and is never written to SQLite.
+
+The message comes from the Claude Code or Codex `Stop` Hook
+(`last_assistant_message`), from the Codex Connector (the turn's last
+`final_answer` agent message, judged when `item/completed` delivers it and
+applied to that turn's `turn/completed`, whose `turn.items` is empty), or from
+the Codex session file (`task_complete.last_agent_message`). Whichever of these
+ends the turn first decides; a later report of the same turn is a duplicate.
+
+The judgement is conservative and only looks at the end of the message:
+
+1. Fenced code blocks (three or more backticks or tildes; an unclosed fence
+   runs to the end), headings, horizontal rules, table rows and block quotes
+   are dropped. In the remaining lines, list markers, task boxes, emphasis
+   markers, inline code spans, bare URLs and link targets are removed (a link
+   keeps its text), so a question inside backticks never counts.
+2. The last non-empty line that remains is the end of the last prose
+   paragraph. Its last sentence starts after the last `.`, `!`, `?` or `;`
+   followed by whitespace, or after any `。`, `！`, `？`, `；` or `…`.
+3. The sentence awaits a reply when it ends with `?` or `？` (closing quotes,
+   brackets, emphasis or emoji after the mark are ignored); when it ends with
+   the particle `吗` or `呢`; when it contains `要不要`, `选哪`, `说一声`,
+   `可以吗`, `好吗` or `行吗`; `你选`/`您选`, `告诉我`, `你决定`/`您决定`
+   unless `的`, `了` or `过` follows (`你选的方案`, `你告诉我的路径`); `是否`
+   at the start of a clause or in a clause that opens with `你`, `您`, `请`,
+   `麻烦` or `帮我` (`请确认是否合并`, not `我检查了是否有遗漏`); `确认一下`
+   unless the clause has `我` without addressing the user (`我再确认一下`);
+   `要我` at the start of a clause only (not `不需要我`); or, case-insensitive
+   and between non-letters, `should I`, `shall I`, `do you want`,
+   `would you like`, `would you prefer`, `do you prefer`, `let me know`,
+   `please confirm`, `can you`, `could you`, `which one(s)`, `which option(s)`,
+   `which approach`, `which do you` or `which would you` (a bare `which` is
+   usually a relative pronoun and does not count). Phrases are looked for in
+   the last 2,048 bytes of the sentence.
+
+Questions earlier in the message do not count (`要不要提交？` followed by a
+paragraph `已经提交并推送了。` is `false`), and neither does a conditional
+offer without an explicit request: `你要是也觉得没用，我一并删掉。`,
+`如果需要，我可以再加测试。` and `If you want, I can also add tests.` are
+`false`, while `要提交的话说一声。`, `需要的话告诉我。` and
+`Let me know if you want it pushed.` are `true`. `已完成，测试全部通过。` and a message that is only a code
+block (`foo?` inside a fence) are `false`; `Should I push?` is `true`.

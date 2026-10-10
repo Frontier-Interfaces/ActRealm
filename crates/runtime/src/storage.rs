@@ -567,6 +567,10 @@ pub struct AttentionRecord {
     pub reminder_resolution: Option<String>,
     #[serde(default)]
     pub retain_after_ack: bool,
+    /// A completion whose final Agent message asks the user something: the
+    /// Agent ended its turn and waits for the user's answer.
+    #[serde(default)]
+    pub awaits_reply: bool,
     pub created_at: u64,
     pub resolution: Option<String>,
     #[serde(default)]
@@ -1059,6 +1063,7 @@ enum StoreMessage {
         turn_id: String,
         event: String,
         at: u64,
+        awaits_reply: bool,
         reply: mpsc::SyncSender<Result<bool, StoreError>>,
     },
     MarkExecutionUnconfirmed {
@@ -1514,12 +1519,16 @@ impl RuntimeStore {
         receive(receiver)
     }
 
+    /// Ends a Codex turn that the session-file observer saw end. `awaits_reply`
+    /// tells whether the turn's final answer (`last_agent_message`) asks the
+    /// user something; see [`crate::message_awaits_reply`].
     pub fn observe_codex_turn_end(
         &self,
         thread_id: &str,
         turn_id: &str,
         event: &str,
         at: u64,
+        awaits_reply: bool,
     ) -> Result<bool, StoreError> {
         let (reply, receiver) = mpsc::sync_channel(1);
         self.send(StoreMessage::ObserveCodexTurnEnd {
@@ -1527,6 +1536,7 @@ impl RuntimeStore {
             turn_id: turn_id.into(),
             event: event.into(),
             at,
+            awaits_reply,
             reply,
         })?;
         receive(receiver)
@@ -2440,14 +2450,18 @@ fn writer_loop(
                 turn_id,
                 event,
                 at,
+                awaits_reply,
                 reply,
             } => {
                 let _ = reply.send(observe_codex_turn_end_transaction(
                     &mut connection,
-                    &thread_id,
-                    &turn_id,
-                    &event,
-                    at,
+                    CodexTurnEnd {
+                        thread_id: &thread_id,
+                        turn_id: &turn_id,
+                        event: &event,
+                        at,
+                        awaits_reply,
+                    },
                     completion_hide_policy,
                 ));
             }
@@ -4660,6 +4674,7 @@ fn initialize(connection: &mut Connection) -> Result<(), StoreError> {
               expires_at INTEGER, auto_hide_at INTEGER,
               reminder_acknowledged_at INTEGER, reminder_resolution TEXT,
               retain_after_ack INTEGER NOT NULL DEFAULT 0,
+              awaits_reply INTEGER NOT NULL DEFAULT 0,
               created_at INTEGER NOT NULL,
               resolved_at INTEGER, resolution TEXT,
               remote_actionable INTEGER NOT NULL DEFAULT 0,
@@ -4870,6 +4885,7 @@ fn initialize(connection: &mut Connection) -> Result<(), StoreError> {
     ensure_attention_auto_hide_column(connection)?;
     ensure_attention_reminder_columns(connection)?;
     ensure_attention_retention_column(connection)?;
+    ensure_attention_awaits_reply_column(connection)?;
     ensure_command_commit_delay_column(connection)?;
     ensure_session_task_visibility_columns(connection)?;
     normalize_legacy_subagent_rows(connection)?;
@@ -5763,6 +5779,27 @@ fn ensure_attention_retention_column(connection: &Connection) -> Result<(), Stor
     Ok(())
 }
 
+fn ensure_attention_awaits_reply_column(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(attention_items)")
+        .map_err(storage_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    drop(statement);
+    if !columns.iter().any(|column| column == "awaits_reply") {
+        connection
+            .execute(
+                "ALTER TABLE attention_items ADD COLUMN awaits_reply INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(storage_error)?;
+    }
+    Ok(())
+}
+
 fn ensure_session_task_visibility_columns(connection: &Connection) -> Result<(), StoreError> {
     let mut statement = connection
         .prepare("PRAGMA table_info(sessions)")
@@ -6125,9 +6162,13 @@ fn ingest_transaction(
         .map(|turn_id| turn_contains_meaningful_activity(&transaction, turn_id))
         .transpose()?
         .unwrap_or(false);
-    // A turn that leaves active background work behind is not complete yet.
-    let completed_without_background =
-        parsed.kind == EventKind::Stopped && active_background_work(&request.raw) == 0;
+    // A turn whose final message asks the user something needs the user even
+    // while background work keeps running; otherwise a turn that leaves
+    // active background work behind is not complete yet.
+    let stop_awaits_reply =
+        parsed.kind == EventKind::Stopped && final_message_awaits_reply(&request.raw);
+    let stop_raises_completion = parsed.kind == EventKind::Stopped
+        && (stop_awaits_reply || active_background_work(&request.raw) == 0);
     let plan_progress = update_plan_progress(
         &transaction,
         &session_id,
@@ -6222,6 +6263,7 @@ fn ingest_transaction(
                         .request_id
                         .map(|id| format!("interactive:{id}"))
                         .unwrap_or_else(|| format!("interactive:{}", request.id)),
+                    awaits_reply: false,
                 },
                 CompletionTaskHidePolicy::AfterConfirmation,
             )?)
@@ -6241,6 +6283,7 @@ fn ingest_transaction(
                     turn_id.as_deref().unwrap_or("none"),
                     request.id
                 ),
+                awaits_reply: false,
             },
             CompletionTaskHidePolicy::AfterConfirmation,
         )?),
@@ -6272,12 +6315,13 @@ fn ingest_transaction(
                             .map(ToOwned::to_owned)
                             .unwrap_or_else(|| request.id.to_string())
                     ),
+                    awaits_reply: false,
                 },
                 CompletionTaskHidePolicy::AfterConfirmation,
             )?)
         }
         EventKind::Stopped
-            if completed_without_background
+            if stop_raises_completion
                 && turn_has_meaningful_activity
                 && !native_permission_open =>
         {
@@ -6295,6 +6339,7 @@ fn ingest_transaction(
                         session_id,
                         turn_id.as_deref().unwrap_or("none")
                     ),
+                    awaits_reply: stop_awaits_reply,
                 },
                 completion_hide_policy,
             )?)
@@ -7437,14 +7482,26 @@ fn release_session_if_unblocked(
     Ok(())
 }
 
+struct CodexTurnEnd<'a> {
+    thread_id: &'a str,
+    turn_id: &'a str,
+    event: &'a str,
+    at: u64,
+    awaits_reply: bool,
+}
+
 fn observe_codex_turn_end_transaction(
     connection: &mut Connection,
-    thread_id: &str,
-    turn_id: &str,
-    event: &str,
-    at: u64,
+    end: CodexTurnEnd<'_>,
     hide_policy: CompletionTaskHidePolicy,
 ) -> Result<bool, StoreError> {
+    let CodexTurnEnd {
+        thread_id,
+        turn_id,
+        event,
+        at,
+        awaits_reply,
+    } = end;
     if !matches!(event, "Stop" | "StopFailure" | "TurnInterrupted") {
         return Ok(false);
     }
@@ -7470,7 +7527,8 @@ fn observe_codex_turn_end_transaction(
     let mut request = BridgeRequest::from_hook_at(
         Provider::Codex,
         json!({
-            "hook_event_name": event, "session_id": thread_id, "turn_id": turn_id
+            "hook_event_name": event, "session_id": thread_id, "turn_id": turn_id,
+            CODEX_FINAL_ANSWER_AWAITS_REPLY: awaits_reply
         }),
         at,
     );
@@ -9694,7 +9752,7 @@ fn read_snapshot(
                         risk_codes, command_preview, expires_at, auto_hide_at,
                         reminder_acknowledged_at, reminder_resolution,
                         retain_after_ack, created_at, resolution,
-                        remote_actionable
+                        remote_actionable, awaits_reply
                  FROM attention_items
                  WHERE ?1 IS NULL
                     OR state IN ('open', 'committing', 'decision_sent', 'snoozed')
@@ -9756,6 +9814,7 @@ fn read_snapshot(
                         && state == "open"
                         && request_id.is_some()
                         && expires_at.is_some(),
+                    awaits_reply: row.get(22)?,
                 })
             })
             .map_err(storage_error)?
@@ -11724,6 +11783,7 @@ struct NonApprovalSpec<'a> {
     title: &'a str,
     detail: Option<&'a str>,
     dedupe_key: String,
+    awaits_reply: bool,
 }
 
 fn insert_nonapproval_attention(
@@ -11761,10 +11821,11 @@ fn insert_nonapproval_attention(
             "INSERT INTO attention_items (
                id, session_id, provider, project, turn_id, request_id, kind,
                title, detail, command_preview, risk, risk_notes, dedupe_key,
-               state, expires_at, auto_hide_at, retain_after_ack, created_at
+               state, expires_at, auto_hide_at, retain_after_ack, created_at,
+               awaits_reply
              ) VALUES (
                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, 'unknown',
-               '[]', ?10, 'open', ?11, ?12, ?13, ?14
+               '[]', ?10, 'open', ?11, ?12, ?13, ?14, ?15
              )",
             params![
                 id,
@@ -11782,7 +11843,8 @@ fn insert_nonapproval_attention(
                 request.deadline_at.map(to_i64),
                 auto_hide_at.map(to_i64),
                 retain_after_ack,
-                to_i64(request.received_at)
+                to_i64(request.received_at),
+                spec.awaits_reply
             ],
         )
         .map_err(storage_error)?;
@@ -12585,6 +12647,25 @@ fn background_item_is_active(item: &Value) -> bool {
         status.as_str(),
         "running" | "pending" | "queued" | "in_progress" | "started"
     )
+}
+
+/// Internal flag on a Codex `Stop` that the Runtime built from a Connector
+/// `turn/completed` or a session-file `task_complete`: whether the turn's
+/// final answer awaits a reply. The answer text itself stays with the result
+/// observer.
+pub const CODEX_FINAL_ANSWER_AWAITS_REPLY: &str = "_final_answer_awaits_reply";
+
+/// Whether the final Agent message of a `Stop` asks the user something. Hook
+/// payloads carry the message as `last_assistant_message`; Codex events the
+/// Runtime builds carry the already-judged [`CODEX_FINAL_ANSWER_AWAITS_REPLY`].
+fn final_message_awaits_reply(raw: &Value) -> bool {
+    match raw.get("last_assistant_message").and_then(Value::as_str) {
+        Some(message) => crate::reply::message_awaits_reply(message),
+        None => raw
+            .get(CODEX_FINAL_ANSWER_AWAITS_REPLY)
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
 }
 
 fn is_meaningful_activity(kind: EventKind, raw: &Value) -> bool {
@@ -15052,7 +15133,8 @@ mod tests {
         initialize(&mut connection).unwrap();
         let migrated = connection
             .query_row(
-                "SELECT primary_category, risk_codes, remote_actionable, auto_hide_at
+                "SELECT primary_category, risk_codes, remote_actionable, auto_hide_at,
+                        awaits_reply
                  FROM attention_items WHERE id = 'legacy'",
                 [],
                 |row| {
@@ -15061,11 +15143,12 @@ mod tests {
                         row.get::<_, String>(1)?,
                         row.get::<_, bool>(2)?,
                         row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, bool>(4)?,
                     ))
                 },
             )
             .unwrap();
-        assert_eq!(migrated, (None, "[]".to_owned(), false, None));
+        assert_eq!(migrated, (None, "[]".to_owned(), false, None, false));
         assert_eq!(
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
