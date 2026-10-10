@@ -6125,8 +6125,9 @@ fn ingest_transaction(
         .map(|turn_id| turn_contains_meaningful_activity(&transaction, turn_id))
         .transpose()?
         .unwrap_or(false);
+    // A turn that leaves active background work behind is not complete yet.
     let completed_without_background =
-        parsed.kind == EventKind::Stopped && !has_background_work(&request.raw);
+        parsed.kind == EventKind::Stopped && active_background_work(&request.raw) == 0;
     let plan_progress = update_plan_progress(
         &transaction,
         &session_id,
@@ -12459,7 +12460,7 @@ fn update_subagent_activity(
     if matches!(
         kind,
         EventKind::Stopped | EventKind::Interrupted | EventKind::Failed | EventKind::SessionEnded
-    ) && !has_background_work(raw)
+    ) && active_background_work(raw) == 0
     {
         transaction
             .execute(
@@ -12559,12 +12560,31 @@ fn update_subagent_activity(
     Ok(Some(u32::try_from(active).unwrap_or(u32::MAX)))
 }
 
-fn has_background_work(raw: &Value) -> bool {
-    ["background_tasks", "session_crons"].iter().any(|field| {
-        raw.get(*field)
-            .and_then(Value::as_array)
-            .is_some_and(|items| !items.is_empty())
-    })
+/// Background work that a `Stop` leaves running. Claude Code lists its
+/// background tasks and session cron jobs with the Stop Hook; an item counts
+/// only while its `status` is running, pending, queued, in progress or
+/// started (any case, `-` or a space for `_`). An item without a string
+/// `status` (cron jobs have none) keeps counting as before; a finished one
+/// (completed, failed, killed, stopped, cancelled, done, or any other status)
+/// does not.
+fn active_background_work(raw: &Value) -> usize {
+    ["background_tasks", "session_crons"]
+        .iter()
+        .filter_map(|field| raw.get(*field).and_then(Value::as_array))
+        .flatten()
+        .filter(|item| background_item_is_active(item))
+        .count()
+}
+
+fn background_item_is_active(item: &Value) -> bool {
+    let Some(status) = item.get("status").and_then(Value::as_str) else {
+        return true;
+    };
+    let status = status.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    matches!(
+        status.as_str(),
+        "running" | "pending" | "queued" | "in_progress" | "started"
+    )
 }
 
 fn is_meaningful_activity(kind: EventKind, raw: &Value) -> bool {
@@ -12914,12 +12934,8 @@ fn project_event<'a>(
             ("thinking", None, label.to_owned())
         }
         EventKind::Compacting => ("compacting", None, "Compacting context".to_owned()),
-        EventKind::Stopped if has_background_work(raw) => {
-            let count = ["background_tasks", "session_crons"]
-                .iter()
-                .filter_map(|field| raw.get(*field).and_then(Value::as_array))
-                .map(Vec::len)
-                .sum::<usize>();
+        EventKind::Stopped if active_background_work(raw) > 0 => {
+            let count = active_background_work(raw);
             (
                 "tool_running",
                 None,

@@ -3778,6 +3778,135 @@ fn subagent_counts_and_background_stop_state_are_fact_based() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// Ends a Claude turn that read a file with `stop` and returns the session's
+/// execution state and activity, whether it raised a completion Attention, and
+/// the state the turn ended in.
+fn stop_after_work(
+    root: &std::path::Path,
+    session: &str,
+    stop: Value,
+) -> (String, Option<String>, bool, String) {
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    ingest_tool_turn(&store, Provider::Claude, session, "t1", 1_000);
+    let mut stop = stop;
+    stop["hook_event_name"] = json!("Stop");
+    stop["session_id"] = json!(session);
+    stop["turn_id"] = json!("t1");
+    stop["cwd"] = json!("/tmp/example-project");
+    let stopped = store.ingest(hook(Provider::Claude, stop, 1_100)).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let state = snapshot
+        .sessions
+        .iter()
+        .find(|item| item.id == stopped.session_id)
+        .unwrap();
+    let completion = snapshot
+        .attention
+        .iter()
+        .any(|item| item.session_id == stopped.session_id && item.kind == "completion");
+    let (exec_state, activity) = (state.exec_state.clone(), state.activity.clone());
+    drop(store);
+    let turn_state = Connection::open(root.join("data.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT turns.state FROM turns JOIN sessions ON sessions.id = turns.session_id
+             WHERE sessions.provider_session_id = ?1 ORDER BY turns.ordinal DESC LIMIT 1",
+            [session],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    (exec_state, activity, completion, turn_state)
+}
+
+#[test]
+fn only_running_background_work_keeps_a_stopped_turn_running() {
+    let root = temp_root("background-status");
+    let task = |id: &str, status: &str| json!({"id": id, "type": "shell", "status": status});
+    let finished = [
+        "completed",
+        "failed",
+        "killed",
+        "stopped",
+        "cancelled",
+        "done",
+        "Completed",
+    ]
+    .iter()
+    .enumerate()
+    .map(|(index, status)| task(&format!("done-{index}"), status))
+    .collect::<Vec<_>>();
+
+    // Every listed task has finished: the turn is complete.
+    let (state, activity, completion, turn) = stop_after_work(
+        &root,
+        "finished-only",
+        json!({"background_tasks": finished.clone(), "session_crons": []}),
+    );
+    assert_eq!(state, "response_finished");
+    assert_eq!(activity.as_deref(), Some("Turn completed"));
+    assert!(completion);
+    assert_eq!(turn, "response_finished");
+
+    // One running task still holds the completion back.
+    for status in [
+        "running",
+        "pending",
+        "queued",
+        "in_progress",
+        "In-Progress",
+        "started",
+    ] {
+        let session = format!("active-{status}");
+        let (state, activity, completion, _) = stop_after_work(
+            &root,
+            &session,
+            json!({"background_tasks": [task("bg", status)], "session_crons": []}),
+        );
+        assert_eq!(state, "tool_running", "{status}");
+        assert_eq!(
+            activity.as_deref(),
+            Some("1 background tasks still running"),
+            "{status}"
+        );
+        assert!(!completion, "{status}");
+    }
+
+    // A mixed list counts only the running ones; an item without a status
+    // (a cron job, an unknown shape) still counts as before.
+    let mut mixed = finished.clone();
+    mixed.push(task("bg-running", "running"));
+    mixed.push(json!({"id": "bg-unknown", "type": "shell"}));
+    let (state, activity, completion, _) = stop_after_work(
+        &root,
+        "mixed",
+        json!({
+            "background_tasks": mixed,
+            "session_crons": [
+                {"id": "cron-1", "schedule": "0 9 * * 1-5", "recurring": true, "prompt": "check"},
+                {"id": "cron-2", "schedule": "0 9 * * *", "recurring": false, "prompt": "x", "status": "completed"}
+            ]
+        }),
+    );
+    assert_eq!(state, "tool_running");
+    assert_eq!(
+        activity.as_deref(),
+        Some("3 background tasks still running")
+    );
+    assert!(!completion);
+
+    // A cron job alone keeps the old behaviour.
+    let (state, _, completion, _) = stop_after_work(
+        &root,
+        "cron-only",
+        json!({
+            "background_tasks": [],
+            "session_crons": [{"id": "cron", "schedule": "*/5 * * * *", "recurring": true, "prompt": "loop"}]
+        }),
+    );
+    assert_eq!((state.as_str(), completion), ("tool_running", false));
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn factual_error_question_and_completion_attention_support_local_actions() {
     let root = temp_root("attention-kinds");

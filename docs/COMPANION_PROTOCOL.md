@@ -568,3 +568,20 @@ list. For 2.5 seconds a session's review is reused when its inputs (turn,
 working directory, baseline, concurrent sessions) are the same and one
 `git status --branch` probe still matches HEAD, branch and working tree status
 exactly; otherwise it is recomputed.
+
+## Turn end: background work
+
+A Provider `Stop` ends the turn as `response_finished` and, when the turn held
+real work, raises a `completion` Attention. Claude Code also reports the
+session's background work with `Stop`: `background_tasks` (each item carries a
+`status`) and `session_crons`. Only active items hold the completion back: a
+`status` of `running`, `pending`, `queued`, `in_progress` or `started` (any
+case; `-` or a space count as `_`), or an item without a string `status`
+(cron jobs have none, and an unknown shape keeps the earlier behaviour).
+Finished items (`completed`, `failed`, `killed`, `stopped`, `cancelled`,
+`done` or any other status) do not count. While active items remain the
+session stays `tool_running` with `activityMessage`
+`session.activity.background_tasks_running`, whose `count` is the number of
+active items only, no completion is raised, and active subagents stay active.
+The turn itself is still recorded as `response_finished`.
+

@@ -8,6 +8,12 @@ published a final v1 release; entries below describe development milestones on
 
 ### Post-P0 - Companion task roles, history and turn context
 
+- A Claude Code `Stop` keeps a session running only for background work that
+  is still active: a `background_tasks` or `session_crons` item counts when
+  its `status` is `running`, `pending`, `queued`, `in_progress` or `started`
+  (any case) or when it has no status; finished items (`completed`, `failed`,
+  `killed`, `stopped`, `cancelled`, `done`, ...) no longer hold back the
+  completion, and "N background tasks still running" counts active items only.
 - Companion result excerpts keep up to the first 60 non-empty lines and 4,000
   characters (was 5 lines and 600 characters), so a short answer can be read
   in full on the Display desk screen. Code blocks are still skipped and every
