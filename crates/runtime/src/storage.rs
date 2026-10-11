@@ -370,6 +370,19 @@ pub struct RecentTaskRecord {
     pub latest_attention_kind: Option<String>,
     pub jump_capability: String,
     pub jump_label: String,
+    /// The application the session runs in. Like the transcript path and
+    /// turn start below, only the companion history adds these (or what they
+    /// lead to) to its response; the local History center never sees them.
+    #[serde(skip)]
+    pub term_app: Option<String>,
+    #[serde(skip)]
+    pub term_bundle_id: Option<String>,
+    #[serde(skip)]
+    pub term_surface: Option<String>,
+    #[serde(skip)]
+    pub transcript_path: Option<PathBuf>,
+    #[serde(skip)]
+    pub turn_started_at: Option<u64>,
 }
 
 /// A bounded, local-only summary used by the History center. It intentionally
@@ -10380,7 +10393,10 @@ fn read_recent_tasks(
                         WHERE later_prompt.session_id = sessions.id
                           AND later_prompt.type = 'prompt.submitted'
                           AND later_prompt.occurred_at > latest_attention.created_at
-                      ) AS prompted_after_attention
+                      ) AS prompted_after_attention,
+                      sessions.transcript_path AS transcript_path,
+                      sessions.cwd AS cwd,
+                      outcome_turn.started_at AS turn_started_at
                FROM sessions
                LEFT JOIN turns AS outcome_turn ON outcome_turn.id = (
                  SELECT turns.id FROM turns WHERE turns.session_id = sessions.id
@@ -10445,6 +10461,16 @@ fn read_recent_tasks(
                 let term_surface = row.get::<_, Option<String>>(23)?;
                 let attention_resolution = row.get::<_, Option<String>>(24)?;
                 let prompted_after_attention = row.get::<_, bool>(25)?;
+                let transcript_path = (provider == "claude")
+                    .then(|| {
+                        claude_session_transcript(
+                            row.get::<_, Option<String>>(26).ok().flatten().as_deref(),
+                            row.get::<_, Option<String>>(27).ok().flatten().as_deref(),
+                            &provider_session_id,
+                        )
+                    })
+                    .flatten();
+                let turn_started_at = row.get::<_, Option<i64>>(28)?.map(from_i64);
                 let (jump_capability, jump_label) = jump_descriptor(
                     &provider,
                     &provider_session_id,
@@ -10455,6 +10481,11 @@ fn read_recent_tasks(
                     term_surface.as_deref(),
                 );
                 Ok(RecentTaskRecord {
+                    term_app,
+                    term_bundle_id,
+                    term_surface,
+                    transcript_path,
+                    turn_started_at,
                     id: row.get(0)?,
                     provider,
                     project: row.get(3)?,

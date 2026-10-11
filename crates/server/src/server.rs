@@ -3720,12 +3720,45 @@ async fn companion_history(
         .store
         .recent_tasks(query.since, query.limit, query.include_side)
     {
-        Ok(tasks) => Json(json!({
-            "schemaVersion": 1,
-            "generatedAt": now,
-            "tasks": tasks,
-        }))
-        .into_response(),
+        Ok(tasks) => {
+            // Like snapshot sessions: the application a task runs in and the
+            // end of its latest Agent message, so a finished task can be read
+            // without opening its conversation.
+            let queries = tasks
+                .iter()
+                .filter(|task| now.saturating_sub(task.last_event_at) <= LATEST_MESSAGE_WINDOW_MS)
+                .map(|task| actrealm_runtime::LatestMessageQuery {
+                    session_id: task.id.clone(),
+                    transcript: task.transcript_path.clone(),
+                    turn_started_at: task.turn_started_at,
+                    turn_ended_at: task.completed_at,
+                })
+                .collect::<Vec<_>>();
+            let mut latest = state.store.latest_messages(
+                &queries,
+                actrealm_runtime::LatestMessageForm::Glance,
+                now,
+            );
+            let tasks = tasks
+                .into_iter()
+                .map(|task| {
+                    let mut value = json!(task);
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("termApp".to_owned(), json!(task.term_app));
+                        object.insert("termBundleId".to_owned(), json!(task.term_bundle_id));
+                        object.insert("termSurface".to_owned(), json!(task.term_surface));
+                        object.insert("lastMessage".to_owned(), json!(latest.remove(&task.id)));
+                    }
+                    value
+                })
+                .collect::<Vec<_>>();
+            Json(json!({
+                "schemaVersion": 1,
+                "generatedAt": now,
+                "tasks": tasks,
+            }))
+            .into_response()
+        }
         Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "STORAGE_ERROR"),
     }
 }
@@ -11494,6 +11527,17 @@ mod tests {
         assert_eq!(history.len(), 3);
         assert_eq!(task(&main_session)["reviewState"], "unseen");
         assert_eq!(task(&main_session)["latestAttentionKind"], "completion");
+        // A finished task can be read from the history alone: where it ran
+        // and the end of its latest Agent message.
+        assert_eq!(task(&main_session)["termApp"], "Visual Studio Code");
+        assert_eq!(task(&main_session)["termBundleId"], "com.microsoft.VSCode");
+        assert_eq!(task(&main_session)["termSurface"], "editor");
+        assert_eq!(task(&main_session)["lastMessage"], main["lastMessage"]);
+        assert_eq!(
+            task(&background_session)["lastMessage"]["text"],
+            background["lastMessage"]["text"]
+        );
+        assert!(task(&main_session).get("transcriptPath").is_none());
         let side = history
             .iter()
             .find(|task| task["provider"] == "codex")

@@ -366,7 +366,11 @@ never falls back to the Runtime title derived from the prompt), `taskRole`,
 `userTurnCount`, `status` (`running`, `waiting`, `completed`, `interrupted` or
 `failed`), `startedAt`, `lastEventAt`, `completedAt` (end of the outcome
 turn), `branch`, `validationState`, `reviewState`, `latestAttentionKind`
-(`completion`, `error` or null), `jumpCapability` and `jumpLabel`. Once the
+(`completion`, `error` or null), `jumpCapability`, `jumpLabel`, and, as on
+snapshot sessions, `termApp`, `termBundleId`, `termSurface` (see "Client
+application") and `lastMessage` (see "Latest Agent message"; null past its
+window or when none was found), so a finished task that already left the
+snapshot can still be read without opening its conversation. Once the
 session is idle, `status` and `completedAt` come from its outcome turn: the
 latest turn that the user started with a prompt or that the Provider ended
 itself (`Stop`, `StopFailure`, `TurnInterrupted`). A turn without a prompt

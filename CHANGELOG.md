@@ -8,6 +8,10 @@ published a final v1 release; entries below describe development milestones on
 
 ### Post-P0 - Companion task roles, history and turn context
 
+- Companion history tasks carry `termApp`, `termBundleId`, `termSurface` and
+  `lastMessage` like snapshot sessions, so a task that finished earlier today
+  (and left the snapshot) can be read without opening its conversation. The
+  local History center response is unchanged.
 - A Claude Code `Stop` always ends the turn. With background work still
   active the session becomes `response_finished` (it used to stay
   `tool_running` until the next prompt, which showed a waiting Agent as
