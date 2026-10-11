@@ -5,6 +5,7 @@ mod diagnostics;
 pub use agent_connection::{handle_agent_connection_event, wait_for_agent_reply};
 mod fsutil;
 mod instance;
+mod latest;
 mod outcome;
 mod project;
 mod reply;
@@ -19,6 +20,7 @@ pub use diagnostics::{
     MAX_DIAGNOSTIC_CAPTURE_BYTES,
 };
 pub use instance::{InstanceError, RuntimeInstanceGuard};
+pub use latest::{LatestMessage, LatestMessageForm, LatestMessageQuery};
 pub use outcome::{ResultArtifact, SessionPrompt, SessionResult};
 pub use reply::message_awaits_reply;
 pub use spool::{default_spool_path, EventSpool, SpoolError};

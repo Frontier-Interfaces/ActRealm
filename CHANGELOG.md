@@ -8,6 +8,35 @@ published a final v1 release; entries below describe development milestones on
 
 ### Post-P0 - Companion task roles, history and turn context
 
+- A Claude Code `Stop` always ends the turn. With background work still
+  active the session becomes `response_finished` (it used to stay
+  `tool_running` until the next prompt, which showed a waiting Agent as
+  running for hours), keeps "N background tasks still running" as its
+  activity and raises no completion; the new snapshot session field
+  `backgroundTasks` (integer, `0` when none or once a new turn starts) tells
+  this waiting state apart, and such a session stays listed for a further day.
+  Ambient work Claude Code keeps running on its own no longer counts: the
+  live-update monitor of a published Artifact (which made every later turn of
+  that session look unfinished), `dream`, `auto-mode scan` and
+  `memory import`. Tool Hooks from inside a subagent (`agent_id`) after the
+  main turn ended no longer reopen it. A Claude Code `idle_prompt`
+  Notification (terminal interface only) ends a turn whose `Stop` was lost
+  when nothing waits for the user. The internal `events.summary` of a `Stop`
+  records the reported background items by type and status only. See
+  `docs/COMPANION_PROTOCOL.md`, "Turn end".
+- Companion snapshot sessions gain `lastMessage` (`text`, `at`, `final`,
+  `truncated`, or null): a sanitized excerpt of the end (up to 400
+  characters) of the latest Agent message, also while a turn runs, from the
+  `Stop` Hook, the Claude Code transcript (read from its end and cached by
+  path, size and modification time; the path is stored in the new
+  `sessions.transcript_path` column so it survives a restart, the text never
+  is), the Codex Connector and the Codex rollout file. The result endpoint
+  adds `latest`, the same message within the result excerpt bounds; `result`
+  is unchanged. Claude transcript paths derived from a working directory now
+  follow Claude Code's encoding (every non-alphanumeric character becomes
+  `-`, long names get its hash). See "Latest Agent message".
+- Companion snapshot sessions expose the application they run in as
+  `termApp`, `termBundleId` and `termSurface`. See "Client application".
 - Prompts Claude Code injects for a subagent report (`<agent-message>`), a
   background task event (`<task-notification>`) or a system note
   (`<system-reminder>`) no longer become the session's task title or the

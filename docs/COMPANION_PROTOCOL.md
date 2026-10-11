@@ -179,8 +179,10 @@ must preserve its original `capturedAt`. A Spark-only rollout without an
 official standard-plan entry never proves that the account is Pro.
 
 It excludes raw prompts, complete commands, tool input/output, file contents,
-transcripts, answers, secrets, Hook payloads, Provider reply channels, private
-jump locators, Web credentials, Cloud credentials, and Provider cookies.
+transcripts (beyond the sanitized excerpt of the latest Agent message, see
+"Latest Agent message"), answers, secrets, Hook payloads, Provider reply
+channels, private jump locators, Web credentials, Cloud credentials, and
+Provider cookies.
 
 ## Project labels
 
@@ -602,19 +604,61 @@ session's background work with `Stop`: `background_tasks` (each item carries a
 case; `-` or a space count as `_`), or an item without a string `status`
 (cron jobs have none, and an unknown shape keeps the earlier behaviour).
 Finished items (`completed`, `failed`, `killed`, `stopped`, `cancelled`,
-`done` or any other status) do not count. While active items remain the
-session stays `tool_running` with `activityMessage`
-`session.activity.background_tasks_running`, whose `count` is the number of
-active items only, no completion is raised, and active subagents stay active.
-The turn itself is still recorded as `response_finished`.
+`done` or any other status) do not count, and neither does ambient work that
+Claude Code keeps running on its own for the rest of the session: the
+live-update monitor attached to every published Artifact (`type` `monitor`
+with a `description` starting `live updates for artifact`), memory
+consolidation (`dream`), the auto-mode scan (`auto-mode scan`) and memory
+import (`memory import`).
+
+A Claude Code `Stop` always ends the turn, also while active items remain: the
+Agent has handed control back and the next move is the user's. The session
+becomes `response_finished` (never `thinking`, `tool_running` or
+`compacting`), the turn is recorded as `response_finished` with its end time,
+and `activityMessage` is `session.activity.background_tasks_running` with
+`count` the number of active items. No completion is raised for such a turn
+(each one would otherwise announce "task finished" while the work goes on),
+and active subagents stay active. Clients that need to tell this waiting state
+from a plain finished turn read `backgroundTasks`:
+
+| Snapshot session field | Type | Meaning |
+| --- | --- | --- |
+| `backgroundTasks` | integer, never null | Active background items the session's last `Stop` reported; `0` when there were none and as soon as the session leaves `response_finished` (a new prompt, a tool start of the main Agent, a session start or end) |
+
+`execState` `response_finished` with `backgroundTasks > 0` therefore means
+"the Agent waits for the user while N background items run". Such a session
+stays in the snapshot for a further 24 hours past the usual 30-minute
+retention of a finished session, since no completion keeps it listed.
+
+The next turn makes the session run again: a new prompt (Claude Code also
+submits one, starting with `<task-notification>`, when a finished background
+task wakes the Agent), a tool start of the main Agent (a `Stop` Hook that
+blocks continues the same turn) or a Connector `turn/started`. A Hook from
+inside a subagent (Claude Code adds `agent_id` only there) does not: a
+background subagent keeps calling tools after the main turn ended, and those
+events neither reopen the turn nor change `execState`.
+
+Claude Code's `Notification` with `notification_type` `idle_prompt` ("Claude
+is waiting for your input") is sent only by its terminal interface, 60 seconds
+after a turn ended without input (later while a background subagent, workflow
+or teammate still runs); the VS Code extension, the desktop app and other SDK
+clients never send it. When it arrives while the session is still shown as
+working (its `Stop` was lost) and no approval, question or elicitation is
+pending, the session ends the turn the same way: `response_finished`, the turn
+ended, activity "Turn completed", and no completion.
+
+For diagnosis, the internal `events.summary` of a Claude Code `Stop` lists the
+reported background items by type and status, for example
+`background: subagent running×2, shell pending×1, monitor running ambient×1, cron×1`.
+It never contains a description, command, prompt or identifier, and it is not
+part of any client response.
 
 Snapshot Attention items carry `awaitsReply` (boolean, `false` by default). It
 is `true` on a `completion` whose turn ended with a final Agent message that
 asks the user something: the Agent has stopped and waits for the user's
 answer. Such a completion is raised even while active background work remains,
-because the user is needed either way; the session then keeps reporting the
-running work (`tool_running`, `background_tasks_running`), and `awaitsReply` is
-what tells the client the next move is the user's. Without a question the
+because the user is needed either way; the session then also reports the
+running work (`backgroundTasks`, `background_tasks_running`). Without a question the
 background rule above applies unchanged. Every other Attention kind, and a
 completion raised without a final message (a Codex native approval that ends a
 turn, a `Stop` replayed from the offline spool, which never keeps message
@@ -661,3 +705,97 @@ offer without an explicit request: `你要是也觉得没用，我一并删掉�
 `false`, while `要提交的话说一声。`, `需要的话告诉我。` and
 `Let me know if you want it pushed.` are `true`. `已完成，测试全部通过。` and a message that is only a code
 block (`foo?` inside a fence) are `false`; `Should I push?` is `true`.
+
+## Latest Agent message
+
+These are additive v7 fields; `protocolVersion` and every schema version stay
+unchanged, and existing fields keep their meaning.
+
+Each snapshot session carries `lastMessage`, the latest text the Agent wrote
+in the session's main conversation, at any point of a turn, or `null`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `text` | string | Sanitized excerpt: the end of the message, at most 400 characters |
+| `at` | integer | When the Agent wrote it (milliseconds since the epoch) |
+| `final` | boolean | The message is its turn's final answer: it came with the turn's end (`Stop`, Codex `final_answer`), or the turn ended right after it |
+| `truncated` | boolean | Something of the message is not in `text` |
+
+The excerpt is the end of the message, where an Agent puts its conclusion or
+question: whole lines from the end; when room remains, the line before
+contributes its last sentences, starting after a sentence end (`.`, `!`, `?`,
+`;` before a space, or `。`, `！`, `？`, `；`, `…`), else after a space, else at
+the character bound. A last line longer than the bound is cut the same way.
+`truncated` is `true` when the start was cut off or anything was left out (a
+code block, a line that looked like a credential); a client may show a
+leading ellipsis. The message is not cleared when a new turn starts: compare
+`at` with `turnStartedAt` to tell whether it belongs to the current turn.
+`lastMessage` is `null` when no message is known, when the message is more
+than 24 hours old, or when the session had no event in the last 24 hours.
+
+`GET /api/v1/companion/sessions/{id}/result` adds `latest`, the same object
+for the same message but with the start of the message within the result
+excerpt bounds (the first 60 non-empty lines and 4,000 characters, code blocks
+skipped). Unlike `result`, which only a finished turn has and whose meaning is
+unchanged, `latest` is also returned while the turn is running.
+
+Sources, newest first wins:
+
+- Claude Code: the `Stop` Hook's `last_assistant_message` (`final: true`), and
+  the session transcript. The transcript path comes from the Hooks'
+  `transcript_path` (accepted only for `<session id>.jsonl` inside a Claude
+  Code `projects` directory; stored in `sessions.transcript_path` so it
+  survives a Runtime restart) or, for older rows, is derived as
+  `~/.claude/projects/<encoded cwd>/<session id>.jsonl` (`CLAUDE_CONFIG_DIR`
+  replaces `~/.claude`; every UTF-16 unit of the working directory that is not
+  an ASCII letter or digit becomes `-`, and a name longer than 200 characters
+  is cut to 200 and followed by `-` and Claude Code's base-36 hash). Claude
+  desktop app sessions use the same location. The transcript is read from its
+  end (64 KB, doubling up to 4 MB): the latest `type: "assistant"` record with
+  non-empty `text` content, skipping subagent records (`isSidechain: true`),
+  thinking and tool-use blocks, API errors (`isApiErrorMessage`), meta and
+  synthetic (`model: "<synthetic>"`) records and a half-written last line; text
+  blocks of one message are joined. A transcript message is `final` when the
+  session's latest turn has ended and the message was written during it.
+- Codex: the `Stop` Hook's `last_assistant_message` (`final: true`), the
+  Connector's `agentMessage` items (`final` for phase `final_answer`), and the
+  latest assistant message of the session's rollout file (`final` for phase
+  `final_answer`).
+
+Every excerpt passes the result-excerpt line filter and the whole-text secret
+check. Message text and excerpts live only in Runtime memory; SQLite, the
+spool and exports never receive them (only the transcript path is stored), and
+after a Runtime restart a Claude Code message is read again from its
+transcript and a Codex message from its rollout file. Transcripts are read
+only for sessions in the snapshot with an event in the last 24 hours, and only
+when the file changed since the last read (path, size and modification time);
+when it only grew, just the appended lines are read.
+
+## Client application
+
+Each snapshot session also names the application it runs in, as the Hook
+process recorded it (`null` when unknown). Only the Companion snapshot carries
+these fields; `environment` keeps its meaning as the display label.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `termApp` | string or null | Application name |
+| `termBundleId` | string or null | macOS bundle identifier |
+| `termSurface` | string or null | Kind of client, one of the values below |
+
+| `termSurface` | Recorded for | `termApp` / `termBundleId` examples |
+| --- | --- | --- |
+| `terminal` | A CLI in a terminal or multiplexer: Terminal, iTerm2, Warp, Ghostty, WezTerm, Alacritty, kitty, Windows Terminal, tmux, GNU screen, or any other terminal that sets `TERM_PROGRAM` | `Terminal`/`com.apple.Terminal`, `iTerm2`/`com.googlecode.iterm2`, `Warp`/`dev.warp.Warp-Stable`, `Ghostty`/its bundle identifier, `tmux`/null |
+| `editor` | An editor or IDE: its Agent extension, or a CLI started in its integrated terminal (both run below the editor's app bundle): Visual Studio Code, VS Code Insiders, Cursor, Windsurf, Zed, Xcode, JetBrains IDEs | `Visual Studio Code`/`com.microsoft.VSCode`, `Cursor`/its bundle identifier |
+| `codex_app` | The Codex app or the ChatGPT app | `Codex app`/`com.openai.codex`, `ChatGPT app`/`com.openai.chat` |
+| `claude_app` | The Claude app | `Claude app`/`com.anthropic.claudefordesktop` |
+| `kimi_app` | The Kimi Code app | `Kimi Code app`/`com.kimi.code.desktop` |
+| `grok_app` | The Grok app | `Grok app` |
+| `desktop_app` | Any other app bundle found among the Hook's parent processes | `Claude Code`/`com.anthropic.claude-code` |
+| `connector` | An ActRealm Connector session (Codex app-server, ACP) | the Connector name, e.g. `ActRealm ACP` |
+| `remote` | A session reached over SSH | `SSH`/null |
+
+The first matching rule wins: an app bundle among the Hook's parent processes,
+then SSH, then tmux or GNU screen, then `TERM_PROGRAM` / `LC_TERMINAL` and the
+bundle identifier of the environment, then an explicit `ACTREALM_SURFACE`, and
+finally any other `TERM_PROGRAM` value as `terminal`.

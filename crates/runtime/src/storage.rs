@@ -1,6 +1,7 @@
 use crate::fsutil::ensure_private_directory;
 use crate::title::{
-    resolve_codex_session_titles, resolve_event_title, resolve_session_title, ProviderTitle,
+    claude_session_transcript, resolve_codex_session_titles, resolve_event_title,
+    resolve_session_title, trusted_claude_transcript_path, ProviderTitle,
 };
 use actrealm_core::{
     is_codex_native_attention_tool, AttentionRiskCode, BridgeRequest, Decision, EventKind,
@@ -27,6 +28,10 @@ use uuid::Uuid;
 
 const SCHEMA_VERSION: i64 = 38;
 const SNAPSHOT_CACHE_MAX_AGE_MS: u64 = 2_000;
+/// How long past the regular retention a session that ended its turn with
+/// background work still running stays listed (also in the SQL of
+/// [`read_snapshot`]).
+const BACKGROUND_WAIT_LISTED_MS: u64 = 86_400_000;
 const STORAGE_DIAGNOSTICS_CACHE_MAX_AGE_MS: u64 = 60_000;
 const SQLITE_MAX_VARIABLE_NUMBER: usize = 32_766;
 const MAX_UI_SNAPSHOT_SESSION_IDS: usize = SQLITE_MAX_VARIABLE_NUMBER - 1;
@@ -273,14 +278,21 @@ pub struct SessionRecord {
     pub environment: Option<String>,
     pub jump_capability: String,
     pub jump_label: String,
+    /// The application the session runs in, as recorded from the Hook
+    /// process (`Visual Studio Code`, `Codex app`, `iTerm2`, ...). Like the
+    /// other locators it stays out of the serialized snapshot; only the
+    /// Companion snapshot exposes the application, bundle and surface.
     #[serde(skip)]
     pub term_app: Option<String>,
     #[serde(skip)]
     pub term_session_id: Option<String>,
     #[serde(skip)]
     pub term_tty: Option<String>,
+    /// That application's bundle identifier (`com.microsoft.VSCode`).
     #[serde(skip)]
     pub term_bundle_id: Option<String>,
+    /// The kind of client: `terminal`, `editor`, `codex_app`, `claude_app`,
+    /// `kimi_app`, `grok_app`, `desktop_app`, `connector` or `remote`.
     #[serde(skip)]
     pub term_surface: Option<String>,
     #[serde(skip)]
@@ -297,6 +309,14 @@ pub struct SessionRecord {
     /// forked-without-turns, or ignored internal sessions.
     #[serde(default = "default_task_role")]
     pub task_role: String,
+    /// Active background items (tasks, cron jobs) the last Claude Code
+    /// `Stop` reported; 0 when there were none or a new turn has started.
+    #[serde(default)]
+    pub background_tasks: u32,
+    /// The Claude Code transcript the latest Agent message is read from.
+    /// Never serialized.
+    #[serde(skip)]
+    pub transcript_path: Option<PathBuf>,
 }
 
 const TASK_ROLE_MAIN: &str = "main";
@@ -408,6 +428,8 @@ pub struct LocalReviewContext {
     pub turn_ended_at: Option<u64>,
     pub last_event_at: u64,
     pub concurrent_active_sessions: u32,
+    /// The Claude Code transcript the latest Agent message is read from.
+    pub transcript_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1012,6 +1034,7 @@ pub struct RuntimeStore {
 
 struct StoreInner {
     outcomes: Mutex<crate::outcome::OutcomeRegistry>,
+    latest: Mutex<crate::latest::LatestMessages>,
     sender: mpsc::Sender<StoreMessage>,
     writer: Mutex<Option<thread::JoinHandle<()>>>,
 }
@@ -1271,6 +1294,7 @@ impl RuntimeStore {
         Ok(Self {
             inner: Arc::new(StoreInner {
                 outcomes: Mutex::new(crate::outcome::OutcomeRegistry::default()),
+                latest: Mutex::new(crate::latest::LatestMessages::default()),
                 sender,
                 writer: Mutex::new(Some(writer)),
             }),
@@ -1338,6 +1362,10 @@ impl RuntimeStore {
                     at,
                     &format!("hook:{event}"),
                 );
+                // The message a turn ends with is its final answer.
+                if event == "Stop" {
+                    self.observe_latest_message(&result.session_id, &message, at, true);
+                }
             }
         } else if !result.suppressed && result.kind == EventKind::PromptSubmitted {
             // The same turn can be reported twice (a Connector `turn/started`
@@ -1369,6 +1397,38 @@ impl RuntimeStore {
         if let Ok(mut registry) = self.inner.outcomes.lock() {
             registry.observe(session, text, cwd, at, source);
         }
+    }
+
+    /// Records an Agent message a Provider event reported for a session.
+    /// `is_final` marks the final answer of a turn. Memory-only, like result
+    /// excerpts.
+    pub fn observe_latest_message(&self, session: &str, text: &str, at: u64, is_final: bool) {
+        if let Ok(mut latest) = self.inner.latest.lock() {
+            latest.observe(session, text, at, is_final);
+        }
+    }
+
+    /// The latest Agent message of each queried session (sessions without
+    /// one are left out): the newer of the last message a Provider event
+    /// reported and, for Claude Code, the last one in the session transcript.
+    /// Transcripts are read only when they changed since the last call.
+    pub fn latest_messages(
+        &self,
+        queries: &[crate::LatestMessageQuery],
+        form: crate::LatestMessageForm,
+        now: u64,
+    ) -> HashMap<String, crate::LatestMessage> {
+        let Ok(mut latest) = self.inner.latest.lock() else {
+            return HashMap::new();
+        };
+        queries
+            .iter()
+            .filter_map(|query| {
+                latest
+                    .latest(query, form, now)
+                    .map(|message| (query.session_id.clone(), message))
+            })
+            .collect()
     }
 
     pub fn session_result(
@@ -4586,6 +4646,7 @@ fn initialize(connection: &mut Connection) -> Result<(), StoreError> {
               last_meaningful_activity_at INTEGER,
               task_hidden_at INTEGER, task_hidden_reason TEXT,
               ended_at INTEGER,
+              background_tasks INTEGER NOT NULL DEFAULT 0, transcript_path TEXT,
               UNIQUE(provider, provider_session_id)
             );
             CREATE TABLE IF NOT EXISTS turns (
@@ -4889,6 +4950,7 @@ fn initialize(connection: &mut Connection) -> Result<(), StoreError> {
     ensure_attention_awaits_reply_column(connection)?;
     ensure_command_commit_delay_column(connection)?;
     ensure_session_task_visibility_columns(connection)?;
+    ensure_session_turn_end_columns(connection)?;
     normalize_legacy_subagent_rows(connection)?;
     normalize_orphaned_local_approval_sessions(connection, now_millis())?;
     suppress_existing_codex_internal_sessions(connection)?;
@@ -5802,6 +5864,36 @@ fn ensure_attention_awaits_reply_column(connection: &Connection) -> Result<(), S
     Ok(())
 }
 
+/// `background_tasks`: active background items the last Claude Code `Stop`
+/// reported (0 once a new turn starts). `transcript_path`: the trusted
+/// Claude Code transcript file of the session, from which the latest Agent
+/// message is read on demand; the message text itself is never stored.
+fn ensure_session_turn_end_columns(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(sessions)")
+        .map_err(storage_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    drop(statement);
+    for (column, definition) in [
+        ("background_tasks", "INTEGER NOT NULL DEFAULT 0"),
+        ("transcript_path", "TEXT"),
+    ] {
+        if !columns.iter().any(|existing| existing == column) {
+            connection
+                .execute(
+                    &format!("ALTER TABLE sessions ADD COLUMN {column} {definition}"),
+                    [],
+                )
+                .map_err(storage_error)?;
+        }
+    }
+    Ok(())
+}
+
 fn ensure_session_task_visibility_columns(connection: &Connection) -> Result<(), StoreError> {
     let mut statement = connection
         .prepare("PRAGMA table_info(sessions)")
@@ -6042,6 +6134,23 @@ fn ingest_transaction(
         (session_id, "idle".to_owned(), None, None, occurred_at)
     };
 
+    // The transcript locator lets the latest Agent message be read again
+    // after a Runtime restart; only the path is stored, never its content.
+    if request.provider == Provider::Claude {
+        if let Some(transcript) =
+            trusted_claude_transcript_path(&request.raw, &parsed.provider_session_id)
+                .and_then(|path| path.to_str().map(ToOwned::to_owned))
+        {
+            transaction
+                .execute(
+                    "UPDATE sessions SET transcript_path = ?2
+                     WHERE id = ?1 AND transcript_path IS NOT ?2",
+                    params![session_id, transcript],
+                )
+                .map_err(storage_error)?;
+        }
+    }
+
     let provider_event_key = stable_provider_event_key(&parsed, &request.raw);
     if let Some(provider_event_key) = provider_event_key.as_deref() {
         let duplicate_attention_id = transaction
@@ -6072,6 +6181,16 @@ fn ingest_transaction(
     let terminal = matches!(current_state.as_str(), "response_finished" | "failed")
         || (current_state == "idle"
             && current_activity.as_deref() == Some(TURN_INTERRUPTED_ACTIVITY));
+    // Claude Code adds `agent_id` to a Hook only inside a subagent. A
+    // background subagent keeps working (and calling tools) after the main
+    // turn ended; that is the background work the `Stop` reported, not a new
+    // turn, so it neither reopens the turn nor makes the session run again.
+    let subagent_event = request.provider == Provider::Claude
+        && request
+            .raw
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .is_some_and(|agent_id| !agent_id.is_empty());
     let turn_id = select_or_create_turn(
         &transaction,
         &session_id,
@@ -6079,6 +6198,7 @@ fn ingest_transaction(
         occurred_at,
         parsed.kind,
         terminal,
+        !subagent_event,
     )?;
     if parsed.kind == EventKind::PromptSubmitted {
         reset_turn_scoped_task_state(&transaction, &session_id)?;
@@ -6165,12 +6285,15 @@ fn ingest_transaction(
         .transpose()?
         .unwrap_or(false);
     // A turn whose final message asks the user something needs the user even
-    // while background work keeps running; otherwise a turn that leaves
-    // active background work behind is not complete yet.
+    // while background work keeps running. A turn that leaves active
+    // background work behind still ends (the session waits for the user), but
+    // raises no completion: that would announce every such turn as finished.
     let stop_awaits_reply =
         parsed.kind == EventKind::Stopped && final_message_awaits_reply(&request.raw);
+    let stop_background_tasks =
+        (parsed.kind == EventKind::Stopped).then(|| active_background_work(&request.raw));
     let stop_raises_completion = parsed.kind == EventKind::Stopped
-        && (stop_awaits_reply || active_background_work(&request.raw) == 0);
+        && (stop_awaits_reply || stop_background_tasks == Some(0));
     let plan_progress = update_plan_progress(
         &transaction,
         &session_id,
@@ -6408,11 +6531,18 @@ fn ingest_transaction(
         && (!terminal
             || matches!(
                 parsed.kind,
-                EventKind::PromptSubmitted
-                    | EventKind::SessionStarted
-                    | EventKind::SessionEnded
-                    | EventKind::ToolStarted
-            ));
+                EventKind::PromptSubmitted | EventKind::SessionStarted | EventKind::SessionEnded
+            )
+            || (parsed.kind == EventKind::ToolStarted && !subagent_event));
+    // Claude Code's `idle_prompt` Notification comes only from its terminal
+    // interface, a minute after a turn ended with no input since. A session
+    // still shown as working (its `Stop` was lost) has ended its turn, unless
+    // a request still waits for the user.
+    let idle_turn_end = request.provider == Provider::Claude
+        && parsed.kind == EventKind::Notification
+        && request.raw.get("notification_type").and_then(Value::as_str) == Some("idle_prompt")
+        && execution_state_is_active(&current_state)
+        && !blocking_attention_open(&transaction, &session_id)?;
     // A structured plan update can legitimately arrive after the Provider has
     // already emitted a terminal lifecycle signal for the previous activity.
     // Keep the terminal execution state, but do not leave the session summary
@@ -6462,6 +6592,8 @@ fn ingest_transaction(
         } else if request.provider_handles_approval && parsed.kind == EventKind::PermissionRequested
         {
             provider_handled_permission_state(parsed.permission_mode.as_deref(), &request.raw)
+        } else if idle_turn_end {
+            ("response_finished", None, "Turn completed".to_owned())
         } else {
             let (state, owner, activity) = project_event(parsed.kind, &request.raw, &current_state);
             if native_permission_resolved
@@ -6540,7 +6672,12 @@ fn ingest_transaction(
                      THEN review_workdir
                      ELSE COALESCE(?24, review_workdir)
                    END,
-                   ended_at = CASE WHEN ?6 = 1 THEN ?5 ELSE ended_at END
+                   ended_at = CASE WHEN ?6 = 1 THEN ?5 ELSE ended_at END,
+                   background_tasks = CASE
+                     WHEN ?29 IS NOT NULL THEN ?29
+                     WHEN ?2 = 'response_finished' THEN background_tasks
+                     ELSE 0
+                   END
                  WHERE id = ?1",
                 params![
                     session_id,
@@ -6589,6 +6726,12 @@ fn ingest_transaction(
                         term.app.is_some() || term.bundle_id.is_some() || term.surface.is_some()
                     })),
                     i64::from(request.term.as_ref().is_some_and(|term| term.surface.as_deref() == Some("connector"))),
+                    // A Stop always records what it left running (0 for
+                    // none); a later event keeps that count only while the
+                    // turn stays ended.
+                    stop_background_tasks
+                        .filter(|_| next_state == "response_finished")
+                        .map(|count| i64::try_from(count).unwrap_or(i64::MAX)),
                 ],
             )
             .map_err(storage_error)?;
@@ -6602,10 +6745,11 @@ fn ingest_transaction(
         )?;
     }
 
-    if matches!(
+    if (matches!(
         parsed.kind,
         EventKind::Stopped | EventKind::Interrupted | EventKind::Failed | EventKind::SessionEnded
-    ) && !(parsed.kind == EventKind::Stopped && preserves_native_request)
+    ) && !(parsed.kind == EventKind::Stopped && preserves_native_request))
+        || (idle_turn_end && may_update)
     {
         if let Some(turn_id) = turn_id.as_deref() {
             transaction
@@ -8172,7 +8316,8 @@ fn read_local_review_context(
                     sessions.exec_state, turns.id, turns.started_at, turns.ended_at,
                     sessions.last_event_at,
                     sessions.term_app, sessions.term_session_id, sessions.term_tty,
-                    sessions.term_bundle_id, sessions.term_surface
+                    sessions.term_bundle_id, sessions.term_surface,
+                    sessions.transcript_path, sessions.cwd
              FROM sessions
              LEFT JOIN turns ON turns.id = (
                SELECT current_turn.id FROM turns AS current_turn
@@ -8197,6 +8342,10 @@ fn read_local_review_context(
                     row.get::<_, Option<String>>(11)?,
                     row.get::<_, Option<String>>(12)?,
                     row.get::<_, Option<String>>(13)?,
+                    (
+                        row.get::<_, Option<String>>(14)?,
+                        row.get::<_, Option<String>>(15)?,
+                    ),
                 ))
             },
         )
@@ -8217,10 +8366,20 @@ fn read_local_review_context(
         term_tty,
         term_bundle_id,
         term_surface,
+        (reported_transcript, cwd),
     )) = record
     else {
         return Ok(None);
     };
+    let transcript_path = (provider == "claude")
+        .then(|| {
+            claude_session_transcript(
+                reported_transcript.as_deref(),
+                cwd.as_deref(),
+                &provider_session_id,
+            )
+        })
+        .flatten();
     let working_directory = working_directory
         .filter(|value| !value.trim().is_empty() && value != "/")
         .map(PathBuf::from);
@@ -8281,6 +8440,7 @@ fn read_local_review_context(
         turn_ended_at,
         last_event_at,
         concurrent_active_sessions,
+        transcript_path,
     }))
 }
 
@@ -9597,7 +9757,8 @@ fn read_snapshot(
                           SELECT 1 FROM ignored_provider_sessions AS ignored
                           WHERE ignored.provider = sessions.provider
                             AND ignored.provider_session_id = sessions.provider_session_id
-                        )
+                        ),
+                        sessions.background_tasks, sessions.transcript_path, sessions.cwd
                  FROM sessions
                  LEFT JOIN session_usage AS usage
                    ON usage.provider = sessions.provider
@@ -9611,6 +9772,16 @@ fn read_snapshot(
                             sessions.exec_state IN ('idle', 'response_finished', 'failed')
                             AND sessions.last_meaningful_activity_at IS NOT NULL
                             AND COALESCE(sessions.activity_since, sessions.last_event_at) >= ?1
+                        )
+                        -- A turn that ended while its background work kept
+                        -- running raised no completion to keep it listed: the
+                        -- session waits for the user for a further day.
+                        OR (
+                            sessions.exec_state = 'response_finished'
+                            AND sessions.background_tasks > 0
+                            AND sessions.last_meaningful_activity_at IS NOT NULL
+                            AND COALESCE(sessions.activity_since, sessions.last_event_at)
+                                >= MAX(?1 - 86400000, 0)
                         )
                         OR EXISTS (
                             SELECT 1 FROM attention_items
@@ -9643,6 +9814,20 @@ fn read_snapshot(
                     .unwrap_or_default();
                 let ignored = row.get::<_, bool>(47)?;
                 let role = task_role(provider_title.as_deref(), user_turn_count, ignored);
+                let background_tasks = row
+                    .get::<_, Option<i64>>(48)?
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or_default();
+                let transcript_path = (provider == "claude")
+                    .then(|| -> rusqlite::Result<Option<PathBuf>> {
+                        Ok(claude_session_transcript(
+                            row.get::<_, Option<String>>(49)?.as_deref(),
+                            row.get::<_, Option<String>>(50)?.as_deref(),
+                            &provider_session_id,
+                        ))
+                    })
+                    .transpose()?
+                    .flatten();
                 let current_tool = if exec_state == "tool_running" {
                     row.get(26)?
                 } else {
@@ -9737,6 +9922,8 @@ fn read_snapshot(
                     last_meaningful_activity_at: row.get::<_, Option<i64>>(45)?.map(from_i64),
                     user_turn_count,
                     task_role: role.to_owned(),
+                    background_tasks,
+                    transcript_path,
                 })
             })
             .map_err(storage_error)?
@@ -10518,6 +10705,11 @@ fn filter_ui_snapshot_for_cutoff(snapshot: &mut StoreSnapshot, cutoff: u64) {
             "idle" | "response_finished" | "failed"
         ) || (session.last_meaningful_activity_at.is_some()
             && session.activity_since.unwrap_or(session.last_event_at) >= cutoff)
+            || (session.exec_state == "response_finished"
+                && session.background_tasks > 0
+                && session.last_meaningful_activity_at.is_some()
+                && session.activity_since.unwrap_or(session.last_event_at)
+                    >= cutoff.saturating_sub(BACKGROUND_WAIT_LISTED_MS))
             || actionable_sessions.contains(session.id.as_str())
     });
 
@@ -11440,6 +11632,7 @@ fn select_or_create_turn(
     occurred_at: i64,
     kind: EventKind,
     terminal_session: bool,
+    tool_start_reopens_turn: bool,
 ) -> Result<Option<String>, StoreError> {
     if matches!(kind, EventKind::SessionStarted | EventKind::SessionEnded) {
         return Ok(None);
@@ -11472,7 +11665,7 @@ fn select_or_create_turn(
             // concrete tool start is authoritative evidence that the turn is
             // active again; reopen that turn instead of leaving Runtime in a
             // contradictory completed state while workflow events advance.
-            if kind == EventKind::ToolStarted {
+            if kind == EventKind::ToolStarted && tool_start_reopens_turn {
                 if let Some(turn_id) = latest.as_deref() {
                     transaction
                         .execute(
@@ -11851,6 +12044,26 @@ fn insert_nonapproval_attention(
         )
         .map_err(storage_error)?;
     Ok(id)
+}
+
+/// An approval, native approval, question or elicitation of the session
+/// still waits for the user.
+fn blocking_attention_open(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+) -> Result<bool, StoreError> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM attention_items
+               WHERE session_id = ?1
+                 AND kind IN ('approval', 'native_approval', 'question', 'elicitation')
+                 AND state IN ('open', 'committing', 'decision_sent', 'snoozed')
+             )",
+            [session_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(storage_error)
 }
 
 fn is_structured_question(raw: &Value) -> bool {
@@ -12630,7 +12843,7 @@ fn update_subagent_activity(
 /// started (any case, `-` or a space for `_`). An item without a string
 /// `status` (cron jobs have none) keeps counting as before; a finished one
 /// (completed, failed, killed, stopped, cancelled, done, or any other status)
-/// does not.
+/// does not, and neither does ambient work ([`background_item_is_ambient`]).
 fn active_background_work(raw: &Value) -> usize {
     ["background_tasks", "session_crons"]
         .iter()
@@ -12641,6 +12854,9 @@ fn active_background_work(raw: &Value) -> usize {
 }
 
 fn background_item_is_active(item: &Value) -> bool {
+    if background_item_is_ambient(item) {
+        return false;
+    }
     let Some(status) = item.get("status").and_then(Value::as_str) else {
         return true;
     };
@@ -12649,6 +12865,36 @@ fn background_item_is_active(item: &Value) -> bool {
         status.as_str(),
         "running" | "pending" | "queued" | "in_progress" | "started"
     )
+}
+
+/// Tasks Claude Code keeps running on its own for the rest of the session,
+/// with nothing for the user to wait for: the live-update monitor it attaches
+/// to every published Artifact (`type` `monitor`, description
+/// `live updates for artifact ...`, running until the process exits),
+/// automatic memory consolidation (`dream`), the auto-mode scan and memory
+/// import. They never hold a turn open.
+fn background_item_is_ambient(item: &Value) -> bool {
+    let kind = item
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_");
+    match kind.as_str() {
+        "dream" | "auto_mode_scan" | "memory_import" | "local_memory_import" => true,
+        "monitor" | "monitor_ws" => {
+            item.get("description")
+                .and_then(Value::as_str)
+                .is_some_and(|description| {
+                    description
+                        .trim_start()
+                        .to_ascii_lowercase()
+                        .starts_with("live updates for artifact")
+                })
+        }
+        _ => false,
+    }
 }
 
 /// Internal flag on a Codex `Stop` that the Runtime built from a Connector
@@ -13025,10 +13271,13 @@ fn project_event<'a>(
             ("thinking", None, label.to_owned())
         }
         EventKind::Compacting => ("compacting", None, "Compacting context".to_owned()),
+        // The Agent has handed control back even though background work it
+        // started keeps running: the turn is over and the next move is the
+        // user's. Only the activity line still reports that work.
         EventKind::Stopped if active_background_work(raw) > 0 => {
             let count = active_background_work(raw);
             (
-                "tool_running",
+                "response_finished",
                 None,
                 format!("{count} background tasks still running"),
             )
@@ -13934,8 +14183,67 @@ fn event_summary(raw: &Value, kind: EventKind) -> Option<String> {
         EventKind::AutoReviewCompleted => Some("Codex auto approval review completed".to_owned()),
         EventKind::Interrupted => Some("Provider turn interrupted".to_owned()),
         EventKind::Unknown => Some("Unknown Provider event".to_owned()),
+        EventKind::Stopped => background_work_summary(raw),
         _ => None,
     }
+}
+
+/// The kinds and states of the background work a Claude Code `Stop` reports,
+/// for later diagnosis in the internal `events.summary` column (never shown
+/// to clients): for example
+/// `background: subagent running×2, shell pending×1, monitor running ambient×1, cron×1`.
+/// Only the item type (spaces as `_`) and status are kept, and whether the
+/// item is ambient work; descriptions, commands, prompts and identifiers are
+/// not. A type or status that is not a short identifier is recorded as
+/// `other`; an item without a status (cron jobs) records its type only.
+fn background_work_summary(raw: &Value) -> Option<String> {
+    fn identifier(value: Option<&str>) -> Option<String> {
+        let value = value?.trim().to_ascii_lowercase().replace(' ', "_");
+        Some(
+            if !value.is_empty()
+                && value.len() <= 32
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            {
+                value
+            } else {
+                "other".to_owned()
+            },
+        )
+    }
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for (field, default_kind) in [("background_tasks", "task"), ("session_crons", "cron")] {
+        for item in raw
+            .get(field)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(256)
+        {
+            let kind = identifier(item.get("type").and_then(Value::as_str))
+                .unwrap_or_else(|| default_kind.to_owned());
+            let mut label = match identifier(item.get("status").and_then(Value::as_str)) {
+                Some(status) => format!("{kind} {status}"),
+                None => kind,
+            };
+            if background_item_is_ambient(item) {
+                label.push_str(" ambient");
+            }
+            match counts.iter_mut().find(|(existing, _)| *existing == label) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((label, 1)),
+            }
+        }
+    }
+    if counts.is_empty() {
+        return None;
+    }
+    let parts = counts
+        .into_iter()
+        .map(|(label, count)| format!("{label}\u{d7}{count}"))
+        .collect::<Vec<_>>();
+    Some(format!("background: {}", parts.join(", ")))
 }
 
 fn event_type(kind: EventKind) -> &'static str {

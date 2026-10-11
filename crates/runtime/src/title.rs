@@ -99,36 +99,97 @@ fn home_directory() -> Option<PathBuf> {
     env::var_os("HOME").map(PathBuf::from)
 }
 
+/// The transcript Claude Code writes for a session started in `cwd`:
+/// `<config>/projects/<encoded cwd>/<session id>.jsonl`. Claude Code encodes
+/// the directory by replacing every UTF-16 code unit that is not an ASCII
+/// letter or digit with `-`; an encoded name longer than 200 characters is
+/// cut to 200 and followed by `-` and a base-36 hash of the directory.
 fn claude_transcript_path(cwd: &str, provider_session_id: &str) -> Option<PathBuf> {
     if !safe_path_component(provider_session_id) || cwd.trim().is_empty() {
         return None;
     }
-    let encoded = cwd
-        .chars()
-        .map(|character| {
-            if character == '/' || character == ' ' || !character.is_ascii() {
-                '-'
-            } else {
-                character
-            }
-        })
-        .collect::<String>();
     Some(
         claude_config_root()?
             .join("projects")
-            .join(encoded)
+            .join(claude_project_directory(cwd))
             .join(format!("{provider_session_id}.jsonl")),
     )
 }
 
-fn trusted_claude_transcript_path(raw: &Value, provider_session_id: &str) -> Option<PathBuf> {
+fn claude_project_directory(cwd: &str) -> String {
+    let encoded = cwd
+        .encode_utf16()
+        .map(|unit| match char::from_u32(u32::from(unit)) {
+            Some(character) if character.is_ascii_alphanumeric() => character,
+            _ => '-',
+        })
+        .collect::<String>();
+    if encoded.len() <= 200 {
+        return encoded;
+    }
+    // The Java-style string hash Claude Code uses (32-bit wrapping), as an
+    // absolute value in base 36.
+    let hash = cwd.encode_utf16().fold(0_i32, |hash, unit| {
+        hash.wrapping_shl(5)
+            .wrapping_sub(hash)
+            .wrapping_add(i32::from(unit))
+    });
+    let mut value = i64::from(hash).unsigned_abs();
+    let mut digits = Vec::new();
+    loop {
+        let digit = u8::try_from(value % 36).unwrap_or_default();
+        digits.push(char::from(if digit < 10 {
+            b'0' + digit
+        } else {
+            b'a' + digit - 10
+        }));
+        value /= 36;
+        if value == 0 {
+            break;
+        }
+    }
+    let hash = digits.into_iter().rev().collect::<String>();
+    format!("{}-{hash}", &encoded[..200])
+}
+
+/// The Claude Code transcript of a session: the path a Hook reported (and
+/// Runtime stored) when it is trusted, otherwise the path Claude Code derives
+/// from the session's working directory.
+pub(crate) fn claude_session_transcript(
+    reported: Option<&str>,
+    cwd: Option<&str>,
+    provider_session_id: &str,
+) -> Option<PathBuf> {
+    reported
+        .and_then(|path| trusted_transcript(PathBuf::from(path), provider_session_id))
+        .or_else(|| claude_transcript_path(cwd?, provider_session_id))
+}
+
+/// The Hook's `transcript_path` when it is trusted (see [`trusted_transcript`]).
+pub(crate) fn trusted_claude_transcript_path(
+    raw: &Value,
+    provider_session_id: &str,
+) -> Option<PathBuf> {
+    trusted_transcript(
+        PathBuf::from(raw.get("transcript_path")?.as_str()?),
+        provider_session_id,
+    )
+}
+
+/// A transcript path is trusted when it is absolute, names the session's
+/// own `<session id>.jsonl`, and lies in a Claude Code `projects` directory
+/// (`.claude/projects/...`, or below the configured Claude directory).
+fn trusted_transcript(path: PathBuf, provider_session_id: &str) -> Option<PathBuf> {
     if !safe_path_component(provider_session_id) {
         return None;
     }
-    let path = PathBuf::from(raw.get("transcript_path")?.as_str()?);
     if !path.is_absolute()
+        || path.as_os_str().len() > 4096
         || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
         || path.file_stem().and_then(|value| value.to_str()) != Some(provider_session_id)
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
     {
         return None;
     }
@@ -139,10 +200,13 @@ fn trusted_claude_transcript_path(raw: &Value, provider_session_id: &str) -> Opt
             _ => None,
         })
         .collect::<Vec<_>>();
-    components
-        .windows(2)
-        .any(|pair| pair == [".claude", "projects"])
-        .then_some(path)
+    let configured =
+        claude_config_root().is_some_and(|root| path.starts_with(root.join("projects")));
+    (configured
+        || components
+            .windows(2)
+            .any(|pair| pair == [".claude", "projects"]))
+    .then_some(path)
 }
 
 fn safe_path_component(value: &str) -> bool {
@@ -363,6 +427,57 @@ mod tests {
         assert_eq!(resolved.title, "用户最终标题");
         assert_eq!(resolved.source, "claude_custom_title");
         assert!(!resolved.title.contains("private prompt"));
+    }
+
+    #[test]
+    fn claude_project_directories_follow_the_claude_code_encoding() {
+        assert_eq!(
+            claude_project_directory("/Users/mmx/ActRealm/Display.worktrees/main"),
+            "-Users-mmx-ActRealm-Display-worktrees-main"
+        );
+        assert_eq!(
+            claude_project_directory("/Users/mmx/Documents/my_app v2"),
+            "-Users-mmx-Documents-my-app-v2"
+        );
+        // Each UTF-16 unit of a non-ASCII name becomes one `-`.
+        assert_eq!(claude_project_directory("/tmp/\u{56fe}\u{7247}"), "-tmp---");
+        let long = format!("/Users/mmx/{}", "a".repeat(240));
+        let encoded = claude_project_directory(&long);
+        assert!(encoded.starts_with(&format!("-Users-mmx-{}", "a".repeat(189))));
+        assert_eq!(encoded.as_bytes()[200], b'-');
+        assert!(encoded[201..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase()));
+        // The Java string hash of "abc" is 96354 ("22ci" in base 36).
+        let hash = "abc".encode_utf16().fold(0_i32, |hash, unit| {
+            hash.wrapping_shl(5)
+                .wrapping_sub(hash)
+                .wrapping_add(i32::from(unit))
+        });
+        assert_eq!(hash, 96_354);
+    }
+
+    #[test]
+    fn only_a_claude_projects_transcript_of_the_session_is_trusted() {
+        let session = "0a367746-d310-4bee-b18f-8d0f8ea10d28";
+        let good = format!("/Users/example/.claude/projects/-tmp-demo/{session}.jsonl");
+        assert_eq!(
+            claude_session_transcript(Some(&good), None, session),
+            Some(PathBuf::from(&good))
+        );
+        for bad in [
+            "/Users/example/.claude/projects/-tmp-demo/other.jsonl".to_owned(),
+            format!("/Users/example/notes/{session}.jsonl"),
+            format!("relative/.claude/projects/x/{session}.jsonl"),
+            format!("/Users/example/.claude/projects/../../{session}.jsonl"),
+            format!("/Users/example/.claude/projects/x/{session}.txt"),
+        ] {
+            assert_ne!(
+                claude_session_transcript(Some(&bad), None, session),
+                Some(PathBuf::from(&bad)),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

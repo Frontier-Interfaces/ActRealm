@@ -3765,7 +3765,9 @@ fn subagent_counts_and_background_stop_state_are_fact_based() {
         .iter()
         .find(|session| session.provider_session_id == "background-session")
         .unwrap();
-    assert_eq!(background.exec_state, "tool_running");
+    // The turn is over: the session waits for the user while the shell runs.
+    assert_eq!(background.exec_state, "response_finished");
+    assert_eq!(background.background_tasks, 1);
     assert_eq!(
         background.activity.as_deref(),
         Some("1 background tasks still running")
@@ -3820,7 +3822,7 @@ fn stop_after_work(
 }
 
 #[test]
-fn only_running_background_work_keeps_a_stopped_turn_running() {
+fn only_running_background_work_holds_back_the_completion() {
     let root = temp_root("background-status");
     let task = |id: &str, status: &str| json!({"id": id, "type": "shell", "status": status});
     let finished = [
@@ -3848,7 +3850,8 @@ fn only_running_background_work_keeps_a_stopped_turn_running() {
     assert_eq!(completion, Some(false));
     assert_eq!(turn, "response_finished");
 
-    // One running task still holds the completion back.
+    // One running task still holds the completion back; the turn ends all
+    // the same and the session waits for the user.
     for status in [
         "running",
         "pending",
@@ -3858,12 +3861,13 @@ fn only_running_background_work_keeps_a_stopped_turn_running() {
         "started",
     ] {
         let session = format!("active-{status}");
-        let (state, activity, completion, _) = stop_after_work(
+        let (state, activity, completion, turn) = stop_after_work(
             &root,
             &session,
             json!({"background_tasks": [task("bg", status)], "session_crons": []}),
         );
-        assert_eq!(state, "tool_running", "{status}");
+        assert_eq!(state, "response_finished", "{status}");
+        assert_eq!(turn, "response_finished", "{status}");
         assert_eq!(
             activity.as_deref(),
             Some("1 background tasks still running"),
@@ -3888,7 +3892,7 @@ fn only_running_background_work_keeps_a_stopped_turn_running() {
             ]
         }),
     );
-    assert_eq!(state, "tool_running");
+    assert_eq!(state, "response_finished");
     assert_eq!(
         activity.as_deref(),
         Some("3 background tasks still running")
@@ -3904,7 +3908,290 @@ fn only_running_background_work_keeps_a_stopped_turn_running() {
             "session_crons": [{"id": "cron", "schedule": "*/5 * * * *", "recurring": true, "prompt": "loop"}]
         }),
     );
-    assert_eq!((state.as_str(), completion), ("tool_running", None));
+    assert_eq!((state.as_str(), completion), ("response_finished", None));
+
+    // Ambient work Claude Code keeps running on its own never holds a turn
+    // open: the live-update monitor of a published Artifact (the shape
+    // Claude Code 2.1.292 reports), memory consolidation, the auto-mode scan.
+    let (state, activity, completion, _) = stop_after_work(
+        &root,
+        "artifact-monitor",
+        json!({
+            "background_tasks": [
+                {
+                    "id": "m1", "type": "monitor", "status": "running",
+                    "description": "live updates for artifact https://claude.ai/code/artifact/x (subscription)"
+                },
+                {"id": "d1", "type": "dream", "status": "running", "description": "memory"},
+                {"id": "a1", "type": "auto-mode scan", "status": "pending", "description": "scan"}
+            ],
+            "session_crons": []
+        }),
+    );
+    assert_eq!(state, "response_finished");
+    assert_eq!(activity.as_deref(), Some("Turn completed"));
+    assert_eq!(completion, Some(false));
+    // Any other monitor (a Monitor tool watch, an MCP monitor) is real work.
+    let (_, activity, completion, _) = stop_after_work(
+        &root,
+        "mcp-monitor",
+        json!({
+            "background_tasks": [{
+                "id": "m2", "type": "monitor", "status": "running",
+                "description": "watch deploy", "server": "ci", "tool": "watch"
+            }]
+        }),
+    );
+    assert_eq!(
+        (activity.as_deref(), completion),
+        (Some("1 background tasks still running"), None)
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_stop_with_background_work_ends_the_turn_until_the_next_one_starts() {
+    let root = temp_root("background-turn-end");
+    let database = root.join("data.sqlite");
+    let store = RuntimeStore::open(&database).unwrap();
+    let session = "background-wait";
+    ingest_tool_turn(&store, Provider::Claude, session, "t1", 1_000);
+    let stopped = claude_event(
+        &store,
+        session,
+        json!({
+            "hook_event_name": "Stop",
+            "turn_id": "t1",
+            "last_assistant_message": "Started the long build in the background.",
+            "background_tasks": [
+                {"id": "a1", "type": "subagent", "status": "running", "description": "PRIVATE TASK", "agent_type": "Explore"},
+                {"id": "a2", "type": "subagent", "status": "running", "description": "PRIVATE TASK"},
+                {"id": "b1", "type": "shell", "status": "pending", "description": "PRIVATE", "command": "PRIVATE COMMAND"},
+                {"id": "m1", "type": "monitor", "status": "running", "description": "live updates for artifact https://example.test/a"},
+                {"id": "x1", "type": "MCP task", "status": "running", "description": "PRIVATE"}
+            ],
+            "session_crons": [{"id": "c1", "schedule": "*/5 * * * *", "recurring": true, "prompt": "PRIVATE PROMPT"}]
+        }),
+        1_100,
+    );
+    let state = |store: &RuntimeStore| {
+        let session = store
+            .snapshot()
+            .unwrap()
+            .sessions
+            .into_iter()
+            .find(|item| item.id == stopped)
+            .unwrap();
+        (
+            session.exec_state,
+            session.activity,
+            session.background_tasks,
+            session.turn_ended_at,
+        )
+    };
+    // Five active items (the Artifact monitor is ambient; the cron job has no
+    // status and counts): the turn ended, nothing runs in the foreground and
+    // no completion is raised.
+    assert_eq!(
+        state(&store),
+        (
+            "response_finished".to_owned(),
+            Some("5 background tasks still running".to_owned()),
+            5,
+            Some(1_100)
+        )
+    );
+    assert!(store
+        .snapshot()
+        .unwrap()
+        .attention
+        .iter()
+        .all(|item| item.session_id != stopped));
+    let serialized = serde_json::to_value(store.snapshot().unwrap().sessions).unwrap();
+    assert!(serialized
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["backgroundTasks"] == 5));
+
+    // A background subagent keeps calling tools: still the turn that ended.
+    for (offset, event) in [(0, "PreToolUse"), (10, "PostToolUse")] {
+        claude_event(
+            &store,
+            session,
+            json!({
+                "hook_event_name": event, "tool_name": "Bash", "tool_use_id": "sub-bash",
+                "tool_input": {"command": "cargo build"},
+                "agent_id": "a1", "agent_type": "Explore"
+            }),
+            2_000 + offset,
+        );
+    }
+    claude_event(
+        &store,
+        session,
+        json!({"hook_event_name": "SubagentStop", "agent_id": "a1", "agent_type": "Explore"}),
+        3_000,
+    );
+    assert_eq!(state(&store).0, "response_finished");
+    assert_eq!(state(&store).3, Some(1_100));
+
+    // The task notification wakes the main Agent with a new prompt.
+    claude_event(
+        &store,
+        session,
+        json!({"hook_event_name": "UserPromptSubmit", "prompt": "<task-notification>done</task-notification>"}),
+        4_000,
+    );
+    let (exec_state, _, background_tasks, turn_ended_at) = state(&store);
+    assert_eq!(
+        (exec_state.as_str(), background_tasks, turn_ended_at),
+        ("thinking", 0, None)
+    );
+    drop(store);
+
+    // Only the kinds and states of the background work are kept, for
+    // diagnosis; no description, command or prompt.
+    let summary = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT summary FROM events WHERE type = 'turn.stopped'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        summary,
+        "background: subagent running\u{d7}2, shell pending\u{d7}1, monitor running ambient\u{d7}1, mcp_task running\u{d7}1, cron\u{d7}1"
+    );
+    let contents = fs::read(&database).unwrap();
+    for private in ["PRIVATE TASK", "PRIVATE COMMAND", "PRIVATE PROMPT"] {
+        assert!(!contents
+            .windows(private.len())
+            .any(|window| window == private.as_bytes()));
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_main_agent_tool_after_the_stop_still_reopens_the_turn() {
+    let root = temp_root("background-main-tool");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    ingest_tool_turn(&store, Provider::Claude, "main-tool", "t1", 1_000);
+    let session = claude_event(
+        &store,
+        "main-tool",
+        json!({
+            "hook_event_name": "Stop", "turn_id": "t1",
+            "background_tasks": [{"id": "b1", "type": "shell", "status": "running"}]
+        }),
+        1_100,
+    );
+    // A Stop Hook that blocks makes the main Agent continue the same turn.
+    claude_event(
+        &store,
+        "main-tool",
+        json!({
+            "hook_event_name": "PreToolUse", "tool_name": "Read", "tool_use_id": "main-read",
+            "tool_input": {"file_path": "/tmp/example-project/file.rs"}
+        }),
+        1_200,
+    );
+    let snapshot = store.snapshot().unwrap();
+    let state = snapshot
+        .sessions
+        .iter()
+        .find(|item| item.id == session)
+        .unwrap();
+    assert_eq!(state.exec_state, "tool_running");
+    assert_eq!(state.background_tasks, 0);
+    assert_eq!(state.turn_ended_at, None);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn an_idle_prompt_ends_a_turn_whose_stop_was_lost() {
+    let root = temp_root("idle-prompt-turn-end");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let state = |store: &RuntimeStore, id: &str| {
+        let snapshot = store.snapshot().unwrap();
+        let session = snapshot.sessions.iter().find(|item| item.id == id).unwrap();
+        (session.exec_state.clone(), session.turn_ended_at)
+    };
+    // The turn's Stop never arrived.
+    ingest_tool_turn(&store, Provider::Claude, "lost-stop", "t1", 1_000);
+    let session = claude_event(
+        &store,
+        "lost-stop",
+        json!({
+            "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_use_id": "bash",
+            "tool_input": {"command": "ls"}
+        }),
+        1_100,
+    );
+    assert_eq!(state(&store, &session).0, "tool_running");
+    claude_event(&store, "lost-stop", idle_prompt_notification(), 61_100);
+    assert_eq!(
+        state(&store, &session),
+        ("response_finished".to_owned(), Some(61_100))
+    );
+    assert!(store
+        .snapshot()
+        .unwrap()
+        .attention
+        .iter()
+        .all(|item| item.session_id != session));
+
+    // A pending approval still needs the user: the notification changes
+    // nothing.
+    ingest_tool_turn(&store, Provider::Claude, "approval", "t1", 1_000);
+    let session = claude_event(
+        &store,
+        "approval",
+        json!({
+            "hook_event_name": "PermissionRequest", "tool_name": "Bash",
+            "tool_input": {"command": "git push"}
+        }),
+        1_100,
+    );
+    let before = state(&store, &session);
+    claude_event(&store, "approval", idle_prompt_notification(), 61_100);
+    assert_eq!(state(&store, &session), before);
+    assert_eq!(before.0, "awaiting_approval");
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_session_waiting_with_background_work_stays_listed_for_a_day() {
+    let root = temp_root("background-listed");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let hour = 60 * 60 * 1000;
+    ingest_tool_turn(&store, Provider::Claude, "waiting", "t1", 1_000);
+    let waiting = claude_event(
+        &store,
+        "waiting",
+        json!({
+            "hook_event_name": "Stop", "turn_id": "t1",
+            "background_tasks": [{"id": "b1", "type": "shell", "status": "running"}]
+        }),
+        1_100,
+    );
+    let listed = |cutoff: u64| {
+        store
+            .ui_snapshot(cutoff)
+            .unwrap()
+            .sessions
+            .iter()
+            .any(|item| item.id == waiting)
+    };
+    // The regular 30-minute retention has passed; the session still waits.
+    assert!(listed(1_100 + 2 * hour));
+    assert!(listed(1_100 + 24 * hour));
+    assert!(!listed(1_100 + 25 * hour));
+    drop(store);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -3941,7 +4228,7 @@ fn a_final_question_marks_the_completion_as_awaiting_a_reply() {
             "session_crons": []
         }),
     );
-    assert_eq!(state, "tool_running");
+    assert_eq!(state, "response_finished");
     assert_eq!(
         activity.as_deref(),
         Some("1 background tasks still running")

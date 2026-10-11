@@ -139,6 +139,8 @@ const TASK_CARD_DISPLAY_FIELDS: &[&str] = &[
     "lastEventAt",
 ];
 const SESSION_LIST_RETENTION_MS: u64 = 30 * 60 * 1_000;
+/// Only sessions with an event in this window report a latest message.
+const LATEST_MESSAGE_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
 const USAGE_COLLECTION_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const USAGE_BACKFILL_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const USAGE_LIVE_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -2312,6 +2314,21 @@ fn update_codex_notification(
 
     if notification.method == "item/completed" {
         let item = &notification.params["item"];
+        // Every Agent message (commentary while the turn works, then the
+        // final answer) becomes the session's latest message.
+        if item["type"] == "agentMessage" && item["phase"] != "final_answer" {
+            if let Some(text) = item["text"].as_str().filter(|text| !text.trim().is_empty()) {
+                if let Some(session_id) = store.snapshot().ok().and_then(|snapshot| {
+                    snapshot
+                        .sessions
+                        .into_iter()
+                        .find(|s| s.provider == "codex" && s.provider_session_id == thread_id)
+                        .map(|session| session.id)
+                }) {
+                    store.observe_latest_message(&session_id, text, observed_at, false);
+                }
+            }
+        }
         if item["type"] == "agentMessage" && item["phase"] == "final_answer" {
             if let Some(text) = item["text"].as_str() {
                 let awaits_reply = actrealm_runtime::message_awaits_reply(text);
@@ -2341,6 +2358,7 @@ fn update_codex_notification(
                             observed_at,
                             "codex:app_server_final",
                         );
+                        store.observe_latest_message(&session.id, text, observed_at, true);
                     }
                 }
             }
@@ -3956,12 +3974,35 @@ async fn companion_session_result(
             .store
             .session_prompt(&session_id, turn_started_at, now_millis())
     });
+    // The latest Agent message at any point of the turn (the start of it,
+    // within the result excerpt bounds), unlike `result`, which only a
+    // finished turn has.
+    let now = now_millis();
+    let latest = (now.saturating_sub(context.last_event_at) <= LATEST_MESSAGE_WINDOW_MS)
+        .then(|| {
+            let query = actrealm_runtime::LatestMessageQuery {
+                session_id: session_id.clone(),
+                transcript: context.transcript_path.clone(),
+                turn_started_at: context.turn_started_at,
+                turn_ended_at: context.turn_ended_at,
+            };
+            state
+                .store
+                .latest_messages(
+                    std::slice::from_ref(&query),
+                    actrealm_runtime::LatestMessageForm::Full,
+                    now,
+                )
+                .remove(&session_id)
+        })
+        .flatten();
     Json(json!({
         "schemaVersion": 1,
         "sessionId": session_id,
         "result": result,
         "activities": activities,
         "prompt": prompt,
+        "latest": latest,
     }))
     .into_response()
 }
@@ -8595,6 +8636,14 @@ fn apply_live_codex_metrics(
 }
 
 fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
+    snapshot_value_and_sessions(state).map(|(value, _)| value)
+}
+
+/// The UI snapshot together with the session records it was built from, for
+/// projections that need fields the serialized sessions leave out.
+fn snapshot_value_and_sessions(
+    state: &AppState,
+) -> Result<(Value, Vec<SessionRecord>), StoreError> {
     let now = now_millis();
     state.codex.retry_unsynced_native_approvals();
     let snapshot = state
@@ -8945,7 +8994,7 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
             Value::Number(coarse_ui_timestamp(now).into()),
         );
     }
-    Ok(json!({
+    let value = json!({
         "sessions": sessions,
         "attention": attention,
         "asyncQuestions": state.codex.state.lock().ok().map(|mut s| s.async_questions.snapshot(now)).unwrap_or_default(),
@@ -8961,7 +9010,25 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
             "codexConnector": state.codex.capability_value(),
             "providerMatrix": provider_capability_matrix()
         }
-    }))
+    });
+    Ok((value, snapshot.sessions))
+}
+
+/// What the latest-message lookup needs to know about a session: its
+/// transcript (Claude Code) and its current turn. Sessions without an event
+/// in the last day are left out.
+fn latest_message_query(
+    session: &SessionRecord,
+    now: u64,
+) -> Option<actrealm_runtime::LatestMessageQuery> {
+    (now.saturating_sub(session.last_event_at) <= LATEST_MESSAGE_WINDOW_MS).then(|| {
+        actrealm_runtime::LatestMessageQuery {
+            session_id: session.id.clone(),
+            transcript: session.transcript_path.clone(),
+            turn_started_at: session.turn_started_at,
+            turn_ended_at: session.turn_ended_at,
+        }
+    })
 }
 
 fn coarse_ui_timestamp(value: u64) -> u64 {
@@ -8972,7 +9039,7 @@ fn companion_snapshot_value(
     state: &AppState,
     authorization: &CompanionAuthorization,
 ) -> Result<Value, StoreError> {
-    let source = snapshot_value(state)?;
+    let (source, records) = snapshot_value_and_sessions(state)?;
     let sessions = project_array_fields(
         source.get("sessions"),
         &[
@@ -9021,9 +9088,35 @@ fn companion_snapshot_value(
             "lastEventAt",
             "userTurnCount",
             "taskRole",
+            "backgroundTasks",
         ],
     );
     let mut sessions = sessions;
+    // The application a session runs in, and its latest Agent message (the
+    // end of it, sanitized; memory-only like result excerpts).
+    let now = now_millis();
+    let queries = records
+        .iter()
+        .filter_map(|record| latest_message_query(record, now))
+        .collect::<Vec<_>>();
+    let mut latest =
+        state
+            .store
+            .latest_messages(&queries, actrealm_runtime::LatestMessageForm::Glance, now);
+    for row in &mut sessions {
+        let Some(record) = row["id"]
+            .as_str()
+            .and_then(|id| records.iter().find(|record| record.id == id))
+        else {
+            continue;
+        };
+        if let Some(object) = row.as_object_mut() {
+            object.insert("termApp".to_owned(), json!(record.term_app));
+            object.insert("termBundleId".to_owned(), json!(record.term_bundle_id));
+            object.insert("termSurface".to_owned(), json!(record.term_surface));
+            object.insert("lastMessage".to_owned(), json!(latest.remove(&record.id)));
+        }
+    }
     if let Ok(native) = state.codex.state.lock() {
         for row in &mut sessions {
             let latest = row["id"]
@@ -9457,6 +9550,16 @@ fn observe_codex_questions(state: &AppState, scanner: &mut QuestionScanner) {
                         at,
                         "codex:final_response",
                     );
+                }
+                Observation::Message {
+                    session_id,
+                    text,
+                    at,
+                    is_final,
+                } => {
+                    state
+                        .store
+                        .observe_latest_message(&session_id, &text, at, is_final);
                 }
                 Observation::Clear { thread_id, at } => {
                     current.async_questions.clear_thread(&thread_id, at);
@@ -11115,6 +11218,34 @@ mod tests {
     /// Writes the real Companion responses that Display decodes in its own
     /// tests. Set ACTREALM_CONTRACT_SAMPLE_DIR to export them; otherwise the
     /// test only verifies the combined shape.
+    /// Formats epoch milliseconds the way Claude Code transcripts record
+    /// time (`2026-10-10T17:36:20.123Z`).
+    fn rfc3339_millis(value: u64) -> String {
+        let days = i64::try_from(value / 86_400_000).unwrap();
+        let in_day = value % 86_400_000;
+        let shifted = days + 719_468;
+        let era = shifted.div_euclid(146_097);
+        let day_of_era = shifted - era * 146_097;
+        let year_of_era =
+            (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+        let month_index = (5 * day_of_year + 2) / 153;
+        let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+        let month = if month_index < 10 {
+            month_index + 3
+        } else {
+            month_index - 9
+        };
+        let year = year_of_era + era * 400 + i64::from(month <= 2);
+        format!(
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+            in_day / 3_600_000,
+            in_day / 60_000 % 60,
+            in_day / 1_000 % 60,
+            in_day % 1_000
+        )
+    }
+
     #[test]
     fn companion_contract_samples_cover_display_agent_fields() {
         let root = std::env::temp_dir().join(format!("actrealm-contract-{}", Uuid::now_v7()));
@@ -11146,8 +11277,17 @@ mod tests {
             &[COMPANION_SCOPE_SNAPSHOT, COMPANION_SCOPE_JUMP],
         );
         let at = now_millis();
+        let vscode = |mut request: BridgeRequest| {
+            request.term = Some(actrealm_core::TermContext {
+                app: Some("Visual Studio Code".to_owned()),
+                bundle_id: Some("com.microsoft.VSCode".to_owned()),
+                surface: Some("editor".to_owned()),
+                ..Default::default()
+            });
+            request
+        };
         let main_session = store
-            .ingest(BridgeRequest::from_hook_at(
+            .ingest(vscode(BridgeRequest::from_hook_at(
                 Provider::Claude,
                 json!({
                     "hook_event_name":"UserPromptSubmit","session_id":"contract-main","turn_id":"m1",
@@ -11155,7 +11295,7 @@ mod tests {
                     "session_title":"Checkout button polish"
                 }),
                 at,
-            ))
+            )))
             .unwrap()
             .session_id;
         for (offset, event) in [(10, "PreToolUse"), (20, "PostToolUse")] {
@@ -11192,6 +11332,73 @@ mod tests {
                 at + 40,
             ))
             .unwrap();
+        // A turn that ended while a background build and a subagent keep
+        // running; its latest message comes from the Claude Code transcript.
+        let transcript = root
+            .join(".claude/projects/-contract-background")
+            .join("contract-background.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            [
+                json!({"type":"user","message":{"role":"user","content":"跑一遍完整构建"}}),
+                json!({
+                    "type":"assistant","isSidechain":false,"timestamp":rfc3339_millis(at + 65),
+                    "message":{"id":"msg-1","role":"assistant","model":"claude-test","content":[
+                        {"type":"text","text":"完整构建已在后台运行，另开了一个子代理排查告警。结果出来前你可以先看别的。"}
+                    ]}
+                }),
+            ]
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>(),
+        )
+        .unwrap();
+        fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600)).unwrap();
+        let background_session = store
+            .ingest(vscode(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                json!({
+                    "hook_event_name":"UserPromptSubmit","session_id":"contract-background",
+                    "cwd":repository,"transcript_path":transcript,"prompt":"跑一遍完整构建",
+                    "session_title":"Full build"
+                }),
+                at + 50,
+            )))
+            .unwrap()
+            .session_id;
+        for (offset, raw) in [
+            (
+                60,
+                json!({
+                    "hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"build",
+                    "tool_input":{"command":"cargo build --release"}
+                }),
+            ),
+            (
+                70,
+                json!({
+                    "hook_event_name":"Stop",
+                    "background_tasks":[
+                        {"id":"b1","type":"shell","status":"running","description":"release build","command":"cargo build --release"},
+                        {"id":"a1","type":"subagent","status":"running","description":"warnings","agent_type":"Explore"}
+                    ],
+                    "session_crons":[]
+                }),
+            ),
+        ] {
+            let mut raw = raw;
+            raw["session_id"] = json!("contract-background");
+            raw["cwd"] = json!(repository);
+            raw["transcript_path"] = json!(transcript);
+            store
+                .ingest(vscode(BridgeRequest::from_hook_at(
+                    Provider::Claude,
+                    raw,
+                    at + offset,
+                )))
+                .unwrap();
+        }
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -11235,6 +11442,39 @@ mod tests {
             .clone();
         assert_eq!(main["taskRole"], "main");
         assert_eq!(main["userTurnCount"], 1);
+        assert_eq!(main["termApp"], "Visual Studio Code");
+        assert_eq!(main["termBundleId"], "com.microsoft.VSCode");
+        assert_eq!(main["termSurface"], "editor");
+        assert_eq!(main["backgroundTasks"], 0);
+        assert_eq!(
+            main["lastMessage"],
+            json!({
+                "text": "按钮圆角已改为 12，并新增 CheckoutTests。\n要提交的话说一声。",
+                "at": at + 30,
+                "final": true,
+                "truncated": false
+            })
+        );
+        let background = sample("snapshot.json")["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == background_session.as_str())
+            .unwrap()
+            .clone();
+        assert_eq!(background["execState"], "response_finished");
+        assert_eq!(background["backgroundTasks"], 2);
+        assert_eq!(
+            background["lastMessage"]["text"],
+            "完整构建已在后台运行，另开了一个子代理排查告警。结果出来前你可以先看别的。"
+        );
+        assert_eq!(background["lastMessage"]["at"], at + 65);
+        assert_eq!(background["lastMessage"]["final"], true);
+        assert!(sample("snapshot.json")["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["sessionId"] != background_session.as_str()));
         let completion = sample("snapshot.json")["attention"]
             .as_array()
             .unwrap()
@@ -11244,14 +11484,34 @@ mod tests {
             .clone();
         assert_eq!(completion["awaitsReply"], true);
         let history = sample("history.json")["tasks"].as_array().unwrap();
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[1]["reviewState"], "unseen");
-        assert_eq!(history[1]["latestAttentionKind"], "completion");
-        assert_eq!(history[0]["taskRole"], "side");
-        assert!(history[0]["title"].is_null());
+        let task = |id: &str| {
+            history
+                .iter()
+                .find(|task| task["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(history.len(), 3);
+        assert_eq!(task(&main_session)["reviewState"], "unseen");
+        assert_eq!(task(&main_session)["latestAttentionKind"], "completion");
+        let side = history
+            .iter()
+            .find(|task| task["provider"] == "codex")
+            .unwrap();
+        assert_eq!(side["taskRole"], "side");
+        assert!(side["title"].is_null());
         assert_eq!(
             sample("result.json")["prompt"]["text"],
             "把结算页按钮改成 12 圆角，并补一个测试"
+        );
+        assert_eq!(
+            sample("result.json")["latest"],
+            json!({
+                "text": "按钮圆角已改为 12，并新增 CheckoutTests。\n要提交的话说一声。",
+                "at": at + 30,
+                "final": true,
+                "truncated": false
+            })
         );
         let files = sample("review.json")["repository"]["files"]
             .as_array()

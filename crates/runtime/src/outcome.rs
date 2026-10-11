@@ -15,6 +15,8 @@ const MAX_PROMPT_CHARS: usize = 2_000;
 /// scrolls; a long report still sends the reader back to the conversation.
 const MAX_RESULT_LINES: usize = 60;
 const MAX_RESULT_CHARS: usize = 4_000;
+/// The end of the latest Agent message that a session card shows.
+pub(crate) const GLANCE_CHARS: usize = 400;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -93,57 +95,15 @@ impl OutcomeRegistry {
             return;
         }
         self.prune(at);
-        let raw: String = text.chars().take(MAX_SOURCE).collect();
-        let (plain, paths) = extract_links(&raw);
-        // Code blocks are skipped as a whole, up to the fence that opened them.
-        let mut fenced: Option<&str> = None;
-        let mut lines = Vec::new();
-        let mut filter = CredentialLineFilter::default();
-        // Anything not shown (a skipped code block, lines past the limit)
-        // marks the excerpt truncated, so the reader knows to look further.
-        let mut omitted = false;
-        for line in plain.lines() {
-            if let Some(fence) = code_fence(line.trim_start()) {
-                match fenced {
-                    None => {
-                        fenced = Some(fence);
-                        omitted = true;
-                        filter.skipped_code_block();
-                    }
-                    Some(open) if open == fence => fenced = None,
-                    Some(_) => {}
-                }
-                continue;
-            }
-            if fenced.is_some() {
-                continue;
-            }
-            let indent = leading_whitespace(line);
-            let list_item = is_list_item(line);
-            let line = strip_markdown(line.trim());
-            if line.trim().is_empty() {
-                filter.blank_line();
-                continue;
-            }
-            if let Some(safe) = filter.filter_line(indent, &line, list_item) {
-                if lines.len() >= MAX_RESULT_LINES {
-                    omitted = true;
-                    break;
-                }
-                lines.push(safe);
-            }
-        }
-        let joined = lines.join("\n");
-        let mut summary: String = joined.chars().take(MAX_RESULT_CHARS).collect();
-        let mut truncated = filter.removed
-            || omitted
-            || joined.chars().count() > MAX_RESULT_CHARS
-            || raw.len() < text.len();
-        // The known-format detection runs once more over the whole excerpt.
-        if sanitize_result_text(&summary).is_err() {
-            summary.clear();
-            truncated = true;
-        }
+        let message = sanitized_message(text, Some(MAX_RESULT_LINES));
+        let Some(Excerpt {
+            text: summary,
+            truncated,
+        }) = head_excerpt(&message)
+        else {
+            return;
+        };
+        let paths = message.paths;
         let artifacts = paths
             .into_iter()
             .filter_map(|p| resolve_artifact(&p, cwd))
@@ -262,6 +222,182 @@ impl OutcomeRegistry {
             self.started_at.clear();
         }
     }
+}
+
+/// A message after the result line filter: the lines that may be shown,
+/// whether anything of the message is not among them, and the link targets
+/// it named (candidate artifacts).
+struct SanitizedMessage {
+    lines: Vec<String>,
+    /// A skipped code block, a removed credential line, lines past the line
+    /// bound, or text past [`MAX_SOURCE`].
+    omitted: bool,
+    paths: Vec<String>,
+}
+
+/// Runs the result line filter over the first [`MAX_SOURCE`] characters of
+/// an Agent message: code blocks are skipped as a whole, Markdown decoration
+/// is dropped, every line passes [`CredentialLineFilter`], and link targets
+/// are collected instead of shown. With `max_lines` the scan stops once that
+/// many lines are kept.
+fn sanitized_message(text: &str, max_lines: Option<usize>) -> SanitizedMessage {
+    let raw: String = text.chars().take(MAX_SOURCE).collect();
+    let (plain, paths) = extract_links(&raw);
+    // Code blocks are skipped as a whole, up to the fence that opened them.
+    let mut fenced: Option<&str> = None;
+    let mut lines = Vec::new();
+    let mut filter = CredentialLineFilter::default();
+    // Anything not shown (a skipped code block, lines past the limit) marks
+    // the excerpt truncated, so the reader knows to look further.
+    let mut omitted = raw.len() < text.len();
+    for line in plain.lines() {
+        if let Some(fence) = code_fence(line.trim_start()) {
+            match fenced {
+                None => {
+                    fenced = Some(fence);
+                    omitted = true;
+                    filter.skipped_code_block();
+                }
+                Some(open) if open == fence => fenced = None,
+                Some(_) => {}
+            }
+            continue;
+        }
+        if fenced.is_some() {
+            continue;
+        }
+        let indent = leading_whitespace(line);
+        let list_item = is_list_item(line);
+        let line = strip_markdown(line.trim());
+        if line.trim().is_empty() {
+            filter.blank_line();
+            continue;
+        }
+        if let Some(safe) = filter.filter_line(indent, &line, list_item) {
+            if max_lines.is_some_and(|max| lines.len() >= max) {
+                omitted = true;
+                break;
+            }
+            lines.push(safe);
+        }
+    }
+    SanitizedMessage {
+        lines,
+        omitted: omitted || filter.removed,
+        paths,
+    }
+}
+
+/// A bounded excerpt of an Agent message. `truncated` is set when anything
+/// of the message is not in `text`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Excerpt {
+    pub text: String,
+    pub truncated: bool,
+}
+
+/// The start of a message, as result excerpts show it: up to the first
+/// [`MAX_RESULT_LINES`] lines and [`MAX_RESULT_CHARS`] characters. `None`
+/// when nothing may be shown; an excerpt the whole-text secret check rejects
+/// is empty and truncated.
+fn head_excerpt(message: &SanitizedMessage) -> Option<Excerpt> {
+    let joined = message
+        .lines
+        .iter()
+        .take(MAX_RESULT_LINES)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut text: String = joined.chars().take(MAX_RESULT_CHARS).collect();
+    let mut truncated = message.omitted
+        || message.lines.len() > MAX_RESULT_LINES
+        || joined.chars().count() > MAX_RESULT_CHARS;
+    // The known-format detection runs once more over the whole excerpt.
+    if sanitize_result_text(&text).is_err() {
+        text.clear();
+        truncated = true;
+    }
+    (!text.is_empty() || !message.paths.is_empty()).then_some(Excerpt { text, truncated })
+}
+
+/// The end of a message, where an Agent puts its conclusion or question: at
+/// most `max_chars` characters of its last lines. Whole lines are taken from
+/// the end; when budget remains, the line before contributes its last
+/// sentences, cut after a sentence end (`.`, `!`, `?`, `;` before a space, or
+/// `。`, `！`, `？`, `；`, `…`), else after a space, else at the character
+/// bound. A last line longer than the bound is cut the same way.
+fn tail_excerpt(message: &SanitizedMessage, max_chars: usize) -> Option<Excerpt> {
+    let mut kept: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    let mut cut = false;
+    for line in message.lines.iter().rev() {
+        let separator = usize::from(!kept.is_empty());
+        let length = line.chars().count();
+        if used + separator + length <= max_chars {
+            kept.push(line.clone());
+            used += separator + length;
+            continue;
+        }
+        cut = true;
+        let budget = max_chars.saturating_sub(used + separator);
+        // A fragment shorter than this says too little to be worth showing
+        // unless it is all there is.
+        if budget >= 24 || kept.is_empty() {
+            if let Some(fragment) = line_tail(line, budget) {
+                kept.push(fragment);
+            }
+        }
+        break;
+    }
+    kept.reverse();
+    let text = kept.join("\n");
+    if text.trim().is_empty() || sanitize_result_text(&text).is_err() {
+        return None;
+    }
+    Some(Excerpt {
+        text,
+        truncated: cut || message.omitted,
+    })
+}
+
+/// The last at most `budget` characters of `line`, starting at a sentence or
+/// word boundary when one exists inside them.
+fn line_tail(line: &str, budget: usize) -> Option<String> {
+    if budget == 0 {
+        return None;
+    }
+    let characters: Vec<char> = line.chars().collect();
+    let start = characters.len().saturating_sub(budget);
+    let window = &characters[start..];
+    let boundary = |at: usize| -> bool {
+        // `at` is the index (in `window`) of the first character kept.
+        if at == 0 {
+            return start == 0;
+        }
+        let previous = window[at - 1];
+        matches!(
+            previous,
+            '\u{3002}' | '\u{ff01}' | '\u{ff1f}' | '\u{ff1b}' | '\u{2026}'
+        ) || (previous.is_whitespace()
+            && at >= 2
+            && matches!(window[at - 2], '.' | '!' | '?' | ';'))
+    };
+    let sentence = (0..window.len()).find(|at| boundary(*at));
+    let word = || (1..window.len()).find(|at| window[*at - 1].is_whitespace());
+    let from = sentence.or_else(word).unwrap_or(0);
+    let fragment: String = window[from..].iter().collect::<String>().trim().to_owned();
+    (!fragment.is_empty()).then_some(fragment)
+}
+
+/// Excerpts of an Agent message for the latest-message view: `full` follows
+/// the result excerpt bounds (the start of the message), `glance` is the end
+/// of the message in at most [`GLANCE_CHARS`] characters. `None` when nothing
+/// of the message may be shown.
+pub(crate) fn message_excerpts(text: &str) -> Option<(Excerpt, Excerpt)> {
+    let message = sanitized_message(text, None);
+    let full = head_excerpt(&message).filter(|excerpt| !excerpt.text.is_empty())?;
+    let glance = tail_excerpt(&message, GLANCE_CHARS)?;
+    Some((full, glance))
 }
 
 /// Applies the Runtime result sanitizer line by line through
@@ -2428,6 +2564,76 @@ fn valid_artifact(path: &Path, identity: Option<(u64, u64)>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latest_message_excerpts_show_the_end_and_the_start_within_their_bounds() {
+        // A short message is shown whole in both forms.
+        let (full, glance) = message_excerpts("测试都过了。\n\n要提交的话说一声。").unwrap();
+        assert_eq!(full.text, "测试都过了。\n要提交的话说一声。");
+        assert_eq!(glance, full);
+        assert!(!glance.truncated);
+
+        // A long message: the glance keeps whole last lines and starts the
+        // line before at a sentence.
+        let opening = "First line of a long report.";
+        let middle = format!(
+            "{} The build is green. All 539 tests pass.",
+            "Earlier detail sentence. ".repeat(20)
+        );
+        let message = format!("{opening}\n{middle}\nShould I push the branch?");
+        let (full, glance) = message_excerpts(&message).unwrap();
+        assert!(full.text.starts_with(opening));
+        assert!(!full.truncated);
+        assert!(glance.truncated);
+        assert!(glance.text.chars().count() <= GLANCE_CHARS);
+        assert!(glance
+            .text
+            .ends_with("All 539 tests pass.\nShould I push the branch?"));
+        assert!(
+            glance.text.starts_with("Earlier detail sentence.")
+                || glance.text.starts_with("The build")
+        );
+
+        // One very long Chinese line is cut after a sentence end.
+        let line = format!(
+            "{}最后确认：要不要合并？",
+            "前面的说明句子很长。".repeat(60)
+        );
+        let (_, glance) = message_excerpts(&line).unwrap();
+        assert!(glance.truncated);
+        assert!(glance.text.starts_with("前面的说明句子很长。"));
+        assert!(glance.text.ends_with("最后确认：要不要合并？"));
+        assert!(glance.text.chars().count() <= GLANCE_CHARS);
+
+        // A line without any boundary is cut at the character bound.
+        let (_, glance) = message_excerpts(&"x".repeat(1_000)).unwrap();
+        assert_eq!(glance.text.chars().count(), GLANCE_CHARS);
+        assert!(glance.truncated);
+    }
+
+    #[test]
+    fn latest_message_excerpts_drop_code_and_credentials() {
+        let message = concat!(
+            "已更新配置。\n",
+            "```\nlet token = load();\n```\n",
+            "password=hunter2-correct-horse\n",
+            "下一步要不要部署？"
+        );
+        let (full, glance) = message_excerpts(message).unwrap();
+        for excerpt in [&full, &glance] {
+            assert_eq!(excerpt.text, "已更新配置。\n下一步要不要部署？");
+            assert!(excerpt.truncated);
+        }
+        let secret = concat!("Use sk_", "live_abcdefghij1234567890ABCD for the API.");
+        assert!(message_excerpts(secret).is_none());
+        // Only code: nothing to show.
+        assert!(message_excerpts("```\nfoo?\n```").is_none());
+        // Links keep their text, paths become placeholders.
+        let (full, _) =
+            message_excerpts("Report: [summary](/tmp/report.md) at /Users/me/x.txt").unwrap();
+        assert_eq!(full.text, "Report: summary at <path>");
+    }
+
     #[test]
     fn excerpts_keep_provider_results_but_drop_secrets_and_older_turns() {
         let mut r = OutcomeRegistry::default();
