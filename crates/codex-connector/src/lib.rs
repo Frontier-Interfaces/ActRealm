@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
@@ -76,6 +76,9 @@ struct Inner {
     protocol: Mutex<ProtocolSupport>,
     next_id: AtomicU64,
     shared_connection: bool,
+    /// Set once the app-server rejects `account/rateLimits/read` parameters
+    /// (releases before `GetAccountRateLimitsParams`).
+    rate_limit_params_rejected: AtomicBool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -169,6 +172,7 @@ impl CodexConnector {
                 protocol: Mutex::new(ProtocolSupport::default()),
                 next_id: AtomicU64::new(1),
                 shared_connection: shared_socket.is_some(),
+                rate_limit_params_rejected: AtomicBool::new(false),
             }),
         };
         let reader_connector = connector.downgrade();
@@ -317,7 +321,30 @@ impl CodexConnector {
     /// Reads Codex account rate limits without starting or resuming a task.
     /// The app-server owns authentication; ActRealm receives only the
     /// allowlisted usage snapshot returned by the provider protocol.
+    ///
+    /// Quota reads are background polls, so they ask the app-server to skip
+    /// its separate reset-credit detail lookup (the available count is still
+    /// returned). An app-server that predates that parameter gets the plain
+    /// request instead.
     pub fn read_rate_limits(&self) -> Result<Value, ConnectorError> {
+        if !self
+            .inner
+            .rate_limit_params_rejected
+            .load(Ordering::Relaxed)
+        {
+            match self.call(
+                "account/rateLimits/read",
+                json!({"excludeResetCreditDetails": true}),
+                RPC_TIMEOUT,
+            ) {
+                Err(ConnectorError::Protocol(_)) => {
+                    self.inner
+                        .rate_limit_params_rejected
+                        .store(true, Ordering::Relaxed);
+                }
+                result => return result,
+            }
+        }
         self.call("account/rateLimits/read", json!({}), RPC_TIMEOUT)
     }
 
@@ -663,6 +690,9 @@ while IFS= read -r line; do
       printf '{"id":%s,"result":{"thread":{"id":"thread-1","sessionId":"session-1","cwd":"/tmp/project","name":"Recovered thread","status":{"type":"active","activeFlags":["waitingOnUserInput"]},"turns":[],"updatedAt":100}}}\n' "$request_id"
       printf '%s\n' '{"id":"server-request-1","method":"item/tool/requestUserInput","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","questions":[{"id":"choice","header":"Choice","question":"Continue?","isOther":false,"isSecret":false,"options":null}]}}'
       ;;
+    *'"method":"account/rateLimits/read"'*'"excludeResetCreditDetails"'*)
+      printf '{"id":%s,"error":{"code":-32602,"message":"Invalid params"}}\n' "$request_id"
+      ;;
     *'"method":"account/rateLimits/read"'*)
       printf '{"id":%s,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":12,"windowDurationMins":300,"resetsAt":1784140000}}}}\n' "$request_id"
       ;;
@@ -690,8 +720,16 @@ done
         assert_eq!(threads[0].active_flags, vec!["waitingOnUserInput"]);
         let resumed = connector.resume_thread("thread-1").unwrap();
         assert_eq!(resumed.name.as_deref(), Some("Recovered thread"));
+        // This app-server predates the background-poll parameter: the read
+        // falls back to the plain request and keeps using it.
         let rate_limits = connector.read_rate_limits().unwrap();
         assert_eq!(rate_limits["rateLimits"]["primary"]["usedPercent"], 12);
+        assert!(connector
+            .inner
+            .rate_limit_params_rejected
+            .load(Ordering::Relaxed));
+        let again = connector.read_rate_limits().unwrap();
+        assert_eq!(again["rateLimits"]["primary"]["usedPercent"], 12);
 
         let one_shot = CodexConnector::read_rate_limits_once(&executable).unwrap();
         assert_eq!(one_shot["rateLimits"]["primary"]["usedPercent"], 12);

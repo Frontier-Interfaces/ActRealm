@@ -10,8 +10,8 @@ use actrealm_installer::{
     ConfigHealth, HookProvider, InstallIntent, InstallOptions, InstallPaths, Installer,
 };
 use actrealm_quota::{
-    codex_app_server_entries, QuotaCollector, QuotaEntry, QuotaError, QuotaPaths,
-    CODEX_APP_SERVER_SOURCE,
+    codex_app_server_entries, mark_reset_window_stale, QuotaCollector, QuotaEntry, QuotaError,
+    QuotaPaths, CODEX_APP_SERVER_SOURCE,
 };
 use actrealm_runtime::{
     ApprovalAction, AttentionAction, CommandState, MetricEvent, QuotaRecord,
@@ -146,6 +146,9 @@ const USAGE_BACKFILL_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const USAGE_LIVE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const CODEX_CREDENTIAL_REFRESH_FIRST_USAGE_GRACE_MS: u64 = 30 * 60 * 1_000;
 const UI_STATUS_TIMESTAMP_GRANULARITY_MS: u64 = 30_000;
+/// The quota loop reads the Codex account every `quota_poll_interval`
+/// (60 s). A snapshot older than this means those reads have been failing.
+const CODEX_OFFICIAL_QUOTA_FRESHNESS_MS: u64 = 15 * 60 * 1_000;
 const USAGE_FAILURE_BACKOFF: Duration = Duration::from_millis(100);
 const RESTART_REQUEST_TTL: Duration = Duration::from_secs(3);
 const RESTART_REQUEST_PENDING: u8 = 0;
@@ -1411,9 +1414,23 @@ impl CodexManager {
             .as_ref()
             .and_then(|connector| connector.read_rate_limits().ok())
             .or_else(|| {
-                self.executable
-                    .as_deref()
-                    .and_then(|executable| CodexConnector::read_rate_limits_once(executable).ok())
+                // The executable found at startup can be missing (the desktop
+                // app was mid-update) or moved by a later update. Discover it
+                // again so official quota recovers without a Runtime restart.
+                // Only `start` records the account file; a disabled manager
+                // (Connector turned off) must never launch Codex.
+                let enabled = self.auth_path.is_some();
+                let executable = self
+                    .executable
+                    .clone()
+                    .filter(|path| path.is_file())
+                    .or_else(|| {
+                        enabled
+                            .then(|| discover_provider_availability(HookProvider::Codex))?
+                            .app_server_executable()
+                            .map(ToOwned::to_owned)
+                    })?;
+                CodexConnector::read_rate_limits_once(&executable).ok()
             });
         let Some(rate_limits) = rate_limits else {
             if let Ok(mut state) = self.state.lock() {
@@ -9242,6 +9259,11 @@ fn companion_snapshot_value(
             "capturedAt",
             "windowMessage",
             "reasonMessage",
+            "spentMinor",
+            "limitMinor",
+            "currency",
+            "currencyExponent",
+            "disabledReason",
         ],
     );
     let commands = project_array_fields(
@@ -9937,13 +9959,10 @@ fn quota_entries(state: &AppState) -> Result<Vec<QuotaEntry>, StoreError> {
         if quota.oauth_last_result.as_ref().is_some_and(Result::is_err) {
             mark_claude_quota_stale(&mut entries);
         }
-        let fallback_codex = if official_codex
-            .as_ref()
-            .is_none_or(|(entries, _)| !has_standard_codex_quota(entries))
-        {
-            quota.collector.collect_codex(now)
-        } else {
+        let fallback_codex = if codex_official_is_current(official_codex.as_ref(), now) {
             Vec::new()
+        } else {
+            quota.collector.collect_codex(now)
         };
         let (codex_entries, codex_captured_at) = select_codex_quota_entries(
             &quota.entries,
@@ -10019,10 +10038,11 @@ fn start_oauth_quota_refresh(state: &AppState, force: bool) {
         .spawn(move || {
             let result = collector.refresh_claude_oauth(now);
             let official_codex = codex.rate_limit_entries();
-            let fallback_codex = if official_codex.as_ref()
-                .is_none_or(|(entries, _)| !has_standard_codex_quota(entries)) {
+            let fallback_codex = if codex_official_is_current(official_codex.as_ref(), now_millis()) {
+                Vec::new()
+            } else {
                 collector.collect_codex(now_millis())
-            } else { Vec::new() };
+            };
             let Ok(mut quota) = quota_state.lock() else { return };
             quota.collector = collector;
             match result {
@@ -10076,6 +10096,19 @@ fn has_standard_codex_quota(entries: &[QuotaEntry]) -> bool {
     })
 }
 
+/// Whether the official app-server snapshot is recent enough to show on
+/// its own. Older snapshots mean the account read has been failing.
+fn codex_official_is_current(official: Option<&(Vec<QuotaEntry>, u64)>, now_ms: u64) -> bool {
+    official.is_some_and(|(entries, captured_at)| {
+        has_standard_codex_quota(entries)
+            && now_ms.saturating_sub(*captured_at) <= CODEX_OFFICIAL_QUOTA_FRESHNESS_MS
+    })
+}
+
+fn newest_capture(entries: &[QuotaEntry]) -> Option<u64> {
+    entries.iter().filter_map(|entry| entry.captured_at).max()
+}
+
 fn select_codex_quota_entries(
     previous: &[QuotaEntry],
     previous_captured_at: Option<u64>,
@@ -10083,40 +10116,64 @@ fn select_codex_quota_entries(
     fallback: Vec<QuotaEntry>,
     now_ms: u64,
 ) -> (Vec<QuotaEntry>, Option<u64>) {
-    if let Some((entries, captured_at)) = official.as_ref() {
-        if has_standard_codex_quota(entries) {
-            return (entries.clone(), Some(*captured_at));
-        }
+    let marker = official
+        .as_ref()
+        .map(|(_, captured_at)| *captured_at)
+        .or(previous_captured_at);
+    if codex_official_is_current(official.as_ref(), now_ms) {
+        let (entries, captured_at) = official.unwrap_or_default();
+        return (
+            entries
+                .into_iter()
+                .map(|entry| mark_reset_window_stale(entry, now_ms))
+                .collect(),
+            Some(captured_at),
+        );
     }
 
-    let retained = previous
-        .iter()
-        .filter(|entry| {
-            entry.provider == "codex"
-                && entry.source == CODEX_APP_SERVER_SOURCE
-                && entry
-                    .resets_at
-                    .is_some_and(|reset| reset.saturating_mul(1_000) > now_ms)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if has_standard_codex_quota(&retained) {
-        let marker = official
-            .as_ref()
-            .map(|(_, captured_at)| *captured_at)
-            .or(previous_captured_at);
-        return (
-            retained
-                .into_iter()
-                .map(|entry| {
-                    entry.mark_stale(
-                        "quota.reason.codex_refresh_failed",
-                        "Codex quota refresh failed. The last successfully captured values are shown.",
-                    )
-                })
-                .collect(),
-            marker,
-        );
+    // The account read is failing. Keep the last official values, labelled
+    // stale, unless a local rollout has recorded a newer reading since.
+    let window_open = |entry: &QuotaEntry| {
+        entry
+            .resets_at
+            .is_none_or(|reset| reset.saturating_mul(1_000) > now_ms)
+    };
+    let last_official = match official {
+        Some((entries, _)) if has_standard_codex_quota(&entries) => {
+            entries.into_iter().filter(window_open).collect::<Vec<_>>()
+        }
+        // The latest read lacked the standard plan (for example a Spark-only
+        // update); fall back to the previous official values while their
+        // known window is still open.
+        _ => previous
+            .iter()
+            .filter(|entry| {
+                entry.provider == "codex"
+                    && entry.source == CODEX_APP_SERVER_SOURCE
+                    && entry.resets_at.is_some()
+                    && window_open(entry)
+            })
+            .cloned()
+            .collect(),
+    };
+    if has_standard_codex_quota(&last_official) {
+        let rollout_is_newer = has_standard_codex_quota(&fallback)
+            && newest_capture(&fallback) > newest_capture(&last_official);
+        if !rollout_is_newer {
+            return (
+                last_official
+                    .into_iter()
+                    .map(|entry| {
+                        entry.mark_stale(
+                            "quota.reason.codex_refresh_failed",
+                            "Codex quota refresh failed. The last successfully captured values are shown.",
+                        )
+                    })
+                    .collect(),
+                marker,
+            );
+        }
+        return (fallback, marker);
     }
 
     (fallback, None)
@@ -11432,6 +11489,49 @@ mod tests {
                 )))
                 .unwrap();
         }
+        // Quota: Claude from the OAuth usage cache, with Extra Usage spend in
+        // minor currency units, and Codex from the official app-server read
+        // of a Pro account that has only a weekly window.
+        let claude_cache = state.quota.lock().unwrap().collector.paths().claude_cache();
+        fs::create_dir_all(claude_cache.parent().unwrap()).unwrap();
+        let claude_window = |window: &str, minutes: Value, used: f64, resets: Value| {
+            json!({
+                "window": window, "label": Value::Null, "windowMinutes": minutes,
+                "usedPct": used, "usedPctSource": "oauth_usage", "usedPctCapturedAt": at,
+                "resetsAt": resets, "resetSource": "oauth_usage", "resetCapturedAt": at
+            })
+        };
+        let five_hour_reset = at / 1_000 + 3 * 60 * 60;
+        let mut extra_usage = claude_window("extra_usage", Value::Null, 90.0, Value::Null);
+        extra_usage["label"] = json!("Extra usage");
+        extra_usage["spentMinor"] = json!(4_500);
+        extra_usage["limitMinor"] = json!(5_000);
+        extra_usage["currency"] = json!("USD");
+        extra_usage["currencyExponent"] = json!(2);
+        let claude_windows = vec![
+            claude_window("5h", json!(300), 5.0, json!(five_hour_reset)),
+            claude_window("7d", json!(10_080), 34.0, json!(at / 1_000 + 5 * 86_400)),
+        ];
+        let write_claude_cache = |windows: Vec<Value>, disabled: Value| {
+            let mut document = json!({
+                "schemaVersion": 1, "provider": "claude", "source": "oauth_usage",
+                "capturedAt": at, "windows": windows
+            });
+            if !disabled.is_null() {
+                document["extraUsageDisabled"] = disabled;
+            }
+            fs::write(&claude_cache, serde_json::to_vec(&document).unwrap()).unwrap();
+            state.quota.lock().unwrap().refreshed_at = None;
+        };
+        write_claude_cache(
+            [claude_windows.clone(), vec![extra_usage]].concat(),
+            Value::Null,
+        );
+        {
+            let mut codex = state.codex.state.lock().unwrap();
+            codex.rate_limits = Some(pro_weekly_only_rate_limits(13, at / 1_000 + 6 * 86_400));
+            codex.rate_limits_captured_at = Some(at);
+        }
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -11465,7 +11565,63 @@ mod tests {
             }
             samples
         });
+        // The same account after Extra Usage was turned off.
+        write_claude_cache(
+            claude_windows,
+            json!({"capturedAt": at, "reason": "user_disabled"}),
+        );
+        let extra_usage_off = rt.block_on(async {
+            let response = router(state.clone())
+                .oneshot(companion_request(
+                    "GET",
+                    "/api/v1/companion/snapshot",
+                    token,
+                    Value::Null,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            json_body(response).await
+        });
+        let mut samples = samples;
+        samples.push(("snapshot-extra-usage-off.json", extra_usage_off));
         let sample = |name: &str| &samples.iter().find(|(file, _)| *file == name).unwrap().1;
+        let quota = |name: &str, provider: &str, window: &str| {
+            sample(name)["quota"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["provider"] == provider && entry["window"] == window)
+                .unwrap_or_else(|| panic!("{name}: {provider} {window}"))
+                .clone()
+        };
+        let extra = quota("snapshot.json", "claude", "extra_usage");
+        assert_eq!(extra["status"], "available");
+        assert_eq!(extra["usedPct"], 90.0);
+        assert_eq!(extra["spentMinor"], 4_500);
+        assert_eq!(extra["limitMinor"], 5_000);
+        assert_eq!(extra["currency"], "USD");
+        assert_eq!(extra["currencyExponent"], 2);
+        assert!(extra["capturedAt"].is_u64());
+        let five_hour = quota("snapshot.json", "claude", "5h");
+        assert_eq!(five_hour["resetsAt"], five_hour_reset);
+        assert!(five_hour.get("spentMinor").is_none());
+        let codex = quota("snapshot.json", "codex", "10080m");
+        assert_eq!(codex["status"], "available");
+        assert_eq!(codex["source"], CODEX_APP_SERVER_SOURCE);
+        assert_eq!(codex["windowMinutes"], 10_080);
+        assert_eq!(codex["planType"], "pro");
+        assert_eq!(codex["usedPct"], 13.0);
+        assert_eq!(codex["capturedAt"], coarse_ui_timestamp(at));
+        assert!(codex.get("credits").is_none());
+        let off = quota("snapshot-extra-usage-off.json", "claude", "extra_usage");
+        assert_eq!(off["status"], "unavailable");
+        assert!(off.get("usedPct").is_none());
+        assert_eq!(off["disabledReason"], "user_disabled");
+        assert_eq!(
+            off["reasonMessage"]["code"],
+            "quota.reason.extra_usage_disabled"
+        );
         let main = sample("snapshot.json")["sessions"]
             .as_array()
             .unwrap()
@@ -12134,6 +12290,125 @@ mod tests {
         assert_eq!(selected, fallback);
         assert_eq!(marker, None);
         assert!(!has_standard_codex_quota(&selected));
+    }
+
+    /// The `account/rateLimits/read` shape Codex 0.162 returns for a Pro
+    /// account today: one weekly window, no five-hour window.
+    fn pro_weekly_only_rate_limits(used_percent: u64, resets_at: u64) -> Value {
+        let snapshot = json!({
+            "limitId": "codex",
+            "limitName": null,
+            "normalModelSlug": null,
+            "primary": {
+                "usedPercent": used_percent,
+                "windowDurationMins": 10080,
+                "resetsAt": resets_at
+            },
+            "secondary": null,
+            "credits": {"hasCredits": true, "unlimited": false, "balance": null},
+            "individualLimit": null,
+            "spendControlReached": false,
+            "planType": "pro",
+            "rateLimitReachedType": null
+        });
+        json!({
+            "ordinaryUsageAllowed": true,
+            "rateLimits": snapshot,
+            "rateLimitsByLimitId": {"codex": snapshot},
+            "rateLimitResetCredits": {"availableCount": 3, "credits": null}
+        })
+    }
+
+    #[test]
+    fn weekly_only_pro_snapshot_is_official_and_ages_into_stale() {
+        let now = 1_791_712_537_000;
+        let resets_at = 1_792_317_226;
+        let official = codex_app_server_entries(&pro_weekly_only_rate_limits(13, resets_at), now);
+        assert_eq!(official.len(), 1);
+        assert!(has_standard_codex_quota(&official));
+        let rollout = {
+            let mut entry = official[0].clone();
+            entry.source = "rollout_experimental".to_owned();
+            entry.used_pct = Some(9.0);
+            entry.remaining_pct = Some(91.0);
+            entry.captured_at = Some(now - 60 * 60 * 1_000);
+            entry
+        };
+
+        // A weekly-only snapshot is the account's standard quota.
+        let (selected, marker) = select_codex_quota_entries(
+            &[],
+            None,
+            Some((official.clone(), now)),
+            Vec::new(),
+            now + 60_000,
+        );
+        assert_eq!(marker, Some(now));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].status, "available");
+        assert_eq!(selected[0].source, CODEX_APP_SERVER_SOURCE);
+        assert_eq!(selected[0].window_minutes, Some(10_080));
+        assert_eq!(selected[0].captured_at, Some(now));
+        assert!(codex_official_is_current(
+            Some(&(official.clone(), now)),
+            now + 60_000
+        ));
+
+        // Reads have failed for longer than the freshness bound: the last
+        // official value stays, labelled stale, over an older rollout.
+        let later = now + CODEX_OFFICIAL_QUOTA_FRESHNESS_MS + 1;
+        assert!(!codex_official_is_current(
+            Some(&(official.clone(), now)),
+            later
+        ));
+        let (selected, marker) = select_codex_quota_entries(
+            &[],
+            None,
+            Some((official.clone(), now)),
+            vec![rollout.clone()],
+            later,
+        );
+        assert_eq!(marker, Some(now));
+        assert_eq!(selected[0].status, "stale");
+        assert_eq!(selected[0].source, CODEX_APP_SERVER_SOURCE);
+        assert_eq!(
+            selected[0].reason_code.as_deref(),
+            Some("quota.reason.codex_refresh_failed")
+        );
+        assert_eq!(selected[0].captured_at, Some(now));
+
+        // A rollout recorded after the last official read is newer truth.
+        let mut newer_rollout = rollout;
+        newer_rollout.captured_at = Some(later - 1_000);
+        let (selected, marker) = select_codex_quota_entries(
+            &[],
+            None,
+            Some((official, now)),
+            vec![newer_rollout],
+            later,
+        );
+        assert_eq!(marker, Some(now));
+        assert_eq!(selected[0].source, "rollout_experimental");
+        assert_eq!(selected[0].used_pct, Some(9.0));
+    }
+
+    #[test]
+    fn disabled_codex_manager_never_launches_codex_for_quota() {
+        let root = std::env::temp_dir().join(format!(
+            "actrealm-server-codex-disabled-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let manager = CodexManager::disabled(store.clone());
+        assert_eq!(
+            manager.refresh_rate_limits_quota_only(),
+            CodexQuotaRefresh::Failed
+        );
+        assert!(manager.rate_limit_entries().is_none());
+        drop(manager);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

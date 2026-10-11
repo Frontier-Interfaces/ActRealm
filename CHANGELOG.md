@@ -6,6 +6,48 @@ published a final v1 release; entries below describe development milestones on
 
 ## Unreleased - M14 accepted candidate
 
+### Post-P0 - Quota sources, freshness and Extra Usage amounts
+
+- Codex account quota comes from the official app-server again on Macs with
+  ChatGPT 26.1007 or later. That release moved the bundled Codex CLI from
+  `ChatGPT.app/Contents/Resources/codex` to
+  `Contents/Resources/codex-cli/bin/codex` (which runs
+  `codex-cli/CodexCLI.app/Contents/MacOS/codex`); Runtime only looked at the
+  old path, so with no Codex CLI on `PATH` it never started the app-server
+  Connector and silently showed local rollout values, which do not include
+  usage from the phone, the web or other computers and stop moving when Codex
+  is idle. Desktop discovery now checks the new paths first (the old one is
+  kept). When the persistent Connector is unavailable the quota poll discovers
+  the executable again and makes a one-shot read, so a Codex app update no
+  longer needs a Runtime restart. Quota reads ask the app-server to skip its
+  separate reset-credit detail lookup (`excludeResetCreditDetails`), falling
+  back to the plain request for older app-servers.
+- A Codex snapshot older than 15 minutes (reads failing) is marked `stale`
+  (`quota.reason.codex_refresh_failed`) instead of being shown as current, and
+  a rollout reading recorded after it replaces it.
+- Codex rollout fallback picks the newest `token_count` rate-limit event by its
+  own `timestamp` across recent rollout files, instead of the last event of the
+  most recently modified file (a file touched later by a title or compaction
+  record could hold an older reading). Its `capturedAt` is that event time,
+  not the file modification time; a rollout value older than one hour is
+  `stale` (`quota.reason.codex_rollout_stale`). Any quota item whose
+  `resetsAt` has passed is `stale` (`quota.reason.window_reset`).
+- Claude reset times are kept again: the usage endpoint sends
+  `2026-10-05T15:59:59.987495+00:00`, which the RFC 3339 reader rejected
+  (it accepted only whole seconds with `Z`), so every OAuth window lost its
+  `resetsAt`. Fractions and `+HH:MM` / `-HH:MM` offsets are now accepted.
+- Claude Extra Usage carries its amounts: `spentMinor`, `limitMinor` (minor
+  currency units, cents for USD), `currency` (ISO 4217) and `currencyExponent`.
+  When Extra Usage is turned off the item is `unavailable` with
+  `quota.reason.extra_usage_disabled` and an optional `disabledReason`
+  (`user_disabled`, or Claude's own code). Before, an Extra Usage percentage
+  stayed in the quota cache after Extra Usage was turned off (a 90% captured
+  in August was still shown in October); each successful Claude usage
+  response now replaces the Extra Usage state, and a value older than 31 days
+  is never shown. The cache keeps the turned-off state in a separate
+  `extraUsageDisabled` field so earlier Runtime versions still read it. See
+  `docs/COMPANION_PROTOCOL.md`, "Quota entries".
+
 ### Post-P0 - Companion task roles, history and turn context
 
 - Companion history tasks carry `termApp`, `termBundleId`, `termSurface` and

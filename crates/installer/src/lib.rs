@@ -104,34 +104,14 @@ pub fn discover_provider_availability(provider: HookProvider) -> ProviderAvailab
     let cli_path = provider_cli_candidates(provider).into_iter().next();
 
     #[cfg(target_os = "macos")]
-    let (desktop_app_path, bundled_cli_path) = {
-        let mut desktop_app_path = None;
-        let mut bundled_cli_path = None;
-        for root in application_roots() {
-            let candidates: &[(&str, &str)] = match provider {
-                HookProvider::Claude => &[("Claude.app", "Contents/MacOS/Claude")],
-                HookProvider::Codex => &[
-                    ("ChatGPT.app", "Contents/Resources/codex"),
-                    ("Codex.app", "Contents/Resources/codex"),
-                ],
-            };
-            for (bundle, executable) in candidates {
-                let app = root.join(bundle);
-                let runtime = app.join(executable);
-                if is_executable_file(&runtime) {
-                    desktop_app_path = Some(app);
-                    if provider == HookProvider::Codex {
-                        bundled_cli_path = Some(runtime);
-                    }
-                    break;
-                }
+    let (desktop_app_path, bundled_cli_path) =
+        match find_desktop_executable(&application_roots(), provider) {
+            Some((app, executable)) => {
+                let bundled = (provider == HookProvider::Codex).then_some(executable);
+                (Some(app), bundled)
             }
-            if desktop_app_path.is_some() {
-                break;
-            }
-        }
-        (desktop_app_path, bundled_cli_path)
-    };
+            None => (None, None),
+        };
 
     #[cfg(not(target_os = "macos"))]
     let (desktop_app_path, bundled_cli_path): (Option<PathBuf>, Option<PathBuf>) = (None, None);
@@ -141,6 +121,54 @@ pub fn discover_provider_availability(provider: HookProvider) -> ProviderAvailab
         desktop_app_path,
         bundled_cli_path,
     }
+}
+
+/// Executables inside a Provider's desktop application, in preference order.
+///
+/// ChatGPT 26.1007 moved the bundled Codex CLI from `Contents/Resources/codex`
+/// into a `codex-cli` package whose declared entrypoint is `bin/codex` (a
+/// launcher that execs `CodexCLI.app/Contents/MacOS/codex`). Without these
+/// paths the app-server Connector is never started and Codex quota silently
+/// falls back to local rollout files.
+#[cfg(any(target_os = "macos", test))]
+fn desktop_executable_candidates(
+    provider: HookProvider,
+) -> &'static [(&'static str, &'static str)] {
+    match provider {
+        HookProvider::Claude => &[("Claude.app", "Contents/MacOS/Claude")],
+        HookProvider::Codex => &[
+            ("ChatGPT.app", "Contents/Resources/codex-cli/bin/codex"),
+            (
+                "ChatGPT.app",
+                "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+            ),
+            ("ChatGPT.app", "Contents/Resources/codex"),
+            ("Codex.app", "Contents/Resources/codex-cli/bin/codex"),
+            (
+                "Codex.app",
+                "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+            ),
+            ("Codex.app", "Contents/Resources/codex"),
+        ],
+    }
+}
+
+/// Returns `(application bundle, executable)` for the first installed
+/// desktop application under `roots` that ships a usable executable.
+#[cfg(any(target_os = "macos", test))]
+fn find_desktop_executable(
+    roots: &[PathBuf],
+    provider: HookProvider,
+) -> Option<(PathBuf, PathBuf)> {
+    roots.iter().find_map(|root| {
+        desktop_executable_candidates(provider)
+            .iter()
+            .find_map(|(bundle, executable)| {
+                let app = root.join(bundle);
+                let runtime = app.join(executable);
+                is_executable_file(&runtime).then_some((app, runtime))
+            })
+    })
 }
 
 /// Returns trusted, executable Provider CLI candidates in preference order.
@@ -1972,5 +2000,52 @@ impl Drop for InstallLock {
     fn drop(&mut self) {
         // SAFETY: the descriptor remains live for the duration of this call.
         let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(test)]
+mod desktop_discovery_tests {
+    use super::*;
+
+    fn fake_executable(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn chatgpt_codex_cli_package_is_found_for_the_app_server() {
+        let root = env::temp_dir().join(format!(
+            "actrealm-installer-desktop-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let app = root.join("ChatGPT.app");
+        let launcher = app.join("Contents/Resources/codex-cli/bin/codex");
+        let binary = app.join("Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex");
+        fake_executable(&binary);
+        assert_eq!(
+            find_desktop_executable(std::slice::from_ref(&root), HookProvider::Codex),
+            Some((app.clone(), binary.clone()))
+        );
+        fake_executable(&launcher);
+        assert_eq!(
+            find_desktop_executable(std::slice::from_ref(&root), HookProvider::Codex),
+            Some((app.clone(), launcher))
+        );
+        // The pre-26.1007 layout keeps working.
+        let legacy_root = root.join("legacy");
+        let legacy = legacy_root.join("Codex.app/Contents/Resources/codex");
+        fake_executable(&legacy);
+        assert_eq!(
+            find_desktop_executable(std::slice::from_ref(&legacy_root), HookProvider::Codex),
+            Some((legacy_root.join("Codex.app"), legacy))
+        );
+        assert_eq!(
+            find_desktop_executable(&[legacy_root], HookProvider::Claude),
+            None
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

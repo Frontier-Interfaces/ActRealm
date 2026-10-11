@@ -24,6 +24,16 @@ const CLAUDE_OAUTH_SOURCE: &str = "oauth_usage";
 const CODEX_SOURCE: &str = "rollout_experimental";
 pub const CODEX_APP_SERVER_SOURCE: &str = "codex_app_server";
 const CLAUDE_CACHE_FRESHNESS_MS: u64 = 15 * 60 * 1_000;
+/// A rollout value only moves when Codex runs on this Mac; past this age it
+/// no longer reflects usage elsewhere and is labelled stale.
+const CODEX_ROLLOUT_FRESHNESS_MS: u64 = 60 * 60 * 1_000;
+/// A rollout event is written just before the file's modification time.
+/// Files modified this much before the newest event found so far cannot
+/// contain a newer one.
+const ROLLOUT_EVENT_MTIME_TOLERANCE_MS: u64 = 60 * 1_000;
+const EXTRA_USAGE_WINDOW: &str = "extra_usage";
+const EXTRA_USAGE_DISABLED_REASON: &str = "quota.reason.extra_usage_disabled";
+const EXTRA_USAGE_MAX_AGE_MS: u64 = 31 * 24 * 60 * 60 * 1_000;
 const MAX_CLOCK_SKEW_MS: u64 = 5 * 60 * 1_000;
 const MAX_STATUSLINE_BYTES: u64 = 256 * 1_024;
 const MAX_ROLLOUT_TAIL_BYTES: u64 = 2 * 1_024 * 1_024;
@@ -90,6 +100,25 @@ pub struct QuotaEntry {
     pub reason_code: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub reason_args: BTreeMap<String, String>,
+    /// Claude Extra Usage only: spend in the current billing period, in the
+    /// minor unit of `currency` (cents for USD).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spent_minor: Option<u64>,
+    /// Claude Extra Usage only: monthly spend cap, in the minor unit of
+    /// `currency`. Absent when the account has no cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_minor: Option<u64>,
+    /// ISO 4217 code for `spent_minor` and `limit_minor`. The amounts are
+    /// never present without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    /// Decimal places of `currency` as reported by the Provider; one major
+    /// unit is `10^currency_exponent` minor units.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency_exponent: Option<u32>,
+    /// Claude Extra Usage only: why the Provider reports it as turned off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
 }
 
 impl QuotaEntry {
@@ -152,6 +181,11 @@ impl QuotaEntry {
             reason: None,
             reason_code: None,
             reason_args: BTreeMap::new(),
+            spent_minor: None,
+            limit_minor: None,
+            currency: None,
+            currency_exponent: None,
+            disabled_reason: None,
         }
     }
 
@@ -180,6 +214,11 @@ impl QuotaEntry {
             reason: Some(reason.into()),
             reason_code: Some(reason_code.to_owned()),
             reason_args: BTreeMap::new(),
+            spent_minor: None,
+            limit_minor: None,
+            currency: None,
+            currency_exponent: None,
+            disabled_reason: None,
         }
     }
 
@@ -426,7 +465,9 @@ impl QuotaCollector {
                 "Quota cache timestamp is later than the local clock.",
             );
         }
-        let entries = cache
+        let cache_source = cache.source;
+        let cache_captured_at = cache.captured_at;
+        let mut entries = cache
             .windows
             .into_iter()
             .filter(|window| {
@@ -434,17 +475,25 @@ impl QuotaCollector {
                     && window.used_pct.is_finite()
                     && (0.0..=100.0).contains(&window.used_pct)
             })
+            .filter(|window| {
+                // Extra Usage is spend for one billing month. A value older
+                // than that belongs to an earlier month and is never shown.
+                window.window != EXTRA_USAGE_WINDOW
+                    || now_ms
+                        .saturating_sub(window.used_pct_captured_at.unwrap_or(cache_captured_at))
+                        <= EXTRA_USAGE_MAX_AGE_MS
+            })
             .map(|window| {
                 let source = window
                     .used_pct_source
                     .as_deref()
-                    .unwrap_or(cache.source.as_str());
-                let captured_at = window.used_pct_captured_at.unwrap_or(cache.captured_at);
+                    .unwrap_or(cache_source.as_str());
+                let captured_at = window.used_pct_captured_at.unwrap_or(cache_captured_at);
                 let identity = window.window.clone();
                 let reset_passed = window
                     .resets_at
                     .is_some_and(|reset| reset <= now_ms / 1_000);
-                let entry = QuotaEntry::available_optional(
+                let mut entry = QuotaEntry::available_optional(
                     "claude",
                     window.window,
                     window.used_pct,
@@ -454,6 +503,12 @@ impl QuotaCollector {
                 )
                 .with_metadata(window.window_minutes, Some(identity), window.label, None)
                 .with_reset_metadata(window.reset_source, window.reset_captured_at);
+                if let Some(currency) = window.currency.as_deref().and_then(currency_code) {
+                    entry.spent_minor = window.spent_minor;
+                    entry.limit_minor = window.limit_minor;
+                    entry.currency = Some(currency);
+                    entry.currency_exponent = window.currency_exponent;
+                }
                 if now_ms.saturating_sub(captured_at) > CLAUDE_CACHE_FRESHNESS_MS || reset_passed {
                     entry.mark_stale(
                         "quota.reason.cache_stale",
@@ -465,18 +520,44 @@ impl QuotaCollector {
             })
             .collect::<Vec<_>>();
         if entries.is_empty() {
-            unavailable_windows(
+            entries = unavailable_windows(
                 "claude",
                 CLAUDE_SOURCE,
                 &["5h", "7d"],
                 "quota.reason.no_valid_window",
                 "No verifiable quota window was found.",
-            )
-        } else {
-            entries
+            );
         }
+        if let Some(disabled) = cache.extra_usage_disabled.filter(|_| {
+            !entries
+                .iter()
+                .any(|entry| entry.window == EXTRA_USAGE_WINDOW)
+        }) {
+            let mut entry = QuotaEntry::unavailable(
+                "claude",
+                EXTRA_USAGE_WINDOW,
+                CLAUDE_OAUTH_SOURCE,
+                EXTRA_USAGE_DISABLED_REASON,
+                "Extra usage is turned off for this account.",
+            )
+            .with_metadata(
+                None,
+                Some(EXTRA_USAGE_WINDOW.to_owned()),
+                Some("Extra usage".to_owned()),
+                None,
+            );
+            entry.captured_at = Some(disabled.captured_at);
+            entry.disabled_reason = disabled.reason.as_deref().and_then(safe_reason_code);
+            entries.push(entry);
+        }
+        entries
     }
 
+    /// Reads the newest Codex `token_count` rate-limit event across the
+    /// local rollout files. Files are visited newest-modified first, but the
+    /// winner is chosen by the event's own timestamp: a file can be touched
+    /// later (a title or compaction record) while its last quota event is
+    /// older than another file's.
     pub fn collect_codex(&self, now_ms: u64) -> Vec<QuotaEntry> {
         let mut files = Vec::new();
         collect_rollouts(&self.paths.codex_sessions, 0, &mut files);
@@ -490,28 +571,73 @@ impl QuotaCollector {
                 "No Codex rollout file was found.",
             )];
         }
+        let latest_allowed = now_ms.saturating_add(MAX_CLOCK_SKEW_MS);
+        let mut newest: Option<(u64, Vec<QuotaEntry>)> = None;
         for (path, modified_at) in files {
-            if modified_at > now_ms.saturating_add(MAX_CLOCK_SKEW_MS)
-                || read_codex_version(&path).ok().flatten().is_none()
-            {
+            if newest.as_ref().is_some_and(|(event_at, _)| {
+                modified_at.saturating_add(ROLLOUT_EVENT_MTIME_TOLERANCE_MS) < *event_at
+            }) {
+                break;
+            }
+            if modified_at > latest_allowed || read_codex_version(&path).ok().flatten().is_none() {
                 continue;
             }
-            let Ok(entries) = read_codex_limits(&path, modified_at) else {
+            let Ok(Some((event_at, entries))) = read_codex_limits(&path, modified_at) else {
                 continue;
             };
-            if entries.is_empty() {
+            if event_at > latest_allowed || entries.is_empty() {
                 continue;
             }
-            return entries;
+            if newest
+                .as_ref()
+                .is_none_or(|(newest_at, _)| event_at > *newest_at)
+            {
+                newest = Some((event_at, entries));
+            }
         }
-        vec![QuotaEntry::unavailable(
-            "codex",
-            "unknown",
-            CODEX_SOURCE,
-            "quota.reason.codex_window_missing",
-            "No verifiable quota window was found in the Codex rollout.",
-        )]
+        let Some((_, entries)) = newest else {
+            return vec![QuotaEntry::unavailable(
+                "codex",
+                "unknown",
+                CODEX_SOURCE,
+                "quota.reason.codex_window_missing",
+                "No verifiable quota window was found in the Codex rollout.",
+            )];
+        };
+        entries
+            .into_iter()
+            .map(|entry| mark_reset_window_stale(entry, now_ms))
+            .map(|entry| {
+                let age = entry
+                    .captured_at
+                    .map_or(u64::MAX, |captured_at| now_ms.saturating_sub(captured_at));
+                if entry.status != "stale" && age > CODEX_ROLLOUT_FRESHNESS_MS {
+                    entry.mark_stale(
+                        "quota.reason.codex_rollout_stale",
+                        "Codex quota comes from an old local session record; usage on other devices is not included.",
+                    )
+                } else {
+                    entry
+                }
+            })
+            .collect()
     }
+}
+
+/// A value captured before its window reset describes the previous window.
+/// Keep it visible but never present it as current.
+pub fn mark_reset_window_stale(entry: QuotaEntry, now_ms: u64) -> QuotaEntry {
+    if entry.status == "stale"
+        || !entry
+            .resets_at
+            .is_some_and(|reset| reset.saturating_mul(1_000) <= now_ms)
+    {
+        return entry;
+    }
+    entry.mark_stale(
+        "quota.reason.window_reset",
+        "This quota window has reset since the value was captured; waiting for a fresh update.",
+    )
 }
 
 fn unavailable_windows(
@@ -542,6 +668,19 @@ struct CacheDocument {
     source: String,
     captured_at: u64,
     windows: Vec<CacheWindow>,
+    /// Set when the latest OAuth response reported Extra Usage as turned
+    /// off. Kept outside `windows` because it has no percentage, so earlier
+    /// Runtime versions that require one still read the cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    extra_usage_disabled: Option<CacheExtraUsageDisabled>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheExtraUsageDisabled {
+    captured_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -562,6 +701,14 @@ struct CacheWindow {
     reset_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reset_captured_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spent_minor: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    limit_minor: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    currency: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    currency_exponent: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -620,10 +767,27 @@ struct OAuthModel {
     display_name: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+/// Extra Usage (overage) spend for the current billing period. Amounts are
+/// in the minor unit of `currency` (cents for USD). Every field is read
+/// leniently so one unexpected value cannot reject the whole usage response.
+#[derive(Debug, Default, Deserialize)]
 struct OAuthExtraUsage {
-    is_enabled: bool,
-    utilization: Option<f64>,
+    #[serde(default)]
+    is_enabled: Option<Value>,
+    #[serde(default)]
+    utilization: Option<Value>,
+    #[serde(default)]
+    used_credits: Option<Value>,
+    #[serde(default)]
+    monthly_limit: Option<Value>,
+    #[serde(default)]
+    currency: Option<Value>,
+    #[serde(default)]
+    decimal_places: Option<Value>,
+    #[serde(default)]
+    disabled_reason: Option<Value>,
+    #[serde(default)]
+    user_disabled: Option<Value>,
 }
 
 fn read_oauth_credential() -> Option<OAuthCredential> {
@@ -1034,32 +1198,106 @@ fn oauth_entries(response: OAuthUsageResponse, now_ms: u64) -> Vec<QuotaEntry> {
             .with_metadata(window_minutes, None, Some(model), None),
         );
     }
-    if let Some(extra) = response.extra_usage {
-        if extra.is_enabled {
-            if let Some(utilization) = extra
-                .utilization
-                .filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
-            {
-                entries.push(
-                    QuotaEntry::available_optional(
-                        "claude",
-                        "extra_usage",
-                        utilization,
-                        None,
-                        CLAUDE_OAUTH_SOURCE,
-                        now_ms,
-                    )
-                    .with_metadata(
-                        None,
-                        None,
-                        Some("Extra usage".to_owned()),
-                        None,
-                    ),
-                );
-            }
-        }
+    if let Some(extra) = response
+        .extra_usage
+        .and_then(|extra| extra_usage_entry(extra, now_ms))
+    {
+        entries.push(extra);
     }
     entries
+}
+
+/// Projects Claude Extra Usage. An enabled bucket becomes a percentage with
+/// its spend and cap in minor currency units; a disabled one becomes an
+/// `unavailable` entry that says so, so an old percentage cannot linger.
+fn extra_usage_entry(extra: OAuthExtraUsage, now_ms: u64) -> Option<QuotaEntry> {
+    let enabled = extra.is_enabled.as_ref().and_then(Value::as_bool);
+    if enabled != Some(true) {
+        let reason = extra
+            .disabled_reason
+            .as_ref()
+            .and_then(Value::as_str)
+            .and_then(safe_reason_code)
+            .or_else(|| {
+                (extra.user_disabled.as_ref().and_then(Value::as_bool) == Some(true))
+                    .then(|| "user_disabled".to_owned())
+            });
+        let mut entry = QuotaEntry::unavailable(
+            "claude",
+            EXTRA_USAGE_WINDOW,
+            CLAUDE_OAUTH_SOURCE,
+            EXTRA_USAGE_DISABLED_REASON,
+            "Extra usage is turned off for this account.",
+        )
+        .with_metadata(None, None, Some("Extra usage".to_owned()), None);
+        entry.captured_at = Some(now_ms);
+        entry.disabled_reason = reason;
+        return Some(entry);
+    }
+    let currency = extra
+        .currency
+        .as_ref()
+        .and_then(Value::as_str)
+        .and_then(currency_code);
+    let spent = extra.used_credits.as_ref().and_then(minor_amount);
+    let limit = extra
+        .monthly_limit
+        .as_ref()
+        .and_then(minor_amount)
+        .filter(|limit| *limit > 0);
+    let utilization = extra
+        .utilization
+        .as_ref()
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
+        .or_else(|| {
+            let (spent, limit) = (spent?, limit?);
+            Some((spent as f64 / limit as f64 * 100.0).clamp(0.0, 100.0))
+        })?;
+    let mut entry = QuotaEntry::available_optional(
+        "claude",
+        EXTRA_USAGE_WINDOW,
+        utilization,
+        None,
+        CLAUDE_OAUTH_SOURCE,
+        now_ms,
+    )
+    .with_metadata(None, None, Some("Extra usage".to_owned()), None);
+    if let Some(currency) = currency {
+        entry.spent_minor = spent;
+        entry.limit_minor = limit;
+        entry.currency = Some(currency);
+        entry.currency_exponent = extra
+            .decimal_places
+            .as_ref()
+            .and_then(Value::as_u64)
+            .filter(|places| *places <= 4)
+            .and_then(|places| u32::try_from(places).ok());
+    }
+    Some(entry)
+}
+
+/// A non-negative amount in minor currency units. Fractions of a minor unit
+/// are rounded; anything else is rejected rather than guessed.
+fn minor_amount(value: &Value) -> Option<u64> {
+    let amount = value.as_f64()?;
+    (amount.is_finite() && (0.0..=1e15).contains(&amount)).then(|| amount.round() as u64)
+}
+
+fn currency_code(value: &str) -> Option<String> {
+    let value = value.trim();
+    (value.len() == 3 && value.bytes().all(|byte| byte.is_ascii_alphabetic()))
+        .then(|| value.to_ascii_uppercase())
+}
+
+fn safe_reason_code(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')))
+    .then(|| value.to_owned())
 }
 
 fn push_oauth_window(
@@ -1109,24 +1347,35 @@ fn safe_window_component(value: &str) -> String {
 }
 
 fn parse_rfc3339_epoch(value: &str) -> Option<u64> {
+    parse_rfc3339_millis(value).map(|millis| millis / 1_000)
+}
+
+/// Parses `YYYY-MM-DDTHH:MM:SS[.fraction](Z|+HH:MM|-HH:MM)` into epoch
+/// milliseconds. Claude's usage endpoint sends microseconds with `+00:00`;
+/// Codex rollout events send milliseconds with `Z`.
+fn parse_rfc3339_millis(value: &str) -> Option<u64> {
     let bytes = value.as_bytes();
     if bytes.len() < 20
         || bytes.get(4) != Some(&b'-')
         || bytes.get(7) != Some(&b'-')
-        || bytes.get(10) != Some(&b'T')
+        || !matches!(bytes.get(10), Some(b'T' | b't'))
         || bytes.get(13) != Some(&b':')
         || bytes.get(16) != Some(&b':')
-        || !value.ends_with('Z')
     {
         return None;
     }
-    let number = |start: usize, end: usize| value.get(start..end)?.parse::<i64>().ok();
-    let year = number(0, 4)?;
-    let month = number(5, 7)?;
-    let day = number(8, 10)?;
-    let hour = number(11, 13)?;
-    let minute = number(14, 16)?;
-    let second = number(17, 19)?;
+    fn digits(text: &str, start: usize, end: usize) -> Option<i64> {
+        let part = text.get(start..end)?;
+        part.bytes()
+            .all(|byte| byte.is_ascii_digit())
+            .then(|| part.parse::<i64>().ok())?
+    }
+    let year = digits(value, 0, 4)?;
+    let month = digits(value, 5, 7)?;
+    let day = digits(value, 8, 10)?;
+    let hour = digits(value, 11, 13)?;
+    let minute = digits(value, 14, 16)?;
+    let second = digits(value, 17, 19)?;
     if !(1..=12).contains(&month)
         || !(1..=31).contains(&day)
         || !(0..=23).contains(&hour)
@@ -1135,6 +1384,40 @@ fn parse_rfc3339_epoch(value: &str) -> Option<u64> {
     {
         return None;
     }
+    let mut rest = &value[19..];
+    let mut millis = 0_i64;
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let length = fraction
+            .bytes()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if length == 0 || length > 9 {
+            return None;
+        }
+        let mut scaled = fraction[..length.min(3)].to_owned();
+        while scaled.len() < 3 {
+            scaled.push('0');
+        }
+        millis = scaled.parse::<i64>().ok()?;
+        rest = &fraction[length..];
+    }
+    let offset_seconds = match rest.as_bytes() {
+        [b'Z' | b'z'] => 0,
+        [sign @ (b'+' | b'-'), _, _, b':', _, _] => {
+            let hours = digits(rest, 1, 3)?;
+            let minutes = digits(rest, 4, 6)?;
+            if !(0..=23).contains(&hours) || !(0..=59).contains(&minutes) {
+                return None;
+            }
+            let magnitude = hours * 3_600 + minutes * 60;
+            if *sign == b'+' {
+                magnitude
+            } else {
+                -magnitude
+            }
+        }
+        _ => return None,
+    };
     let adjusted_year = year - i64::from(month <= 2);
     let era = if adjusted_year >= 0 {
         adjusted_year
@@ -1148,8 +1431,10 @@ fn parse_rfc3339_epoch(value: &str) -> Option<u64> {
     let days = era * 146_097 + day_of_era - 719_468;
     let seconds = days
         .checked_mul(86_400)?
-        .checked_add(hour * 3_600 + minute * 60 + second)?;
-    u64::try_from(seconds).ok()
+        .checked_add(hour * 3_600 + minute * 60 + second)?
+        .checked_sub(offset_seconds)?;
+    let millis = seconds.checked_mul(1_000)?.checked_add(millis)?;
+    u64::try_from(millis).ok()
 }
 
 fn write_claude_cache(
@@ -1171,28 +1456,46 @@ fn write_claude_cache(
                 resets_at: entry.resets_at,
                 reset_source: entry.reset_source.clone(),
                 reset_captured_at: entry.reset_captured_at,
+                spent_minor: entry.spent_minor,
+                limit_minor: entry.limit_minor,
+                currency: entry.currency.clone(),
+                currency_exponent: entry.currency_exponent,
             })
         })
         .collect::<Vec<_>>();
-    let windows = merge_claude_windows(cache_path, incoming, now_ms);
+    let existing = read_claude_cache_for_merge(cache_path, now_ms);
+    // OAuth is the only source of Extra Usage. A successful OAuth response
+    // therefore replaces both its percentage and its turned-off marker, while
+    // a StatusLine capture keeps whatever OAuth last reported.
+    let extra_usage_disabled = if source == CLAUDE_OAUTH_SOURCE {
+        entries
+            .iter()
+            .find(|entry| entry.window == EXTRA_USAGE_WINDOW && entry.used_pct.is_none())
+            .map(|entry| CacheExtraUsageDisabled {
+                captured_at: entry.captured_at.unwrap_or(now_ms),
+                reason: entry.disabled_reason.clone(),
+            })
+    } else {
+        existing
+            .as_ref()
+            .and_then(|cache| cache.extra_usage_disabled.clone())
+    };
+    let windows = merge_claude_windows(existing, source, incoming, now_ms);
     let document = CacheDocument {
         schema_version: CACHE_SCHEMA_VERSION,
         provider: "claude".to_owned(),
         source: source.to_owned(),
         captured_at: now_ms,
         windows,
+        extra_usage_disabled,
     };
     let mut bytes = serde_json::to_vec_pretty(&document)?;
     bytes.push(b'\n');
     atomic_write(cache_path, &bytes, 0o600)
 }
 
-fn merge_claude_windows(
-    cache_path: &Path,
-    mut incoming: Vec<CacheWindow>,
-    now_ms: u64,
-) -> Vec<CacheWindow> {
-    let existing = read_bounded(cache_path, MAX_STATUSLINE_BYTES)
+fn read_claude_cache_for_merge(cache_path: &Path, now_ms: u64) -> Option<CacheDocument> {
+    read_bounded(cache_path, MAX_STATUSLINE_BYTES)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<CacheDocument>(&bytes).ok())
         .filter(|cache| {
@@ -1200,7 +1503,15 @@ fn merge_claude_windows(
                 && cache.provider == "claude"
                 && matches!(cache.source.as_str(), CLAUDE_SOURCE | CLAUDE_OAUTH_SOURCE)
                 && cache.captured_at <= now_ms.saturating_add(MAX_CLOCK_SKEW_MS)
-        });
+        })
+}
+
+fn merge_claude_windows(
+    existing: Option<CacheDocument>,
+    source: &str,
+    mut incoming: Vec<CacheWindow>,
+    now_ms: u64,
+) -> Vec<CacheWindow> {
     let Some(existing) = existing else {
         return incoming;
     };
@@ -1211,6 +1522,10 @@ fn merge_claude_windows(
             .find(|current| current.window == previous.window)
         {
             merge_reset_field(current, &previous, now_ms);
+        } else if source == CLAUDE_OAUTH_SOURCE && previous.window == EXTRA_USAGE_WINDOW {
+            // The OAuth response no longer reports a usable Extra Usage
+            // percentage (turned off, or no longer offered). Keeping the
+            // previous one would show months-old spend as if it were current.
         } else {
             // A StatusLine payload usually contains only core windows, while
             // OAuth can also expose scoped-model and Extra Usage buckets.
@@ -1316,6 +1631,10 @@ pub fn capture_claude_statusline(
             resets_at: Some(resets_at),
             reset_source: Some(CLAUDE_SOURCE.to_owned()),
             reset_captured_at: Some(now_ms),
+            spent_minor: None,
+            limit_minor: None,
+            currency: None,
+            currency_exponent: None,
         });
     }
     if windows.is_empty() {
@@ -1407,6 +1726,8 @@ fn read_codex_version(path: &Path) -> Result<Option<String>, QuotaError> {
 struct EventEnvelope {
     #[serde(rename = "type")]
     kind: String,
+    #[serde(default)]
+    timestamp: Option<String>,
     payload: EventPayload,
 }
 
@@ -1522,7 +1843,13 @@ pub fn codex_app_server_entries(value: &Value, captured_at: u64) -> Vec<QuotaEnt
         .collect()
 }
 
-fn read_codex_limits(path: &Path, captured_at: u64) -> Result<Vec<QuotaEntry>, QuotaError> {
+/// Returns the file's last rate-limit event as `(event time, entries)`. The
+/// event time is the record's own `timestamp`; only records without one
+/// (early Codex releases) fall back to the file's modification time.
+fn read_codex_limits(
+    path: &Path,
+    modified_at: u64,
+) -> Result<Option<(u64, Vec<QuotaEntry>)>, QuotaError> {
     refuse_symlink(path)?;
     let mut file = File::open(path).map_err(|source| QuotaError::Io {
         path: path.to_path_buf(),
@@ -1564,6 +1891,11 @@ fn read_codex_limits(path: &Path, captured_at: u64) -> Result<Vec<QuotaEntry>, Q
         let Some(limits) = envelope.payload.rate_limits else {
             continue;
         };
+        let captured_at = envelope
+            .timestamp
+            .as_deref()
+            .and_then(parse_rfc3339_millis)
+            .unwrap_or(modified_at);
         let limit_id = limits.limit_id.and_then(|value| bounded_label(&value));
         let limit_name = limits.limit_name.and_then(|value| bounded_label(&value));
         let plan_type = limits.plan_type.and_then(|value| bounded_label(&value));
@@ -1593,9 +1925,9 @@ fn read_codex_limits(path: &Path, captured_at: u64) -> Result<Vec<QuotaEntry>, Q
                 ),
             );
         }
-        return Ok(entries);
+        return Ok(Some((captured_at, entries)));
     }
-    Ok(Vec::new())
+    Ok(None)
 }
 
 fn claude_window_id(value: &str) -> Option<String> {
@@ -2442,5 +2774,275 @@ mod tests {
             br#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}"#
         )
         .is_none());
+    }
+
+    fn write_timed_rollout(
+        root: &Path,
+        day: &str,
+        name: &str,
+        events: &[(&str, f64, u64)],
+        modified_ms: u64,
+    ) -> PathBuf {
+        let directory = root.join(day);
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("rollout-{name}.jsonl"));
+        let mut text = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"cli_version": "0.162.0"}
+        })
+        .to_string();
+        text.push('\n');
+        for (timestamp, used, resets_at) in events {
+            text.push_str(
+                &serde_json::json!({
+                    "timestamp": timestamp,
+                    "type": "event_msg",
+                    "payload": {"type": "token_count", "rate_limits": {
+                        "limit_id": "codex",
+                        "primary": {"used_percent": used, "window_minutes": 10080, "resets_at": resets_at},
+                        "secondary": null,
+                        "plan_type": "pro"
+                    }}
+                })
+                .to_string(),
+            );
+            text.push('\n');
+        }
+        fs::write(&path, text).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_millis(modified_ms)),
+            )
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn codex_rollout_picks_the_newest_event_not_the_newest_file() {
+        let root = root("codex-event-time");
+        let older_event = 1_791_549_714_877; // 2026-10-09T12:41:54.877Z
+        let newer_event = 1_791_634_866_426; // 2026-10-10T12:21:06.426Z
+        let resets_at = 1_791_948_525;
+        // Touched later (a title record) although its last quota event is older.
+        write_timed_rollout(
+            &root,
+            "2026/09/15",
+            "touched-later",
+            &[("2026-10-09T12:41:54.877Z", 13.0, resets_at)],
+            1_791_638_042_000,
+        );
+        write_timed_rollout(
+            &root,
+            "2026/10/10",
+            "newer-event",
+            &[
+                ("2026-10-10T12:00:00.000Z", 18.0, resets_at),
+                ("2026-10-10T12:21:06.426Z", 20.0, resets_at),
+            ],
+            newer_event + 200,
+        );
+        let collector = QuotaCollector::new(QuotaPaths {
+            actrealm_home: root.join("flow"),
+            codex_sessions: root.clone(),
+        });
+
+        let fresh = collector.collect_codex(newer_event + 10 * 60 * 1_000);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].status, "available");
+        assert_eq!(fresh[0].window, "10080m");
+        assert_eq!(fresh[0].used_pct, Some(20.0));
+        assert_eq!(fresh[0].plan_type.as_deref(), Some("pro"));
+        assert_eq!(fresh[0].captured_at, Some(newer_event));
+        assert_ne!(fresh[0].captured_at, Some(older_event));
+
+        // Past an hour the value no longer reflects usage elsewhere.
+        let old = collector.collect_codex(newer_event + 2 * 60 * 60 * 1_000);
+        assert_eq!(old[0].status, "stale");
+        assert_eq!(
+            old[0].reason_code.as_deref(),
+            Some("quota.reason.codex_rollout_stale")
+        );
+        assert_eq!(old[0].used_pct, Some(20.0));
+        assert_eq!(old[0].captured_at, Some(newer_event));
+
+        // After the window resets the value describes the previous window.
+        let reset = collector.collect_codex(resets_at * 1_000 + 1);
+        assert_eq!(reset[0].status, "stale");
+        assert_eq!(
+            reset[0].reason_code.as_deref(),
+            Some("quota.reason.window_reset")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rfc3339_accepts_fractions_and_offsets() {
+        assert_eq!(
+            parse_rfc3339_millis("2026-10-10T12:21:06.426Z"),
+            Some(1_791_634_866_426)
+        );
+        // Claude's usage endpoint format.
+        assert_eq!(
+            parse_rfc3339_millis("2026-10-05T15:59:59.987495+00:00"),
+            Some(1_791_215_999_987)
+        );
+        assert_eq!(
+            parse_rfc3339_millis("2026-10-05T23:59:59.5+08:00"),
+            Some(1_791_215_999_500)
+        );
+        assert_eq!(
+            parse_rfc3339_epoch("2026-10-05T15:59:59.987495+00:00"),
+            Some(1_791_215_999)
+        );
+        for invalid in [
+            "2026-10-05T15:59:59",
+            "2026-10-05T15:59:59.Z",
+            "2026-10-05T15:59:59+0000",
+            "2026-10-05T15:59:59+24:00",
+            "2026-1a-05T15:59:59Z",
+            "2026-10-05T15:59:59.1234567890Z",
+        ] {
+            assert_eq!(parse_rfc3339_millis(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn extra_usage_keeps_spend_in_minor_units_and_reports_when_turned_off() {
+        let root = root("extra-usage");
+        let paths = QuotaPaths {
+            actrealm_home: root.clone(),
+            codex_sessions: root.join("none"),
+        };
+        let cache = paths.claude_cache();
+        let collector = QuotaCollector::new(paths);
+        let month_ago = 1_786_600_916_070;
+        let now = 1_791_712_537_343;
+
+        let enabled: OAuthUsageResponse = serde_json::from_value(serde_json::json!({
+            "five_hour": {"utilization": 5, "resets_at": "2026-10-11T12:59:59.987495+00:00"},
+            "extra_usage": {
+                "is_enabled": true, "monthly_limit": 5000, "used_credits": 4500.0,
+                "utilization": 90.0, "currency": "usd", "decimal_places": 2,
+                "disabled_reason": null
+            }
+        }))
+        .unwrap();
+        let entries = oauth_entries(enabled, month_ago);
+        let five_hour = entries.iter().find(|entry| entry.window == "5h").unwrap();
+        assert_eq!(five_hour.resets_at, Some(1_791_723_599));
+        let extra = entries
+            .iter()
+            .find(|entry| entry.window == EXTRA_USAGE_WINDOW)
+            .unwrap();
+        assert_eq!(extra.used_pct, Some(90.0));
+        assert_eq!(extra.spent_minor, Some(4_500));
+        assert_eq!(extra.limit_minor, Some(5_000));
+        assert_eq!(extra.currency.as_deref(), Some("USD"));
+        assert_eq!(extra.currency_exponent, Some(2));
+        write_claude_cache(&cache, CLAUDE_OAUTH_SOURCE, &entries, month_ago).unwrap();
+        let cached = collector.collect_claude(month_ago + 1_000);
+        let cached = cached
+            .iter()
+            .find(|entry| entry.window == EXTRA_USAGE_WINDOW)
+            .unwrap();
+        assert_eq!(cached.spent_minor, Some(4_500));
+        assert_eq!(cached.limit_minor, Some(5_000));
+        assert_eq!(cached.currency.as_deref(), Some("USD"));
+        let json = serde_json::to_value(cached).unwrap();
+        assert_eq!(json["spentMinor"], 4_500);
+        assert_eq!(json["limitMinor"], 5_000);
+        assert_eq!(json["currency"], "USD");
+        assert_eq!(json["currencyExponent"], 2);
+
+        // Without utilization the percentage follows from spend and cap.
+        let derived: OAuthUsageResponse = serde_json::from_value(serde_json::json!({
+            "extra_usage": {"is_enabled": true, "monthly_limit": 2000, "used_credits": 500,
+                "utilization": null, "currency": "EUR"}
+        }))
+        .unwrap();
+        let derived = oauth_entries(derived, now);
+        assert_eq!(derived[0].used_pct, Some(25.0));
+        assert_eq!(derived[0].currency_exponent, None);
+
+        // The account later turned Extra Usage off. The old 90% must not
+        // survive the next successful OAuth response or a StatusLine merge.
+        let disabled: OAuthUsageResponse = serde_json::from_value(serde_json::json!({
+            "seven_day": {"utilization": 34, "resets_at": null},
+            "extra_usage": {
+                "is_enabled": false, "monthly_limit": null, "used_credits": null,
+                "utilization": null, "currency": null, "decimal_places": null,
+                "disabled_reason": null, "user_disabled": true
+            }
+        }))
+        .unwrap();
+        let entries = oauth_entries(disabled, now);
+        write_claude_cache(&cache, CLAUDE_OAUTH_SOURCE, &entries, now).unwrap();
+        capture_claude_statusline(
+            br#"{"rate_limits":{"five_hour":{"used_percentage":6,"resets_at":1791723599}}}"#,
+            &cache,
+            now + 1_000,
+        )
+        .unwrap();
+        let snapshot = collector.collect_claude(now + 2_000);
+        let extra = snapshot
+            .iter()
+            .filter(|entry| entry.window == EXTRA_USAGE_WINDOW)
+            .collect::<Vec<_>>();
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].status, "unavailable");
+        assert_eq!(extra[0].used_pct, None);
+        assert_eq!(extra[0].spent_minor, None);
+        assert_eq!(extra[0].captured_at, Some(now));
+        assert_eq!(extra[0].disabled_reason.as_deref(), Some("user_disabled"));
+        assert_eq!(
+            extra[0].reason_code.as_deref(),
+            Some(EXTRA_USAGE_DISABLED_REASON)
+        );
+
+        // A provider reason wins over the user flag; invalid text is dropped.
+        let reason: OAuthUsageResponse = serde_json::from_value(serde_json::json!({
+            "extra_usage": {"is_enabled": false, "disabled_reason": "org_level_disabled",
+                "user_disabled": true}
+        }))
+        .unwrap();
+        assert_eq!(
+            oauth_entries(reason, now)[0].disabled_reason.as_deref(),
+            Some("org_level_disabled")
+        );
+        let odd: OAuthUsageResponse = serde_json::from_value(serde_json::json!({
+            "extra_usage": {"is_enabled": "yes", "disabled_reason": "not a code!"}
+        }))
+        .unwrap();
+        assert_eq!(oauth_entries(odd, now)[0].disabled_reason, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn extra_usage_from_an_earlier_billing_month_is_not_shown() {
+        let root = root("extra-usage-old");
+        let paths = QuotaPaths {
+            actrealm_home: root.clone(),
+            codex_sessions: root.join("none"),
+        };
+        let cache = paths.claude_cache();
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        // The shape an earlier Runtime left behind: a two-month-old 90%.
+        fs::write(
+            &cache,
+            br#"{"schemaVersion":1,"provider":"claude","source":"oauth_usage","capturedAt":1791712537343,"windows":[
+              {"window":"7d","usedPct":34.0,"usedPctSource":"oauth_usage","usedPctCapturedAt":1791712537343,"resetsAt":null},
+              {"window":"extra_usage","label":"Extra usage","usedPct":90.0,"usedPctSource":"oauth_usage","usedPctCapturedAt":1786600916070,"resetsAt":null}
+            ]}"#,
+        )
+        .unwrap();
+        let entries = QuotaCollector::new(paths).collect_claude(1_791_712_600_000);
+        assert!(entries.iter().any(|entry| entry.window == "7d"));
+        assert!(!entries
+            .iter()
+            .any(|entry| entry.window == EXTRA_USAGE_WINDOW));
+        fs::remove_dir_all(root).unwrap();
     }
 }

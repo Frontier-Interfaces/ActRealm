@@ -176,7 +176,8 @@ Codex account quota prefers the desktop-bundled app-server over an older global
 CLI. A transient Connector failure may return the last official, unexpired
 snapshot with `status: stale`; consumers may keep the percentage visible but
 must preserve its original `capturedAt`. A Spark-only rollout without an
-official standard-plan entry never proves that the account is Pro.
+official standard-plan entry never proves that the account is Pro. See
+"Quota entries" for sources, freshness and Extra Usage amounts.
 
 It excludes raw prompts, complete commands, tool input/output, file contents,
 transcripts (beyond the sanitized excerpt of the latest Agent message, see
@@ -803,3 +804,83 @@ The first matching rule wins: an app bundle among the Hook's parent processes,
 then SSH, then tmux or GNU screen, then `TERM_PROGRAM` / `LC_TERMINAL` and the
 bundle identifier of the environment, then an explicit `ACTREALM_SURFACE`, and
 finally any other `TERM_PROGRAM` value as `terminal`.
+
+## Quota entries
+
+Each `quota[]` item of the snapshot describes one Provider quota window.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `provider`, `window` | string | Provider and window identity (`10080m`, `5h`, `7d`, `extra_usage`, ...) |
+| `status` | string | `available`, `stale` (values kept, not current) or `unavailable` (no values) |
+| `usedPct`, `remainingPct` | number, optional | Percentages, 0 to 100 |
+| `resetsAt` | integer, optional | Window reset, epoch seconds |
+| `source` | string | `codex_app_server`, `rollout_experimental`, `oauth_usage`, `statusline`, ... |
+| `windowMinutes`, `limitId`, `limitName`, `planType`, `quotaKind` | optional | Window metadata |
+| `capturedAt` | integer, optional | When the source produced the value, epoch milliseconds rounded down to 30 s |
+| `reasonMessage` | object, optional | Why the item is `stale` or `unavailable` |
+| `spentMinor`, `limitMinor`, `currency`, `currencyExponent`, `disabledReason` | optional | Claude Extra Usage only, see below |
+
+### Freshness
+
+`capturedAt` is the time the value was produced, never the time the snapshot
+was built:
+
+- `codex_app_server`: when Runtime received Codex's `account/rateLimits/read`
+  response or an `account/rateLimits/updated` notification. Runtime reads the
+  account every 60 seconds through the Codex app-server (its own
+  `codex app-server --stdio` child, or the shared daemon when one is running),
+  so this is server-side usage including other devices.
+- `rollout_experimental`: the `timestamp` of the Codex `token_count` event that
+  carried the limits (the rollout file's modification time only for early
+  Codex records without a timestamp). A rollout only changes when Codex runs on
+  this Mac.
+- `oauth_usage`: when Claude's usage response was received; `statusline`: when
+  Claude Code's StatusLine reported the value.
+
+An item is `stale` with one of these `reasonMessage` codes:
+
+| Code | When |
+| --- | --- |
+| `quota.reason.window_reset` | `resetsAt` has passed; the value describes the previous window |
+| `quota.reason.codex_refresh_failed` | The last official Codex read is more than 15 minutes old, or only an earlier official snapshot is left |
+| `quota.reason.codex_rollout_stale` | A rollout value more than one hour old |
+| `quota.reason.cache_stale`, `quota.reason.claude_refresh_failed` | A Claude value more than 15 minutes old, or the latest Claude refresh failed |
+
+### Codex source selection
+
+The official app-server snapshot is used while it is at most 15 minutes old.
+After that the last official values stay, marked stale, unless a rollout has
+recorded a newer reading, which then replaces them. Without any official
+snapshot the newest rollout reading is used, chosen by event time across the
+recent rollout files, not by file modification time. A plan with only a weekly
+window (Codex Pro: `windowMinutes: 10080`, no five-hour window) is a complete
+standard quota. Codex's `credits.balance` is not exposed.
+
+### Claude Extra Usage
+
+`window: "extra_usage"` is the overage spend for the current billing month, not
+a window that stops the Agent, and appears only on Claude items.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `spentMinor` | integer, optional | Spend so far this billing period, in the minor unit of `currency` (cents for USD) |
+| `limitMinor` | integer, optional | Monthly cap in the minor unit of `currency`; absent when there is no cap |
+| `currency` | string, optional | ISO 4217 code in upper case (`USD`); the two amounts never appear without it |
+| `currencyExponent` | integer, optional | Decimal places reported by Claude; one major unit is `10^currencyExponent` minor units. When absent use the ISO 4217 minor unit (USD: 2) |
+| `disabledReason` | string, optional | Why Extra Usage is off: Claude's own code (such as `org_level_disabled`), or `user_disabled` when the account holder turned it off |
+
+While Extra Usage is on, the item is `available` with `usedPct` equal to spend
+over cap (Claude's `utilization`, or `spentMinor / limitMinor` when Claude
+omits it). While it is off, the item is `unavailable` with no percentages,
+`reasonMessage.code` `quota.reason.extra_usage_disabled`, `capturedAt` of that
+response and, when known, `disabledReason`. Every successful Claude usage
+response replaces the previous Extra Usage state, and an Extra Usage value more
+than 31 days old is never shown.
+
+```json
+{"provider": "claude", "window": "extra_usage", "status": "available",
+ "usedPct": 90.0, "remainingPct": 10.0, "source": "oauth_usage",
+ "limitName": "Extra usage", "capturedAt": 1791712530000,
+ "spentMinor": 4500, "limitMinor": 5000, "currency": "USD", "currencyExponent": 2}
+```
