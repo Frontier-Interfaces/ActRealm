@@ -149,6 +149,11 @@ const UI_STATUS_TIMESTAMP_GRANULARITY_MS: u64 = 30_000;
 /// The quota loop reads the Codex account every `quota_poll_interval`
 /// (60 s). A snapshot older than this means those reads have been failing.
 const CODEX_OFFICIAL_QUOTA_FRESHNESS_MS: u64 = 15 * 60 * 1_000;
+/// A Claude quota refresh takes seconds; even with every bounded step timing
+/// out it stays under four minutes. One running this long has stopped
+/// responding and is replaced, so the quota cannot stay frozen. Measured on
+/// `Instant`, which does not advance while the Mac sleeps.
+const CLAUDE_QUOTA_REFRESH_ABANDON: Duration = Duration::from_secs(5 * 60);
 const USAGE_FAILURE_BACKOFF: Duration = Duration::from_millis(100);
 const RESTART_REQUEST_TTL: Duration = Duration::from_secs(3);
 const RESTART_REQUEST_PENDING: u8 = 0;
@@ -574,6 +579,8 @@ impl ApiServer {
                 claude_cache_modified_at: None,
                 codex_rate_limits_captured_at: None,
                 oauth_refresh_in_progress: false,
+                oauth_refresh_started_at: None,
+                oauth_refresh_abandoned: None,
                 oauth_next_poll_at: 0,
                 oauth_last_result: None,
             })),
@@ -989,6 +996,9 @@ struct QuotaState {
     claude_cache_modified_at: Option<SystemTime>,
     codex_rate_limits_captured_at: Option<u64>,
     oauth_refresh_in_progress: bool,
+    /// When the running refresh started, and the flag that abandons it.
+    oauth_refresh_started_at: Option<Instant>,
+    oauth_refresh_abandoned: Option<Arc<AtomicBool>>,
     oauth_next_poll_at: u64,
     oauth_last_result: Option<Result<u64, (&'static str, String)>>,
 }
@@ -10005,15 +10015,40 @@ fn oauth_poll_due(in_progress: bool, next_poll_at: u64, now: u64, force: bool) -
     !in_progress && (force || now >= next_poll_at)
 }
 
+/// Gives up on a Claude quota refresh that has stopped responding, so the
+/// next poll starts a new one instead of the quota freezing until restart.
+/// The old thread may still return later; its flag keeps it from renewing
+/// the credential, writing the cache, or touching this state.
+fn abandon_stuck_oauth_refresh(quota: &mut QuotaState, now: Instant) -> bool {
+    if !quota.oauth_refresh_in_progress
+        || quota.oauth_refresh_started_at.is_none_or(|started| {
+            now.saturating_duration_since(started) < CLAUDE_QUOTA_REFRESH_ABANDON
+        })
+    {
+        return false;
+    }
+    if let Some(abandoned) = quota.oauth_refresh_abandoned.take() {
+        abandoned.store(true, Ordering::Release);
+    }
+    quota.oauth_refresh_in_progress = false;
+    mark_claude_quota_stale(&mut quota.entries);
+    quota.oauth_last_result = Some(Err((
+        "CLAUDE_QUOTA_REFRESH_FAILED",
+        "The Claude quota refresh stopped responding and was restarted.".to_owned(),
+    )));
+    true
+}
+
 fn start_oauth_quota_refresh(state: &AppState, force: bool) {
     if !state.claude_oauth_quota {
         return;
     }
     let now = now_millis();
-    let mut collector = {
+    let (mut collector, abandoned) = {
         let Ok(mut quota) = state.quota.lock() else {
             return;
         };
+        abandon_stuck_oauth_refresh(&mut quota, Instant::now());
         if !oauth_poll_due(
             quota.oauth_refresh_in_progress,
             quota.oauth_next_poll_at,
@@ -10023,12 +10058,17 @@ fn start_oauth_quota_refresh(state: &AppState, force: bool) {
             return;
         }
         quota.oauth_refresh_in_progress = true;
+        quota.oauth_refresh_started_at = Some(Instant::now());
+        let abandoned = Arc::new(AtomicBool::new(false));
+        quota.oauth_refresh_abandoned = Some(abandoned.clone());
         // Keep the previous failure visible until a successful response replaces it.
         quota.oauth_next_poll_at = now.saturating_add(state.quota_poll_interval.as_millis() as u64);
         // Keep credential-refresh cooldown and HTTP backoff across polls.
         // Snapshot reads use an independent cache-only placeholder meanwhile.
         let placeholder = QuotaCollector::new(quota.collector.paths().clone());
-        std::mem::replace(&mut quota.collector, placeholder)
+        let mut collector = std::mem::replace(&mut quota.collector, placeholder);
+        collector.set_oauth_abandon_flag(abandoned.clone());
+        (collector, abandoned)
     };
     let quota_state = state.quota.clone();
     let store = state.store.clone();
@@ -10044,6 +10084,10 @@ fn start_oauth_quota_refresh(state: &AppState, force: bool) {
                 collector.collect_codex(now_millis())
             };
             let Ok(mut quota) = quota_state.lock() else { return };
+            // Given up on while it was stuck: a newer refresh owns the state.
+            if abandoned.load(Ordering::Acquire) {
+                return;
+            }
             quota.collector = collector;
             match result {
                 Ok(mut entries) => {
@@ -10076,10 +10120,12 @@ fn start_oauth_quota_refresh(state: &AppState, force: bool) {
                 quota.oauth_last_result = Some(Err(("QUOTA_PERSIST_FAILED", "Could not persist the quota snapshot".into())));
             }
             quota.oauth_refresh_in_progress = false;
+            quota.oauth_refresh_abandoned = None;
         });
     if result.is_err() {
         if let Ok(mut quota) = state.quota.lock() {
             quota.oauth_refresh_in_progress = false;
+            quota.oauth_refresh_abandoned = None;
             quota.oauth_last_result = Some(Err((
                 "CLAUDE_QUOTA_REFRESH_FAILED",
                 "Could not start quota refresh".into(),
@@ -12606,6 +12652,8 @@ done
                 claude_cache_modified_at: None,
                 codex_rate_limits_captured_at: None,
                 oauth_refresh_in_progress: false,
+                oauth_refresh_started_at: None,
+                oauth_refresh_abandoned: None,
                 oauth_next_poll_at: 0,
                 oauth_last_result: None,
             })),
@@ -16798,6 +16846,63 @@ done
     }
 
     #[test]
+    fn stuck_claude_quota_refresh_is_abandoned_so_polling_resumes() {
+        let root = std::env::temp_dir().join(format!("actrealm-quota-stuck-{}", Uuid::now_v7()));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        let started = Instant::now();
+        let abandoned = Arc::new(AtomicBool::new(false));
+        {
+            let mut quota = state.quota.lock().unwrap();
+            quota.entries = vec![serde_json::from_value(json!({
+                "provider": "claude", "window": "5h", "status": "available",
+                "usedPct": 25.0, "source": "oauth_usage", "capturedAt": 1_000
+            }))
+            .unwrap()];
+            quota.oauth_refresh_in_progress = true;
+            quota.oauth_refresh_abandoned = Some(abandoned.clone());
+            quota.oauth_next_poll_at = 0;
+
+            // Without a start time there is nothing to measure.
+            let late = started + CLAUDE_QUOTA_REFRESH_ABANDON;
+            assert!(!abandon_stuck_oauth_refresh(&mut quota, late));
+
+            // A slow refresh is left alone.
+            quota.oauth_refresh_started_at = Some(started);
+            let slow = late - Duration::from_millis(1);
+            assert!(!abandon_stuck_oauth_refresh(&mut quota, slow));
+            assert!(quota.oauth_refresh_in_progress);
+            assert!(!abandoned.load(Ordering::Acquire));
+            assert_eq!(quota.entries[0].status, "available");
+
+            // One that stopped responding is given up on, and the next poll is due.
+            assert!(abandon_stuck_oauth_refresh(&mut quota, late));
+            assert!(abandoned.load(Ordering::Acquire));
+            assert!(quota.oauth_refresh_abandoned.is_none());
+            assert!(oauth_poll_due(
+                quota.oauth_refresh_in_progress,
+                quota.oauth_next_poll_at,
+                now_millis(),
+                false
+            ));
+            assert_eq!(quota.entries[0].status, "stale");
+            assert_eq!(quota.entries[0].used_pct, Some(25.0));
+            assert!(matches!(
+                &quota.oauth_last_result,
+                Some(Err(("CLAUDE_QUOTA_REFRESH_FAILED", _)))
+            ));
+            // Nothing running: nothing to abandon.
+            assert!(!abandon_stuck_oauth_refresh(
+                &mut quota,
+                late + CLAUDE_QUOTA_REFRESH_ABANDON
+            ));
+        }
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn manual_refresh_joins_background_job_and_returns_its_actual_outcome() {
         let root = std::env::temp_dir().join(format!("actrealm-quota-join-{}", Uuid::now_v7()));
         let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
@@ -16820,6 +16925,7 @@ done
                 {
                     let mut quota = state.quota.lock().unwrap();
                     quota.oauth_refresh_in_progress = true;
+                    quota.oauth_refresh_started_at = Some(Instant::now());
                     quota.oauth_last_result = None;
                 }
                 let completed = state.quota.clone();

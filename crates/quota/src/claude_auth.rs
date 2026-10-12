@@ -10,14 +10,40 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-struct ProbeChild(Child);
+/// How long cleanup waits for a killed probe before leaving it to a reaper.
+const PROBE_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A probe that leads its own session, and the PTY master that is its
+/// controlling terminal.
+struct ProbeChild {
+    child: Child,
+    master: Option<File>,
+}
 
 impl Drop for ProbeChild {
     fn drop(&mut self) {
         // The child owns a new session. Reap it and any subprocesses on every
         // exit path, including timeout, a closed PTY, and a successful renewal.
-        unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
-        let _ = self.0.wait();
+        unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
+        // macOS finishes a session leader's exit only after its terminal
+        // output drains, and nothing reads the master from here on. Close it
+        // first: waiting with it open held the quota job for hours.
+        drop(self.master.take());
+        let deadline = Instant::now() + PROBE_REAP_TIMEOUT;
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
+                Ok(Some(_)) | Err(_) => return,
+            }
+        }
+        // Never hold the quota job on a process that cannot finish exiting.
+        let pid = self.child.id() as libc::pid_t;
+        let _ = thread::Builder::new()
+            .name("actrealm-claude-probe-reaper".to_owned())
+            .spawn(move || {
+                let mut status = 0;
+                unsafe { libc::waitpid(pid, &mut status, 0) };
+            });
     }
 }
 
@@ -60,7 +86,7 @@ fn refresh_command(
         return Err(io::Error::other("unsafe Claude quota probe directory"));
     }
     fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
-    let (mut master, slave) = terminal()?;
+    let (master, slave) = terminal()?;
     command
         .args([
             "--tools", "", "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}",
@@ -84,10 +110,20 @@ fn refresh_command(
             Ok(())
         });
     }
-    let mut child = ProbeChild(command.spawn()?);
+    let mut probe = ProbeChild {
+        child: command.spawn()?,
+        master: Some(master),
+    };
     // Command retains its configured Stdio handles after spawn. Close the
     // parent's slave handles so only the child owns that side of the PTY.
     drop(command);
+    let ProbeChild {
+        child,
+        master: Some(master),
+    } = &mut probe
+    else {
+        return Ok(credential_changed());
+    };
     let started = Instant::now();
     let mut next_check = Duration::from_millis(500);
     let mut sent_status = false;
@@ -135,7 +171,7 @@ fn refresh_command(
             master.write_all(b"/status\r")?;
             sent_status = true;
         }
-        if child.0.try_wait()?.is_some() {
+        if child.try_wait()?.is_some() {
             break;
         }
         thread::sleep(Duration::from_millis(50));
@@ -214,6 +250,41 @@ mod tests {
             || root.join("renewed").exists()
         )
         .unwrap());
+        let pid: i32 = fs::read_to_string(root.join("pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn renewal_returns_while_the_probe_is_still_writing_to_its_terminal() {
+        // macOS finishes a session leader's exit only after its terminal
+        // output drains. A probe still printing when renewal is detected
+        // once held the quota job in wait() for hours.
+        let root = super::super::tests::root("auth-probe-flood");
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("fake-claude");
+        fs::write(
+            &executable,
+            "[ -t 1 ] || exit 1\nprintf '%s' $$ > pid\n: > renewed\nwhile :; do printf '%s\\n' 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; done\n",
+        )
+        .unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let probe_root = root.clone();
+        thread::spawn(move || {
+            let renewed = refresh_command(
+                fixture_command(&probe_root.join("fake-claude")),
+                &probe_root,
+                Duration::from_secs(5),
+                || probe_root.join("renewed").exists(),
+            );
+            let _ = sender.send(renewed.unwrap());
+        });
+        assert!(receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("probe cleanup must not wait on an undrained terminal"));
         let pid: i32 = fs::read_to_string(root.join("pid"))
             .unwrap()
             .parse()

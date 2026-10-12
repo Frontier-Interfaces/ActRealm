@@ -11,7 +11,8 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 pub mod agents;
@@ -45,6 +46,8 @@ const OAUTH_RETRY_AFTER_MS: u64 = 60 * 1_000;
 const OAUTH_REFRESH_SKEW_MS: u64 = 4 * 60 * 1_000;
 const OAUTH_REFRESH_COOLDOWN_MS: u64 = 60 * 1_000;
 const OAUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a bounded command's output may keep arriving after it exits.
+const COMMAND_OUTPUT_GRACE: Duration = Duration::from_secs(1);
 #[cfg(target_os = "macos")]
 const MAX_KEYCHAIN_DUMP_BYTES: usize = 4 * 1024 * 1024;
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -286,6 +289,7 @@ pub struct QuotaCollector {
     oauth_credential: Option<OAuthCredential>,
     oauth_retry_after: u64,
     oauth_refresh_after: u64,
+    oauth_abandoned: Arc<AtomicBool>,
 }
 
 impl QuotaCollector {
@@ -295,11 +299,26 @@ impl QuotaCollector {
             oauth_credential: None,
             oauth_retry_after: 0,
             oauth_refresh_after: 0,
+            oauth_abandoned: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn paths(&self) -> &QuotaPaths {
         &self.paths
+    }
+
+    /// Ties the next OAuth refresh to `flag`. Once the caller sets it, that
+    /// refresh stops before renewing the credential, fetching, or writing the
+    /// cache, so a refresh the caller gave up on cannot act later.
+    pub fn set_oauth_abandon_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.oauth_abandoned = flag;
+    }
+
+    fn ensure_oauth_not_abandoned(&self) -> Result<(), QuotaError> {
+        if self.oauth_abandoned.load(Ordering::Acquire) {
+            return Err(QuotaError::OAuthRequest("refresh was abandoned".to_owned()));
+        }
+        Ok(())
     }
 
     pub fn collect(&self, now_ms: u64) -> Vec<QuotaEntry> {
@@ -312,6 +331,7 @@ impl QuotaCollector {
     /// credentials are already present. The credential remains memory-only;
     /// only validated percentages and reset timestamps enter the local cache.
     pub fn refresh_claude_oauth(&mut self, now_ms: u64) -> Result<Vec<QuotaEntry>, QuotaError> {
+        self.ensure_oauth_not_abandoned()?;
         if now_ms < self.oauth_retry_after {
             return Err(QuotaError::OAuthRequest(
                 "temporarily rate limited".to_owned(),
@@ -341,6 +361,7 @@ impl QuotaCollector {
             .ok_or(QuotaError::OAuthUnavailable)?
             .access_token
             .clone();
+        self.ensure_oauth_not_abandoned()?;
         let response = match fetch_oauth_usage(&access_token) {
             Ok(response) => response,
             Err(OAuthFetchError::Unauthorized) => {
@@ -354,6 +375,7 @@ impl QuotaCollector {
                 if updated_token == access_token {
                     return Err(self.map_oauth_error(OAuthFetchError::Unauthorized, now_ms));
                 }
+                self.ensure_oauth_not_abandoned()?;
                 fetch_oauth_usage(&updated_token)
                     .map_err(|error| self.map_oauth_error(error, now_ms))?
             }
@@ -365,6 +387,8 @@ impl QuotaCollector {
                 "response contained no supported usage windows".to_owned(),
             ));
         }
+        // A refresh given up on must not replace newer numbers with its own.
+        self.ensure_oauth_not_abandoned()?;
         write_claude_cache(
             &self.paths.claude_cache(),
             CLAUDE_OAUTH_SOURCE,
@@ -380,6 +404,11 @@ impl QuotaCollector {
     fn refresh_oauth_credential_from_provider(&mut self, now_ms: u64) {
         if now_ms < self.oauth_refresh_after {
             self.oauth_credential = read_oauth_credential();
+            return;
+        }
+        // Never start a renewal for a refresh that was given up on: a newer
+        // one may be renewing the same rotating credential chain.
+        if self.ensure_oauth_not_abandoned().is_err() {
             return;
         }
         self.oauth_refresh_after = now_ms.saturating_add(OAUTH_REFRESH_COOLDOWN_MS);
@@ -898,10 +927,15 @@ fn bounded_command_output(
         .spawn()
         .ok()?;
     let stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        stdout.take(limit as u64 + 1).read_to_end(&mut bytes).ok()?;
-        (bytes.len() <= limit).then_some(bytes)
+        let read = stdout
+            .take(limit as u64 + 1)
+            .read_to_end(&mut bytes)
+            .ok()
+            .and_then(|_| (bytes.len() <= limit).then_some(bytes));
+        let _ = sender.send(read);
     });
     let start = Instant::now();
     let success = loop {
@@ -917,7 +951,9 @@ fn bounded_command_output(
     };
     // An exited command may have left a helper holding its stdout pipe.
     unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-    let bytes = reader.join().ok().flatten();
+    // A helper that left the process group survives that kill and can hold
+    // the pipe open indefinitely. Give up on the read instead of waiting.
+    let bytes = receiver.recv_timeout(COMMAND_OUTPUT_GRACE).ok().flatten();
     success.then_some(bytes).flatten()
 }
 
@@ -2192,6 +2228,51 @@ mod tests {
         })
         .collect_claude(1_784_130_100_000);
         assert_eq!(collected[1].status, "available");
+    }
+
+    #[test]
+    fn abandoned_oauth_refresh_does_nothing() {
+        let root = root("oauth-abandoned");
+        let mut collector = QuotaCollector::new(QuotaPaths {
+            actrealm_home: root.clone(),
+            codex_sessions: root.join("none"),
+        });
+        collector.set_oauth_abandon_flag(Arc::new(AtomicBool::new(true)));
+        assert!(matches!(
+            collector.refresh_claude_oauth(1_000),
+            Err(QuotaError::OAuthRequest(message)) if message == "refresh was abandoned"
+        ));
+        assert!(!collector.paths().claude_cache().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn helper_outside_the_process_group_cannot_hold_a_bounded_command() {
+        // The helper starts its own session and keeps stdout open after the
+        // command exits. The read must give up instead of waiting for it.
+        let root = root("bounded-helper");
+        let pid_file = root.join("helper.pid");
+        let started = Instant::now();
+        let output = bounded_command_output(
+            Command::new("/usr/bin/perl").args([
+                "-MPOSIX",
+                "-e",
+                "my $f = $ARGV[0]; if (fork() == 0) { POSIX::setsid(); open(my $h, '>', \"$f.tmp\"); print $h $$; close $h; rename(\"$f.tmp\", $f); sleep 20; exit 0 } for (1..300) { last if -e $f; select(undef, undef, undef, 0.01) } print 'ok'; exit 0",
+                pid_file.to_str().unwrap(),
+            ]),
+            1_024,
+            Duration::from_secs(3),
+        );
+        let elapsed = started.elapsed();
+        if let Some(pid) = fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+        {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(elapsed < Duration::from_secs(6), "waited {elapsed:?}");
+        assert_eq!(output, None);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
