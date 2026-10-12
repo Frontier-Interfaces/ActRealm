@@ -2231,7 +2231,7 @@ mod tests {
     }
 
     #[test]
-    fn abandoned_oauth_refresh_does_nothing() {
+    fn oauth_refresh_abandoned_before_it_starts_does_nothing() {
         let root = root("oauth-abandoned");
         let mut collector = QuotaCollector::new(QuotaPaths {
             actrealm_home: root.clone(),
@@ -2264,13 +2264,15 @@ mod tests {
             Duration::from_secs(3),
         );
         let elapsed = started.elapsed();
-        if let Some(pid) = fs::read_to_string(&pid_file)
-            .ok()
-            .and_then(|pid| pid.trim().parse::<i32>().ok())
-        {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-        }
+        let pid: i32 = fs::read_to_string(&pid_file)
+            .expect("the helper started and kept stdout open")
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(pid > 1);
+        unsafe { libc::kill(pid, libc::SIGKILL) };
         assert!(elapsed < Duration::from_secs(6), "waited {elapsed:?}");
+        assert!(elapsed >= COMMAND_OUTPUT_GRACE, "gave up after {elapsed:?}");
         assert_eq!(output, None);
         fs::remove_dir_all(root).unwrap();
     }

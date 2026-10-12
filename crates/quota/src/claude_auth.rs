@@ -2,7 +2,7 @@
 //! tools, hooks, MCP servers, transcript capture, or credential writes here.
 use std::fs::{self, DirBuilder, File};
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -179,14 +179,58 @@ fn refresh_command(
     Ok(credential_changed())
 }
 
+const TERMINAL_SIZE: libc::winsize = libc::winsize {
+    ws_row: 50,
+    ws_col: 160,
+    ws_xpixel: 0,
+    ws_ypixel: 0,
+};
+
+/// Opens the probe's PTY with both ends close-on-exec from the start. std
+/// sets that flag in the same call that opens a file, while openpty() sets it
+/// only afterwards: a child another thread spawned in between would inherit
+/// the master, and closing ours would then no longer end the terminal.
+#[cfg(target_os = "macos")]
 fn terminal() -> io::Result<(File, File)> {
-    let (mut master, mut slave) = (-1, -1);
-    let mut size = libc::winsize {
-        ws_row: 50,
-        ws_col: 160,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
+    use std::ffi::{CStr, OsStr};
+    use std::fs::OpenOptions;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let open = |path: &Path| {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(path)
     };
+    let master = open(Path::new("/dev/ptmx"))?;
+    let fd = master.as_raw_fd();
+    if unsafe { libc::grantpt(fd) } == -1 || unsafe { libc::unlockpt(fd) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut name = [0u8; 128];
+    if unsafe { libc::ioctl(fd, libc::TIOCPTYGNAME as _, name.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let name = CStr::from_bytes_until_nul(&name)
+        .map_err(|_| io::Error::other("unnamed Claude quota probe terminal"))?;
+    let slave = open(Path::new(OsStr::from_bytes(name.to_bytes())))?;
+    if unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &TERMINAL_SIZE) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((master, slave))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn terminal() -> io::Result<(File, File)> {
+    use std::os::fd::FromRawFd;
+
+    let (mut master, mut slave) = (-1, -1);
+    let mut size = TERMINAL_SIZE;
     if unsafe {
         libc::openpty(
             &mut master,
@@ -222,6 +266,102 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command.arg(script);
         command
+    }
+
+    #[test]
+    fn probe_terminal_is_a_sized_nonblocking_tty_closed_on_exec() {
+        let (master, slave) = terminal().unwrap();
+        for file in [&master, &slave] {
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+            assert_ne!(flags, -1);
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        }
+        assert_eq!(unsafe { libc::isatty(slave.as_raw_fd()) }, 1);
+        let mut size = libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_ne!(
+            unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCGWINSZ, &mut size) },
+            -1
+        );
+        assert_eq!((size.ws_row, size.ws_col), (50, 160));
+        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        assert_ne!(flags & libc::O_NONBLOCK, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn children_spawned_while_probe_terminals_open_never_inherit_them() {
+        // openpty() marked both ends close-on-exec only after opening them,
+        // so a child spawned by another thread in between kept the terminal.
+        let baseline = device_fds(&spawn_sleeper());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spawning = stop.clone();
+        let spawner = thread::spawn(move || {
+            let mut children = Vec::new();
+            while !spawning.load(std::sync::atomic::Ordering::Relaxed) && children.len() < 200 {
+                children.push(spawn_sleeper());
+            }
+            children
+        });
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(300) {
+            drop(terminal().unwrap());
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut children = spawner.join().unwrap();
+        // Let the last children finish starting before looking at them.
+        thread::sleep(Duration::from_millis(50));
+        let leaked = children
+            .iter()
+            .filter(|child| device_fds(child) > baseline)
+            .count();
+        for child in &mut children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert_eq!(leaked, 0, "of {} children", children.len());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn spawn_sleeper() -> Child {
+        Command::new("/bin/sleep")
+            .arg("5")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    /// Open files above stdio. A terminal is a file; pipes and sockets other
+    /// tests may leak into children are not counted.
+    #[cfg(target_os = "macos")]
+    fn device_fds(child: &Child) -> usize {
+        let empty = libc::proc_fdinfo {
+            proc_fd: 0,
+            proc_fdtype: 0,
+        };
+        let mut fds = vec![empty; 64];
+        let size = std::mem::size_of_val(fds.as_slice()) as libc::c_int;
+        let bytes = unsafe {
+            libc::proc_pidinfo(
+                child.id() as libc::c_int,
+                libc::PROC_PIDLISTFDS,
+                0,
+                fds.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        assert!(bytes > 0);
+        fds.truncate(bytes as usize / std::mem::size_of::<libc::proc_fdinfo>());
+        fds.iter()
+            .filter(|fd| fd.proc_fd > 2 && fd.proc_fdtype as libc::c_int == libc::PROX_FDTYPE_VNODE)
+            .count()
     }
 
     #[test]
@@ -272,19 +412,32 @@ mod tests {
         )
         .unwrap();
         let (sender, receiver) = std::sync::mpsc::channel();
+        let renewed_at = std::sync::Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let seen = renewed_at.clone();
         let probe_root = root.clone();
         thread::spawn(move || {
             let renewed = refresh_command(
                 fixture_command(&probe_root.join("fake-claude")),
                 &probe_root,
                 Duration::from_secs(5),
-                || probe_root.join("renewed").exists(),
+                || {
+                    let renewed = probe_root.join("renewed").exists();
+                    if renewed {
+                        seen.lock().unwrap().get_or_insert_with(Instant::now);
+                    }
+                    renewed
+                },
             );
-            let _ = sender.send(renewed.unwrap());
+            let _ = sender.send((renewed.unwrap(), Instant::now()));
         });
-        assert!(receiver
+        let (renewed, returned) = receiver
             .recv_timeout(Duration::from_secs(10))
-            .expect("probe cleanup must not wait on an undrained terminal"));
+            .expect("probe cleanup must not wait on an undrained terminal");
+        assert!(renewed);
+        // Closing the terminal first lets the probe exit at once. Waiting on
+        // it first would run out the whole reap timeout instead.
+        let renewed_at = renewed_at.lock().unwrap().expect("renewal was seen");
+        assert!(returned.duration_since(renewed_at) < PROBE_REAP_TIMEOUT / 2);
         let pid: i32 = fs::read_to_string(root.join("pid"))
             .unwrap()
             .parse()

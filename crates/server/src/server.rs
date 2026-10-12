@@ -1396,17 +1396,19 @@ impl CodexManager {
     fn refresh_rate_limits(&self) -> CodexQuotaRefresh {
         let current_stamp = self.auth_path.as_deref().and_then(credential_stamp);
         if credential_stamp_changed(&self.auth_stamp, &current_stamp) {
-            let should_reconnect = self.state.lock().is_ok_and(|mut state| {
-                if !begin_codex_credential_reconnect(&mut state) {
-                    return false;
-                }
-                state.rate_limits_error =
-                    Some("Codex account credentials changed; reconnecting".to_owned());
-                true
-            });
-            if !should_reconnect {
+            let Ok(mut state) = self.state.lock() else {
                 return CodexQuotaRefresh::Failed;
+            };
+            if !begin_codex_credential_reconnect(&mut state) {
+                drop(state);
+                // The restart for this change already failed. A one-shot
+                // app-server reads the current credentials each time, so the
+                // official quota stays current until Runtime is restarted.
+                return self.refresh_rate_limits_quota_only();
             }
+            state.rate_limits_error =
+                Some("Codex account credentials changed; reconnecting".to_owned());
+            drop(state);
             if let Some(connector) = self.connector.as_ref() {
                 connector.shutdown();
             }
@@ -4113,8 +4115,8 @@ async fn companion_reveal_artifact(
     #[cfg(target_os = "macos")]
     let revealed = tokio::task::spawn_blocking(move || {
         let mut command = ProcessCommand::new("/usr/bin/open");
-        command.arg("-R").arg(path);
-        wait_for_artifact_reveal(command, Duration::from_secs(3))
+        command.arg("-R").arg(path).stderr(Stdio::null());
+        wait_for_bounded_child(command, Duration::from_secs(3))
     })
     .await
     .unwrap_or(false);
@@ -4132,14 +4134,9 @@ async fn companion_reveal_artifact(
 
 // Starting `open` is not success: Launch Services can reject the request later.
 // Keep this bounded and off the HTTP executor, and reap children on every path.
-#[cfg(any(target_os = "macos", test))]
-fn wait_for_artifact_reveal(mut command: ProcessCommand, timeout: Duration) -> bool {
-    let Ok(mut child) = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
+// Stdout never reaches Runtime's own output; stderr is the caller's choice.
+fn wait_for_bounded_child(mut command: ProcessCommand, timeout: Duration) -> bool {
+    let Ok(mut child) = command.stdin(Stdio::null()).stdout(Stdio::null()).spawn() else {
         return false;
     };
     let deadline = Instant::now() + timeout;
@@ -4167,7 +4164,7 @@ async fn companion_jump_session(
     if !authorization.has_scope(COMPANION_SCOPE_JUMP) {
         return api_error(StatusCode::FORBIDDEN, "COMPANION_SCOPE_REQUIRED");
     }
-    process_jump_session(&state, &session_id)
+    process_jump_session_off_executor(state, session_id).await
 }
 
 /// Marks a task as seen after the user opened it from a Companion, typically
@@ -6320,7 +6317,8 @@ async fn checkpoint_action(
                 &preflight.view.blockers.join(","),
             );
         }
-        return process_jump_session(&state, &checkpoint.session_id);
+        return process_jump_session_off_executor(state.clone(), checkpoint.session_id.clone())
+            .await;
     }
     let preflight = match checkpoint_preflight_for(&checkpoint, &request.action) {
         Ok(preflight) => preflight,
@@ -7860,7 +7858,16 @@ async fn jump_session(
     if !authorized_mutation(&state, &headers) {
         return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_MUTATION");
     }
-    process_jump_session(&state, &session_id)
+    process_jump_session_off_executor(state, session_id).await
+}
+
+/// Jumping waits on Launch Services or AppleScript, which can take minutes
+/// when an app does not answer. Keep it off the single API thread so
+/// snapshots and quota polling go on meanwhile.
+async fn process_jump_session_off_executor(state: AppState, session_id: String) -> Response {
+    tokio::task::spawn_blocking(move || process_jump_session(&state, &session_id))
+        .await
+        .unwrap_or_else(|_| api_error(StatusCode::CONFLICT, "JUMP_FAILED"))
 }
 
 fn process_jump_session(state: &AppState, session_id: &str) -> Response {
@@ -7879,7 +7886,7 @@ fn process_jump_session(state: &AppState, session_id: &str) -> Response {
         return api_error(StatusCode::CONFLICT, "JUMP_UNSUPPORTED");
     }
     for target in &targets {
-        if run_jump_target(target, session).is_ok_and(|success| success) {
+        if run_jump_target(target, session) {
             let capability = jump_target_capability(target);
             return Json(json!({
                 "success": true,
@@ -8052,36 +8059,56 @@ fn safe_locator(value: &str) -> bool {
         })
 }
 
-fn run_jump_target(target: &JumpTarget, session: &SessionRecord) -> io::Result<bool> {
-    let status = match target {
-        JumpTarget::CodexThread(thread_id) => ProcessCommand::new("/usr/bin/open")
-            .arg(format!("codex://threads/{thread_id}"))
-            .status()?,
-        JumpTarget::ITermSession => ProcessCommand::new("/usr/bin/osascript")
-            .arg("-e")
-            .arg(ITERM_JUMP_SCRIPT)
-            .env(
-                "ACTREALM_JUMP_SESSION",
-                session.term_session_id.as_deref().unwrap_or_default(),
-            )
-            .env(
-                "ACTREALM_JUMP_TTY",
-                session.term_tty.as_deref().unwrap_or_default(),
-            )
-            .status()?,
-        JumpTarget::TerminalTty => ProcessCommand::new("/usr/bin/osascript")
-            .arg("-e")
-            .arg(TERMINAL_JUMP_SCRIPT)
-            .env(
-                "ACTREALM_JUMP_TTY",
-                session.term_tty.as_deref().unwrap_or_default(),
-            )
-            .status()?,
-        JumpTarget::AppBundle(bundle) => ProcessCommand::new("/usr/bin/open")
-            .args(["-b", bundle.as_str()])
-            .status()?,
+/// Long enough for `open` to start an app that was closed. A script waiting
+/// on an app that does not answer must still not hold a thread for good.
+const JUMP_TARGET_TIMEOUT: Duration = Duration::from_secs(10);
+/// The first AppleScript jump waits on the Automation prompt until the user
+/// answers it; killing it sooner would land on the app, not the tab.
+const JUMP_SCRIPT_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn run_jump_target(target: &JumpTarget, session: &SessionRecord) -> bool {
+    let timeout = match target {
+        JumpTarget::ITermSession | JumpTarget::TerminalTty => JUMP_SCRIPT_TIMEOUT,
+        JumpTarget::CodexThread(_) | JumpTarget::AppBundle(_) => JUMP_TARGET_TIMEOUT,
     };
-    Ok(status.success())
+    // Stderr stays with Runtime, so a refused permission still reaches the log.
+    wait_for_bounded_child(jump_command(target, session), timeout)
+}
+
+fn jump_command(target: &JumpTarget, session: &SessionRecord) -> ProcessCommand {
+    let tty = session.term_tty.as_deref().unwrap_or_default();
+    match target {
+        JumpTarget::CodexThread(thread_id) => {
+            let mut command = ProcessCommand::new("/usr/bin/open");
+            command.arg(format!("codex://threads/{thread_id}"));
+            command
+        }
+        JumpTarget::ITermSession => {
+            let mut command = ProcessCommand::new("/usr/bin/osascript");
+            command
+                .arg("-e")
+                .arg(ITERM_JUMP_SCRIPT)
+                .env(
+                    "ACTREALM_JUMP_SESSION",
+                    session.term_session_id.as_deref().unwrap_or_default(),
+                )
+                .env("ACTREALM_JUMP_TTY", tty);
+            command
+        }
+        JumpTarget::TerminalTty => {
+            let mut command = ProcessCommand::new("/usr/bin/osascript");
+            command
+                .arg("-e")
+                .arg(TERMINAL_JUMP_SCRIPT)
+                .env("ACTREALM_JUMP_TTY", tty);
+            command
+        }
+        JumpTarget::AppBundle(bundle) => {
+            let mut command = ProcessCommand::new("/usr/bin/open");
+            command.args(["-b", bundle.as_str()]);
+            command
+        }
+    }
 }
 
 const ITERM_JUMP_SCRIPT: &str = r#"
@@ -10039,36 +10066,136 @@ fn abandon_stuck_oauth_refresh(quota: &mut QuotaState, now: Instant) -> bool {
     true
 }
 
+/// Claims the next Claude quota refresh when one is due: marks it running
+/// and hands over the collector, tied to the flag that can abandon it.
+fn claim_oauth_quota_refresh(
+    quota: &mut QuotaState,
+    now_ms: u64,
+    now: Instant,
+    force: bool,
+    poll_interval: Duration,
+) -> Option<(QuotaCollector, Arc<AtomicBool>)> {
+    abandon_stuck_oauth_refresh(quota, now);
+    if !oauth_poll_due(
+        quota.oauth_refresh_in_progress,
+        quota.oauth_next_poll_at,
+        now_ms,
+        force,
+    ) {
+        return None;
+    }
+    quota.oauth_refresh_in_progress = true;
+    quota.oauth_refresh_started_at = Some(now);
+    let abandoned = Arc::new(AtomicBool::new(false));
+    quota.oauth_refresh_abandoned = Some(abandoned.clone());
+    // Keep the previous failure visible until a successful response replaces it.
+    quota.oauth_next_poll_at = now_ms.saturating_add(poll_interval.as_millis() as u64);
+    // Keep credential-refresh cooldown and HTTP backoff across polls.
+    // Snapshot reads use an independent cache-only placeholder meanwhile.
+    let placeholder = QuotaCollector::new(quota.collector.paths().clone());
+    let mut collector = std::mem::replace(&mut quota.collector, placeholder);
+    collector.set_oauth_abandon_flag(abandoned.clone());
+    Some((collector, abandoned))
+}
+
+/// What a Claude quota refresh brings back to the shared state.
+struct OAuthQuotaOutcome {
+    collector: QuotaCollector,
+    result: Result<Vec<QuotaEntry>, QuotaError>,
+    official_codex: Option<(Vec<QuotaEntry>, u64)>,
+    fallback_codex: Vec<QuotaEntry>,
+    started_at: u64,
+}
+
+/// Writes a finished Claude quota refresh back, unless it was abandoned
+/// while stuck: then a newer refresh owns the state and nothing changes.
+fn finish_oauth_quota_refresh(
+    quota: &mut QuotaState,
+    store: &RuntimeStore,
+    abandoned: &AtomicBool,
+    outcome: OAuthQuotaOutcome,
+) {
+    if abandoned.load(Ordering::Acquire) {
+        return;
+    }
+    quota.collector = outcome.collector;
+    match outcome.result {
+        Ok(mut entries) => {
+            let captured_at = entries
+                .iter()
+                .filter_map(|entry| entry.captured_at)
+                .max()
+                .unwrap_or(outcome.started_at);
+            let (codex_entries, codex_captured_at) = select_codex_quota_entries(
+                &quota.entries,
+                quota.codex_rate_limits_captured_at,
+                outcome.official_codex,
+                outcome.fallback_codex,
+                now_millis(),
+            );
+            entries.extend(codex_entries);
+            // Kimi and Grok come from their own caches, as in quota_entries.
+            entries.extend(actrealm_quota::agents::read_agent_cache(
+                &quota.collector.paths().actrealm_home,
+                now_millis(),
+            ));
+            quota.entries = entries;
+            quota.codex_rate_limits_captured_at = codex_captured_at;
+            quota.claude_cache_modified_at = fs::metadata(quota.collector.paths().claude_cache())
+                .and_then(|metadata| metadata.modified())
+                .ok();
+            quota.refreshed_at = Some(Instant::now());
+            quota.oauth_last_result = Some(Ok(captured_at));
+        }
+        Err(error) => {
+            mark_claude_quota_stale(&mut quota.entries);
+            // Network may still be resuming after wake. Retry promptly,
+            // while the collector continues to enforce HTTP 429 backoff.
+            if matches!(&error, QuotaError::OAuthRequest(message)
+                if message != "credential was rejected" && message != "temporarily rate limited")
+            {
+                quota.oauth_next_poll_at = now_millis().saturating_add(10_000);
+            }
+            quota.oauth_last_result = Some(Err((
+                quota_refresh_error_code(&error),
+                quota_refresh_error_detail(&error),
+            )));
+        }
+    }
+    let persisted = quota
+        .entries
+        .iter()
+        .filter_map(quota_record)
+        .collect::<Vec<_>>();
+    if store.replace_quota_snapshots(persisted).is_err() {
+        quota.oauth_last_result = Some(Err((
+            "QUOTA_PERSIST_FAILED",
+            "Could not persist the quota snapshot".into(),
+        )));
+    }
+    quota.oauth_refresh_in_progress = false;
+    quota.oauth_refresh_abandoned = None;
+}
+
 fn start_oauth_quota_refresh(state: &AppState, force: bool) {
     if !state.claude_oauth_quota {
         return;
     }
     let now = now_millis();
-    let (mut collector, abandoned) = {
+    let claimed = {
         let Ok(mut quota) = state.quota.lock() else {
             return;
         };
-        abandon_stuck_oauth_refresh(&mut quota, Instant::now());
-        if !oauth_poll_due(
-            quota.oauth_refresh_in_progress,
-            quota.oauth_next_poll_at,
+        claim_oauth_quota_refresh(
+            &mut quota,
             now,
+            Instant::now(),
             force,
-        ) {
-            return;
-        }
-        quota.oauth_refresh_in_progress = true;
-        quota.oauth_refresh_started_at = Some(Instant::now());
-        let abandoned = Arc::new(AtomicBool::new(false));
-        quota.oauth_refresh_abandoned = Some(abandoned.clone());
-        // Keep the previous failure visible until a successful response replaces it.
-        quota.oauth_next_poll_at = now.saturating_add(state.quota_poll_interval.as_millis() as u64);
-        // Keep credential-refresh cooldown and HTTP backoff across polls.
-        // Snapshot reads use an independent cache-only placeholder meanwhile.
-        let placeholder = QuotaCollector::new(quota.collector.paths().clone());
-        let mut collector = std::mem::replace(&mut quota.collector, placeholder);
-        collector.set_oauth_abandon_flag(abandoned.clone());
-        (collector, abandoned)
+            state.quota_poll_interval,
+        )
+    };
+    let Some((mut collector, abandoned)) = claimed else {
+        return;
     };
     let quota_state = state.quota.clone();
     let store = state.store.clone();
@@ -10078,49 +10205,27 @@ fn start_oauth_quota_refresh(state: &AppState, force: bool) {
         .spawn(move || {
             let result = collector.refresh_claude_oauth(now);
             let official_codex = codex.rate_limit_entries();
-            let fallback_codex = if codex_official_is_current(official_codex.as_ref(), now_millis()) {
+            let fallback_codex = if codex_official_is_current(official_codex.as_ref(), now_millis())
+            {
                 Vec::new()
             } else {
                 collector.collect_codex(now_millis())
             };
-            let Ok(mut quota) = quota_state.lock() else { return };
-            // Given up on while it was stuck: a newer refresh owns the state.
-            if abandoned.load(Ordering::Acquire) {
+            let Ok(mut quota) = quota_state.lock() else {
                 return;
-            }
-            quota.collector = collector;
-            match result {
-                Ok(mut entries) => {
-                    let captured_at = entries.iter().filter_map(|entry| entry.captured_at).max().unwrap_or(now);
-                    let (codex_entries, codex_captured_at) = select_codex_quota_entries(
-                        &quota.entries, quota.codex_rate_limits_captured_at,
-                        official_codex, fallback_codex, now_millis(),
-                    );
-                    entries.extend(codex_entries);
-                    quota.entries = entries;
-                    quota.codex_rate_limits_captured_at = codex_captured_at;
-                    quota.claude_cache_modified_at = fs::metadata(quota.collector.paths().claude_cache())
-                        .and_then(|metadata| metadata.modified()).ok();
-                    quota.refreshed_at = Some(Instant::now());
-                    quota.oauth_last_result = Some(Ok(captured_at));
-                }
-                Err(error) => {
-                    mark_claude_quota_stale(&mut quota.entries);
-                    // Network may still be resuming after wake. Retry promptly,
-                    // while the collector continues to enforce HTTP 429 backoff.
-                    if matches!(&error, QuotaError::OAuthRequest(message)
-                        if message != "credential was rejected" && message != "temporarily rate limited") {
-                        quota.oauth_next_poll_at = now_millis().saturating_add(10_000);
-                    }
-                    quota.oauth_last_result = Some(Err((quota_refresh_error_code(&error), quota_refresh_error_detail(&error))));
-                }
-            }
-            let persisted = quota.entries.iter().filter_map(quota_record).collect::<Vec<_>>();
-            if store.replace_quota_snapshots(persisted).is_err() {
-                quota.oauth_last_result = Some(Err(("QUOTA_PERSIST_FAILED", "Could not persist the quota snapshot".into())));
-            }
-            quota.oauth_refresh_in_progress = false;
-            quota.oauth_refresh_abandoned = None;
+            };
+            finish_oauth_quota_refresh(
+                &mut quota,
+                &store,
+                &abandoned,
+                OAuthQuotaOutcome {
+                    collector,
+                    result,
+                    official_codex,
+                    fallback_codex,
+                    started_at: now,
+                },
+            );
         });
     if result.is_err() {
         if let Ok(mut quota) = state.quota.lock() {
@@ -10540,25 +10645,22 @@ mod tests {
 
     #[test]
     fn artifact_reveal_checks_exit_status_and_times_out() {
-        assert!(wait_for_artifact_reveal(
+        assert!(wait_for_bounded_child(
             ProcessCommand::new("/usr/bin/true"),
             Duration::from_secs(1)
         ));
-        assert!(!wait_for_artifact_reveal(
+        assert!(!wait_for_bounded_child(
             ProcessCommand::new("/usr/bin/false"),
             Duration::from_secs(1)
         ));
-        assert!(!wait_for_artifact_reveal(
+        assert!(!wait_for_bounded_child(
             ProcessCommand::new("/nonexistent/actrealm-reveal"),
             Duration::from_secs(1)
         ));
         let mut delayed = ProcessCommand::new("/bin/sleep");
         delayed.arg("10");
         let start = Instant::now();
-        assert!(!wait_for_artifact_reveal(
-            delayed,
-            Duration::from_millis(20)
-        ));
+        assert!(!wait_for_bounded_child(delayed, Duration::from_millis(20)));
         assert!(start.elapsed() < Duration::from_secs(2));
     }
 
@@ -14357,6 +14459,35 @@ done
             .unwrap();
         assert_eq!(terminal.jump_label, "Open terminal");
         assert_eq!(jump_target(terminal), Some(JumpTarget::ITermSession));
+        // Commands are only built here, never run.
+        let iterm = jump_command(&JumpTarget::ITermSession, terminal);
+        assert_eq!(iterm.get_program(), "/usr/bin/osascript");
+        assert_eq!(
+            iterm.get_args().collect::<Vec<_>>(),
+            ["-e", ITERM_JUMP_SCRIPT]
+        );
+        assert!(iterm
+            .get_envs()
+            .any(|(key, value)| key == "ACTREALM_JUMP_SESSION"
+                && value == Some(std::ffi::OsStr::new("w0t0p0:ABC-123"))));
+        let Some(JumpTarget::CodexThread(thread_id)) = jump_target(exact) else {
+            panic!("Codex app sessions open their exact thread");
+        };
+        let codex = jump_command(&JumpTarget::CodexThread(thread_id.clone()), exact);
+        assert_eq!(codex.get_program(), "/usr/bin/open");
+        assert_eq!(
+            codex.get_args().collect::<Vec<_>>(),
+            [format!("codex://threads/{thread_id}").as_str()]
+        );
+        let bundle = jump_command(
+            &JumpTarget::AppBundle("com.microsoft.VSCode".to_owned()),
+            vscode_codex,
+        );
+        assert_eq!(bundle.get_program(), "/usr/bin/open");
+        assert_eq!(
+            bundle.get_args().collect::<Vec<_>>(),
+            ["-b", "com.microsoft.VSCode"]
+        );
         let app = snapshot
             .sessions
             .iter()
@@ -16903,6 +17034,104 @@ done
     }
 
     #[test]
+    fn next_claude_quota_claim_replaces_a_stuck_refresh_at_once() {
+        let root = std::env::temp_dir().join(format!("actrealm-quota-claim-{}", Uuid::now_v7()));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        let poll = Duration::from_secs(60);
+        let started = Instant::now();
+        let stuck = Arc::new(AtomicBool::new(false));
+        {
+            let mut quota = state.quota.lock().unwrap();
+            quota.oauth_refresh_in_progress = true;
+            quota.oauth_refresh_started_at = Some(started);
+            quota.oauth_refresh_abandoned = Some(stuck.clone());
+            quota.oauth_next_poll_at = 1_000;
+
+            // Within the limit nothing new starts, not even when forced.
+            let slow = started + poll;
+            assert!(claim_oauth_quota_refresh(&mut quota, 2_000, slow, true, poll).is_none());
+            assert!(!stuck.load(Ordering::Acquire));
+
+            // Past it the stuck refresh is abandoned and the next one claimed.
+            let late = started + CLAUDE_QUOTA_REFRESH_ABANDON;
+            let (_collector, fresh) =
+                claim_oauth_quota_refresh(&mut quota, 400_000, late, false, poll)
+                    .expect("a new refresh replaces the stuck one");
+            assert!(stuck.load(Ordering::Acquire));
+            assert!(!fresh.load(Ordering::Acquire));
+            assert!(quota.oauth_refresh_in_progress);
+            assert_eq!(quota.oauth_refresh_started_at, Some(late));
+            assert!(quota
+                .oauth_refresh_abandoned
+                .as_ref()
+                .is_some_and(|flag| Arc::ptr_eq(flag, &fresh)));
+            assert_eq!(quota.oauth_next_poll_at, 460_000);
+        }
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finished_claude_quota_refresh_keeps_agent_quota_unless_abandoned() {
+        let root = std::env::temp_dir().join(format!("actrealm-quota-finish-{}", Uuid::now_v7()));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        let home = root.join("actrealm-home");
+        fs::create_dir_all(home.join("cache")).unwrap();
+        let now = now_millis();
+        fs::write(
+            home.join("cache/kimi-quota.json"),
+            serde_json::to_vec(&json!([{
+                "provider": "kimi", "window": "7d", "status": "available",
+                "usedPct": 30.0, "source": "kimi_api", "capturedAt": now
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+        let claude: QuotaEntry = serde_json::from_value(json!({
+            "provider": "claude", "window": "5h", "status": "available",
+            "usedPct": 40.0, "source": "oauth_usage", "capturedAt": now
+        }))
+        .unwrap();
+        let outcome = || OAuthQuotaOutcome {
+            collector: QuotaCollector::new(QuotaPaths {
+                actrealm_home: home.clone(),
+                codex_sessions: root.join("none"),
+            }),
+            result: Ok(vec![claude.clone()]),
+            official_codex: None,
+            fallback_codex: Vec::new(),
+            started_at: now,
+        };
+        {
+            let mut quota = state.quota.lock().unwrap();
+            quota.oauth_refresh_in_progress = true;
+
+            // Abandoned while stuck: a newer refresh owns the state.
+            finish_oauth_quota_refresh(&mut quota, &store, &AtomicBool::new(true), outcome());
+            assert!(quota.entries.is_empty());
+            assert!(quota.oauth_refresh_in_progress);
+            assert!(quota.oauth_last_result.is_none());
+
+            // Finished: Claude's rows are replaced and Kimi's stay.
+            finish_oauth_quota_refresh(&mut quota, &store, &AtomicBool::new(false), outcome());
+            let providers = quota
+                .entries
+                .iter()
+                .map(|entry| entry.provider.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(providers, ["claude", "kimi"]);
+            assert!(!quota.oauth_refresh_in_progress);
+            assert!(matches!(quota.oauth_last_result, Some(Ok(captured)) if captured == now));
+        }
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn manual_refresh_joins_background_job_and_returns_its_actual_outcome() {
         let root = std::env::temp_dir().join(format!("actrealm-quota-join-{}", Uuid::now_v7()));
         let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
@@ -17041,6 +17270,78 @@ done
             entry.limit_id.as_deref() == Some("codex_bengalfox")
                 && entry.plan_type.as_deref() == Some("pro")
         }));
+        drop(manager);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_quota_keeps_refreshing_after_a_failed_credential_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "actrealm-server-codex-restart-failed-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let launches = root.join("launches");
+        let executable = root.join("fake-codex");
+        fs::write(
+            &executable,
+            format!(
+                r#"#!/bin/sh
+printf 'x' >> '{}'
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{{"id":1,"result":{{"userAgent":"codex_cli_rs/0.144.6"}}}}'
+      ;;
+    *'"method":"account/rateLimits/read"'*)
+      printf '%s\n' '{{"id":2,"result":{{"rateLimits":{{"limitId":"codex","planType":"pro","primary":{{"usedPercent":26,"windowDurationMins":10080,"resetsAt":1788757309}}}}}}}}'
+      ;;
+  esac
+done
+"#,
+                launches.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        warm_codex_test_executable(&executable);
+        let _ = fs::remove_file(&launches);
+        let auth = root.join("auth.json");
+        fs::write(&auth, "{\"account\":\"before\"}").unwrap();
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let manager = CodexManager {
+            connector: None,
+            executable: Some(executable),
+            state: Arc::new(Mutex::new(CodexManagerState::default())),
+            store: store.clone(),
+            waiters: WaiterRegistry::default(),
+            auth_path: Some(auth.clone()),
+            auth_stamp: credential_stamp(&auth),
+        };
+        let replacement = root.join("auth.json.new");
+        fs::write(&replacement, "{\"account\":\"after, signed in again\"}").unwrap();
+        fs::rename(&replacement, &auth).unwrap();
+
+        // The change first asks for a Runtime restart, without reading quota.
+        assert_eq!(
+            manager.refresh_rate_limits(),
+            CodexQuotaRefresh::CredentialsChanged
+        );
+        assert!(!launches.exists());
+
+        // That restart failed. Later polls still read the official quota,
+        // and never ask for a second restart.
+        manager.mark_credential_restart_failed();
+        assert_eq!(manager.refresh_rate_limits(), CodexQuotaRefresh::Refreshed);
+        let (entries, _) = manager.rate_limit_entries().unwrap();
+        assert!(entries.iter().any(|entry| entry.used_pct == Some(26.0)));
+        assert_eq!(fs::read_to_string(&launches).unwrap(), "x");
+        let state = manager.state.lock().unwrap();
+        assert!(state.credential_change_handled);
+        assert_eq!(state.status, "unavailable");
+        drop(state);
         drop(manager);
         drop(store);
         fs::remove_dir_all(root).unwrap();
