@@ -211,14 +211,29 @@ fn host_bundle(path: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(&text[..end]))
 }
 
+/// The first app bundle among the Hook's parents, and the provider's own
+/// bundle if one was passed over on the way.
 fn process_source(
+    provider: Provider,
     processes: &[Process],
     inspect: impl Fn(&Path) -> Option<Source>,
-) -> Option<Source> {
-    processes
-        .iter()
-        .filter_map(|p| host_bundle(&p.path))
-        .find_map(|bundle| inspect(&bundle))
+) -> (Option<Source>, Option<Source>) {
+    let mut passed_over = None;
+    for process in processes {
+        let Some(source) = host_bundle(&process.path).and_then(|bundle| inspect(&bundle)) else {
+            continue;
+        };
+        // A provider shipped as an app bundle of its own, like the
+        // background-only claude.app that Claude desktop runs, is not where
+        // the user works. Unless it is a known client, keep walking up to the
+        // app that launched it, and use it only when nothing else matches.
+        if source.surface == "desktop_app" && provider_executable(provider, &process.path) {
+            passed_over.get_or_insert(source);
+            continue;
+        }
+        return (Some(source), passed_over);
+    }
+    (None, passed_over)
 }
 
 fn provider_process(provider: Provider, processes: &[Process]) -> Option<u32> {
@@ -251,58 +266,61 @@ pub fn capture_client_context(provider: Provider, start_pid: u32) -> TermContext
     let bundle = std::env::var("__CFBundleIdentifier")
         .ok()
         .filter(|b| valid_client_bundle_id(b));
-    let source = process_source(&processes, inspect_bundle).or_else(|| {
-        if processes
-            .iter()
-            .any(|p| p.path.file_name().is_some_and(|n| n == "sshd"))
-            || std::env::var_os("SSH_CONNECTION").is_some()
-            || std::env::var_os("SSH_CLIENT").is_some()
-        {
-            return Some(Source {
-                app: "SSH".to_owned(),
-                bundle: None,
-                surface: "remote".to_owned(),
-            });
-        }
-        let mux = if std::env::var_os("TMUX").is_some() {
-            Some("tmux")
-        } else if std::env::var_os("STY").is_some() {
-            Some("screen")
-        } else {
-            None
-        };
-        if let Some(mux) = mux {
-            return identify(Some(mux), None);
-        }
-        if let Some(source) = identify(app.as_deref(), bundle.as_deref()) {
-            return Some(source);
-        }
-        if let Some(surface) = std::env::var("ACTREALM_SURFACE").ok().filter(|s| {
-            matches!(
-                s.as_str(),
-                "terminal"
-                    | "editor"
-                    | "codex_app"
-                    | "claude_app"
-                    | "kimi_app"
-                    | "grok_app"
-                    | "desktop_app"
-                    | "connector"
-                    | "remote"
-            )
-        }) {
-            return Some(Source {
-                app: app.as_deref().and_then(name).unwrap_or_default(),
-                bundle: bundle.clone(),
-                surface,
-            });
-        }
-        app.as_deref().and_then(name).map(|app| Source {
-            app,
-            bundle,
-            surface: "terminal".to_owned(),
+    let (host, passed_over) = process_source(provider, &processes, inspect_bundle);
+    let source = host
+        .or_else(|| {
+            if processes
+                .iter()
+                .any(|p| p.path.file_name().is_some_and(|n| n == "sshd"))
+                || std::env::var_os("SSH_CONNECTION").is_some()
+                || std::env::var_os("SSH_CLIENT").is_some()
+            {
+                return Some(Source {
+                    app: "SSH".to_owned(),
+                    bundle: None,
+                    surface: "remote".to_owned(),
+                });
+            }
+            let mux = if std::env::var_os("TMUX").is_some() {
+                Some("tmux")
+            } else if std::env::var_os("STY").is_some() {
+                Some("screen")
+            } else {
+                None
+            };
+            if let Some(mux) = mux {
+                return identify(Some(mux), None);
+            }
+            if let Some(source) = identify(app.as_deref(), bundle.as_deref()) {
+                return Some(source);
+            }
+            if let Some(surface) = std::env::var("ACTREALM_SURFACE").ok().filter(|s| {
+                matches!(
+                    s.as_str(),
+                    "terminal"
+                        | "editor"
+                        | "codex_app"
+                        | "claude_app"
+                        | "kimi_app"
+                        | "grok_app"
+                        | "desktop_app"
+                        | "connector"
+                        | "remote"
+                )
+            }) {
+                return Some(Source {
+                    app: app.as_deref().and_then(name).unwrap_or_default(),
+                    bundle: bundle.clone(),
+                    surface,
+                });
+            }
+            app.as_deref().and_then(name).map(|app| Source {
+                app,
+                bundle,
+                surface: "terminal".to_owned(),
+            })
         })
-    });
+        .or(passed_over);
     let mut context = TermContext {
         app: None,
         bundle_id: None,
@@ -517,9 +535,10 @@ mod tests {
                 path: "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal".into(),
             },
         ];
-        let source = process_source(&processes, |bundle| {
+        let source = process_source(Provider::Codex, &processes, |bundle| {
             identify(bundle.file_stem()?.to_str(), None)
         })
+        .0
         .unwrap();
         assert_eq!(source.app, "Terminal");
         assert!(provider_executable(Provider::Codex, &processes[0].path));
@@ -530,11 +549,77 @@ mod tests {
         }];
         assert_eq!(provider_process(Provider::Kimi, &python), Some(9));
         assert_eq!(provider_process(Provider::Grok, &[]), None);
-        assert!(process_source(&processes[..1], |_| panic!(
-            "resource binary is not a host app"
-        ))
-        .is_none());
+        assert_eq!(
+            process_source(Provider::Codex, &processes[..1], |_| panic!(
+                "resource binary is not a host app"
+            )),
+            (None, None)
+        );
         assert_eq!(host_bundle(Path::new("/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)")), Some(PathBuf::from("/Applications/Visual Studio Code.app")));
+    }
+
+    #[test]
+    fn claude_desktop_owns_the_claude_code_bundle_it_runs() {
+        let cli = Process {
+            pid: 4,
+            parent: 3,
+            path: "/Users/test/Library/Application Support/Claude/claude-code/2.1.295/abc/claude.app/Contents/MacOS/claude".into(),
+        };
+        let processes = vec![
+            cli.clone(),
+            Process {
+                pid: 3,
+                parent: 2,
+                path: "/Applications/Claude.app/Contents/Helpers/disclaimer".into(),
+            },
+            Process {
+                pid: 2,
+                parent: 1,
+                path: "/Applications/Claude.app/Contents/MacOS/Claude".into(),
+            },
+        ];
+        let inspect = |bundle: &Path| match bundle.file_stem()?.to_str()? {
+            // The background-only claude.app, as its Info.plist reads.
+            "claude" => Some(Source {
+                app: "Claude Code".to_owned(),
+                bundle: Some("com.anthropic.claude-code".to_owned()),
+                surface: "desktop_app".to_owned(),
+            }),
+            stem => identify(Some(stem), None),
+        };
+        let (source, passed_over) = process_source(Provider::Claude, &processes, inspect);
+        let source = source.unwrap();
+        assert_eq!(source.surface, "claude_app");
+        assert_eq!(
+            source.bundle.as_deref(),
+            Some("com.anthropic.claudefordesktop")
+        );
+        assert_eq!(passed_over.unwrap().app, "Claude Code");
+        // The desktop app's own executable shares the provider's name.
+        let desktop = process_source(Provider::Claude, &processes[2..], inspect);
+        assert_eq!(desktop.0.unwrap().surface, "claude_app");
+        // Started from a terminal, the same binary belongs to the terminal.
+        let terminal = [
+            cli.clone(),
+            Process {
+                pid: 5,
+                parent: 1,
+                path: "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal".into(),
+            },
+        ];
+        let source = process_source(Provider::Claude, &terminal, inspect)
+            .0
+            .unwrap();
+        assert_eq!(source.app, "Terminal");
+        // Another Agent run inside Claude desktop does not own that bundle.
+        let codex = process_source(Provider::Codex, &processes, inspect)
+            .0
+            .unwrap();
+        assert_eq!(codex.app, "Claude Code");
+        // With nothing above it, the passed-over bundle is all there is.
+        let (host, passed_over) = process_source(Provider::Claude, &[cli], inspect);
+        assert!(host.is_none());
+        assert_eq!(passed_over.unwrap().app, "Claude Code");
     }
 
     #[test]

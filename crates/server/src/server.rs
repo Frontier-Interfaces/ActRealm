@@ -8005,6 +8005,10 @@ fn jump_targets(session: &SessionRecord) -> Vec<JumpTarget> {
         targets.push(JumpTarget::AppBundle("dev.warp.Warp-Stable".to_owned()));
     } else if session.term_surface.as_deref() == Some("claude_app")
         || bundle == "com.anthropic.claudefordesktop"
+        // Claude desktop's own background-only claude.app, recorded for
+        // sessions from before it was looked past and for other Agents run
+        // inside Claude desktop. Opening that bundle shows nothing.
+        || bundle == "com.anthropic.claude-code"
     {
         targets.push(JumpTarget::AppBundle(
             "com.anthropic.claudefordesktop".to_owned(),
@@ -16207,6 +16211,39 @@ done
                 ))
             );
         }
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sessions_recorded_as_the_claude_code_bundle_open_claude_desktop() {
+        let root =
+            std::env::temp_dir().join(format!("actrealm-claude-code-jump-{}", Uuid::now_v7()));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let mut request = BridgeRequest::from_hook_at(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"UserPromptSubmit", "session_id":"claude-desktop-code", "prompt":"fixture"
+            }),
+            now_millis(),
+        );
+        // How Claude desktop sessions were recorded before 10/13.
+        request.term = Some(actrealm_core::TermContext {
+            app: Some("Claude Code".to_owned()),
+            bundle_id: Some("com.anthropic.claude-code".to_owned()),
+            surface: Some("desktop_app".to_owned()),
+            ..Default::default()
+        });
+        store.ingest(request).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let session = &snapshot.sessions[0];
+        assert_eq!(session.jump_capability, "app_only");
+        assert_eq!(
+            jump_targets(session),
+            [JumpTarget::AppBundle(
+                "com.anthropic.claudefordesktop".to_owned()
+            )]
+        );
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }

@@ -6,6 +6,40 @@ published a final v1 release; entries below describe development milestones on
 
 ## Unreleased - M14 accepted candidate
 
+### Post-P0 - Quota refresh that cannot freeze, and Claude desktop jumps
+
+- Claude quota no longer stops refreshing after Runtime renews the Claude Code
+  credential. The renewal probe leads its own terminal session; macOS lets a
+  session leader finish exiting only after its terminal output drains, and
+  Runtime waited for the killed probe without reading or closing the terminal,
+  so the quota thread waited for hours and every later refresh, manual ones
+  included, stayed queued behind it. The probe's terminal is now closed before
+  the probe is reaped, the reap is bounded (2 s, then a background reaper), and
+  the terminal is opened close-on-exec in the same call on macOS so no child
+  spawned meanwhile can keep it open. Bounded command output gives up 1 s after
+  the command exits even when a helper that left the process group holds the
+  pipe.
+- A Claude quota refresh that runs for 5 minutes of awake time is abandoned and
+  replaced. Its flag stops it from renewing the credential, fetching, writing
+  the cache or changing shared state if it ever returns.
+- Kimi and Grok quota rows stay in the snapshot after a Claude quota refresh;
+  they used to disappear for most of every minute.
+- Once Runtime's restart for changed Codex credentials has failed, the official
+  Codex quota is still read through a one-shot app-server instead of freezing
+  until a manual restart.
+- A persistent Codex app-server that takes no input for the request timeout is
+  shut down instead of eventually blocking every writer, the quota loop
+  included. One that reads slowly keeps its connection.
+- Jumping to a session no longer runs on the single API thread, so snapshots
+  and quota polling go on while Launch Services or AppleScript is slow. Each
+  command is bounded: 10 s for `open`, 60 s for AppleScript, which can wait on
+  the first Automation prompt.
+- Claude Code sessions in the Claude app are recorded as `claude_app` and jump
+  to the Claude app. Claude desktop runs Claude Code from a background-only
+  `claude.app` of its own (`com.anthropic.claude-code`); it was taken for the
+  client, so jumping launched that background bundle and showed nothing.
+  Sessions recorded with that bundle also open the Claude app.
+
 ### Post-P0 - Quota sources, freshness and Extra Usage amounts
 
 - Codex account quota comes from the official app-server again on Macs with

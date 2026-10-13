@@ -793,10 +793,10 @@ these fields; `environment` keeps its meaning as the display label.
 | `terminal` | A CLI in a terminal or multiplexer: Terminal, iTerm2, Warp, Ghostty, WezTerm, Alacritty, kitty, Windows Terminal, tmux, GNU screen, or any other terminal that sets `TERM_PROGRAM` | `Terminal`/`com.apple.Terminal`, `iTerm2`/`com.googlecode.iterm2`, `Warp`/`dev.warp.Warp-Stable`, `Ghostty`/its bundle identifier, `tmux`/null |
 | `editor` | An editor or IDE: its Agent extension, or a CLI started in its integrated terminal (both run below the editor's app bundle): Visual Studio Code, VS Code Insiders, Cursor, Windsurf, Zed, Xcode, JetBrains IDEs | `Visual Studio Code`/`com.microsoft.VSCode`, `Cursor`/its bundle identifier |
 | `codex_app` | The Codex app or the ChatGPT app | `Codex app`/`com.openai.codex`, `ChatGPT app`/`com.openai.chat` |
-| `claude_app` | The Claude app | `Claude app`/`com.anthropic.claudefordesktop` |
+| `claude_app` | The Claude app, including the Claude Code sessions it runs | `Claude app`/`com.anthropic.claudefordesktop` |
 | `kimi_app` | The Kimi Code app | `Kimi Code app`/`com.kimi.code.desktop` |
 | `grok_app` | The Grok app | `Grok app` |
-| `desktop_app` | Any other app bundle found among the Hook's parent processes | `Claude Code`/`com.anthropic.claude-code` |
+| `desktop_app` | Any other app bundle found among the Hook's parent processes | the app's name and bundle identifier |
 | `connector` | An ActRealm Connector session (Codex app-server, ACP) | the Connector name, e.g. `ActRealm ACP` |
 | `remote` | A session reached over SSH | `SSH`/null |
 
@@ -804,6 +804,13 @@ The first matching rule wins: an app bundle among the Hook's parent processes,
 then SSH, then tmux or GNU screen, then `TERM_PROGRAM` / `LC_TERMINAL` and the
 bundle identifier of the environment, then an explicit `ACTREALM_SURFACE`, and
 finally any other `TERM_PROGRAM` value as `terminal`.
+
+An Agent's own app bundle that is not a known client is passed over in favor
+of the app that launched it, and used only when no rule above matches. Claude
+desktop runs Claude Code from such a bundle, a background-only `claude.app`
+(`com.anthropic.claude-code`), so its sessions are recorded as `claude_app`.
+Sessions recorded with that bundle before this rule, or another Agent run
+inside Claude desktop, still jump to the Claude app.
 
 ## Quota entries
 
