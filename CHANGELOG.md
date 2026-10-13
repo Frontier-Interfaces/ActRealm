@@ -6,7 +6,7 @@ published a final v1 release; entries below describe development milestones on
 
 ## Unreleased - M14 accepted candidate
 
-### Post-P0 - Quota refresh that cannot freeze, and Claude desktop jumps
+### Post-P0 - Quota refresh that cannot freeze, client detection and Codex restart notice
 
 - Claude quota no longer stops refreshing after Runtime renews the Claude Code
   credential. The renewal probe leads its own terminal session; macOS lets a
@@ -39,6 +39,18 @@ published a final v1 release; entries below describe development milestones on
   `claude.app` of its own (`com.anthropic.claude-code`); it was taken for the
   client, so jumping launched that background bundle and showed nothing.
   Sessions recorded with that bundle also open the Claude app.
+- An app inside a framework is no longer taken for the client. `python3` runs
+  as the `Python.app` inside `Python.framework` or `Python3.framework`, so an
+  Agent started by a Python script was recorded under Python (or under Xcode
+  for `/usr/bin/python3` with Xcode selected) and jumping opened that app. It is
+  now recorded under the app that ran the script. Sessions already recorded
+  under Python no longer open it: a Codex conversation opens directly. Sessions
+  already recorded under Xcode this way still open Xcode.
+- `capabilities.codexConnector` reports `restartRequired` and `restartReason`
+  (`connection_lost`, `credentials_changed`, `state_unavailable`) when only a
+  Runtime restart can bring the Codex app-server connection back, so clients
+  can say so. A connection shut down through a launcher that keeps its output
+  open is still reported. Older clients ignore both fields.
 
 ### Post-P0 - Quota sources, freshness and Extra Usage amounts
 

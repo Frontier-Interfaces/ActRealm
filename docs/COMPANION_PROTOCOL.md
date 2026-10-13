@@ -230,6 +230,20 @@ endpoint is exactly loopback HTTP. Tokens are never written to discovery.
 - incompatible schema: stop consuming the snapshot and require a compatible
   version; do not guess field meaning.
 
+### Codex connection that needs a Runtime restart
+
+These are additive fields in protocol 7. `capabilities.codexConnector`
+reports `restartRequired: true` when only a new Runtime process can bring the
+Codex app-server connection back; Runtime never reconnects it on its own.
+`restartReason` says why: `connection_lost` (the app-server exited, or was
+shut down after it stopped reading its input), `credentials_changed` (the
+automatic restart for changed Codex credentials failed), or
+`state_unavailable` (the connector state can no longer be read). It is `null`
+while no restart is needed, including while Runtime restarts itself for
+changed credentials. Clients treat an unknown reason as a plain restart, word
+the message themselves, and use the English `error` for diagnostics only.
+Older Runtime versions omit both fields, which means no restart is requested.
+
 ## Protocol v5: local result excerpts and referenced files
 
 `GET /api/v1/companion/sessions/{id}/result` requires `snapshot.read` and returns
@@ -811,6 +825,13 @@ desktop runs Claude Code from such a bundle, a background-only `claude.app`
 (`com.anthropic.claude-code`), so its sessions are recorded as `claude_app`.
 Sessions recorded with that bundle before this rule, or another Agent run
 inside Claude desktop, still jump to the Claude app.
+
+An app inside a framework is never a client: `python3` runs as the
+`Python.app` inside `Python.framework` (Homebrew, python.org) or
+`Python3.framework` (Xcode, Command Line Tools), so an Agent started by a
+Python script is recorded under the app that ran the script. Sessions recorded
+under that `Python.app` before this rule never jump to it: a Codex
+conversation opens directly, and other providers have no jump target.
 
 ## Quota entries
 

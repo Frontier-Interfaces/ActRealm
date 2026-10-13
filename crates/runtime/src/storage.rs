@@ -14374,8 +14374,10 @@ fn jump_descriptor(
     if (iterm && term_session_id.is_some()) || (terminal && term_tty.is_some()) {
         return ("terminal".to_owned(), "Open terminal".to_owned());
     }
-    let known_app = term_bundle_id.is_some_and(actrealm_core::valid_client_bundle_id)
-        || codex_app
+    let known_app = term_bundle_id.is_some_and(|bundle| {
+        actrealm_core::valid_client_bundle_id(bundle)
+            && !actrealm_core::interpreter_bundle_id(bundle)
+    }) || codex_app
         || term_surface == Some("claude_app")
         || bundle == "com.anthropic.claudefordesktop"
         || iterm

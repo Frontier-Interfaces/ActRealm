@@ -958,6 +958,10 @@ struct CodexManagerState {
     rate_limits_captured_at: Option<u64>,
     rate_limits_error: Option<String>,
     credential_change_handled: bool,
+    /// Why only a new Runtime process brings the app-server connection back.
+    /// Unset while it is up, turned off or not installed, and while Runtime
+    /// restarts itself for changed credentials.
+    restart_reason: Option<&'static str>,
     /// Per thread, from the last `item/completed` final answer until its
     /// turn ends: the turn ID and whether that answer awaits a reply. The
     /// answer text itself is not kept here.
@@ -1367,12 +1371,29 @@ impl CodexManager {
 
     fn capability_value(&self) -> Value {
         let Ok(state) = self.state.lock() else {
-            return json!({"status":"unavailable","error":"Connector state is unavailable"});
+            return json!({
+                "status": "unavailable",
+                "error": "Connector state is unavailable",
+                "restartRequired": true,
+                "restartReason": "state_unavailable"
+            });
         };
+        // A launcher that keeps the app-server's output open after it was
+        // shut down never lets the handlers see the connection close.
+        let restart_reason = state.restart_reason.or_else(|| {
+            (!state.credential_change_handled
+                && self
+                    .connector
+                    .as_ref()
+                    .is_some_and(CodexConnector::is_closed))
+            .then_some("connection_lost")
+        });
         json!({
             "status": state.status,
             "error": state.error,
             "rateLimitsError": state.rate_limits_error,
+            "restartRequired": restart_reason.is_some(),
+            "restartReason": restart_reason,
             "lastNotificationMethod": state.last_notification_method,
             "lastNotificationAt": state.last_notification_at,
             "lastPlanSkipReason": state.last_plan_skip_reason,
@@ -1408,6 +1429,9 @@ impl CodexManager {
             }
             state.rate_limits_error =
                 Some("Codex account credentials changed; reconnecting".to_owned());
+            // Runtime restarts itself now, which also brings back a connection
+            // lost earlier; only that restart failing asks the user again.
+            state.restart_reason = None;
             drop(state);
             if let Some(connector) = self.connector.as_ref() {
                 connector.shutdown();
@@ -1466,6 +1490,7 @@ impl CodexManager {
             state.status = "unavailable".to_owned();
             state.error = Some(detail.to_owned());
             state.rate_limits_error = Some(detail.to_owned());
+            state.restart_reason = Some("credentials_changed");
             take_codex_pending_requests(&mut state)
         } else {
             (Vec::new(), Vec::new())
@@ -1674,8 +1699,7 @@ fn spawn_codex_handlers(
             );
         }
         if let Ok(mut current) = request_state.lock() {
-            current.status = "unavailable".to_owned();
-            current.error = Some("Codex app-server request channel disconnected".to_owned());
+            mark_codex_connection_lost(&mut current, "request");
         }
     });
     let notification_store = store.clone();
@@ -1684,10 +1708,21 @@ fn spawn_codex_handlers(
             update_codex_notification(&state, &notification_store, &waiters, notification);
         }
         if let Ok(mut current) = state.lock() {
-            current.status = "unavailable".to_owned();
-            current.error = Some("Codex app-server notification channel disconnected".to_owned());
+            mark_codex_connection_lost(&mut current, "notification");
         }
     });
+}
+
+/// The app-server connection closed: it exited, was shut down after it
+/// stopped reading, or was closed for changed credentials. Runtime never
+/// reconnects it on its own, so ask for a restart, except while Runtime is
+/// restarting itself for the credentials (only that failing asks).
+fn mark_codex_connection_lost(state: &mut CodexManagerState, channel: &str) {
+    state.status = "unavailable".to_owned();
+    state.error = Some(format!("Codex app-server {channel} channel disconnected"));
+    if !state.credential_change_handled && state.restart_reason.is_none() {
+        state.restart_reason = Some("connection_lost");
+    }
 }
 
 fn initial_codex_execution_is_authoritative(thread: &CodexThread) -> bool {
@@ -8016,11 +8051,9 @@ fn jump_targets(session: &SessionRecord) -> Vec<JumpTarget> {
     }
 
     if targets.is_empty() {
-        if let Some(bundle) = session
-            .term_bundle_id
-            .as_deref()
-            .filter(|b| actrealm_core::valid_client_bundle_id(b))
-        {
+        if let Some(bundle) = session.term_bundle_id.as_deref().filter(|b| {
+            actrealm_core::valid_client_bundle_id(b) && !actrealm_core::interpreter_bundle_id(b)
+        }) {
             targets.push(JumpTarget::AppBundle(bundle.to_owned()));
         }
     }
@@ -16249,6 +16282,34 @@ done
     }
 
     #[test]
+    fn sessions_recorded_under_python_never_open_python() {
+        let root = std::env::temp_dir().join(format!("actrealm-python-jump-{}", Uuid::now_v7()));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let thread = Uuid::now_v7().to_string();
+        let mut request = BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"UserPromptSubmit", "session_id":thread, "prompt":"fixture"
+            }),
+            now_millis(),
+        );
+        // How a Codex started by a python3 script was recorded before 10/13.
+        request.term = Some(actrealm_core::TermContext {
+            app: Some("Python".to_owned()),
+            bundle_id: Some("org.python.python".to_owned()),
+            surface: Some("desktop_app".to_owned()),
+            ..Default::default()
+        });
+        store.ingest(request).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let session = &snapshot.sessions[0];
+        assert_eq!(session.jump_capability, "exact_conversation");
+        assert_eq!(jump_targets(session), [JumpTarget::CodexThread(thread)]);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn codex_native_waiting_flag_opens_and_resolves_attention() {
         let root = std::env::temp_dir().join(format!(
             "actrealm-server-native-approval-{}-{}",
@@ -17368,19 +17429,134 @@ done
         );
         assert!(!launches.exists());
 
+        // Runtime restarts itself first: nothing to ask the user yet.
+        assert_eq!(manager.capability_value()["restartRequired"], false);
+
         // That restart failed. Later polls still read the official quota,
         // and never ask for a second restart.
         manager.mark_credential_restart_failed();
+        let capability = manager.capability_value();
+        assert_eq!(capability["restartRequired"], true);
+        assert_eq!(capability["restartReason"], "credentials_changed");
         assert_eq!(manager.refresh_rate_limits(), CodexQuotaRefresh::Refreshed);
         let (entries, _) = manager.rate_limit_entries().unwrap();
         assert!(entries.iter().any(|entry| entry.used_pct == Some(26.0)));
         assert_eq!(fs::read_to_string(&launches).unwrap(), "x");
+        // The quota error clears; the connection still needs a restart.
+        let capability = manager.capability_value();
+        assert_eq!(capability["rateLimitsError"], Value::Null);
+        assert_eq!(capability["restartRequired"], true);
         let state = manager.state.lock().unwrap();
         assert!(state.credential_change_handled);
         assert_eq!(state.status, "unavailable");
         drop(state);
         drop(manager);
         drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_lost_codex_connection_asks_for_a_runtime_restart() {
+        let mut state = CodexManagerState {
+            status: "connected".to_owned(),
+            ..CodexManagerState::default()
+        };
+        mark_codex_connection_lost(&mut state, "request");
+        assert_eq!(state.status, "unavailable");
+        assert_eq!(state.restart_reason, Some("connection_lost"));
+        // The second channel closing does not change the reason.
+        mark_codex_connection_lost(&mut state, "notification");
+        assert_eq!(state.restart_reason, Some("connection_lost"));
+
+        // Closed for changed credentials: Runtime restarts itself.
+        let mut changed = CodexManagerState {
+            credential_change_handled: true,
+            ..CodexManagerState::default()
+        };
+        mark_codex_connection_lost(&mut changed, "request");
+        assert_eq!(changed.restart_reason, None);
+        // Its restart already failed: that reason stays.
+        changed.restart_reason = Some("credentials_changed");
+        mark_codex_connection_lost(&mut changed, "notification");
+        assert_eq!(changed.restart_reason, Some("credentials_changed"));
+    }
+
+    #[test]
+    fn codex_connections_that_close_ask_for_a_runtime_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "actrealm-server-codex-closed-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let handshake = r#"IFS= read -r line || exit 0
+printf '%s\n' '{"id":1,"result":{"userAgent":"codex_cli_rs/0.144.6"}}'
+IFS= read -r line || exit 0
+"#;
+        let connect = |name: &str, tail: &str| {
+            let executable = root.join(name);
+            fs::write(&executable, format!("#!/bin/sh\n{handshake}{tail}\n")).unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            warm_codex_test_executable(&executable);
+            let (connector, channels) =
+                CodexConnector::connect(&executable, &root.join("unused.sock")).unwrap();
+            let store = RuntimeStore::open(root.join(format!("{name}.sqlite"))).unwrap();
+            let state = Arc::new(Mutex::new(CodexManagerState {
+                status: "connected".to_owned(),
+                ..CodexManagerState::default()
+            }));
+            let waiters = WaiterRegistry::default();
+            spawn_codex_handlers(
+                connector.clone(),
+                channels,
+                Arc::clone(&state),
+                store.clone(),
+                waiters.clone(),
+            );
+            CodexManager {
+                connector: Some(connector),
+                executable: Some(executable),
+                state,
+                store,
+                waiters,
+                auth_path: None,
+                auth_stamp: None,
+            }
+        };
+
+        // The app-server exits after the handshake.
+        let exits = connect("exits", "exit 0");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while exits.capability_value()["restartReason"] != "connection_lost" {
+            assert!(
+                Instant::now() < deadline,
+                "the closed connection was never reported"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(exits.capability_value()["restartRequired"], true);
+        assert_eq!(exits.state.lock().unwrap().status, "unavailable");
+
+        // A launcher whose child keeps the output open: shutting it down
+        // never closes the connection, yet the restart is still asked for.
+        let held = root.join("held.pid");
+        let launcher = connect(
+            "launcher",
+            &format!("sleep 30 &\nprintf '%s' $! > '{}'\nwait", held.display()),
+        );
+        assert_eq!(launcher.capability_value()["restartRequired"], false);
+        launcher.connector.as_ref().unwrap().shutdown();
+        let capability = launcher.capability_value();
+        assert_eq!(capability["restartRequired"], true);
+        assert_eq!(capability["restartReason"], "connection_lost");
+        if let Some(pid) = fs::read_to_string(&held)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+        {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        drop(exits);
+        drop(launcher);
         fs::remove_dir_all(root).unwrap();
     }
 

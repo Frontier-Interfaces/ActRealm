@@ -79,6 +79,8 @@ struct Inner {
     /// Set once the app-server rejects `account/rateLimits/read` parameters
     /// (releases before `GetAccountRateLimitsParams`).
     rate_limit_params_rejected: AtomicBool,
+    /// Set by `shutdown`; the connection never comes back after it.
+    closed: AtomicBool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -175,6 +177,7 @@ impl CodexConnector {
                 next_id: AtomicU64::new(1),
                 shared_connection: shared_socket.is_some(),
                 rate_limit_params_rejected: AtomicBool::new(false),
+                closed: AtomicBool::new(false),
             }),
         };
         let reader_connector = connector.downgrade();
@@ -396,6 +399,7 @@ impl CodexConnector {
     }
 
     pub fn shutdown(&self) {
+        self.inner.closed.store(true, Ordering::Release);
         self.fail_all_pending("connector_shutdown");
         if let Ok(mut managed) = self.inner.child.lock() {
             if let Some(mut child) = managed.take() {
@@ -403,6 +407,12 @@ impl CodexConnector {
                 let _ = child.wait();
             }
         }
+    }
+
+    /// Whether `shutdown` closed this connection, even when a launcher's child
+    /// that the shutdown cannot reach still holds the output open.
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire)
     }
 
     fn write(&self, value: &Value) -> Result<(), ConnectorError> {

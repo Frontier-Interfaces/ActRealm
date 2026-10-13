@@ -98,6 +98,13 @@ pub fn valid_client_bundle_id(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
 }
 
+/// The Python.app that python3 runs as. Sessions recorded before apps inside
+/// frameworks were passed over may name it as their client; it never is.
+pub fn interpreter_bundle_id(value: &str) -> bool {
+    value.eq_ignore_ascii_case("org.python.python")
+        || value.eq_ignore_ascii_case("com.apple.python3")
+}
+
 fn identify(app: Option<&str>, bundle: Option<&str>) -> Option<Source> {
     let app = app.and_then(name);
     let bundle = bundle.filter(|s| valid_client_bundle_id(s));
@@ -204,7 +211,11 @@ fn host_bundle(path: &Path) -> Option<PathBuf> {
     // A resource binary inside an app bundle can be launched from any terminal.
     // Require an actual app/helper executable, then use its outer host bundle.
     let text = path.to_str()?;
-    if !text.contains(".app/Contents/MacOS/") {
+    let own = text.rfind(".app/Contents/MacOS/")?;
+    // An app inside a framework is not one the user works in: python3 runs
+    // as the Python.app in Python.framework (Homebrew, python.org, Xcode),
+    // and an app's framework helpers run below the app's own process.
+    if text[..own].contains(".framework/") {
         return None;
     }
     let end = text.find(".app/")? + 4;
@@ -654,5 +665,60 @@ mod tests {
         ] {
             assert!(!valid_client_bundle_id(value));
         }
+    }
+
+    #[test]
+    fn python_apps_inside_frameworks_are_not_hosts() {
+        // python3 runs as the Python.app inside Python.framework, so a script
+        // that starts an Agent is not the client; the app that ran it is.
+        let terminal = "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal";
+        for python in [
+            "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python",
+            "/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python",
+            "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python",
+            // /usr/bin/python3 with Xcode selected: not Xcode either.
+            "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python",
+        ] {
+            assert_eq!(host_bundle(Path::new(python)), None, "{python}");
+            let processes = [
+                Process { pid: 4, parent: 3, path: "/opt/homebrew/bin/codex".into() },
+                Process { pid: 3, parent: 2, path: python.into() },
+                Process { pid: 2, parent: 1, path: terminal.into() },
+            ];
+            let (source, passed_over) = process_source(Provider::Codex, &processes, |bundle| {
+                identify(bundle.file_stem()?.to_str(), None)
+            });
+            assert_eq!(source.unwrap().app, "Terminal", "{python}");
+            assert!(passed_over.is_none());
+            // Started by launchd or cron, it has no client at all.
+            assert_eq!(
+                process_source(Provider::Codex, &processes[..2], |_| panic!("{python} is not a host")),
+                (None, None)
+            );
+        }
+        // An app's own helpers still name the app: Electron keeps them in
+        // Contents/Frameworks, Chromium inside its framework, below the app.
+        assert_eq!(
+            host_bundle(Path::new("/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)")),
+            Some(PathBuf::from("/Applications/Visual Studio Code.app"))
+        );
+        assert_eq!(
+            host_bundle(Path::new("/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex")),
+            Some(PathBuf::from("/Applications/ChatGPT.app"))
+        );
+        let chromium = [
+            Process { pid: 3, parent: 2, path: "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/154.0.8037.99/Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper".into() },
+            Process { pid: 2, parent: 1, path: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into() },
+        ];
+        let source = process_source(Provider::Codex, &chromium, |bundle| {
+            Some(Source {
+                app: bundle.file_stem()?.to_str()?.to_owned(),
+                bundle: None,
+                surface: "desktop_app".to_owned(),
+            })
+        })
+        .0
+        .unwrap();
+        assert_eq!(source.app, "Google Chrome");
     }
 }
