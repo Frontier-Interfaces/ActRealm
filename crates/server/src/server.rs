@@ -962,6 +962,11 @@ struct CodexManagerState {
     /// Unset while it is up, turned off or not installed, and while Runtime
     /// restarts itself for changed credentials.
     restart_reason: Option<&'static str>,
+    /// Whether observed Codex sessions are attached on their own; see
+    /// `codex_auto_connect::spawn`.
+    automatic_attachment: bool,
+    /// Threads automatic attachment stopped trying this run.
+    attach_given_up: HashSet<String>,
     /// Per thread, from the last `item/completed` final answer until its
     /// turn ends: the turn ID and whether that answer awaits a reply. The
     /// answer text itself is not kept here.
@@ -1337,13 +1342,18 @@ impl CodexManager {
             store.clone(),
             waiters.clone(),
         );
-        codex_auto_connect::spawn(
-            connector.downgrade(),
-            Arc::clone(&state),
-            store.clone(),
-            waiters.clone(),
-            managed,
-        );
+        // Runtime's own app-server is a second writer beside the Codex app's.
+        // Attaching there would lock the user out of their conversations, so
+        // sessions are attached on their own only through Codex's shared one.
+        if codex_auto_connect::attaches_on_its_own(&connector) {
+            codex_auto_connect::spawn(
+                connector.downgrade(),
+                Arc::clone(&state),
+                store.clone(),
+                waiters.clone(),
+                managed,
+            );
+        }
         Self {
             connector: Some(connector),
             executable: Some(executable),
@@ -1353,6 +1363,12 @@ impl CodexManager {
             auth_path: Some(auth_path.to_path_buf()),
             auth_stamp,
         }
+    }
+
+    fn attaches_through_shared_connection(&self) -> bool {
+        self.connector
+            .as_ref()
+            .is_some_and(codex_auto_connect::attaches_on_its_own)
     }
 
     fn attach(&self, thread_id: &str) -> Result<CodexThread, String> {
@@ -1399,7 +1415,7 @@ impl CodexManager {
             "lastPlanSkipReason": state.last_plan_skip_reason,
             "lastPlanFieldKeys": state.last_plan_field_keys,
             "managedThreads": state.managed.len(),
-            "automaticConnection": true,
+            "automaticConnection": state.automatic_attachment,
             "sharedConnection": self.connector.as_ref().is_some_and(CodexConnector::is_shared_connection),
             "protocol": "app-server",
             "experimentalUserInput": true,
@@ -7967,7 +7983,10 @@ async fn manage_session(
     else {
         return api_error(StatusCode::NOT_FOUND, "SESSION_NOT_FOUND");
     };
-    if session.provider != "codex" {
+    // Attaching through Runtime's own app-server would hold Codex's
+    // single-writer lock until Runtime exits: the Codex app could no longer
+    // open the conversation.
+    if session.provider != "codex" || !state.codex.attaches_through_shared_connection() {
         return api_error(StatusCode::CONFLICT, "MANAGED_CONNECTOR_UNSUPPORTED");
     }
     match state.codex.attach(&session.provider_session_id) {
@@ -16282,6 +16301,51 @@ done
     }
 
     #[test]
+    fn manual_codex_attach_is_refused_without_the_shared_app_server() {
+        let root = std::env::temp_dir().join(format!("actrealm-manual-attach-{}", Uuid::now_v7()));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Codex,
+                json!({
+                    "hook_event_name":"UserPromptSubmit", "session_id":Uuid::now_v7().to_string(),
+                    "prompt":"fixture"
+                }),
+                now_millis(),
+            ))
+            .unwrap();
+        let session_id = store.snapshot().unwrap().sessions[0].id.clone();
+        let state = test_state(store.clone(), &root);
+        {
+            let mut auth = state.auth.lock().unwrap();
+            auth.session_token = Some("test-session".into());
+            auth.csrf_token = Some("test-csrf".into());
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let response = router(state.clone())
+                .oneshot(authorized_request(
+                    "POST",
+                    &format!("/api/v1/sessions/{session_id}/manage"),
+                    json!({"action":"attach"}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                json_body(response).await["error"]["code"],
+                "MANAGED_CONNECTOR_UNSUPPORTED"
+            );
+        });
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn sessions_recorded_under_python_never_open_python() {
         let root = std::env::temp_dir().join(format!("actrealm-python-jump-{}", Uuid::now_v7()));
         let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
@@ -17535,6 +17599,13 @@ IFS= read -r line || exit 0
             thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(exits.capability_value()["restartRequired"], true);
+        // Runtime's own app-server never attaches sessions, on its own or on
+        // request.
+        assert!(!codex_auto_connect::attaches_on_its_own(
+            exits.connector.as_ref().unwrap()
+        ));
+        assert!(!exits.attaches_through_shared_connection());
+        assert_eq!(exits.capability_value()["automaticConnection"], false);
         assert_eq!(exits.state.lock().unwrap().status, "unavailable");
 
         // A launcher whose child keeps the output open: shutting it down

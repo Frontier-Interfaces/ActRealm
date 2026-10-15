@@ -1308,11 +1308,11 @@ private struct TaskRow: View {
             case "pending", "connecting":
                 return localized("正在自动连接会话", locale: locale)
             case "owned_elsewhere":
-                return localized("原窗口正在使用，等待自动接入", locale: locale)
+                return localized("原窗口正在使用，仅观察", locale: locale)
             case "retrying":
                 return localized("自动连接失败，正在重试", locale: locale)
             case "unavailable":
-                return localized("自动连接暂不可用，继续观察", locale: locale)
+                return localized("未自动连接，仅观察", locale: locale)
             default: break
             }
         }

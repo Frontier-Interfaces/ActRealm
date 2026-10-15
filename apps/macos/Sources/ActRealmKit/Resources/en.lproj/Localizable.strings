@@ -2010,11 +2010,11 @@
 
 "正在自动连接会话" = "Connecting session automatically";
 "自动连接失败，正在重试" = "Automatic connection failed; retrying";
-"自动连接暂不可用，继续观察" = "Automatic connection unavailable; observing";
+"未自动连接，仅观察" = "Not connected automatically; observing";
 "已自动连接；原生审批仍需在 Codex 处理" = "Automatically connected; native approvals remain in Codex";
 "已自动连接；当前版本审批需原界面" = "Automatically connected; approvals require the provider app on this version";
 
-"原窗口正在使用，等待自动接入" = "In use by the original window; waiting to connect automatically";
+"原窗口正在使用，仅观察" = "In use by the original window; observing";
 
 "客户端来源" = "Client source";
 "来源未识别" = "Source unidentified";

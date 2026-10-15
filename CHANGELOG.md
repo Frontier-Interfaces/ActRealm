@@ -6,7 +6,7 @@ published a final v1 release; entries below describe development milestones on
 
 ## Unreleased - M14 accepted candidate
 
-### Post-P0 - Quota refresh that cannot freeze, client detection and Codex restart notice
+### Post-P0 - Quota refresh that cannot freeze, client detection and Codex conversations
 
 - Claude quota no longer stops refreshing after Runtime renews the Claude Code
   credential. The renewal probe leads its own terminal session; macOS lets a
@@ -51,6 +51,14 @@ published a final v1 release; entries below describe development milestones on
   Runtime restart can bring the Codex app-server connection back, so clients
   can say so. A connection shut down through a launcher that keeps its output
   open is still reported. Older clients ignore both fields.
+- Codex conversations are no longer locked by Runtime. Runtime's own Codex
+  app-server attached every observed Codex session and held Codex's
+  single-writer lock without ever releasing it, so once the Codex app unloaded
+  an idle conversation, Runtime took it over and the app showed it as open in
+  another app until Runtime stopped. Sessions are now attached, on their own
+  or on request, only through Codex's official shared app-server (its control
+  socket); a thread held elsewhere is never taken over, and threads that keep
+  failing stop being retried and report `unavailable`.
 
 ### Post-P0 - Quota sources, freshness and Extra Usage amounts
 

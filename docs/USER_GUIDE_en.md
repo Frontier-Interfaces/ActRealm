@@ -184,14 +184,18 @@ is saved locally. UI copy changes immediately; macOS menus adopt the choice
 when ActRealm restarts. User task titles, questions and Provider-authored content
 remain in their original language.
 
-Observed Codex sessions connect automatically in the background. There is no
-per-task managed-connection button or opt-in. Runtime connects existing task
-cards at startup, discovers new tasks, and retries failed attachments with
-backoff. The task detail shows connecting, retrying or unavailable states; a
-successful attachment is required before it is called connected. A thread held
-by an independent Codex window may reject another writer; it stays observed
-and displays that it is waiting for automatic access. The official shared local
-app-server is preferred when its control socket is available at startup. Reopening a
+Observed Codex sessions connect automatically in the background only when
+Codex's official shared local app-server is available (its control socket
+exists at startup). Codex lets one app-server process write a conversation at a
+time, so Runtime's own app-server never attaches a session: doing so would
+leave the Codex app showing the conversation as open in another app. Without
+the shared app-server, Codex tasks are observed through Hooks and show that they
+are not connected automatically. With it, Runtime connects existing task cards
+at startup, discovers new tasks, and retries failed attachments with backoff,
+giving up on a thread after six failed attempts. The task detail shows
+connecting, retrying or unavailable states; a successful attachment is required
+before it is called connected. A thread held by another Codex window is never
+taken over; it stays observed. Reopening a
 stored thread does not start a model turn or transfer a running Desktop turn.
 Original-client approval and question ownership still require a live reply
 channel. Claude Hooks and supported Grok/Kimi local sessions keep their existing

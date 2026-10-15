@@ -339,6 +339,18 @@ versions and non-Codex providers. This observation never grants response scope
 or substitutes for a live request channel. `tokenUsage` remains the Runtime
 aggregation; partial history must not be presented as complete account usage.
 
+Runtime attaches Codex sessions only through Codex's official shared
+app-server, reached through its control socket
+(`capabilities.codexConnector.automaticConnection` is then `true`). Codex lets
+one app-server process write a thread at a time; attaching in Runtime's own
+app-server would hold that lock until Runtime exits, and the Codex app would
+show the conversation as open in another app. So without the shared app-server
+nothing is attached, on its own or through `POST /api/v1/sessions/{id}/manage`
+(which answers `409 MANAGED_CONNECTOR_UNSUPPORTED`), and sessions report
+`unavailable`. A thread held elsewhere (`owned_elsewhere`) is never taken over,
+and one that failed to attach six times reports `unavailable` for the rest of
+the Runtime run. An attached thread that is loaded reports `connected`.
+
 ## Task roles, history and turn context
 
 These are additive v7 fields; `protocolVersion` and every schema version stay
