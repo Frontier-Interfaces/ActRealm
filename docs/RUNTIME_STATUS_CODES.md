@@ -74,6 +74,9 @@ Current snapshot fields are:
 | `quota.reason.no_valid_window` | No verifiable quota window was found | 没有找到可验证的额度窗口 |
 | `quota.reason.claude_refresh_failed` | Claude quota refresh failed; showing the last capture | Claude 额度刷新失败，显示上次数据 |
 | `quota.reason.codex_refresh_failed` | Codex quota refresh failed; showing the last capture | Codex 额度刷新失败，显示上次数据 |
+| `quota.reason.codex_rollout_stale` | Codex quota comes from an old local session record | Codex 额度来自本机较早的会话记录 |
+| `quota.reason.window_reset` | The window has reset since the value was captured | 额度窗口在记录之后已重置 |
+| `quota.reason.extra_usage_disabled` | Extra usage is turned off for this account | 该账户未开启额外用量 |
 
 The JSON contract contains the complete list, including parameters and
 long-form quota failure guidance.

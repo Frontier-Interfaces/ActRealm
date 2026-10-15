@@ -87,6 +87,9 @@
 "quota.reason.codex_window_missing" = "Codex rollout 中没有可验证的额度窗口。";
 "quota.reason.claude_refresh_failed" = "Claude 额度刷新失败，当前显示的是上次成功获取的数据。";
 "quota.reason.codex_refresh_failed" = "Codex 额度刷新失败，当前显示的是上次成功获取的数据。";
+"quota.reason.codex_rollout_stale" = "Codex 额度来自本机较早的会话记录，不含其他设备上的用量。";
+"quota.reason.window_reset" = "该额度窗口在记录之后已重置，正在等待新数据。";
+"quota.reason.extra_usage_disabled" = "该账户未开启额外用量。";
 "额度更新结果：%@" = "额度更新结果：%@";
 "本机请求失败（HTTP %@）" = "本机请求失败（HTTP %@）";
 "请求失败（%@）" = "请求失败（%@）";

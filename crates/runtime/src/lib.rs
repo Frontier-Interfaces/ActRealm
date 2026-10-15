@@ -5,7 +5,10 @@ mod diagnostics;
 pub use agent_connection::{handle_agent_connection_event, wait_for_agent_reply};
 mod fsutil;
 mod instance;
+mod latest;
 mod outcome;
+mod project;
+mod reply;
 mod sanitize;
 mod spool;
 mod storage;
@@ -17,17 +20,20 @@ pub use diagnostics::{
     MAX_DIAGNOSTIC_CAPTURE_BYTES,
 };
 pub use instance::{InstanceError, RuntimeInstanceGuard};
-pub use outcome::{ResultArtifact, SessionResult};
+pub use latest::{LatestMessage, LatestMessageForm, LatestMessageQuery};
+pub use outcome::{ResultArtifact, SessionPrompt, SessionResult};
+pub use reply::message_awaits_reply;
 pub use spool::{default_spool_path, EventSpool, SpoolError};
 pub use storage::{
     default_database_path, ApprovalAction, AttentionAction, AttentionRecord, ClaimResult,
     CommandRecord, CommandState, CommitResult, IngestResult, MetricEvent, MetricsSummary,
-    NativeApprovalSyncResult, QuotaRecord, ReviewBaselineCandidate, ReviewBaselineInput,
-    ReviewBaselineRecord, RuntimeStore, SessionRecord, SessionUsageDailyRecord, SessionUsageRecord,
-    StorageDiagnostics, StoreError, StoreSnapshot, TaskCheckpointInput, TaskCheckpointRecord,
-    TaskHistoryMutation, TaskHistoryRecord, TimelineContextAvailability, TimelineEventKind,
-    TimelineEventRecord, TimelinePage, TimelineRiskLevel, TokenUsageBurnRate,
-    TokenUsageDecisionSummary, TokenUsageProjectTotal, TokenUsageTaskTotal,
+    NativeApprovalSyncResult, QuotaRecord, RecentTaskRecord, ReviewBaselineCandidate,
+    ReviewBaselineInput, ReviewBaselineRecord, RuntimeStore, SessionRecord, SessionSeen,
+    SessionUsageDailyRecord, SessionUsageRecord, StorageDiagnostics, StoreError, StoreSnapshot,
+    TaskCheckpointInput, TaskCheckpointRecord, TaskHistoryMutation, TaskHistoryRecord,
+    TimelineContextAvailability, TimelineEventKind, TimelineEventRecord, TimelinePage,
+    TimelineRiskLevel, TokenUsageBurnRate, TokenUsageDecisionSummary, TokenUsageProjectTotal,
+    TokenUsageTaskTotal, CODEX_FINAL_ANSWER_AWAITS_REPLY,
 };
 pub use waiter::{
     InteractiveOption, InteractivePrompt, InteractiveQuestion, RegisterResult, WaiterError,

@@ -803,6 +803,9 @@
   "quota.reason.codex_window_missing": "No verifiable quota window was found in the Codex rollout.",
   "quota.reason.claude_refresh_failed": "Claude quota refresh failed. The last successfully captured values are shown.",
   "quota.reason.codex_refresh_failed": "Codex quota refresh failed. The last successfully captured values are shown.",
+  "quota.reason.codex_rollout_stale": "Codex quota comes from an old local session record; usage on other devices is not included.",
+  "quota.reason.window_reset": "This quota window has reset since the value was captured; waiting for a fresh update.",
+  "quota.reason.extra_usage_disabled": "Extra usage is turned off for this account.",
   "额度更新结果：%@": "Quota update result: %@",
   "本机请求失败（HTTP %@）": "Local request failed (HTTP %@)",
   "请求失败（%@）": "Request failed (%@)",
@@ -1339,6 +1342,18 @@
   "quota.reason.codex_refresh_failed": {
     "en": "Codex quota refresh failed. The last successfully captured values are shown.",
     "zh-Hans": "Codex 额度刷新失败，当前显示的是上次成功获取的数据。"
+  },
+  "quota.reason.codex_rollout_stale": {
+    "en": "Codex quota comes from an old local session record; usage on other devices is not included.",
+    "zh-Hans": "Codex 额度来自本机较早的会话记录，不含其他设备上的用量。"
+  },
+  "quota.reason.window_reset": {
+    "en": "This quota window has reset since the value was captured; waiting for a fresh update.",
+    "zh-Hans": "该额度窗口在记录之后已重置，正在等待新数据。"
+  },
+  "quota.reason.extra_usage_disabled": {
+    "en": "Extra usage is turned off for this account.",
+    "zh-Hans": "该账户未开启额外用量。"
   }
 };
   const API_ERRORS = {

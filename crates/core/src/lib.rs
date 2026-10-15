@@ -1,5 +1,7 @@
 mod client_source;
-pub use client_source::{capture_client_context, client_environment, valid_client_bundle_id};
+pub use client_source::{
+    capture_client_context, client_environment, interpreter_bundle_id, valid_client_bundle_id,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

@@ -1,6 +1,7 @@
 use crate::fsutil::ensure_private_directory;
 use crate::title::{
-    resolve_codex_session_titles, resolve_event_title, resolve_session_title, ProviderTitle,
+    claude_session_transcript, resolve_codex_session_titles, resolve_event_title,
+    resolve_session_title, trusted_claude_transcript_path, ProviderTitle,
 };
 use actrealm_core::{
     is_codex_native_attention_tool, AttentionRiskCode, BridgeRequest, Decision, EventKind,
@@ -27,6 +28,10 @@ use uuid::Uuid;
 
 const SCHEMA_VERSION: i64 = 38;
 const SNAPSHOT_CACHE_MAX_AGE_MS: u64 = 2_000;
+/// How long past the regular retention a session that ended its turn with
+/// background work still running stays listed (also in the SQL of
+/// [`read_snapshot`]).
+const BACKGROUND_WAIT_LISTED_MS: u64 = 86_400_000;
 const STORAGE_DIAGNOSTICS_CACHE_MAX_AGE_MS: u64 = 60_000;
 const SQLITE_MAX_VARIABLE_NUMBER: usize = 32_766;
 const MAX_UI_SNAPSHOT_SESSION_IDS: usize = SQLITE_MAX_VARIABLE_NUMBER - 1;
@@ -39,6 +44,9 @@ const MAX_TOOL_TARGET_CHARS: usize = 96;
 const PROVIDER_TITLE_REFRESH_INTERVAL_MS: u64 = 2_000;
 const PROVIDER_TITLE_ACTIVE_WINDOW_MS: u64 = 30 * 60 * 1_000;
 const UI_SETTINGS_KEY: &str = "ui_settings";
+/// Activity recorded when the user interrupts a turn. Status message
+/// projection maps it to `session.activity.interrupted`.
+const TURN_INTERRUPTED_ACTIVITY: &str = "Turn interrupted";
 const CODEX_INTERNAL_PROMPT_PREFIXES: [&str; 4] = [
     "# Overview Generate 0 to 3 hyperpersonalized suggestions",
     "You are an expert at upholding safety and compliance standards",
@@ -270,14 +278,21 @@ pub struct SessionRecord {
     pub environment: Option<String>,
     pub jump_capability: String,
     pub jump_label: String,
+    /// The application the session runs in, as recorded from the Hook
+    /// process (`Visual Studio Code`, `Codex app`, `iTerm2`, ...). Like the
+    /// other locators it stays out of the serialized snapshot; only the
+    /// Companion snapshot exposes the application, bundle and surface.
     #[serde(skip)]
     pub term_app: Option<String>,
     #[serde(skip)]
     pub term_session_id: Option<String>,
     #[serde(skip)]
     pub term_tty: Option<String>,
+    /// That application's bundle identifier (`com.microsoft.VSCode`).
     #[serde(skip)]
     pub term_bundle_id: Option<String>,
+    /// The kind of client: `terminal`, `editor`, `codex_app`, `claude_app`,
+    /// `kimi_app`, `grok_app`, `desktop_app`, `connector` or `remote`.
     #[serde(skip)]
     pub term_surface: Option<String>,
     #[serde(skip)]
@@ -285,6 +300,89 @@ pub struct SessionRecord {
     pub last_event_at: u64,
     #[serde(skip)]
     pub last_meaningful_activity_at: Option<u64>,
+    /// Turns opened by a user prompt submission (`prompt.submitted`). Turns
+    /// that Runtime opened implicitly for a late tool/lifecycle event are not
+    /// user turns and are excluded.
+    #[serde(default)]
+    pub user_turn_count: u32,
+    /// `main` for a titled, user-driven task; `side` for untitled, scripted,
+    /// forked-without-turns, or ignored internal sessions.
+    #[serde(default = "default_task_role")]
+    pub task_role: String,
+    /// Active background items (tasks, cron jobs) the last Claude Code
+    /// `Stop` reported; 0 when there were none or a new turn has started.
+    #[serde(default)]
+    pub background_tasks: u32,
+    /// The Claude Code transcript the latest Agent message is read from.
+    /// Never serialized.
+    #[serde(skip)]
+    pub transcript_path: Option<PathBuf>,
+}
+
+const TASK_ROLE_MAIN: &str = "main";
+const TASK_ROLE_SIDE: &str = "side";
+
+fn default_task_role() -> String {
+    TASK_ROLE_SIDE.to_owned()
+}
+
+/// A session is a main task only when the Provider itself titled it, the user
+/// submitted at least one prompt in it, and it is not an ignored internal
+/// session. Everything else (script-launched runs, untitled or forked sessions
+/// without user turns) is a side task.
+fn task_role(provider_title: Option<&str>, user_turn_count: u32, ignored: bool) -> &'static str {
+    if !ignored
+        && user_turn_count >= 1
+        && provider_title.is_some_and(|title| !title.trim().is_empty())
+    {
+        TASK_ROLE_MAIN
+    } else {
+        TASK_ROLE_SIDE
+    }
+}
+
+/// A bounded local projection of recently active tasks for Companion clients.
+/// Like [`TaskHistoryRecord`], it never carries prompts, commands, tool
+/// input/output, transcript text, or file paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentTaskRecord {
+    pub id: String,
+    pub provider: String,
+    pub project: Option<String>,
+    /// The Provider's own title, or null. Unlike snapshot sessions it never
+    /// falls back to the Runtime title, which may be derived from prompt text.
+    pub title: Option<String>,
+    pub task_role: String,
+    pub user_turn_count: u32,
+    /// `running`, `waiting`, `completed`, `interrupted`, or `failed`.
+    pub status: String,
+    pub started_at: u64,
+    pub last_event_at: u64,
+    pub completed_at: Option<u64>,
+    pub branch: Option<String>,
+    pub validation_state: Option<String>,
+    /// `unseen`, `seen`, or `none`, derived from the latest completion/error
+    /// attention of the session. Only a user action or a new instruction
+    /// makes it `seen`.
+    pub review_state: String,
+    /// `completion`, `error`, or null.
+    pub latest_attention_kind: Option<String>,
+    pub jump_capability: String,
+    pub jump_label: String,
+    /// The application the session runs in. Like the transcript path and
+    /// turn start below, only the companion history adds these (or what they
+    /// lead to) to its response; the local History center never sees them.
+    #[serde(skip)]
+    pub term_app: Option<String>,
+    #[serde(skip)]
+    pub term_bundle_id: Option<String>,
+    #[serde(skip)]
+    pub term_surface: Option<String>,
+    #[serde(skip)]
+    pub transcript_path: Option<PathBuf>,
+    #[serde(skip)]
+    pub turn_started_at: Option<u64>,
 }
 
 /// A bounded, local-only summary used by the History center. It intentionally
@@ -319,6 +417,16 @@ pub enum TaskHistoryMutation {
     Active,
 }
 
+/// Result of marking a task as seen ([`RuntimeStore::mark_session_seen`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSeen {
+    /// The session's latest completion/error reminder is acknowledged.
+    Seen,
+    /// The session never raised a completion/error reminder.
+    NoReminder,
+    NotFound,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalReviewContext {
     pub session_id: String,
@@ -333,6 +441,8 @@ pub struct LocalReviewContext {
     pub turn_ended_at: Option<u64>,
     pub last_event_at: u64,
     pub concurrent_active_sessions: u32,
+    /// The Claude Code transcript the latest Agent message is read from.
+    pub transcript_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -492,6 +602,10 @@ pub struct AttentionRecord {
     pub reminder_resolution: Option<String>,
     #[serde(default)]
     pub retain_after_ack: bool,
+    /// A completion whose final Agent message asks the user something: the
+    /// Agent ended its turn and waits for the user's answer.
+    #[serde(default)]
+    pub awaits_reply: bool,
     pub created_at: u64,
     pub resolution: Option<String>,
     #[serde(default)]
@@ -933,6 +1047,7 @@ pub struct RuntimeStore {
 
 struct StoreInner {
     outcomes: Mutex<crate::outcome::OutcomeRegistry>,
+    latest: Mutex<crate::latest::LatestMessages>,
     sender: mpsc::Sender<StoreMessage>,
     writer: Mutex<Option<thread::JoinHandle<()>>>,
 }
@@ -984,6 +1099,7 @@ enum StoreMessage {
         turn_id: String,
         event: String,
         at: u64,
+        awaits_reply: bool,
         reply: mpsc::SyncSender<Result<bool, StoreError>>,
     },
     MarkExecutionUnconfirmed {
@@ -1028,10 +1144,21 @@ enum StoreMessage {
         limit: usize,
         reply: mpsc::SyncSender<Result<Vec<TaskHistoryRecord>, StoreError>>,
     },
+    RecentTasks {
+        since: u64,
+        limit: usize,
+        include_side: bool,
+        reply: mpsc::SyncSender<Result<Vec<RecentTaskRecord>, StoreError>>,
+    },
     ArchiveTask {
         session_id: String,
         now: u64,
         reply: mpsc::SyncSender<Result<TaskHistoryMutation, StoreError>>,
+    },
+    MarkSessionSeen {
+        session_id: String,
+        now: u64,
+        reply: mpsc::SyncSender<Result<SessionSeen, StoreError>>,
     },
     DeleteTaskHistory {
         session_id: String,
@@ -1180,6 +1307,7 @@ impl RuntimeStore {
         Ok(Self {
             inner: Arc::new(StoreInner {
                 outcomes: Mutex::new(crate::outcome::OutcomeRegistry::default()),
+                latest: Mutex::new(crate::latest::LatestMessages::default()),
                 sender,
                 writer: Mutex::new(Some(writer)),
             }),
@@ -1205,6 +1333,23 @@ impl RuntimeStore {
             .get("cwd")
             .and_then(Value::as_str)
             .map(PathBuf::from);
+        // The user's own prompt for this turn is kept only in the in-memory
+        // outcome registry (sanitized and bounded there). The SQLite event
+        // row, spool and export never receive it.
+        let prompt = matches!(
+            event.as_str(),
+            "UserPromptSubmit" | "BeforeAgent" | "TurnStarted"
+        )
+        .then(|| {
+            request
+                .raw
+                .get("prompt")
+                .or_else(|| request.raw.get("user_prompt"))
+                .and_then(Value::as_str)
+                .map(user_visible_prompt)
+                .filter(|prompt| !prompt.is_empty())
+        })
+        .flatten();
         let (reply, receiver) = mpsc::sync_channel(1);
         self.send(StoreMessage::Ingest {
             request: Box::new(request),
@@ -1217,6 +1362,11 @@ impl RuntimeStore {
                     registry.clear(&result.session_id, at);
                 }
             }
+            if result.kind == EventKind::PromptSubmitted {
+                if let Ok(mut registry) = self.inner.outcomes.lock() {
+                    registry.observe_prompt(&result.session_id, prompt.as_deref(), at);
+                }
+            }
             if let Some(message) = message {
                 self.observe_result(
                     &result.session_id,
@@ -1225,6 +1375,19 @@ impl RuntimeStore {
                     at,
                     &format!("hook:{event}"),
                 );
+                // The message a turn ends with is its final answer.
+                if event == "Stop" {
+                    self.observe_latest_message(&result.session_id, &message, at, true);
+                }
+            }
+        } else if !result.suppressed && result.kind == EventKind::PromptSubmitted {
+            // The same turn can be reported twice (a Connector `turn/started`
+            // without text and the prompt Hook with text). The duplicate is
+            // not stored again, but its text still belongs to that turn.
+            if let Some(prompt) = prompt.as_deref() {
+                if let Ok(mut registry) = self.inner.outcomes.lock() {
+                    registry.observe_prompt(&result.session_id, Some(prompt), at);
+                }
             }
         }
         Ok(result)
@@ -1249,6 +1412,38 @@ impl RuntimeStore {
         }
     }
 
+    /// Records an Agent message a Provider event reported for a session.
+    /// `is_final` marks the final answer of a turn. Memory-only, like result
+    /// excerpts.
+    pub fn observe_latest_message(&self, session: &str, text: &str, at: u64, is_final: bool) {
+        if let Ok(mut latest) = self.inner.latest.lock() {
+            latest.observe(session, text, at, is_final);
+        }
+    }
+
+    /// The latest Agent message of each queried session (sessions without
+    /// one are left out): the newer of the last message a Provider event
+    /// reported and, for Claude Code, the last one in the session transcript.
+    /// Transcripts are read only when they changed since the last call.
+    pub fn latest_messages(
+        &self,
+        queries: &[crate::LatestMessageQuery],
+        form: crate::LatestMessageForm,
+        now: u64,
+    ) -> HashMap<String, crate::LatestMessage> {
+        let Ok(mut latest) = self.inner.latest.lock() else {
+            return HashMap::new();
+        };
+        queries
+            .iter()
+            .filter_map(|query| {
+                latest
+                    .latest(query, form, now)
+                    .map(|message| (query.session_id.clone(), message))
+            })
+            .collect()
+    }
+
     pub fn session_result(
         &self,
         session: &str,
@@ -1256,6 +1451,22 @@ impl RuntimeStore {
         now: u64,
     ) -> Option<crate::SessionResult> {
         self.inner.outcomes.lock().ok()?.get(session, start, now)
+    }
+
+    /// The sanitized, bounded prompt the user submitted for the turn that
+    /// started at or after `start`. Memory-only: never persisted, spooled, or
+    /// exported, and lost on Runtime restart.
+    pub fn session_prompt(
+        &self,
+        session: &str,
+        start: u64,
+        now: u64,
+    ) -> Option<crate::SessionPrompt> {
+        self.inner
+            .outcomes
+            .lock()
+            .ok()?
+            .get_prompt(session, start, now)
     }
 
     pub fn result_artifact_path(
@@ -1382,12 +1593,16 @@ impl RuntimeStore {
         receive(receiver)
     }
 
+    /// Ends a Codex turn that the session-file observer saw end. `awaits_reply`
+    /// tells whether the turn's final answer (`last_agent_message`) asks the
+    /// user something; see [`crate::message_awaits_reply`].
     pub fn observe_codex_turn_end(
         &self,
         thread_id: &str,
         turn_id: &str,
         event: &str,
         at: u64,
+        awaits_reply: bool,
     ) -> Result<bool, StoreError> {
         let (reply, receiver) = mpsc::sync_channel(1);
         self.send(StoreMessage::ObserveCodexTurnEnd {
@@ -1395,6 +1610,7 @@ impl RuntimeStore {
             turn_id: turn_id.into(),
             event: event.into(),
             at,
+            awaits_reply,
             reply,
         })?;
         receive(receiver)
@@ -1514,6 +1730,30 @@ impl RuntimeStore {
         receive(receiver)
     }
 
+    /// Returns sessions whose last event is at or after `since`, newest
+    /// first, including active ones. Without `include_side`, only main tasks
+    /// (titled, at least one user turn, not ignored) are returned.
+    pub fn recent_tasks(
+        &self,
+        since: u64,
+        limit: usize,
+        include_side: bool,
+    ) -> Result<Vec<RecentTaskRecord>, StoreError> {
+        if limit == 0 || limit > 500 {
+            return Err(StoreError::Storage(
+                "recent task limit must be between 1 and 500".to_owned(),
+            ));
+        }
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send(StoreMessage::RecentTasks {
+            since,
+            limit,
+            include_side,
+            reply,
+        })?;
+        receive(receiver)
+    }
+
     pub fn archive_task(
         &self,
         session_id: impl Into<String>,
@@ -1521,6 +1761,27 @@ impl RuntimeStore {
     ) -> Result<TaskHistoryMutation, StoreError> {
         let (reply, receiver) = mpsc::sync_channel(1);
         self.send(StoreMessage::ArchiveTask {
+            session_id: session_id.into(),
+            now,
+            reply,
+        })?;
+        receive(receiver)
+    }
+
+    /// Records that the user has seen a task, for example after opening it
+    /// from a Companion: the session's latest completion/error reminder is
+    /// acknowledged. A reminder that is still open or snoozed is closed
+    /// exactly like an `ack` command closes it (a delayed or manual
+    /// completion only acknowledges the reminder); a reminder that was
+    /// already closed or hidden stays closed and only records the
+    /// acknowledgement, so history reports the task as `seen`. Idempotent.
+    pub fn mark_session_seen(
+        &self,
+        session_id: impl Into<String>,
+        now: u64,
+    ) -> Result<SessionSeen, StoreError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send(StoreMessage::MarkSessionSeen {
             session_id: session_id.into(),
             now,
             reply,
@@ -2156,6 +2417,7 @@ fn writer_loop(
                 | StoreMessage::UiSnapshot { .. }
                 | StoreMessage::UiSnapshotWithQueryCount { .. }
                 | StoreMessage::TokenUsageDecision { .. }
+                | StoreMessage::RecentTasks { .. }
                 | StoreMessage::ListTaskCheckpoints { .. }
                 | StoreMessage::TaskCheckpoint { .. }
                 | StoreMessage::ReadSetting { .. }
@@ -2262,14 +2524,18 @@ fn writer_loop(
                 turn_id,
                 event,
                 at,
+                awaits_reply,
                 reply,
             } => {
                 let _ = reply.send(observe_codex_turn_end_transaction(
                     &mut connection,
-                    &thread_id,
-                    &turn_id,
-                    &event,
-                    at,
+                    CodexTurnEnd {
+                        thread_id: &thread_id,
+                        turn_id: &turn_id,
+                        event: &event,
+                        at,
+                        awaits_reply,
+                    },
                     completion_hide_policy,
                 ));
             }
@@ -2399,6 +2665,14 @@ fn writer_loop(
             } => {
                 let _ = reply.send(read_task_history(&connection, cutoff, limit));
             }
+            StoreMessage::RecentTasks {
+                since,
+                limit,
+                include_side,
+                reply,
+            } => {
+                let _ = reply.send(read_recent_tasks(&connection, since, limit, include_side));
+            }
             StoreMessage::ArchiveTask {
                 session_id,
                 now,
@@ -2410,6 +2684,17 @@ fn writer_loop(
                     ui_snapshot_cache = None;
                 }
                 let _ = reply.send(result);
+            }
+            StoreMessage::MarkSessionSeen {
+                session_id,
+                now,
+                reply,
+            } => {
+                let _ = reply.send(mark_session_seen_transaction(
+                    &mut connection,
+                    &session_id,
+                    now,
+                ));
             }
             StoreMessage::DeleteTaskHistory {
                 session_id,
@@ -4374,6 +4659,7 @@ fn initialize(connection: &mut Connection) -> Result<(), StoreError> {
               last_meaningful_activity_at INTEGER,
               task_hidden_at INTEGER, task_hidden_reason TEXT,
               ended_at INTEGER,
+              background_tasks INTEGER NOT NULL DEFAULT 0, transcript_path TEXT,
               UNIQUE(provider, provider_session_id)
             );
             CREATE TABLE IF NOT EXISTS turns (
@@ -4463,6 +4749,7 @@ fn initialize(connection: &mut Connection) -> Result<(), StoreError> {
               expires_at INTEGER, auto_hide_at INTEGER,
               reminder_acknowledged_at INTEGER, reminder_resolution TEXT,
               retain_after_ack INTEGER NOT NULL DEFAULT 0,
+              awaits_reply INTEGER NOT NULL DEFAULT 0,
               created_at INTEGER NOT NULL,
               resolved_at INTEGER, resolution TEXT,
               remote_actionable INTEGER NOT NULL DEFAULT 0,
@@ -4673,13 +4960,16 @@ fn initialize(connection: &mut Connection) -> Result<(), StoreError> {
     ensure_attention_auto_hide_column(connection)?;
     ensure_attention_reminder_columns(connection)?;
     ensure_attention_retention_column(connection)?;
+    ensure_attention_awaits_reply_column(connection)?;
     ensure_command_commit_delay_column(connection)?;
     ensure_session_task_visibility_columns(connection)?;
+    ensure_session_turn_end_columns(connection)?;
     normalize_legacy_subagent_rows(connection)?;
     normalize_orphaned_local_approval_sessions(connection, now_millis())?;
     suppress_existing_codex_internal_sessions(connection)?;
     remove_internal_context_task_titles(connection)?;
     normalize_existing_task_title_whitespace(connection)?;
+    refresh_session_project_labels(connection)?;
     connection
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(storage_error)?;
@@ -5566,6 +5856,57 @@ fn ensure_attention_retention_column(connection: &Connection) -> Result<(), Stor
     Ok(())
 }
 
+fn ensure_attention_awaits_reply_column(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(attention_items)")
+        .map_err(storage_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    drop(statement);
+    if !columns.iter().any(|column| column == "awaits_reply") {
+        connection
+            .execute(
+                "ALTER TABLE attention_items ADD COLUMN awaits_reply INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(storage_error)?;
+    }
+    Ok(())
+}
+
+/// `background_tasks`: active background items the last Claude Code `Stop`
+/// reported (0 once a new turn starts). `transcript_path`: the trusted
+/// Claude Code transcript file of the session, from which the latest Agent
+/// message is read on demand; the message text itself is never stored.
+fn ensure_session_turn_end_columns(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(sessions)")
+        .map_err(storage_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    drop(statement);
+    for (column, definition) in [
+        ("background_tasks", "INTEGER NOT NULL DEFAULT 0"),
+        ("transcript_path", "TEXT"),
+    ] {
+        if !columns.iter().any(|existing| existing == column) {
+            connection
+                .execute(
+                    &format!("ALTER TABLE sessions ADD COLUMN {column} {definition}"),
+                    [],
+                )
+                .map_err(storage_error)?;
+        }
+    }
+    Ok(())
+}
+
 fn ensure_session_task_visibility_columns(connection: &Connection) -> Result<(), StoreError> {
     let mut statement = connection
         .prepare("PRAGMA table_info(sessions)")
@@ -5806,6 +6147,23 @@ fn ingest_transaction(
         (session_id, "idle".to_owned(), None, None, occurred_at)
     };
 
+    // The transcript locator lets the latest Agent message be read again
+    // after a Runtime restart; only the path is stored, never its content.
+    if request.provider == Provider::Claude {
+        if let Some(transcript) =
+            trusted_claude_transcript_path(&request.raw, &parsed.provider_session_id)
+                .and_then(|path| path.to_str().map(ToOwned::to_owned))
+        {
+            transaction
+                .execute(
+                    "UPDATE sessions SET transcript_path = ?2
+                     WHERE id = ?1 AND transcript_path IS NOT ?2",
+                    params![session_id, transcript],
+                )
+                .map_err(storage_error)?;
+        }
+    }
+
     let provider_event_key = stable_provider_event_key(&parsed, &request.raw);
     if let Some(provider_event_key) = provider_event_key.as_deref() {
         let duplicate_attention_id = transaction
@@ -5829,7 +6187,23 @@ fn ingest_transaction(
         }
     }
 
-    let terminal = matches!(current_state.as_str(), "response_finished" | "failed");
+    // A user interruption ends the turn as `idle` rather than `failed`, but a
+    // late tool/status event from that turn must still not reopen it as a new
+    // implicit turn. Treat the interrupted idle state like the other terminal
+    // turn outcomes.
+    let terminal = matches!(current_state.as_str(), "response_finished" | "failed")
+        || (current_state == "idle"
+            && current_activity.as_deref() == Some(TURN_INTERRUPTED_ACTIVITY));
+    // Claude Code adds `agent_id` to a Hook only inside a subagent. A
+    // background subagent keeps working (and calling tools) after the main
+    // turn ended; that is the background work the `Stop` reported, not a new
+    // turn, so it neither reopens the turn nor makes the session run again.
+    let subagent_event = request.provider == Provider::Claude
+        && request
+            .raw
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .is_some_and(|agent_id| !agent_id.is_empty());
     let turn_id = select_or_create_turn(
         &transaction,
         &session_id,
@@ -5837,6 +6211,7 @@ fn ingest_transaction(
         occurred_at,
         parsed.kind,
         terminal,
+        !subagent_event,
     )?;
     if parsed.kind == EventKind::PromptSubmitted {
         reset_turn_scoped_task_state(&transaction, &session_id)?;
@@ -5922,8 +6297,16 @@ fn ingest_transaction(
         .map(|turn_id| turn_contains_meaningful_activity(&transaction, turn_id))
         .transpose()?
         .unwrap_or(false);
-    let completed_without_background =
-        parsed.kind == EventKind::Stopped && !has_background_work(&request.raw);
+    // A turn whose final message asks the user something needs the user even
+    // while background work keeps running. A turn that leaves active
+    // background work behind still ends (the session waits for the user), but
+    // raises no completion: that would announce every such turn as finished.
+    let stop_awaits_reply =
+        parsed.kind == EventKind::Stopped && final_message_awaits_reply(&request.raw);
+    let stop_background_tasks =
+        (parsed.kind == EventKind::Stopped).then(|| active_background_work(&request.raw));
+    let stop_raises_completion = parsed.kind == EventKind::Stopped
+        && (stop_awaits_reply || stop_background_tasks == Some(0));
     let plan_progress = update_plan_progress(
         &transaction,
         &session_id,
@@ -6018,6 +6401,7 @@ fn ingest_transaction(
                         .request_id
                         .map(|id| format!("interactive:{id}"))
                         .unwrap_or_else(|| format!("interactive:{}", request.id)),
+                    awaits_reply: false,
                 },
                 CompletionTaskHidePolicy::AfterConfirmation,
             )?)
@@ -6037,30 +6421,14 @@ fn ingest_transaction(
                     turn_id.as_deref().unwrap_or("none"),
                     request.id
                 ),
+                awaits_reply: false,
             },
             CompletionTaskHidePolicy::AfterConfirmation,
         )?),
-        EventKind::Interrupted => Some(insert_nonapproval_attention(
-            &transaction,
-            &session_id,
-            turn_id.as_deref(),
-            &request,
-            NonApprovalSpec {
-                kind: "error",
-                title: "Agent turn interrupted",
-                detail: request
-                    .raw
-                    .get("error")
-                    .or_else(|| request.raw.get("reason"))
-                    .and_then(Value::as_str),
-                dedupe_key: format!(
-                    "{}:{}:interrupted",
-                    session_id,
-                    turn_id.as_deref().unwrap_or("none")
-                ),
-            },
-            CompletionTaskHidePolicy::AfterConfirmation,
-        )?),
+        // A user interruption is a deliberate end of the turn, not an Agent
+        // error: it records the lifecycle event and idles the session without
+        // raising an error attention. Real failures (StopFailure) still do.
+        EventKind::Interrupted => None,
         EventKind::Notification if is_structured_question(&request.raw) => {
             Some(insert_nonapproval_attention(
                 &transaction,
@@ -6085,12 +6453,13 @@ fn ingest_transaction(
                             .map(ToOwned::to_owned)
                             .unwrap_or_else(|| request.id.to_string())
                     ),
+                    awaits_reply: false,
                 },
                 CompletionTaskHidePolicy::AfterConfirmation,
             )?)
         }
         EventKind::Stopped
-            if completed_without_background
+            if stop_raises_completion
                 && turn_has_meaningful_activity
                 && !native_permission_open =>
         {
@@ -6108,6 +6477,7 @@ fn ingest_transaction(
                         session_id,
                         turn_id.as_deref().unwrap_or("none")
                     ),
+                    awaits_reply: stop_awaits_reply,
                 },
                 completion_hide_policy,
             )?)
@@ -6174,11 +6544,18 @@ fn ingest_transaction(
         && (!terminal
             || matches!(
                 parsed.kind,
-                EventKind::PromptSubmitted
-                    | EventKind::SessionStarted
-                    | EventKind::SessionEnded
-                    | EventKind::ToolStarted
-            ));
+                EventKind::PromptSubmitted | EventKind::SessionStarted | EventKind::SessionEnded
+            )
+            || (parsed.kind == EventKind::ToolStarted && !subagent_event));
+    // Claude Code's `idle_prompt` Notification comes only from its terminal
+    // interface, a minute after a turn ended with no input since. A session
+    // still shown as working (its `Stop` was lost) has ended its turn, unless
+    // a request still waits for the user.
+    let idle_turn_end = request.provider == Provider::Claude
+        && parsed.kind == EventKind::Notification
+        && request.raw.get("notification_type").and_then(Value::as_str) == Some("idle_prompt")
+        && execution_state_is_active(&current_state)
+        && !blocking_attention_open(&transaction, &session_id)?;
     // A structured plan update can legitimately arrive after the Provider has
     // already emitted a terminal lifecycle signal for the previous activity.
     // Keep the terminal execution state, but do not leave the session summary
@@ -6228,6 +6605,8 @@ fn ingest_transaction(
         } else if request.provider_handles_approval && parsed.kind == EventKind::PermissionRequested
         {
             provider_handled_permission_state(parsed.permission_mode.as_deref(), &request.raw)
+        } else if idle_turn_end {
+            ("response_finished", None, "Turn completed".to_owned())
         } else {
             let (state, owner, activity) = project_event(parsed.kind, &request.raw, &current_state);
             if native_permission_resolved
@@ -6306,7 +6685,12 @@ fn ingest_transaction(
                      THEN review_workdir
                      ELSE COALESCE(?24, review_workdir)
                    END,
-                   ended_at = CASE WHEN ?6 = 1 THEN ?5 ELSE ended_at END
+                   ended_at = CASE WHEN ?6 = 1 THEN ?5 ELSE ended_at END,
+                   background_tasks = CASE
+                     WHEN ?29 IS NOT NULL THEN ?29
+                     WHEN ?2 = 'response_finished' THEN background_tasks
+                     ELSE 0
+                   END
                  WHERE id = ?1",
                 params![
                     session_id,
@@ -6355,6 +6739,12 @@ fn ingest_transaction(
                         term.app.is_some() || term.bundle_id.is_some() || term.surface.is_some()
                     })),
                     i64::from(request.term.as_ref().is_some_and(|term| term.surface.as_deref() == Some("connector"))),
+                    // A Stop always records what it left running (0 for
+                    // none); a later event keeps that count only while the
+                    // turn stays ended.
+                    stop_background_tasks
+                        .filter(|_| next_state == "response_finished")
+                        .map(|count| i64::try_from(count).unwrap_or(i64::MAX)),
                 ],
             )
             .map_err(storage_error)?;
@@ -6368,10 +6758,11 @@ fn ingest_transaction(
         )?;
     }
 
-    if matches!(
+    if (matches!(
         parsed.kind,
         EventKind::Stopped | EventKind::Interrupted | EventKind::Failed | EventKind::SessionEnded
-    ) && !(parsed.kind == EventKind::Stopped && preserves_native_request)
+    ) && !(parsed.kind == EventKind::Stopped && preserves_native_request))
+        || (idle_turn_end && may_update)
     {
         if let Some(turn_id) = turn_id.as_deref() {
             transaction
@@ -6380,7 +6771,8 @@ fn ingest_transaction(
                     params![
                         turn_id,
                         match parsed.kind {
-                            EventKind::Interrupted | EventKind::Failed => "failed",
+                            EventKind::Interrupted => "interrupted",
+                            EventKind::Failed => "failed",
                             EventKind::SessionEnded => "idle",
                             _ => "response_finished",
                         },
@@ -6389,6 +6781,38 @@ fn ingest_transaction(
                 )
                 .map_err(storage_error)?;
         }
+    }
+    // `SessionEnd` carries no turn of its own, so the turn that is still open
+    // when the session ends never reached its `Stop`: Claude Code reports no
+    // Hook when the user presses Esc and then exits. When the session was
+    // still working on a turn that holds real work (the user's prompt or a
+    // tool the Agent started), that turn ends as `interrupted`, so history
+    // reports it like a user interruption instead of a completion without an
+    // end time. Any other open turn was only opened implicitly by a
+    // non-prompt event after the previous turn ended (an idle notification
+    // while background work runs, a background subagent finishing, a
+    // compaction after a resume) and simply ends as `idle`; it never turns a
+    // completed task into an interrupted one.
+    if parsed.kind == EventKind::SessionEnded && may_update {
+        let working = !matches!(
+            current_state.as_str(),
+            "idle" | "response_finished" | "failed"
+        );
+        transaction
+            .execute(
+                "UPDATE turns SET state = CASE
+                   WHEN ?2 = 1 AND EXISTS (
+                     SELECT 1 FROM events AS turn_work
+                     WHERE turn_work.turn_id = turns.id
+                       AND turn_work.type IN ('prompt.submitted', 'tool.started')
+                   ) THEN 'interrupted'
+                   ELSE 'idle'
+                 END,
+                 ended_at = ?3
+                 WHERE session_id = ?1 AND ended_at IS NULL",
+                params![session_id, i64::from(working), occurred_at],
+            )
+            .map_err(storage_error)?;
     }
 
     increment_ingest_metrics(
@@ -6854,6 +7278,20 @@ fn act_attention_transaction(
     {
         return CommandState::parse(&state);
     }
+    apply_attention_action(&transaction, command_id, attention_id, action, now)?;
+    transaction.commit().map_err(storage_error)?;
+    Ok(CommandState::Confirmed)
+}
+
+/// Applies an acknowledge / snooze / dismiss command to a non-approval
+/// Attention item inside `transaction` and records the command.
+fn apply_attention_action(
+    transaction: &Transaction<'_>,
+    command_id: Uuid,
+    attention_id: &str,
+    action: AttentionAction,
+    now: u64,
+) -> Result<(), StoreError> {
     let (kind, state, session_id, auto_hide_at, reminder_acknowledged_at, retain_after_ack) =
         transaction
             .query_row(
@@ -6970,14 +7408,13 @@ fn act_attention_transaction(
         .map_err(storage_error)?;
     if matches!(action, AttentionAction::Ack | AttentionAction::Dismiss) && !reminder_only_ack {
         release_session_if_unblocked(
-            &transaction,
+            transaction,
             &session_id,
             "Attention item resolved; waiting for the Agent's next event",
             now,
         )?;
     }
-    transaction.commit().map_err(storage_error)?;
-    Ok(CommandState::Confirmed)
+    Ok(())
 }
 
 fn reconcile_transaction(
@@ -7204,14 +7641,26 @@ fn release_session_if_unblocked(
     Ok(())
 }
 
+struct CodexTurnEnd<'a> {
+    thread_id: &'a str,
+    turn_id: &'a str,
+    event: &'a str,
+    at: u64,
+    awaits_reply: bool,
+}
+
 fn observe_codex_turn_end_transaction(
     connection: &mut Connection,
-    thread_id: &str,
-    turn_id: &str,
-    event: &str,
-    at: u64,
+    end: CodexTurnEnd<'_>,
     hide_policy: CompletionTaskHidePolicy,
 ) -> Result<bool, StoreError> {
+    let CodexTurnEnd {
+        thread_id,
+        turn_id,
+        event,
+        at,
+        awaits_reply,
+    } = end;
     if !matches!(event, "Stop" | "StopFailure" | "TurnInterrupted") {
         return Ok(false);
     }
@@ -7237,7 +7686,8 @@ fn observe_codex_turn_end_transaction(
     let mut request = BridgeRequest::from_hook_at(
         Provider::Codex,
         json!({
-            "hook_event_name": event, "session_id": thread_id, "turn_id": turn_id
+            "hook_event_name": event, "session_id": thread_id, "turn_id": turn_id,
+            CODEX_FINAL_ANSWER_AWAITS_REPLY: awaits_reply
         }),
         at,
     );
@@ -7879,7 +8329,8 @@ fn read_local_review_context(
                     sessions.exec_state, turns.id, turns.started_at, turns.ended_at,
                     sessions.last_event_at,
                     sessions.term_app, sessions.term_session_id, sessions.term_tty,
-                    sessions.term_bundle_id, sessions.term_surface
+                    sessions.term_bundle_id, sessions.term_surface,
+                    sessions.transcript_path, sessions.cwd
              FROM sessions
              LEFT JOIN turns ON turns.id = (
                SELECT current_turn.id FROM turns AS current_turn
@@ -7904,6 +8355,10 @@ fn read_local_review_context(
                     row.get::<_, Option<String>>(11)?,
                     row.get::<_, Option<String>>(12)?,
                     row.get::<_, Option<String>>(13)?,
+                    (
+                        row.get::<_, Option<String>>(14)?,
+                        row.get::<_, Option<String>>(15)?,
+                    ),
                 ))
             },
         )
@@ -7924,10 +8379,20 @@ fn read_local_review_context(
         term_tty,
         term_bundle_id,
         term_surface,
+        (reported_transcript, cwd),
     )) = record
     else {
         return Ok(None);
     };
+    let transcript_path = (provider == "claude")
+        .then(|| {
+            claude_session_transcript(
+                reported_transcript.as_deref(),
+                cwd.as_deref(),
+                &provider_session_id,
+            )
+        })
+        .flatten();
     let working_directory = working_directory
         .filter(|value| !value.trim().is_empty() && value != "/")
         .map(PathBuf::from);
@@ -7988,6 +8453,7 @@ fn read_local_review_context(
         turn_ended_at,
         last_event_at,
         concurrent_active_sessions,
+        transcript_path,
     }))
 }
 
@@ -9292,7 +9758,20 @@ fn read_snapshot(
                         usage.estimated_cost_usd_micros, usage.cost_kind,
                         usage.pricing_source, usage.usage_source,
                         usage.usage_quality, usage.captured_at,
-                        sessions.last_meaningful_activity_at
+                        sessions.last_meaningful_activity_at,
+                        (SELECT COUNT(*) FROM turns AS user_turns
+                         WHERE user_turns.session_id = sessions.id
+                           AND EXISTS (
+                             SELECT 1 FROM events AS prompt_events
+                             WHERE prompt_events.turn_id = user_turns.id
+                               AND prompt_events.type = 'prompt.submitted'
+                           )),
+                        EXISTS (
+                          SELECT 1 FROM ignored_provider_sessions AS ignored
+                          WHERE ignored.provider = sessions.provider
+                            AND ignored.provider_session_id = sessions.provider_session_id
+                        ),
+                        sessions.background_tasks, sessions.transcript_path, sessions.cwd
                  FROM sessions
                  LEFT JOIN session_usage AS usage
                    ON usage.provider = sessions.provider
@@ -9306,6 +9785,16 @@ fn read_snapshot(
                             sessions.exec_state IN ('idle', 'response_finished', 'failed')
                             AND sessions.last_meaningful_activity_at IS NOT NULL
                             AND COALESCE(sessions.activity_since, sessions.last_event_at) >= ?1
+                        )
+                        -- A turn that ended while its background work kept
+                        -- running raised no completion to keep it listed: the
+                        -- session waits for the user for a further day.
+                        OR (
+                            sessions.exec_state = 'response_finished'
+                            AND sessions.background_tasks > 0
+                            AND sessions.last_meaningful_activity_at IS NOT NULL
+                            AND COALESCE(sessions.activity_since, sessions.last_event_at)
+                                >= MAX(?1 - 86400000, 0)
                         )
                         OR EXISTS (
                             SELECT 1 FROM attention_items
@@ -9330,6 +9819,28 @@ fn read_snapshot(
                     .get::<_, Option<i64>>(23)?
                     .and_then(|value| u32::try_from(value).ok());
                 let exec_state = row.get::<_, String>(8)?;
+                let provider_title = row.get::<_, Option<String>>(5)?;
+                let user_turn_count = row
+                    .get::<_, i64>(46)
+                    .ok()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or_default();
+                let ignored = row.get::<_, bool>(47)?;
+                let role = task_role(provider_title.as_deref(), user_turn_count, ignored);
+                let background_tasks = row
+                    .get::<_, Option<i64>>(48)?
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or_default();
+                let transcript_path = (provider == "claude")
+                    .then(|| -> rusqlite::Result<Option<PathBuf>> {
+                        Ok(claude_session_transcript(
+                            row.get::<_, Option<String>>(49)?.as_deref(),
+                            row.get::<_, Option<String>>(50)?.as_deref(),
+                            &provider_session_id,
+                        ))
+                    })
+                    .transpose()?
+                    .flatten();
                 let current_tool = if exec_state == "tool_running" {
                     row.get(26)?
                 } else {
@@ -9366,7 +9877,7 @@ fn read_snapshot(
                     provider_session_id,
                     project: row.get(3)?,
                     title: row.get(4)?,
-                    provider_title: row.get(5)?,
+                    provider_title,
                     provider_title_source: row.get(6)?,
                     model: row.get(7)?,
                     exec_state,
@@ -9422,6 +9933,10 @@ fn read_snapshot(
                     provider_pid,
                     last_event_at: from_i64(row.get(24)?),
                     last_meaningful_activity_at: row.get::<_, Option<i64>>(45)?.map(from_i64),
+                    user_turn_count,
+                    task_role: role.to_owned(),
+                    background_tasks,
+                    transcript_path,
                 })
             })
             .map_err(storage_error)?
@@ -9439,7 +9954,7 @@ fn read_snapshot(
                         risk_codes, command_preview, expires_at, auto_hide_at,
                         reminder_acknowledged_at, reminder_resolution,
                         retain_after_ack, created_at, resolution,
-                        remote_actionable
+                        remote_actionable, awaits_reply
                  FROM attention_items
                  WHERE ?1 IS NULL
                     OR state IN ('open', 'committing', 'decision_sent', 'snoozed')
@@ -9501,6 +10016,7 @@ fn read_snapshot(
                         && state == "open"
                         && request_id.is_some()
                         && expires_at.is_some(),
+                    awaits_reply: row.get(22)?,
                 })
             })
             .map_err(storage_error)?
@@ -9583,9 +10099,7 @@ fn read_task_history(
                       THEN usage.model END,
                       sessions.model, usage.model), sessions.exec_state,
                     sessions.started_at, sessions.last_event_at,
-                    (SELECT ended_at FROM turns
-                     WHERE turns.session_id = sessions.id
-                     ORDER BY ordinal DESC LIMIT 1),
+                    outcome_turn.ended_at,
                     sessions.task_hidden_at, sessions.task_hidden_reason,
                     COALESCE(
                       (SELECT branch FROM task_review_baselines
@@ -9608,11 +10122,27 @@ fn read_task_history(
                          'tool.failed', 'turn.failed'
                        )),
                     sessions.term_app, sessions.term_session_id, sessions.term_tty,
-                    sessions.term_bundle_id, sessions.term_surface
+                    sessions.term_bundle_id, sessions.term_surface, sessions.activity,
+                    outcome_turn.state
              FROM sessions
              LEFT JOIN session_usage AS usage
                ON usage.provider = sessions.provider
               AND usage.provider_session_id = sessions.provider_session_id
+             LEFT JOIN turns AS outcome_turn ON outcome_turn.id = (
+               SELECT turns.id FROM turns WHERE turns.session_id = sessions.id
+               ORDER BY CASE
+                 WHEN EXISTS (
+                   SELECT 1 FROM events AS turn_outcome
+                   WHERE turn_outcome.turn_id = turns.id
+                     AND turn_outcome.type IN (
+                       'prompt.submitted', 'turn.stopped', 'turn.failed', 'turn.interrupted'
+                     )
+                 ) THEN 2
+                 WHEN turns.state = 'interrupted' THEN 1
+                 ELSE 0
+               END DESC, turns.ordinal DESC
+               LIMIT 1
+             )
              WHERE sessions.last_meaningful_activity_at IS NOT NULL
                AND (
                  sessions.task_hidden_at IS NOT NULL
@@ -9644,6 +10174,8 @@ fn read_task_history(
                 let term_tty = row.get::<_, Option<String>>(18)?;
                 let term_bundle_id = row.get::<_, Option<String>>(19)?;
                 let term_surface = row.get::<_, Option<String>>(20)?;
+                let activity = row.get::<_, Option<String>>(21)?;
+                let outcome_turn_state = row.get::<_, Option<String>>(22)?;
                 let (jump_capability, jump_label) = jump_descriptor(
                     &provider,
                     &provider_session_id,
@@ -9659,11 +10191,12 @@ fn read_task_history(
                     project: row.get(3)?,
                     title: row.get(4)?,
                     model: row.get(5)?,
-                    status: if exec_state == "failed" {
-                        "failed".to_owned()
-                    } else {
-                        "completed".to_owned()
-                    },
+                    status: task_history_status(
+                        &exec_state,
+                        activity.as_deref(),
+                        outcome_turn_state.as_deref(),
+                    )
+                    .to_owned(),
                     started_at: from_i64(row.get(7)?),
                     last_event_at: from_i64(row.get(8)?),
                     completed_at: row.get::<_, Option<i64>>(9)?.map(from_i64),
@@ -9690,6 +10223,308 @@ fn read_task_history(
         .collect::<Result<Vec<_>, _>>()
         .map_err(storage_error)?;
     Ok(rows)
+}
+
+/// The History center (`/api/v1/history`) status. It only knows `completed`
+/// and `failed`, and follows the Companion status ([`recent_task_status`],
+/// which also reads the outcome turn): a user interruption used to leave the
+/// session `failed`; it now idles the session, so the History center keeps
+/// reporting such a task as `failed`, exactly as before, also after a later
+/// `SessionEnd` or `SessionStart` rewrote the session activity. Companion
+/// history reports it as `interrupted` instead.
+fn task_history_status(
+    exec_state: &str,
+    activity: Option<&str>,
+    outcome_turn_state: Option<&str>,
+) -> &'static str {
+    match recent_task_status(exec_state, activity, outcome_turn_state) {
+        "failed" | "interrupted" => "failed",
+        _ => "completed",
+    }
+}
+
+/// Companion-facing status vocabulary. It extends the History center's
+/// `completed` / `failed` with the states a still-active or user-interrupted
+/// task can be in. Once the session is idle, the outcome comes from the
+/// outcome turn: the latest turn the user started with a prompt or the
+/// provider ended itself (`Stop`, `StopFailure`, `TurnInterrupted`), so a
+/// turn a background task woke up that then failed, stopped or was
+/// interrupted counts, prompt or not. Turns that a non-prompt event opened
+/// implicitly and that only the session's end closed (an idle notification
+/// after a resume, a background subagent finishing, a compaction) never
+/// replace that outcome, so a session that ended or resumed after a failed or
+/// interrupted turn keeps that turn's outcome, and a completed turn keeps its
+/// own completion time. Only a session with no such turn at all (Hooks
+/// installed mid-turn) falls back to its latest turn that the session's end
+/// interrupted, then to its latest turn of any kind.
+fn recent_task_status(
+    exec_state: &str,
+    activity: Option<&str>,
+    outcome_turn_state: Option<&str>,
+) -> &'static str {
+    match exec_state {
+        "response_finished" => "completed",
+        // Rows written before interruptions stopped counting as failures.
+        "failed" if activity == Some(TURN_INTERRUPTED_ACTIVITY) => "interrupted",
+        "failed" => "failed",
+        "idle"
+            if outcome_turn_state == Some("interrupted")
+                || activity == Some(TURN_INTERRUPTED_ACTIVITY) =>
+        {
+            "interrupted"
+        }
+        "idle" if outcome_turn_state == Some("failed") => "failed",
+        "idle" => "completed",
+        "awaiting_approval" => "waiting",
+        _ => "running",
+    }
+}
+
+/// Resolution of a `completion` / `error` Attention closed by the user's next
+/// prompt in the same session.
+const SUPERSEDED_BY_PROMPT: &str = "superseded_by_prompt";
+
+/// Resolutions of a `completion` / `error` Attention that come from the user
+/// or from the user's next instruction, and therefore mean the result was
+/// seen:
+///
+/// - `ack` / `ack_hidden`: the user acknowledged an error / completion;
+/// - `user_dismissed`: the user dismissed it;
+/// - `history_archived`: the user archived the task in the History center;
+/// - `superseded_by_prompt`: the user's next prompt replaced the reminder.
+///
+/// Every other closure did not involve the user and leaves the result unseen:
+/// `superseded_by_activity` (tool start, compaction, subagent, a Codex turn
+/// continuing on its own, session start; rows written before
+/// `superseded_by_prompt` existed cannot tell a prompt apart and also land
+/// here), `auto_hidden` by the completion hide timer, and any expired or
+/// Provider-side closure.
+const SEEN_ATTENTION_RESOLUTIONS: [&str; 5] = [
+    "ack",
+    "ack_hidden",
+    "user_dismissed",
+    "history_archived",
+    SUPERSEDED_BY_PROMPT,
+];
+
+/// `seen` only after a user action or a new instruction: the latest
+/// completion/error reminder was acknowledged (`reminder_acknowledged_at`),
+/// closed with one of [`SEEN_ATTENTION_RESOLUTIONS`], or the user submitted a
+/// prompt in the session after it was raised (`prompted_after`, which also
+/// covers a reminder that other activity had already closed). `unseen` while
+/// it is still open, snoozed, or was closed without the user. `none` when the
+/// session never raised one.
+fn recent_task_review_state(
+    attention_kind: Option<&str>,
+    attention_state: Option<&str>,
+    attention_resolution: Option<&str>,
+    acknowledged: bool,
+    prompted_after: bool,
+) -> &'static str {
+    if attention_kind.is_none() {
+        return "none";
+    }
+    let closed = !matches!(attention_state, Some("open" | "snoozed"));
+    let closed_by_user = closed
+        && attention_resolution
+            .is_some_and(|resolution| SEEN_ATTENTION_RESOLUTIONS.contains(&resolution));
+    if acknowledged || closed_by_user || prompted_after {
+        "seen"
+    } else {
+        "unseen"
+    }
+}
+
+fn read_recent_tasks(
+    connection: &Connection,
+    since: u64,
+    limit: usize,
+    include_side: bool,
+) -> Result<Vec<RecentTaskRecord>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT * FROM (
+               SELECT sessions.id AS id, sessions.provider AS provider,
+                      sessions.provider_session_id AS provider_session_id,
+                      sessions.project AS project,
+                      NULLIF(TRIM(sessions.provider_title), '') AS title,
+                      sessions.provider_title AS provider_title,
+                      sessions.exec_state AS exec_state,
+                      sessions.activity AS activity,
+                      outcome_turn.state AS turn_state,
+                      sessions.started_at AS started_at,
+                      sessions.last_event_at AS last_event_at,
+                      outcome_turn.ended_at AS completed_at,
+                      COALESCE(
+                        (SELECT branch FROM task_review_baselines
+                         WHERE task_review_baselines.session_id = sessions.id
+                         ORDER BY captured_at DESC LIMIT 1),
+                        (SELECT branch FROM task_checkpoints
+                         WHERE task_checkpoints.session_id = sessions.id
+                         ORDER BY created_at DESC LIMIT 1)
+                      ) AS branch,
+                      (SELECT validation_status FROM events
+                       WHERE events.session_id = sessions.id
+                         AND validation_status IS NOT NULL
+                       ORDER BY ingest_seq DESC LIMIT 1) AS validation_state,
+                      (SELECT COUNT(*) FROM turns AS user_turns
+                       WHERE user_turns.session_id = sessions.id
+                         AND EXISTS (
+                           SELECT 1 FROM events AS prompt_events
+                           WHERE prompt_events.turn_id = user_turns.id
+                             AND prompt_events.type = 'prompt.submitted'
+                         )) AS user_turn_count,
+                      EXISTS (
+                        SELECT 1 FROM ignored_provider_sessions AS ignored
+                        WHERE ignored.provider = sessions.provider
+                          AND ignored.provider_session_id = sessions.provider_session_id
+                      ) AS ignored,
+                      latest_attention.kind AS attention_kind,
+                      latest_attention.state AS attention_state,
+                      latest_attention.reminder_acknowledged_at AS attention_acknowledged_at,
+                      sessions.term_app AS term_app,
+                      sessions.term_session_id AS term_session_id,
+                      sessions.term_tty AS term_tty,
+                      sessions.term_bundle_id AS term_bundle_id,
+                      sessions.term_surface AS term_surface,
+                      latest_attention.resolution AS attention_resolution,
+                      EXISTS (
+                        SELECT 1 FROM events AS later_prompt
+                        WHERE later_prompt.session_id = sessions.id
+                          AND later_prompt.type = 'prompt.submitted'
+                          AND later_prompt.occurred_at > latest_attention.created_at
+                      ) AS prompted_after_attention,
+                      sessions.transcript_path AS transcript_path,
+                      sessions.cwd AS cwd,
+                      outcome_turn.started_at AS turn_started_at
+               FROM sessions
+               LEFT JOIN turns AS outcome_turn ON outcome_turn.id = (
+                 SELECT turns.id FROM turns WHERE turns.session_id = sessions.id
+                 ORDER BY CASE
+                   WHEN EXISTS (
+                     SELECT 1 FROM events AS turn_outcome
+                     WHERE turn_outcome.turn_id = turns.id
+                       AND turn_outcome.type IN (
+                         'prompt.submitted', 'turn.stopped', 'turn.failed', 'turn.interrupted'
+                       )
+                   ) THEN 2
+                   WHEN turns.state = 'interrupted' THEN 1
+                   ELSE 0
+                 END DESC, turns.ordinal DESC
+                 LIMIT 1
+               )
+               LEFT JOIN attention_items AS latest_attention ON latest_attention.id = (
+                 SELECT candidate.id FROM attention_items AS candidate
+                 WHERE candidate.session_id = sessions.id
+                   AND candidate.kind IN ('completion', 'error')
+                 ORDER BY candidate.created_at DESC, candidate.rowid DESC LIMIT 1
+               )
+               WHERE sessions.last_event_at >= ?1
+             ) AS recent
+             WHERE ?3 = 1
+                OR (
+                  recent.ignored = 0
+                  AND recent.user_turn_count >= 1
+                  AND LENGTH(TRIM(COALESCE(recent.provider_title, ''))) > 0
+                )
+             ORDER BY recent.last_event_at DESC, recent.id DESC
+             LIMIT ?2",
+        )
+        .map_err(storage_error)?;
+    let rows = statement
+        .query_map(
+            params![
+                to_i64(since),
+                i64::try_from(limit).unwrap_or(500),
+                i64::from(include_side)
+            ],
+            |row| {
+                let provider = row.get::<_, String>(1)?;
+                let provider_session_id = row.get::<_, String>(2)?;
+                let provider_title = row.get::<_, Option<String>>(5)?;
+                let exec_state = row.get::<_, String>(6)?;
+                let activity = row.get::<_, Option<String>>(7)?;
+                let turn_state = row.get::<_, Option<String>>(8)?;
+                let user_turn_count = row
+                    .get::<_, i64>(14)
+                    .ok()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or_default();
+                let ignored = row.get::<_, bool>(15)?;
+                let attention_kind = row.get::<_, Option<String>>(16)?;
+                let attention_state = row.get::<_, Option<String>>(17)?;
+                let attention_acknowledged = row.get::<_, Option<i64>>(18)?.is_some();
+                let term_app = row.get::<_, Option<String>>(19)?;
+                let term_session_id = row.get::<_, Option<String>>(20)?;
+                let term_tty = row.get::<_, Option<String>>(21)?;
+                let term_bundle_id = row.get::<_, Option<String>>(22)?;
+                let term_surface = row.get::<_, Option<String>>(23)?;
+                let attention_resolution = row.get::<_, Option<String>>(24)?;
+                let prompted_after_attention = row.get::<_, bool>(25)?;
+                let transcript_path = (provider == "claude")
+                    .then(|| {
+                        claude_session_transcript(
+                            row.get::<_, Option<String>>(26).ok().flatten().as_deref(),
+                            row.get::<_, Option<String>>(27).ok().flatten().as_deref(),
+                            &provider_session_id,
+                        )
+                    })
+                    .flatten();
+                let turn_started_at = row.get::<_, Option<i64>>(28)?.map(from_i64);
+                let (jump_capability, jump_label) = jump_descriptor(
+                    &provider,
+                    &provider_session_id,
+                    term_app.as_deref(),
+                    term_session_id.as_deref(),
+                    term_tty.as_deref(),
+                    term_bundle_id.as_deref(),
+                    term_surface.as_deref(),
+                );
+                Ok(RecentTaskRecord {
+                    term_app,
+                    term_bundle_id,
+                    term_surface,
+                    transcript_path,
+                    turn_started_at,
+                    id: row.get(0)?,
+                    provider,
+                    project: row.get(3)?,
+                    title: row.get(4)?,
+                    task_role: task_role(provider_title.as_deref(), user_turn_count, ignored)
+                        .to_owned(),
+                    user_turn_count,
+                    status: recent_task_status(
+                        &exec_state,
+                        activity.as_deref(),
+                        turn_state.as_deref(),
+                    )
+                    .to_owned(),
+                    started_at: from_i64(row.get(9)?),
+                    last_event_at: from_i64(row.get(10)?),
+                    completed_at: row.get::<_, Option<i64>>(11)?.map(from_i64),
+                    branch: row.get(12)?,
+                    validation_state: row.get(13)?,
+                    review_state: recent_task_review_state(
+                        attention_kind.as_deref(),
+                        attention_state.as_deref(),
+                        attention_resolution.as_deref(),
+                        attention_acknowledged,
+                        prompted_after_attention,
+                    )
+                    .to_owned(),
+                    latest_attention_kind: attention_kind,
+                    jump_capability,
+                    jump_label,
+                })
+            },
+        )
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    Ok(rows
+        .into_iter()
+        .filter(|task| include_side || task.task_role == TASK_ROLE_MAIN)
+        .collect())
 }
 
 fn task_history_mutation_state(
@@ -9754,6 +10589,63 @@ fn archive_task_transaction(
         .map_err(storage_error)?;
     transaction.commit().map_err(storage_error)?;
     Ok(TaskHistoryMutation::Applied)
+}
+
+fn mark_session_seen_transaction(
+    connection: &mut Connection,
+    session_id: &str,
+    now: u64,
+) -> Result<SessionSeen, StoreError> {
+    let transaction = connection.transaction().map_err(storage_error)?;
+    let found = transaction
+        .query_row("SELECT 1 FROM sessions WHERE id = ?1", [session_id], |_| {
+            Ok(())
+        })
+        .optional()
+        .map_err(storage_error)?
+        .is_some();
+    if !found {
+        return Ok(SessionSeen::NotFound);
+    }
+    // The same reminder Companion history reads its review state from.
+    let Some((attention_id, state)) = transaction
+        .query_row(
+            "SELECT id, state FROM attention_items
+             WHERE session_id = ?1 AND kind IN ('completion', 'error')
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            [session_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(storage_error)?
+    else {
+        return Ok(SessionSeen::NoReminder);
+    };
+    if matches!(state.as_str(), "open" | "snoozed") {
+        match apply_attention_action(
+            &transaction,
+            Uuid::now_v7(),
+            &attention_id,
+            AttentionAction::Ack,
+            now,
+        ) {
+            // A delayed or manual completion whose reminder was already
+            // acknowledged stays as it is.
+            Ok(()) | Err(StoreError::StaleApproval) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    transaction
+        .execute(
+            "UPDATE attention_items
+             SET reminder_acknowledged_at = ?2,
+                 reminder_resolution = COALESCE(reminder_resolution, 'reminder_acknowledged')
+             WHERE id = ?1 AND reminder_acknowledged_at IS NULL",
+            params![attention_id, to_i64(now)],
+        )
+        .map_err(storage_error)?;
+    transaction.commit().map_err(storage_error)?;
+    Ok(SessionSeen::Seen)
 }
 
 fn delete_task_history_transaction(
@@ -9844,6 +10736,11 @@ fn filter_ui_snapshot_for_cutoff(snapshot: &mut StoreSnapshot, cutoff: u64) {
             "idle" | "response_finished" | "failed"
         ) || (session.last_meaningful_activity_at.is_some()
             && session.activity_since.unwrap_or(session.last_event_at) >= cutoff)
+            || (session.exec_state == "response_finished"
+                && session.background_tasks > 0
+                && session.last_meaningful_activity_at.is_some()
+                && session.activity_since.unwrap_or(session.last_event_at)
+                    >= cutoff.saturating_sub(BACKGROUND_WAIT_LISTED_MS))
             || actionable_sessions.contains(session.id.as_str())
     });
 
@@ -10766,6 +11663,7 @@ fn select_or_create_turn(
     occurred_at: i64,
     kind: EventKind,
     terminal_session: bool,
+    tool_start_reopens_turn: bool,
 ) -> Result<Option<String>, StoreError> {
     if matches!(kind, EventKind::SessionStarted | EventKind::SessionEnded) {
         return Ok(None);
@@ -10798,7 +11696,7 @@ fn select_or_create_turn(
             // concrete tool start is authoritative evidence that the turn is
             // active again; reopen that turn instead of leaving Runtime in a
             // contradictory completed state while workflow events advance.
-            if kind == EventKind::ToolStarted {
+            if kind == EventKind::ToolStarted && tool_start_reopens_turn {
                 if let Some(turn_id) = latest.as_deref() {
                     transaction
                         .execute(
@@ -11111,6 +12009,7 @@ struct NonApprovalSpec<'a> {
     title: &'a str,
     detail: Option<&'a str>,
     dedupe_key: String,
+    awaits_reply: bool,
 }
 
 fn insert_nonapproval_attention(
@@ -11148,10 +12047,11 @@ fn insert_nonapproval_attention(
             "INSERT INTO attention_items (
                id, session_id, provider, project, turn_id, request_id, kind,
                title, detail, command_preview, risk, risk_notes, dedupe_key,
-               state, expires_at, auto_hide_at, retain_after_ack, created_at
+               state, expires_at, auto_hide_at, retain_after_ack, created_at,
+               awaits_reply
              ) VALUES (
                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, 'unknown',
-               '[]', ?10, 'open', ?11, ?12, ?13, ?14
+               '[]', ?10, 'open', ?11, ?12, ?13, ?14, ?15
              )",
             params![
                 id,
@@ -11169,11 +12069,32 @@ fn insert_nonapproval_attention(
                 request.deadline_at.map(to_i64),
                 auto_hide_at.map(to_i64),
                 retain_after_ack,
-                to_i64(request.received_at)
+                to_i64(request.received_at),
+                spec.awaits_reply
             ],
         )
         .map_err(storage_error)?;
     Ok(id)
+}
+
+/// An approval, native approval, question or elicitation of the session
+/// still waits for the user.
+fn blocking_attention_open(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+) -> Result<bool, StoreError> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM attention_items
+               WHERE session_id = ?1
+                 AND kind IN ('approval', 'native_approval', 'question', 'elicitation')
+                 AND state IN ('open', 'committing', 'decision_sent', 'snoozed')
+             )",
+            [session_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(storage_error)
 }
 
 fn is_structured_question(raw: &Value) -> bool {
@@ -11296,15 +12217,29 @@ fn reconcile_superseded_nonblocking_attention(
     ) {
         return Ok(());
     }
+    // A user prompt (`UserPromptSubmit`, `BeforeAgent`, or a Connector
+    // `turn/started`, all stored as `prompt.submitted`) is the user's next
+    // instruction. Any other activity (tool start, compaction, subagents, a
+    // Codex turn continuing on its own, session start) supersedes the
+    // reminder without implying that the user saw it. Both close the item as
+    // `resolved`; only the resolution differs. A reminder the user had
+    // already acknowledged (a delayed or manual completion keeps it open
+    // after the acknowledgement) keeps that evidence: it closes as
+    // `ack_hidden` and keeps its acknowledgement time, so it stays seen.
+    let resolution = if kind == EventKind::PromptSubmitted {
+        SUPERSEDED_BY_PROMPT
+    } else {
+        "superseded_by_activity"
+    };
     transaction
         .execute(
             "UPDATE attention_items SET state = 'resolved', resolved_at = ?2,
-               resolution = 'superseded_by_activity', expires_at = NULL,
-               auto_hide_at = NULL, reminder_acknowledged_at = NULL,
-               reminder_resolution = NULL
+               resolution = CASE WHEN reminder_acknowledged_at IS NOT NULL
+                                 THEN 'ack_hidden' ELSE ?3 END,
+               expires_at = NULL, auto_hide_at = NULL
              WHERE session_id = ?1 AND kind IN ('completion', 'error')
                AND state IN ('open', 'snoozed') AND created_at < ?2",
-            params![session_id, occurred_at],
+            params![session_id, occurred_at, resolution],
         )
         .map_err(storage_error)?;
     Ok(())
@@ -11833,7 +12768,7 @@ fn update_subagent_activity(
     if matches!(
         kind,
         EventKind::Stopped | EventKind::Interrupted | EventKind::Failed | EventKind::SessionEnded
-    ) && !has_background_work(raw)
+    ) && active_background_work(raw) == 0
     {
         transaction
             .execute(
@@ -11933,12 +12868,83 @@ fn update_subagent_activity(
     Ok(Some(u32::try_from(active).unwrap_or(u32::MAX)))
 }
 
-fn has_background_work(raw: &Value) -> bool {
-    ["background_tasks", "session_crons"].iter().any(|field| {
-        raw.get(*field)
-            .and_then(Value::as_array)
-            .is_some_and(|items| !items.is_empty())
-    })
+/// Background work that a `Stop` leaves running. Claude Code lists its
+/// background tasks and session cron jobs with the Stop Hook; an item counts
+/// only while its `status` is running, pending, queued, in progress or
+/// started (any case, `-` or a space for `_`). An item without a string
+/// `status` (cron jobs have none) keeps counting as before; a finished one
+/// (completed, failed, killed, stopped, cancelled, done, or any other status)
+/// does not, and neither does ambient work ([`background_item_is_ambient`]).
+fn active_background_work(raw: &Value) -> usize {
+    ["background_tasks", "session_crons"]
+        .iter()
+        .filter_map(|field| raw.get(*field).and_then(Value::as_array))
+        .flatten()
+        .filter(|item| background_item_is_active(item))
+        .count()
+}
+
+fn background_item_is_active(item: &Value) -> bool {
+    if background_item_is_ambient(item) {
+        return false;
+    }
+    let Some(status) = item.get("status").and_then(Value::as_str) else {
+        return true;
+    };
+    let status = status.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    matches!(
+        status.as_str(),
+        "running" | "pending" | "queued" | "in_progress" | "started"
+    )
+}
+
+/// Tasks Claude Code keeps running on its own for the rest of the session,
+/// with nothing for the user to wait for: the live-update monitor it attaches
+/// to every published Artifact (`type` `monitor`, description
+/// `live updates for artifact ...`, running until the process exits),
+/// automatic memory consolidation (`dream`), the auto-mode scan and memory
+/// import. They never hold a turn open.
+fn background_item_is_ambient(item: &Value) -> bool {
+    let kind = item
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_");
+    match kind.as_str() {
+        "dream" | "auto_mode_scan" | "memory_import" | "local_memory_import" => true,
+        "monitor" | "monitor_ws" => {
+            item.get("description")
+                .and_then(Value::as_str)
+                .is_some_and(|description| {
+                    description
+                        .trim_start()
+                        .to_ascii_lowercase()
+                        .starts_with("live updates for artifact")
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Internal flag on a Codex `Stop` that the Runtime built from a Connector
+/// `turn/completed` or a session-file `task_complete`: whether the turn's
+/// final answer awaits a reply. The answer text itself stays with the result
+/// observer.
+pub const CODEX_FINAL_ANSWER_AWAITS_REPLY: &str = "_final_answer_awaits_reply";
+
+/// Whether the final Agent message of a `Stop` asks the user something. Hook
+/// payloads carry the message as `last_assistant_message`; Codex events the
+/// Runtime builds carry the already-judged [`CODEX_FINAL_ANSWER_AWAITS_REPLY`].
+fn final_message_awaits_reply(raw: &Value) -> bool {
+    match raw.get("last_assistant_message").and_then(Value::as_str) {
+        Some(message) => crate::reply::message_awaits_reply(message),
+        None => raw
+            .get(CODEX_FINAL_ANSWER_AWAITS_REPLY)
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
 }
 
 fn is_meaningful_activity(kind: EventKind, raw: &Value) -> bool {
@@ -12131,12 +13137,17 @@ fn first_task_title_sentence(normalized: &str) -> &str {
 /// summary. These envelopes are transport metadata rather than user-authored
 /// prompt content and must never become the visible task title.
 fn user_visible_prompt(prompt: &str) -> String {
-    const INTERNAL_ENVELOPES: [(&str, &str); 5] = [
+    const INTERNAL_ENVELOPES: [(&str, &str); 8] = [
         ("<in-app-browser-context", "</in-app-browser-context>"),
         ("<environment_context", "</environment_context>"),
         ("<app-context", "</app-context>"),
         ("<source_thread_id", "</source_thread_id>"),
         ("<source_turn_id", "</source_turn_id>"),
+        // Claude Code delivers subagent reports, background task events and
+        // system notes as prompts; none of them is the user's request.
+        ("<agent-message", "</agent-message>"),
+        ("<task-notification", "</task-notification>"),
+        ("<system-reminder", "</system-reminder>"),
     ];
     const REQUEST_MARKER: &str = "## My request:";
 
@@ -12198,7 +13209,10 @@ fn remove_internal_context_task_titles(connection: &Connection) -> Result<(), St
                 OR title LIKE '<codex_delegation%'
                 OR title LIKE '<source_thread_id%'
                 OR title LIKE '<environment_context%'
-                OR title LIKE '<app-context%'",
+                OR title LIKE '<app-context%'
+                OR title LIKE '<agent-message%'
+                OR title LIKE '<task-notification%'
+                OR title LIKE '<system-reminder%'",
             [],
         )
         .map(|_| ())
@@ -12288,20 +13302,20 @@ fn project_event<'a>(
             ("thinking", None, label.to_owned())
         }
         EventKind::Compacting => ("compacting", None, "Compacting context".to_owned()),
-        EventKind::Stopped if has_background_work(raw) => {
-            let count = ["background_tasks", "session_crons"]
-                .iter()
-                .filter_map(|field| raw.get(*field).and_then(Value::as_array))
-                .map(Vec::len)
-                .sum::<usize>();
+        // The Agent has handed control back even though background work it
+        // started keeps running: the turn is over and the next move is the
+        // user's. Only the activity line still reports that work.
+        EventKind::Stopped if active_background_work(raw) > 0 => {
+            let count = active_background_work(raw);
             (
-                "tool_running",
+                "response_finished",
                 None,
                 format!("{count} background tasks still running"),
             )
         }
         EventKind::Stopped => ("response_finished", None, "Turn completed".to_owned()),
-        EventKind::Interrupted => ("failed", None, "Turn interrupted".to_owned()),
+        // The user stopped the turn; it ended, it did not fail.
+        EventKind::Interrupted => ("idle", None, TURN_INTERRUPTED_ACTIVITY.to_owned()),
         EventKind::Failed => ("failed", None, "Run failed".to_owned()),
         EventKind::Unknown => (
             current,
@@ -13200,8 +14214,67 @@ fn event_summary(raw: &Value, kind: EventKind) -> Option<String> {
         EventKind::AutoReviewCompleted => Some("Codex auto approval review completed".to_owned()),
         EventKind::Interrupted => Some("Provider turn interrupted".to_owned()),
         EventKind::Unknown => Some("Unknown Provider event".to_owned()),
+        EventKind::Stopped => background_work_summary(raw),
         _ => None,
     }
+}
+
+/// The kinds and states of the background work a Claude Code `Stop` reports,
+/// for later diagnosis in the internal `events.summary` column (never shown
+/// to clients): for example
+/// `background: subagent running×2, shell pending×1, monitor running ambient×1, cron×1`.
+/// Only the item type (spaces as `_`) and status are kept, and whether the
+/// item is ambient work; descriptions, commands, prompts and identifiers are
+/// not. A type or status that is not a short identifier is recorded as
+/// `other`; an item without a status (cron jobs) records its type only.
+fn background_work_summary(raw: &Value) -> Option<String> {
+    fn identifier(value: Option<&str>) -> Option<String> {
+        let value = value?.trim().to_ascii_lowercase().replace(' ', "_");
+        Some(
+            if !value.is_empty()
+                && value.len() <= 32
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            {
+                value
+            } else {
+                "other".to_owned()
+            },
+        )
+    }
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for (field, default_kind) in [("background_tasks", "task"), ("session_crons", "cron")] {
+        for item in raw
+            .get(field)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(256)
+        {
+            let kind = identifier(item.get("type").and_then(Value::as_str))
+                .unwrap_or_else(|| default_kind.to_owned());
+            let mut label = match identifier(item.get("status").and_then(Value::as_str)) {
+                Some(status) => format!("{kind} {status}"),
+                None => kind,
+            };
+            if background_item_is_ambient(item) {
+                label.push_str(" ambient");
+            }
+            match counts.iter_mut().find(|(existing, _)| *existing == label) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((label, 1)),
+            }
+        }
+    }
+    if counts.is_empty() {
+        return None;
+    }
+    let parts = counts
+        .into_iter()
+        .map(|(label, count)| format!("{label}\u{d7}{count}"))
+        .collect::<Vec<_>>();
+    Some(format!("background: {}", parts.join(", ")))
 }
 
 fn event_type(kind: EventKind) -> &'static str {
@@ -13301,8 +14374,10 @@ fn jump_descriptor(
     if (iterm && term_session_id.is_some()) || (terminal && term_tty.is_some()) {
         return ("terminal".to_owned(), "Open terminal".to_owned());
     }
-    let known_app = term_bundle_id.is_some_and(actrealm_core::valid_client_bundle_id)
-        || codex_app
+    let known_app = term_bundle_id.is_some_and(|bundle| {
+        actrealm_core::valid_client_bundle_id(bundle)
+            && !actrealm_core::interpreter_bundle_id(bundle)
+    }) || codex_app
         || term_surface == Some("claude_app")
         || bundle == "com.anthropic.claudefordesktop"
         || iterm
@@ -13323,8 +14398,63 @@ fn jump_descriptor(
     ("unsupported".to_owned(), "Jump is not supported".to_owned())
 }
 
-fn project_name(path: &str) -> Option<&str> {
-    Path::new(path).file_name().and_then(|value| value.to_str())
+/// The project label for a working directory; see [`crate::project`].
+fn project_name(path: &str) -> Option<String> {
+    crate::project::project_label(path, home_directory().as_deref())
+}
+
+fn home_directory() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Re-derives every session's project label from its working directory, so
+/// sessions recorded under an older rule (a worktree shown as `main`) show
+/// the current label, and updates their Attention items to match. Only rows
+/// whose label changes are written.
+fn refresh_session_project_labels(connection: &mut Connection) -> Result<(), StoreError> {
+    let changed = {
+        let mut statement = connection
+            .prepare("SELECT id, cwd, project FROM sessions WHERE cwd IS NOT NULL")
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+        rows.into_iter()
+            .filter_map(|(id, cwd, project)| {
+                let label = project_name(&cwd);
+                (label != project).then_some((id, label))
+            })
+            .collect::<Vec<_>>()
+    };
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let transaction = connection.transaction().map_err(storage_error)?;
+    for (id, project) in &changed {
+        transaction
+            .execute(
+                "UPDATE sessions SET project = ?2 WHERE id = ?1",
+                params![id, project],
+            )
+            .map_err(storage_error)?;
+        transaction
+            .execute(
+                "UPDATE attention_items SET project = ?2 WHERE session_id = ?1",
+                params![id, project],
+            )
+            .map_err(storage_error)?;
+    }
+    transaction.commit().map_err(storage_error)
 }
 
 fn storage_error(error: rusqlite::Error) -> StoreError {
@@ -13364,6 +14494,109 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    #[test]
+    fn review_state_classifies_every_completion_and_error_closure() {
+        use super::{recent_task_review_state, recent_task_status, task_history_status};
+        let review = |state, resolution, acknowledged| {
+            recent_task_review_state(
+                Some("completion"),
+                Some(state),
+                resolution,
+                acknowledged,
+                false,
+            )
+        };
+        assert_eq!(
+            recent_task_review_state(None, None, None, false, false),
+            "none"
+        );
+        // User actions and new instructions.
+        for resolution in [
+            "ack",
+            "ack_hidden",
+            "history_archived",
+            "superseded_by_prompt",
+        ] {
+            assert_eq!(review("resolved", Some(resolution), false), "seen");
+        }
+        // Any closure followed by a later user prompt.
+        for (state, resolution) in [
+            ("resolved", Some("superseded_by_activity")),
+            ("resolved", Some("auto_hidden")),
+        ] {
+            assert_eq!(
+                recent_task_review_state(Some("error"), Some(state), resolution, false, true),
+                "seen"
+            );
+        }
+        assert_eq!(review("dismissed", Some("user_dismissed"), false), "seen");
+        assert_eq!(review("open", None, true), "seen");
+        assert_eq!(review("resolved", Some("auto_hidden"), true), "seen");
+        // Not the user.
+        assert_eq!(review("open", None, false), "unseen");
+        assert_eq!(review("snoozed", None, false), "unseen");
+        assert_eq!(review("resolved", Some("auto_hidden"), false), "unseen");
+        assert_eq!(
+            review("resolved", Some("superseded_by_activity"), false),
+            "unseen"
+        );
+        assert_eq!(review("expired", Some("runtime_restart"), false), "unseen");
+        assert_eq!(review("expired", Some("deadline"), false), "unseen");
+        assert_eq!(
+            review("resolved", Some("provider_handled"), false),
+            "unseen"
+        );
+        assert_eq!(review("resolved", None, false), "unseen");
+        // A stale resolution on a reopened reminder does not count.
+        assert_eq!(review("open", Some("ack"), false), "unseen");
+
+        assert_eq!(
+            recent_task_status("idle", Some("Session ended"), Some("failed")),
+            "failed"
+        );
+        assert_eq!(
+            recent_task_status("idle", Some("Session ended"), Some("interrupted")),
+            "interrupted"
+        );
+        assert_eq!(
+            recent_task_status("idle", Some("Session ended"), Some("response_finished")),
+            "completed"
+        );
+        // The History center only knows completed/failed and reports an
+        // interruption as failed, also after a later SessionEnd or
+        // SessionStart rewrote the session activity.
+        assert_eq!(
+            task_history_status("idle", Some("Turn interrupted"), Some("interrupted")),
+            "failed"
+        );
+        assert_eq!(
+            task_history_status("failed", Some("Run failed"), Some("failed")),
+            "failed"
+        );
+        for activity in ["Session ended", "Waiting for a new task"] {
+            assert_eq!(
+                task_history_status("idle", Some(activity), Some("interrupted")),
+                "failed"
+            );
+            assert_eq!(
+                task_history_status("idle", Some(activity), Some("failed")),
+                "failed"
+            );
+            assert_eq!(
+                task_history_status("idle", Some(activity), Some("response_finished")),
+                "completed"
+            );
+            assert_eq!(
+                task_history_status("idle", Some(activity), Some("idle")),
+                "completed"
+            );
+        }
+        assert_eq!(
+            task_history_status("response_finished", None, Some("response_finished")),
+            "completed"
+        );
+    }
 
     #[test]
     fn client_source_survives_internal_events_and_changes_as_one_identity() {
@@ -14277,6 +15510,49 @@ mod tests {
     }
 
     #[test]
+    fn opening_relabels_worktree_sessions_and_their_attention() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO sessions(
+                   id, provider, provider_session_id, cwd, project, exec_state,
+                   started_at, last_event_at
+                 ) VALUES
+                   ('worktree', 'claude', 'a', '/srv/ActRealm/Display.worktrees/main',
+                    'main', 'thinking', 1, 1),
+                   ('plain', 'claude', 'b', '/srv/ActRealm', 'ActRealm', 'idle', 1, 1),
+                   ('no-cwd', 'claude', 'c', NULL, 'kept', 'idle', 1, 1);
+                 INSERT INTO attention_items(
+                   id, session_id, provider, project, kind, title, risk, risk_notes,
+                   dedupe_key, state, created_at
+                 ) VALUES (
+                   'completion', 'worktree', 'claude', 'main', 'completion', 'Done',
+                   'unknown', '[]', 'completion-key', 'open', 1
+                 );",
+            )
+            .unwrap();
+
+        initialize(&mut connection).unwrap();
+        let project = |table: &str, id: &str| {
+            connection
+                .query_row(
+                    &format!("SELECT project FROM {table} WHERE id = ?1"),
+                    [id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(project("sessions", "worktree").as_deref(), Some("Display"));
+        assert_eq!(
+            project("attention_items", "completion").as_deref(),
+            Some("Display")
+        );
+        assert_eq!(project("sessions", "plain").as_deref(), Some("ActRealm"));
+        assert_eq!(project("sessions", "no-cwd").as_deref(), Some("kept"));
+    }
+
+    #[test]
     fn legacy_attention_rows_migrate_inert_and_unclassified() {
         let mut connection = Connection::open_in_memory().unwrap();
         initialize(&mut connection).unwrap();
@@ -14306,7 +15582,8 @@ mod tests {
         initialize(&mut connection).unwrap();
         let migrated = connection
             .query_row(
-                "SELECT primary_category, risk_codes, remote_actionable, auto_hide_at
+                "SELECT primary_category, risk_codes, remote_actionable, auto_hide_at,
+                        awaits_reply
                  FROM attention_items WHERE id = 'legacy'",
                 [],
                 |row| {
@@ -14315,11 +15592,12 @@ mod tests {
                         row.get::<_, String>(1)?,
                         row.get::<_, bool>(2)?,
                         row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, bool>(4)?,
                     ))
                 },
             )
             .unwrap();
-        assert_eq!(migrated, (None, "[]".to_owned(), false, None));
+        assert_eq!(migrated, (None, "[]".to_owned(), false, None, false));
         assert_eq!(
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
@@ -14650,6 +15928,28 @@ mod tests {
             ),
             None
         );
+        for injected in [
+            "<agent-message from=\"a60b\">\n[Subagent hand-back] Report.\n</agent-message>",
+            "<task-notification>\n<task-id>b1</task-id>\n</task-notification>",
+            "<system-reminder>\nnote\n</system-reminder>",
+        ] {
+            assert_eq!(
+                super::task_title(
+                    &json!({ "prompt": injected }),
+                    actrealm_core::EventKind::PromptSubmitted
+                ),
+                None,
+                "{injected}"
+            );
+        }
+        assert_eq!(
+            super::task_title(
+                &json!({"prompt":"<system-reminder>note</system-reminder>\n整理发布说明。然后提交"}),
+                actrealm_core::EventKind::PromptSubmitted
+            )
+            .as_deref(),
+            Some("整理发布说明。")
+        );
     }
 
     #[test]
@@ -14673,6 +15973,12 @@ mod tests {
                  INSERT INTO sessions(
                    id, provider, provider_session_id, title, exec_state,
                    started_at, last_event_at
+                 ) VALUES ('agent-message-title', 'claude', 'agent-message-title',
+                           '<agent-message from=a60b> [Subagent hand-back] Th…',
+                           'idle', 1, 1);
+                 INSERT INTO sessions(
+                   id, provider, provider_session_id, title, exec_state,
+                   started_at, last_event_at
                  ) VALUES ('safe-title', 'codex', 'safe-title',
                            'ActRealm H2.4 真实验收', 'idle', 1, 1);
                  INSERT INTO sessions(
@@ -14687,12 +15993,13 @@ mod tests {
         let removed = connection
             .query_row(
                 "SELECT COUNT(*) FROM sessions
-                 WHERE id IN ('context-title', 'delegation-title') AND title IS NULL",
+                 WHERE id IN ('context-title', 'delegation-title', 'agent-message-title')
+                   AND title IS NULL",
                 [],
                 |row| row.get::<_, i64>(0),
             )
             .unwrap();
-        assert_eq!(removed, 2);
+        assert_eq!(removed, 3);
         let safe = connection
             .query_row(
                 "SELECT title FROM sessions WHERE id = 'safe-title'",

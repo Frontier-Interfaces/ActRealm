@@ -11,6 +11,7 @@ use uuid::Uuid;
 const MAX_LINE: usize = 128 * 1024;
 const SCAN_BUDGET: u64 = 2 * 1024 * 1024;
 const QUESTION_TTL: u64 = 60 * 60 * 1000;
+const LATEST_MESSAGE_TTL: u64 = 24 * 60 * 60 * 1000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct Question {
@@ -199,6 +200,9 @@ pub(crate) enum Observation {
         turn_id: String,
         event: &'static str,
         at: u64,
+        /// Whether the turn's final answer asks the user something. Only
+        /// this judgement leaves the scanner, never the answer text.
+        awaits_reply: bool,
     },
     Activity(ObservedActivity),
     Question(QuestionBatch),
@@ -211,6 +215,14 @@ pub(crate) enum Observation {
         text: String,
         cwd: Option<PathBuf>,
         at: u64,
+    },
+    /// The newest Agent message (commentary or final answer) a poll read for
+    /// a session. Its text goes only to the in-memory latest-message view.
+    Message {
+        session_id: String,
+        text: String,
+        at: u64,
+        is_final: bool,
     },
 }
 
@@ -319,6 +331,7 @@ impl QuestionScanner {
             }
             let mut reader = BufReader::new(file);
             let mut line = Vec::new();
+            let mut latest_message: Option<(String, u64, bool)> = None;
             while budget >= MAX_LINE as u64 {
                 line.clear();
                 let Ok(n) = reader
@@ -359,6 +372,11 @@ impl QuestionScanner {
                     continue;
                 }
                 Self::record_lifecycle(&root, thread, at, &mut out);
+                if now.saturating_sub(at) <= LATEST_MESSAGE_TTL {
+                    if let Some((text, is_final)) = Self::agent_message(&root) {
+                        latest_message = Some((text, at, is_final));
+                    }
+                }
                 if now.saturating_sub(at) > QUESTION_TTL {
                     if now.saturating_sub(at) <= 24 * 60 * 60 * 1000 {
                         Self::record_result(cursor, &root, session, at, &mut out);
@@ -367,9 +385,39 @@ impl QuestionScanner {
                 }
                 Self::record(cursor, &root, thread, session, at, &mut out);
             }
+            if let Some((text, at, is_final)) = latest_message {
+                out.push(Observation::Message {
+                    session_id: session.clone(),
+                    text,
+                    at,
+                    is_final,
+                });
+            }
         }
         self.next = (self.next + 1) % candidates.len();
         out
+    }
+
+    /// The text of an assistant message record and whether it is the turn's
+    /// final answer (`phase` `final_answer`, or the `final` channel) rather
+    /// than commentary.
+    fn agent_message(root: &Value) -> Option<(String, bool)> {
+        let payload = &root["payload"];
+        if root["type"] != "response_item"
+            || payload["type"] != "message"
+            || payload["role"] != "assistant"
+        {
+            return None;
+        }
+        let text = payload["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let is_final = payload["channel"] == "final" || payload["phase"] == "final_answer";
+        (!text.trim().is_empty()).then_some((text, is_final))
     }
 
     fn record_lifecycle(root: &Value, thread: &str, at: u64, out: &mut Vec<Observation>) {
@@ -389,11 +437,16 @@ impl QuestionScanner {
             Some("turn_aborted" | "task_aborted") => "TurnInterrupted",
             _ => return,
         };
+        let awaits_reply = event == "Stop"
+            && payload["last_agent_message"]
+                .as_str()
+                .is_some_and(actrealm_runtime::message_awaits_reply);
         out.push(Observation::TurnEnded {
             thread_id: thread.to_owned(),
             turn_id: turn_id.to_owned(),
             event,
             at,
+            awaits_reply,
         });
     }
 
@@ -666,6 +719,74 @@ mod tests {
     }
 
     #[test]
+    fn the_newest_agent_message_of_a_poll_is_reported_once_with_its_phase() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("actrealm-codex-latest-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout-test-thread.jsonl");
+        let message = |at: &str, phase: &str, text: &str| {
+            json!({"timestamp":at,"type":"response_item","payload":{
+                "type":"message","role":"assistant","phase":phase,
+                "content":[{"type":"output_text","text":text}]
+            }})
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                json!({"type":"session_meta","payload":{"id":"thread"}}),
+                message("2026-09-07T12:00:00Z", "commentary", "Reading the config."),
+                json!({"timestamp":"2026-09-07T12:00:01Z","type":"response_item","payload":{
+                    "type":"function_call","name":"exec","call_id":"c1","arguments":"{}"
+                }}),
+                message(
+                    "2026-09-07T12:00:02Z",
+                    "final_answer",
+                    "All tests pass. Merge?"
+                ),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let now = actrealm_usage::timestamp_millis("2026-09-07T12:00:05Z").unwrap();
+        let sessions = HashMap::from([("thread".to_owned(), "session".to_owned())]);
+        let mut scanner = QuestionScanner::default();
+        let messages = scanner
+            .poll(std::slice::from_ref(&path), &sessions, now)
+            .into_iter()
+            .filter_map(|observation| match observation {
+                Observation::Message {
+                    session_id,
+                    text,
+                    at,
+                    is_final,
+                } => Some((session_id, text, at, is_final)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            [(
+                "session".to_owned(),
+                "All tests pass. Merge?".to_owned(),
+                now - 3_000,
+                true
+            )]
+        );
+        // A message older than a day is not reported.
+        let mut scanner = QuestionScanner::default();
+        assert!(!scanner
+            .poll(
+                std::slice::from_ref(&path),
+                &sessions,
+                now + 25 * 60 * 60 * 1000
+            )
+            .iter()
+            .any(|observation| matches!(observation, Observation::Message { .. })));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn echoes_do_not_resurrect_answered_questions_or_downgrade_routes() {
         let mut registry = QuestionRegistry::default();
         registry.observe(batch(100));
@@ -877,7 +998,7 @@ mod lifecycle_tests {
             &mut out,
         );
         assert!(
-            matches!(&out[0], Observation::TurnEnded { thread_id, turn_id, event: "StopFailure", at: 1000 } if thread_id == "thread" && turn_id == "turn")
+            matches!(&out[0], Observation::TurnEnded { thread_id, turn_id, event: "StopFailure", at: 1000, awaits_reply: false } if thread_id == "thread" && turn_id == "turn")
         );
         QuestionScanner::record_lifecycle(
             &json!({"type":"event_msg","payload":{
@@ -901,5 +1022,42 @@ mod lifecycle_tests {
             &mut out,
         );
         assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn a_completed_turn_reports_whether_its_final_answer_awaits_a_reply() {
+        let mut out = Vec::new();
+        for (turn, message) in [
+            ("asks", Some("测试都过了。要不要我顺便提交？")),
+            ("reports", Some("All tests pass.")),
+            ("silent", None),
+        ] {
+            let mut payload = json!({"type":"task_complete","turn_id":turn});
+            if let Some(message) = message {
+                payload["last_agent_message"] = json!(message);
+            }
+            QuestionScanner::record_lifecycle(
+                &json!({"type":"event_msg","payload":payload}),
+                "thread",
+                1000,
+                &mut out,
+            );
+        }
+        let flags = out
+            .iter()
+            .map(|observation| match observation {
+                Observation::TurnEnded {
+                    turn_id,
+                    event: "Stop",
+                    awaits_reply,
+                    ..
+                } => (turn_id.as_str(), *awaits_reply),
+                _ => panic!("unexpected observation"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            flags,
+            [("asks", true), ("reports", false), ("silent", false)]
+        );
     }
 }

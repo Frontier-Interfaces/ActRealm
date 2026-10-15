@@ -2,15 +2,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -76,6 +76,11 @@ struct Inner {
     protocol: Mutex<ProtocolSupport>,
     next_id: AtomicU64,
     shared_connection: bool,
+    /// Set once the app-server rejects `account/rateLimits/read` parameters
+    /// (releases before `GetAccountRateLimitsParams`).
+    rate_limit_params_rejected: AtomicBool,
+    /// Set by `shutdown`; the connection never comes back after it.
+    closed: AtomicBool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -155,6 +160,8 @@ impl CodexConnector {
             .stdin
             .take()
             .ok_or_else(|| ConnectorError::Process("proxy stdin unavailable".to_owned()))?;
+        #[cfg(unix)]
+        set_nonblocking(&writer)?;
         let reader = child
             .stdout
             .take()
@@ -169,6 +176,8 @@ impl CodexConnector {
                 protocol: Mutex::new(ProtocolSupport::default()),
                 next_id: AtomicU64::new(1),
                 shared_connection: shared_socket.is_some(),
+                rate_limit_params_rejected: AtomicBool::new(false),
+                closed: AtomicBool::new(false),
             }),
         };
         let reader_connector = connector.downgrade();
@@ -317,7 +326,30 @@ impl CodexConnector {
     /// Reads Codex account rate limits without starting or resuming a task.
     /// The app-server owns authentication; ActRealm receives only the
     /// allowlisted usage snapshot returned by the provider protocol.
+    ///
+    /// Quota reads are background polls, so they ask the app-server to skip
+    /// its separate reset-credit detail lookup (the available count is still
+    /// returned). An app-server that predates that parameter gets the plain
+    /// request instead.
     pub fn read_rate_limits(&self) -> Result<Value, ConnectorError> {
+        if !self
+            .inner
+            .rate_limit_params_rejected
+            .load(Ordering::Relaxed)
+        {
+            match self.call(
+                "account/rateLimits/read",
+                json!({"excludeResetCreditDetails": true}),
+                RPC_TIMEOUT,
+            ) {
+                Err(ConnectorError::Protocol(_)) => {
+                    self.inner
+                        .rate_limit_params_rejected
+                        .store(true, Ordering::Relaxed);
+                }
+                result => return result,
+            }
+        }
         self.call("account/rateLimits/read", json!({}), RPC_TIMEOUT)
     }
 
@@ -334,7 +366,8 @@ impl CodexConnector {
             .lock()
             .map_err(|_| ConnectorError::Closed)?
             .insert(id.to_string(), sender);
-        if let Err(error) = self.write(&json!({"id": id, "method": method, "params": params})) {
+        let request = json!({"id": id, "method": method, "params": params});
+        if let Err(error) = self.write_before(&request, timeout) {
             if let Ok(mut pending) = self.inner.pending.lock() {
                 pending.remove(&id.to_string());
             }
@@ -366,6 +399,7 @@ impl CodexConnector {
     }
 
     pub fn shutdown(&self) {
+        self.inner.closed.store(true, Ordering::Release);
         self.fail_all_pending("connector_shutdown");
         if let Ok(mut managed) = self.inner.child.lock() {
             if let Some(mut child) = managed.take() {
@@ -375,17 +409,35 @@ impl CodexConnector {
         }
     }
 
+    /// Whether `shutdown` closed this connection, even when a launcher's child
+    /// that the shutdown cannot reach still holds the output open.
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire)
+    }
+
     fn write(&self, value: &Value) -> Result<(), ConnectorError> {
+        self.write_before(value, RPC_TIMEOUT)
+    }
+
+    /// Writes one message line. An app-server that stops reading its input
+    /// would otherwise block every writer, and the quota loop with them, once
+    /// the pipe fills; after `timeout` without progress it is shut down.
+    fn write_before(&self, value: &Value, timeout: Duration) -> Result<(), ConnectorError> {
+        let mut line = serde_json::to_vec(value)
+            .map_err(|error| ConnectorError::Protocol(error.to_string()))?;
+        line.push(b'\n');
         let mut writer = self
             .inner
             .writer
             .lock()
             .map_err(|_| ConnectorError::Closed)?;
-        serde_json::to_writer(&mut *writer, value)
-            .map_err(|error| ConnectorError::Protocol(error.to_string()))?;
-        writer.write_all(b"\n")?;
-        writer.flush()?;
-        Ok(())
+        match write_all_while_read(&mut writer, &line, timeout) {
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                self.shutdown();
+                Err(ConnectorError::Timeout)
+            }
+            result => Ok(result?),
+        }
     }
 
     fn complete_response(&self, id: Value, message: Value) {
@@ -502,6 +554,66 @@ fn legacy_listener_pids(fields: &str, socket_path: &Path) -> Vec<u32> {
     matches.sort_unstable();
     matches.dedup();
     matches
+}
+
+/// Only our end of the pipe: the app-server still reads its input blocking.
+#[cfg(unix)]
+fn set_nonblocking(writer: &ChildStdin) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = writer.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Writes all of `bytes`. Fails only when the reader takes nothing for
+/// `stall`: a large message to a busy but reading app-server still goes out.
+#[cfg(unix)]
+fn write_all_while_read(
+    writer: &mut ChildStdin,
+    mut bytes: &[u8],
+    stall: Duration,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut deadline = Instant::now() + stall;
+    while !bytes.is_empty() {
+        match writer.write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => {
+                bytes = &bytes[written..];
+                deadline = Instant::now() + stall;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                let mut ready = libc::pollfd {
+                    fd: writer.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                let millis = left.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+                if unsafe { libc::poll(&mut ready, 1, millis) } == -1 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_all_while_read(writer: &mut ChildStdin, bytes: &[u8], _stall: Duration) -> io::Result<()> {
+    writer.write_all(bytes)?;
+    writer.flush()
 }
 
 fn id_key(id: &Value) -> String {
@@ -663,6 +775,9 @@ while IFS= read -r line; do
       printf '{"id":%s,"result":{"thread":{"id":"thread-1","sessionId":"session-1","cwd":"/tmp/project","name":"Recovered thread","status":{"type":"active","activeFlags":["waitingOnUserInput"]},"turns":[],"updatedAt":100}}}\n' "$request_id"
       printf '%s\n' '{"id":"server-request-1","method":"item/tool/requestUserInput","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","questions":[{"id":"choice","header":"Choice","question":"Continue?","isOther":false,"isSecret":false,"options":null}]}}'
       ;;
+    *'"method":"account/rateLimits/read"'*'"excludeResetCreditDetails"'*)
+      printf '{"id":%s,"error":{"code":-32602,"message":"Invalid params"}}\n' "$request_id"
+      ;;
     *'"method":"account/rateLimits/read"'*)
       printf '{"id":%s,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":12,"windowDurationMins":300,"resetsAt":1784140000}}}}\n' "$request_id"
       ;;
@@ -690,8 +805,16 @@ done
         assert_eq!(threads[0].active_flags, vec!["waitingOnUserInput"]);
         let resumed = connector.resume_thread("thread-1").unwrap();
         assert_eq!(resumed.name.as_deref(), Some("Recovered thread"));
+        // This app-server predates the background-poll parameter: the read
+        // falls back to the plain request and keeps using it.
         let rate_limits = connector.read_rate_limits().unwrap();
         assert_eq!(rate_limits["rateLimits"]["primary"]["usedPercent"], 12);
+        assert!(connector
+            .inner
+            .rate_limit_params_rejected
+            .load(Ordering::Relaxed));
+        let again = connector.read_rate_limits().unwrap();
+        assert_eq!(again["rateLimits"]["primary"]["usedPercent"], 12);
 
         let one_shot = CodexConnector::read_rate_limits_once(&executable).unwrap();
         assert_eq!(one_shot["rateLimits"]["primary"]["usedPercent"], 12);
@@ -756,5 +879,86 @@ p100\nccodex\nn/Users/test/.actrealm/run/codex-app-server.sock\n";
         assert!(managed_approval_schema_supported((0, 144, 6)));
         assert!(!managed_approval_schema_supported((0, 144, 4)));
         assert!(!managed_approval_schema_supported((0, 145, 0)));
+    }
+
+    #[test]
+    fn app_server_that_stops_reading_is_shut_down_instead_of_blocking_writers() {
+        let root = std::env::temp_dir().join(format!(
+            "actrealm-codex-stuck-reader-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("fake-codex");
+        // Answers initialize, then keeps its input open without reading it.
+        fs::write(
+            &executable,
+            "#!/bin/sh\nIFS= read -r line || exit 0\nprintf '%s\\n' '{\"id\":1,\"result\":{\"userAgent\":\"codex_cli_rs/0.162.0\"}}'\nexec sleep 30\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(Command::new(&executable)
+            .stdin(Stdio::null())
+            .status()
+            .unwrap()
+            .success());
+        let (connector, _channels) = CodexConnector::connect_stdio(&executable).unwrap();
+        let pid = connector.managed_child_id() as i32;
+        let (sender, receiver) = mpsc::channel();
+        let caller = connector.clone();
+        thread::spawn(move || {
+            let filler = json!({"pad": "a".repeat(256 * 1024)});
+            let _ = sender.send(caller.call("x", filler, Duration::from_secs(1)));
+        });
+        let result = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a write the app-server never reads must give up");
+        assert!(matches!(result, Err(ConnectorError::Timeout)));
+        // The app-server was shut down, so the next request fails at once
+        // and quota polling can fall back to a one-shot process.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        let started = Instant::now();
+        assert!(connector.read_rate_limits().is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(connector);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn app_server_that_reads_slowly_keeps_its_connection() {
+        let root = std::env::temp_dir().join(format!(
+            "actrealm-codex-slow-reader-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("fake-codex");
+        // Answers initialize, then takes 8 KiB every 0.2 s and never replies.
+        fs::write(
+            &executable,
+            "#!/bin/sh\nIFS= read -r line || exit 0\nprintf '%s\\n' '{\"id\":1,\"result\":{\"userAgent\":\"codex_cli_rs/0.162.0\"}}'\nwhile :; do dd bs=8192 count=1 of=/dev/null 2>/dev/null; sleep 0.2; done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(Command::new(&executable)
+            .stdin(Stdio::null())
+            .status()
+            .unwrap()
+            .success());
+        let (connector, _channels) = CodexConnector::connect_stdio(&executable).unwrap();
+        let pid = connector.managed_child_id() as i32;
+        // Twice the pipe: writing it takes longer than the timeout, but the
+        // reader keeps taking some, so only the reply times out.
+        let large = json!({"pad": "a".repeat(128 * 1024)});
+        let started = Instant::now();
+        assert!(matches!(
+            connector.call("x", large, Duration::from_secs(1)),
+            Err(ConnectorError::Timeout)
+        ));
+        assert!(started.elapsed() > Duration::from_secs(1));
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+        connector.shutdown();
+        drop(connector);
+        fs::remove_dir_all(root).unwrap();
     }
 }

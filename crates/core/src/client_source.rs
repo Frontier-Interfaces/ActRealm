@@ -98,6 +98,13 @@ pub fn valid_client_bundle_id(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
 }
 
+/// The Python.app that python3 runs as. Sessions recorded before apps inside
+/// frameworks were passed over may name it as their client; it never is.
+pub fn interpreter_bundle_id(value: &str) -> bool {
+    value.eq_ignore_ascii_case("org.python.python")
+        || value.eq_ignore_ascii_case("com.apple.python3")
+}
+
 fn identify(app: Option<&str>, bundle: Option<&str>) -> Option<Source> {
     let app = app.and_then(name);
     let bundle = bundle.filter(|s| valid_client_bundle_id(s));
@@ -204,21 +211,40 @@ fn host_bundle(path: &Path) -> Option<PathBuf> {
     // A resource binary inside an app bundle can be launched from any terminal.
     // Require an actual app/helper executable, then use its outer host bundle.
     let text = path.to_str()?;
-    if !text.contains(".app/Contents/MacOS/") {
+    let own = text.rfind(".app/Contents/MacOS/")?;
+    // An app inside a framework is not one the user works in: python3 runs
+    // as the Python.app in Python.framework (Homebrew, python.org, Xcode),
+    // and an app's framework helpers run below the app's own process.
+    if text[..own].contains(".framework/") {
         return None;
     }
     let end = text.find(".app/")? + 4;
     Some(PathBuf::from(&text[..end]))
 }
 
+/// The first app bundle among the Hook's parents, and the provider's own
+/// bundle if one was passed over on the way.
 fn process_source(
+    provider: Provider,
     processes: &[Process],
     inspect: impl Fn(&Path) -> Option<Source>,
-) -> Option<Source> {
-    processes
-        .iter()
-        .filter_map(|p| host_bundle(&p.path))
-        .find_map(|bundle| inspect(&bundle))
+) -> (Option<Source>, Option<Source>) {
+    let mut passed_over = None;
+    for process in processes {
+        let Some(source) = host_bundle(&process.path).and_then(|bundle| inspect(&bundle)) else {
+            continue;
+        };
+        // A provider shipped as an app bundle of its own, like the
+        // background-only claude.app that Claude desktop runs, is not where
+        // the user works. Unless it is a known client, keep walking up to the
+        // app that launched it, and use it only when nothing else matches.
+        if source.surface == "desktop_app" && provider_executable(provider, &process.path) {
+            passed_over.get_or_insert(source);
+            continue;
+        }
+        return (Some(source), passed_over);
+    }
+    (None, passed_over)
 }
 
 fn provider_process(provider: Provider, processes: &[Process]) -> Option<u32> {
@@ -251,58 +277,61 @@ pub fn capture_client_context(provider: Provider, start_pid: u32) -> TermContext
     let bundle = std::env::var("__CFBundleIdentifier")
         .ok()
         .filter(|b| valid_client_bundle_id(b));
-    let source = process_source(&processes, inspect_bundle).or_else(|| {
-        if processes
-            .iter()
-            .any(|p| p.path.file_name().is_some_and(|n| n == "sshd"))
-            || std::env::var_os("SSH_CONNECTION").is_some()
-            || std::env::var_os("SSH_CLIENT").is_some()
-        {
-            return Some(Source {
-                app: "SSH".to_owned(),
-                bundle: None,
-                surface: "remote".to_owned(),
-            });
-        }
-        let mux = if std::env::var_os("TMUX").is_some() {
-            Some("tmux")
-        } else if std::env::var_os("STY").is_some() {
-            Some("screen")
-        } else {
-            None
-        };
-        if let Some(mux) = mux {
-            return identify(Some(mux), None);
-        }
-        if let Some(source) = identify(app.as_deref(), bundle.as_deref()) {
-            return Some(source);
-        }
-        if let Some(surface) = std::env::var("ACTREALM_SURFACE").ok().filter(|s| {
-            matches!(
-                s.as_str(),
-                "terminal"
-                    | "editor"
-                    | "codex_app"
-                    | "claude_app"
-                    | "kimi_app"
-                    | "grok_app"
-                    | "desktop_app"
-                    | "connector"
-                    | "remote"
-            )
-        }) {
-            return Some(Source {
-                app: app.as_deref().and_then(name).unwrap_or_default(),
-                bundle: bundle.clone(),
-                surface,
-            });
-        }
-        app.as_deref().and_then(name).map(|app| Source {
-            app,
-            bundle,
-            surface: "terminal".to_owned(),
+    let (host, passed_over) = process_source(provider, &processes, inspect_bundle);
+    let source = host
+        .or_else(|| {
+            if processes
+                .iter()
+                .any(|p| p.path.file_name().is_some_and(|n| n == "sshd"))
+                || std::env::var_os("SSH_CONNECTION").is_some()
+                || std::env::var_os("SSH_CLIENT").is_some()
+            {
+                return Some(Source {
+                    app: "SSH".to_owned(),
+                    bundle: None,
+                    surface: "remote".to_owned(),
+                });
+            }
+            let mux = if std::env::var_os("TMUX").is_some() {
+                Some("tmux")
+            } else if std::env::var_os("STY").is_some() {
+                Some("screen")
+            } else {
+                None
+            };
+            if let Some(mux) = mux {
+                return identify(Some(mux), None);
+            }
+            if let Some(source) = identify(app.as_deref(), bundle.as_deref()) {
+                return Some(source);
+            }
+            if let Some(surface) = std::env::var("ACTREALM_SURFACE").ok().filter(|s| {
+                matches!(
+                    s.as_str(),
+                    "terminal"
+                        | "editor"
+                        | "codex_app"
+                        | "claude_app"
+                        | "kimi_app"
+                        | "grok_app"
+                        | "desktop_app"
+                        | "connector"
+                        | "remote"
+                )
+            }) {
+                return Some(Source {
+                    app: app.as_deref().and_then(name).unwrap_or_default(),
+                    bundle: bundle.clone(),
+                    surface,
+                });
+            }
+            app.as_deref().and_then(name).map(|app| Source {
+                app,
+                bundle,
+                surface: "terminal".to_owned(),
+            })
         })
-    });
+        .or(passed_over);
     let mut context = TermContext {
         app: None,
         bundle_id: None,
@@ -517,9 +546,10 @@ mod tests {
                 path: "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal".into(),
             },
         ];
-        let source = process_source(&processes, |bundle| {
+        let source = process_source(Provider::Codex, &processes, |bundle| {
             identify(bundle.file_stem()?.to_str(), None)
         })
+        .0
         .unwrap();
         assert_eq!(source.app, "Terminal");
         assert!(provider_executable(Provider::Codex, &processes[0].path));
@@ -530,11 +560,77 @@ mod tests {
         }];
         assert_eq!(provider_process(Provider::Kimi, &python), Some(9));
         assert_eq!(provider_process(Provider::Grok, &[]), None);
-        assert!(process_source(&processes[..1], |_| panic!(
-            "resource binary is not a host app"
-        ))
-        .is_none());
+        assert_eq!(
+            process_source(Provider::Codex, &processes[..1], |_| panic!(
+                "resource binary is not a host app"
+            )),
+            (None, None)
+        );
         assert_eq!(host_bundle(Path::new("/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)")), Some(PathBuf::from("/Applications/Visual Studio Code.app")));
+    }
+
+    #[test]
+    fn claude_desktop_owns_the_claude_code_bundle_it_runs() {
+        let cli = Process {
+            pid: 4,
+            parent: 3,
+            path: "/Users/test/Library/Application Support/Claude/claude-code/2.1.295/abc/claude.app/Contents/MacOS/claude".into(),
+        };
+        let processes = vec![
+            cli.clone(),
+            Process {
+                pid: 3,
+                parent: 2,
+                path: "/Applications/Claude.app/Contents/Helpers/disclaimer".into(),
+            },
+            Process {
+                pid: 2,
+                parent: 1,
+                path: "/Applications/Claude.app/Contents/MacOS/Claude".into(),
+            },
+        ];
+        let inspect = |bundle: &Path| match bundle.file_stem()?.to_str()? {
+            // The background-only claude.app, as its Info.plist reads.
+            "claude" => Some(Source {
+                app: "Claude Code".to_owned(),
+                bundle: Some("com.anthropic.claude-code".to_owned()),
+                surface: "desktop_app".to_owned(),
+            }),
+            stem => identify(Some(stem), None),
+        };
+        let (source, passed_over) = process_source(Provider::Claude, &processes, inspect);
+        let source = source.unwrap();
+        assert_eq!(source.surface, "claude_app");
+        assert_eq!(
+            source.bundle.as_deref(),
+            Some("com.anthropic.claudefordesktop")
+        );
+        assert_eq!(passed_over.unwrap().app, "Claude Code");
+        // The desktop app's own executable shares the provider's name.
+        let desktop = process_source(Provider::Claude, &processes[2..], inspect);
+        assert_eq!(desktop.0.unwrap().surface, "claude_app");
+        // Started from a terminal, the same binary belongs to the terminal.
+        let terminal = [
+            cli.clone(),
+            Process {
+                pid: 5,
+                parent: 1,
+                path: "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal".into(),
+            },
+        ];
+        let source = process_source(Provider::Claude, &terminal, inspect)
+            .0
+            .unwrap();
+        assert_eq!(source.app, "Terminal");
+        // Another Agent run inside Claude desktop does not own that bundle.
+        let codex = process_source(Provider::Codex, &processes, inspect)
+            .0
+            .unwrap();
+        assert_eq!(codex.app, "Claude Code");
+        // With nothing above it, the passed-over bundle is all there is.
+        let (host, passed_over) = process_source(Provider::Claude, &[cli], inspect);
+        assert!(host.is_none());
+        assert_eq!(passed_over.unwrap().app, "Claude Code");
     }
 
     #[test]
@@ -569,5 +665,60 @@ mod tests {
         ] {
             assert!(!valid_client_bundle_id(value));
         }
+    }
+
+    #[test]
+    fn python_apps_inside_frameworks_are_not_hosts() {
+        // python3 runs as the Python.app inside Python.framework, so a script
+        // that starts an Agent is not the client; the app that ran it is.
+        let terminal = "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal";
+        for python in [
+            "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python",
+            "/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python",
+            "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python",
+            // /usr/bin/python3 with Xcode selected: not Xcode either.
+            "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python",
+        ] {
+            assert_eq!(host_bundle(Path::new(python)), None, "{python}");
+            let processes = [
+                Process { pid: 4, parent: 3, path: "/opt/homebrew/bin/codex".into() },
+                Process { pid: 3, parent: 2, path: python.into() },
+                Process { pid: 2, parent: 1, path: terminal.into() },
+            ];
+            let (source, passed_over) = process_source(Provider::Codex, &processes, |bundle| {
+                identify(bundle.file_stem()?.to_str(), None)
+            });
+            assert_eq!(source.unwrap().app, "Terminal", "{python}");
+            assert!(passed_over.is_none());
+            // Started by launchd or cron, it has no client at all.
+            assert_eq!(
+                process_source(Provider::Codex, &processes[..2], |_| panic!("{python} is not a host")),
+                (None, None)
+            );
+        }
+        // An app's own helpers still name the app: Electron keeps them in
+        // Contents/Frameworks, Chromium inside its framework, below the app.
+        assert_eq!(
+            host_bundle(Path::new("/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)")),
+            Some(PathBuf::from("/Applications/Visual Studio Code.app"))
+        );
+        assert_eq!(
+            host_bundle(Path::new("/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex")),
+            Some(PathBuf::from("/Applications/ChatGPT.app"))
+        );
+        let chromium = [
+            Process { pid: 3, parent: 2, path: "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/154.0.8037.99/Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper".into() },
+            Process { pid: 2, parent: 1, path: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into() },
+        ];
+        let source = process_source(Provider::Codex, &chromium, |bundle| {
+            Some(Source {
+                app: bundle.file_stem()?.to_str()?.to_owned(),
+                bundle: None,
+                surface: "desktop_app".to_owned(),
+            })
+        })
+        .0
+        .unwrap();
+        assert_eq!(source.app, "Google Chrome");
     }
 }

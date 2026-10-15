@@ -10,14 +10,15 @@ use actrealm_installer::{
     ConfigHealth, HookProvider, InstallIntent, InstallOptions, InstallPaths, Installer,
 };
 use actrealm_quota::{
-    codex_app_server_entries, QuotaCollector, QuotaEntry, QuotaError, QuotaPaths,
-    CODEX_APP_SERVER_SOURCE,
+    codex_app_server_entries, mark_reset_window_stale, QuotaCollector, QuotaEntry, QuotaError,
+    QuotaPaths, CODEX_APP_SERVER_SOURCE,
 };
 use actrealm_runtime::{
     ApprovalAction, AttentionAction, CommandState, MetricEvent, QuotaRecord,
     ReviewBaselineCandidate, ReviewBaselineInput, ReviewBaselineRecord, RuntimeStore,
-    SessionRecord, SessionUsageRecord, StoreError, TaskCheckpointInput, TaskCheckpointRecord,
-    TaskHistoryMutation, TimelineEventKind, WaiterError, WaiterRegistry,
+    SessionRecord, SessionSeen, SessionUsageRecord, StoreError, TaskCheckpointInput,
+    TaskCheckpointRecord, TaskHistoryMutation, TimelineEventKind, WaiterError, WaiterRegistry,
+    CODEX_FINAL_ANSWER_AWAITS_REPLY,
 };
 use actrealm_usage::{PricingStatus, UsageCollector, UsagePaths, UsageRecord};
 use axum::body::Body;
@@ -138,11 +139,21 @@ const TASK_CARD_DISPLAY_FIELDS: &[&str] = &[
     "lastEventAt",
 ];
 const SESSION_LIST_RETENTION_MS: u64 = 30 * 60 * 1_000;
+/// Only sessions with an event in this window report a latest message.
+const LATEST_MESSAGE_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
 const USAGE_COLLECTION_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const USAGE_BACKFILL_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const USAGE_LIVE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const CODEX_CREDENTIAL_REFRESH_FIRST_USAGE_GRACE_MS: u64 = 30 * 60 * 1_000;
 const UI_STATUS_TIMESTAMP_GRANULARITY_MS: u64 = 30_000;
+/// The quota loop reads the Codex account every `quota_poll_interval`
+/// (60 s). A snapshot older than this means those reads have been failing.
+const CODEX_OFFICIAL_QUOTA_FRESHNESS_MS: u64 = 15 * 60 * 1_000;
+/// A Claude quota refresh takes seconds; even with every bounded step timing
+/// out it stays under four minutes. One running this long has stopped
+/// responding and is replaced, so the quota cannot stay frozen. Measured on
+/// `Instant`, which does not advance while the Mac sleeps.
+const CLAUDE_QUOTA_REFRESH_ABANDON: Duration = Duration::from_secs(5 * 60);
 const USAGE_FAILURE_BACKOFF: Duration = Duration::from_millis(100);
 const RESTART_REQUEST_TTL: Duration = Duration::from_secs(3);
 const RESTART_REQUEST_PENDING: u8 = 0;
@@ -568,6 +579,8 @@ impl ApiServer {
                 claude_cache_modified_at: None,
                 codex_rate_limits_captured_at: None,
                 oauth_refresh_in_progress: false,
+                oauth_refresh_started_at: None,
+                oauth_refresh_abandoned: None,
                 oauth_next_poll_at: 0,
                 oauth_last_result: None,
             })),
@@ -589,6 +602,7 @@ impl ApiServer {
             review_collection_ready: Arc::new(AtomicBool::new(false)),
             review_consecutive_failures: Arc::new(AtomicUsize::new(0)),
             review_last_success_at: Arc::new(AtomicU64::new(0)),
+            companion_review_cache: CompanionReviewCache::default(),
             #[cfg(test)]
             usage_test_control: None,
             data_paths,
@@ -798,6 +812,7 @@ struct AppState {
     review_collection_ready: Arc<AtomicBool>,
     review_consecutive_failures: Arc<AtomicUsize>,
     review_last_success_at: Arc<AtomicU64>,
+    companion_review_cache: CompanionReviewCache,
     #[cfg(test)]
     usage_test_control: Option<UsageRefreshTestControl>,
     data_paths: DataPaths,
@@ -943,6 +958,14 @@ struct CodexManagerState {
     rate_limits_captured_at: Option<u64>,
     rate_limits_error: Option<String>,
     credential_change_handled: bool,
+    /// Why only a new Runtime process brings the app-server connection back.
+    /// Unset while it is up, turned off or not installed, and while Runtime
+    /// restarts itself for changed credentials.
+    restart_reason: Option<&'static str>,
+    /// Per thread, from the last `item/completed` final answer until its
+    /// turn ends: the turn ID and whether that answer awaits a reply. The
+    /// answer text itself is not kept here.
+    final_answer_awaits_reply: HashMap<String, (Option<String>, bool)>,
 }
 
 fn begin_codex_credential_reconnect(state: &mut CodexManagerState) -> bool {
@@ -977,6 +1000,9 @@ struct QuotaState {
     claude_cache_modified_at: Option<SystemTime>,
     codex_rate_limits_captured_at: Option<u64>,
     oauth_refresh_in_progress: bool,
+    /// When the running refresh started, and the flag that abandons it.
+    oauth_refresh_started_at: Option<Instant>,
+    oauth_refresh_abandoned: Option<Arc<AtomicBool>>,
     oauth_next_poll_at: u64,
     oauth_last_result: Option<Result<u64, (&'static str, String)>>,
 }
@@ -1345,12 +1371,29 @@ impl CodexManager {
 
     fn capability_value(&self) -> Value {
         let Ok(state) = self.state.lock() else {
-            return json!({"status":"unavailable","error":"Connector state is unavailable"});
+            return json!({
+                "status": "unavailable",
+                "error": "Connector state is unavailable",
+                "restartRequired": true,
+                "restartReason": "state_unavailable"
+            });
         };
+        // A launcher that keeps the app-server's output open after it was
+        // shut down never lets the handlers see the connection close.
+        let restart_reason = state.restart_reason.or_else(|| {
+            (!state.credential_change_handled
+                && self
+                    .connector
+                    .as_ref()
+                    .is_some_and(CodexConnector::is_closed))
+            .then_some("connection_lost")
+        });
         json!({
             "status": state.status,
             "error": state.error,
             "rateLimitsError": state.rate_limits_error,
+            "restartRequired": restart_reason.is_some(),
+            "restartReason": restart_reason,
             "lastNotificationMethod": state.last_notification_method,
             "lastNotificationAt": state.last_notification_at,
             "lastPlanSkipReason": state.last_plan_skip_reason,
@@ -1374,17 +1417,22 @@ impl CodexManager {
     fn refresh_rate_limits(&self) -> CodexQuotaRefresh {
         let current_stamp = self.auth_path.as_deref().and_then(credential_stamp);
         if credential_stamp_changed(&self.auth_stamp, &current_stamp) {
-            let should_reconnect = self.state.lock().is_ok_and(|mut state| {
-                if !begin_codex_credential_reconnect(&mut state) {
-                    return false;
-                }
-                state.rate_limits_error =
-                    Some("Codex account credentials changed; reconnecting".to_owned());
-                true
-            });
-            if !should_reconnect {
+            let Ok(mut state) = self.state.lock() else {
                 return CodexQuotaRefresh::Failed;
+            };
+            if !begin_codex_credential_reconnect(&mut state) {
+                drop(state);
+                // The restart for this change already failed. A one-shot
+                // app-server reads the current credentials each time, so the
+                // official quota stays current until Runtime is restarted.
+                return self.refresh_rate_limits_quota_only();
             }
+            state.rate_limits_error =
+                Some("Codex account credentials changed; reconnecting".to_owned());
+            // Runtime restarts itself now, which also brings back a connection
+            // lost earlier; only that restart failing asks the user again.
+            state.restart_reason = None;
+            drop(state);
             if let Some(connector) = self.connector.as_ref() {
                 connector.shutdown();
             }
@@ -1402,9 +1450,23 @@ impl CodexManager {
             .as_ref()
             .and_then(|connector| connector.read_rate_limits().ok())
             .or_else(|| {
-                self.executable
-                    .as_deref()
-                    .and_then(|executable| CodexConnector::read_rate_limits_once(executable).ok())
+                // The executable found at startup can be missing (the desktop
+                // app was mid-update) or moved by a later update. Discover it
+                // again so official quota recovers without a Runtime restart.
+                // Only `start` records the account file; a disabled manager
+                // (Connector turned off) must never launch Codex.
+                let enabled = self.auth_path.is_some();
+                let executable = self
+                    .executable
+                    .clone()
+                    .filter(|path| path.is_file())
+                    .or_else(|| {
+                        enabled
+                            .then(|| discover_provider_availability(HookProvider::Codex))?
+                            .app_server_executable()
+                            .map(ToOwned::to_owned)
+                    })?;
+                CodexConnector::read_rate_limits_once(&executable).ok()
             });
         let Some(rate_limits) = rate_limits else {
             if let Ok(mut state) = self.state.lock() {
@@ -1428,6 +1490,7 @@ impl CodexManager {
             state.status = "unavailable".to_owned();
             state.error = Some(detail.to_owned());
             state.rate_limits_error = Some(detail.to_owned());
+            state.restart_reason = Some("credentials_changed");
             take_codex_pending_requests(&mut state)
         } else {
             (Vec::new(), Vec::new())
@@ -1636,8 +1699,7 @@ fn spawn_codex_handlers(
             );
         }
         if let Ok(mut current) = request_state.lock() {
-            current.status = "unavailable".to_owned();
-            current.error = Some("Codex app-server request channel disconnected".to_owned());
+            mark_codex_connection_lost(&mut current, "request");
         }
     });
     let notification_store = store.clone();
@@ -1646,10 +1708,21 @@ fn spawn_codex_handlers(
             update_codex_notification(&state, &notification_store, &waiters, notification);
         }
         if let Ok(mut current) = state.lock() {
-            current.status = "unavailable".to_owned();
-            current.error = Some("Codex app-server notification channel disconnected".to_owned());
+            mark_codex_connection_lost(&mut current, "notification");
         }
     });
+}
+
+/// The app-server connection closed: it exited, was shut down after it
+/// stopped reading, or was closed for changed credentials. Runtime never
+/// reconnects it on its own, so ask for a restart, except while Runtime is
+/// restarting itself for the credentials (only that failing asks).
+fn mark_codex_connection_lost(state: &mut CodexManagerState, channel: &str) {
+    state.status = "unavailable".to_owned();
+    state.error = Some(format!("Codex app-server {channel} channel disconnected"));
+    if !state.credential_change_handled && state.restart_reason.is_none() {
+        state.restart_reason = Some("connection_lost");
+    }
 }
 
 fn initial_codex_execution_is_authoritative(thread: &CodexThread) -> bool {
@@ -1975,9 +2048,50 @@ fn rpc_id_key(id: &Value) -> String {
         .unwrap_or_else(|| id.to_string())
 }
 
-fn ingest_codex_provider_events(store: &RuntimeStore, notification: &ServerNotification) {
-    for request in codex_notification_events(notification, now_millis()) {
+fn ingest_codex_provider_events(
+    store: &RuntimeStore,
+    state: &Arc<Mutex<CodexManagerState>>,
+    notification: &ServerNotification,
+) {
+    let mut requests = codex_notification_events(notification, now_millis());
+    if notification.method == "turn/completed" {
+        attach_final_answer_judgement(state, notification, &mut requests);
+    }
+    for request in requests {
         let _ = store.ingest(request);
+    }
+}
+
+/// A Connector `turn/completed` carries no answer text (its `turn.items` is
+/// empty), so the `Stop` built from it takes the judgement recorded for the
+/// turn's final answer when that answer arrived (`item/completed`).
+fn attach_final_answer_judgement(
+    state: &Arc<Mutex<CodexManagerState>>,
+    notification: &ServerNotification,
+    requests: &mut [BridgeRequest],
+) {
+    let Some(thread_id) = notification.params.get("threadId").and_then(Value::as_str) else {
+        return;
+    };
+    let Some((answer_turn, awaits_reply)) = state
+        .lock()
+        .ok()
+        .and_then(|mut current| current.final_answer_awaits_reply.remove(thread_id))
+    else {
+        return;
+    };
+    let turn = notification
+        .params
+        .pointer("/turn/id")
+        .and_then(Value::as_str);
+    if answer_turn.is_some() && turn.is_some() && answer_turn.as_deref() != turn {
+        return;
+    }
+    for request in requests
+        .iter_mut()
+        .filter(|request| request.event_name() == Some("Stop"))
+    {
+        request.raw[CODEX_FINAL_ANSWER_AWAITS_REPLY] = Value::Bool(awaits_reply);
     }
 }
 
@@ -2223,7 +2337,7 @@ fn update_codex_notification(
         update_codex_rate_limits(state, &notification.params, observed_at);
         return;
     }
-    ingest_codex_provider_events(store, &notification);
+    ingest_codex_provider_events(store, state, &notification);
     if notification.method == "serverRequest/resolved" {
         if let Some(id) = notification.params.get("requestId") {
             if let Ok(mut current) = state.lock() {
@@ -2264,8 +2378,32 @@ fn update_codex_notification(
 
     if notification.method == "item/completed" {
         let item = &notification.params["item"];
+        // Every Agent message (commentary while the turn works, then the
+        // final answer) becomes the session's latest message.
+        if item["type"] == "agentMessage" && item["phase"] != "final_answer" {
+            if let Some(text) = item["text"].as_str().filter(|text| !text.trim().is_empty()) {
+                if let Some(session_id) = store.snapshot().ok().and_then(|snapshot| {
+                    snapshot
+                        .sessions
+                        .into_iter()
+                        .find(|s| s.provider == "codex" && s.provider_session_id == thread_id)
+                        .map(|session| session.id)
+                }) {
+                    store.observe_latest_message(&session_id, text, observed_at, false);
+                }
+            }
+        }
         if item["type"] == "agentMessage" && item["phase"] == "final_answer" {
             if let Some(text) = item["text"].as_str() {
+                let awaits_reply = actrealm_runtime::message_awaits_reply(text);
+                if let Ok(mut current) = state.lock() {
+                    let turn = notification.params["turnId"]
+                        .as_str()
+                        .map(ToOwned::to_owned);
+                    current
+                        .final_answer_awaits_reply
+                        .insert(thread_id.clone(), (turn, awaits_reply));
+                }
                 if let Ok(snapshot) = store.snapshot() {
                     if let Some(session) = snapshot
                         .sessions
@@ -2284,6 +2422,7 @@ fn update_codex_notification(
                             observed_at,
                             "codex:app_server_final",
                         );
+                        store.observe_latest_message(&session.id, text, observed_at, true);
                     }
                 }
             }
@@ -2333,6 +2472,12 @@ fn update_codex_notification(
             current
                 .async_questions
                 .clear_thread(&thread_id, observed_at);
+            current.final_answer_awaits_reply.remove(&thread_id);
+        }
+    }
+    if notification.method == "thread/closed" {
+        if let Ok(mut current) = state.lock() {
+            current.final_answer_awaits_reply.remove(&thread_id);
         }
     }
 
@@ -2695,6 +2840,7 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/companions/{id}", delete(revoke_companion))
         .route("/api/v1/companion/enroll", post(enroll_companion))
         .route("/api/v1/companion/snapshot", get(companion_snapshot))
+        .route("/api/v1/companion/history", get(companion_history))
         .route(
             "/api/v1/companion/settings/completion",
             get(companion_completion_settings).put(update_companion_completion_settings),
@@ -2718,6 +2864,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/v1/companion/sessions/{id}/jump",
             post(companion_jump_session),
+        )
+        .route(
+            "/api/v1/companion/sessions/{id}/seen",
+            post(companion_mark_session_seen),
         )
         .route("/api/v1/companion/commands", post(companion_command))
         .route("/api/v1/companion/commands/{id}/undo", post(companion_undo))
@@ -3573,6 +3723,110 @@ async fn companion_snapshot(State(state): State<AppState>, headers: HeaderMap) -
         .unwrap_or_else(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "STORAGE_ERROR"))
 }
 
+const COMPANION_HISTORY_DEFAULT_LIMIT: usize = 100;
+const COMPANION_HISTORY_MAX_LIMIT: usize = 200;
+
+#[derive(Debug, PartialEq, Eq)]
+struct CompanionHistoryQuery {
+    since: u64,
+    limit: usize,
+    include_side: bool,
+}
+
+/// Parses the history query by hand so that a missing or malformed value is
+/// reported as a stable API error code instead of a framework rejection.
+fn parse_companion_history_query(
+    params: &HashMap<String, String>,
+) -> Option<CompanionHistoryQuery> {
+    let since = params
+        .get("since")
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))?
+        .parse::<u64>()
+        .ok()?;
+    let limit = match params.get("limit") {
+        None => COMPANION_HISTORY_DEFAULT_LIMIT,
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|limit| (1..=COMPANION_HISTORY_MAX_LIMIT).contains(limit))?,
+    };
+    let include_side = match params.get("includeSide").map(String::as_str) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return None,
+    };
+    Some(CompanionHistoryQuery {
+        since,
+        limit,
+        include_side,
+    })
+}
+
+/// Today's tasks for a Companion: newest first, active ones included. Only
+/// bounded metadata is returned; never prompts, commands, tool input/output,
+/// transcript text, or file paths.
+async fn companion_history(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(authorization) = companion_authorization(&state, &headers) else {
+        return api_error(StatusCode::UNAUTHORIZED, "COMPANION_UNAUTHORIZED");
+    };
+    if !authorization.has_scope(COMPANION_SCOPE_SNAPSHOT) {
+        return api_error(StatusCode::FORBIDDEN, "COMPANION_SCOPE_REQUIRED");
+    }
+    let Some(query) = parse_companion_history_query(&params) else {
+        return api_error(StatusCode::BAD_REQUEST, "INVALID_HISTORY_LIMIT");
+    };
+    let now = now_millis();
+    match state
+        .store
+        .recent_tasks(query.since, query.limit, query.include_side)
+    {
+        Ok(tasks) => {
+            // Like snapshot sessions: the application a task runs in and the
+            // end of its latest Agent message, so a finished task can be read
+            // without opening its conversation.
+            let queries = tasks
+                .iter()
+                .filter(|task| now.saturating_sub(task.last_event_at) <= LATEST_MESSAGE_WINDOW_MS)
+                .map(|task| actrealm_runtime::LatestMessageQuery {
+                    session_id: task.id.clone(),
+                    transcript: task.transcript_path.clone(),
+                    turn_started_at: task.turn_started_at,
+                    turn_ended_at: task.completed_at,
+                })
+                .collect::<Vec<_>>();
+            let mut latest = state.store.latest_messages(
+                &queries,
+                actrealm_runtime::LatestMessageForm::Glance,
+                now,
+            );
+            let tasks = tasks
+                .into_iter()
+                .map(|task| {
+                    let mut value = json!(task);
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("termApp".to_owned(), json!(task.term_app));
+                        object.insert("termBundleId".to_owned(), json!(task.term_bundle_id));
+                        object.insert("termSurface".to_owned(), json!(task.term_surface));
+                        object.insert("lastMessage".to_owned(), json!(latest.remove(&task.id)));
+                    }
+                    value
+                })
+                .collect::<Vec<_>>();
+            Json(json!({
+                "schemaVersion": 1,
+                "generatedAt": now,
+                "tasks": tasks,
+            }))
+            .into_response()
+        }
+        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "STORAGE_ERROR"),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CompanionCompletionSettingsRequest {
@@ -3698,38 +3952,33 @@ async fn companion_session_review(
         .latest_current_local_timeline(&session_id, 100)
         .ok()
         .flatten();
-    let mut limitations = Vec::new();
     let baseline = context
         .turn_id
         .as_deref()
         .and_then(|turn_id| state.store.review_baseline(turn_id).ok().flatten());
-    let mut repository = if let Some(baseline) = baseline.as_ref() {
-        inspect_resolved_git_repository(
-            &baseline.repository_root,
-            context.concurrent_active_sessions,
-            &mut limitations,
-        )
-    } else {
-        match context.working_directory.as_deref() {
-            Some(working_directory) => inspect_git_repository(
-                working_directory,
-                context.concurrent_active_sessions,
-                &mut limitations,
-            ),
-            None => {
-                limitations.push("working_directory_unavailable".to_owned());
-                unavailable_review_repository("working_directory_unavailable")
-            }
-        }
+    let inputs = CompanionReviewInputs {
+        turn_id: context.turn_id.clone(),
+        working_directory: context.working_directory.clone(),
+        baseline,
+        concurrent_active_sessions: context.concurrent_active_sessions,
     };
-    if let Some(baseline) = baseline.as_ref() {
-        apply_review_baseline(
-            &mut repository,
-            baseline,
-            context.concurrent_active_sessions,
-            &mut limitations,
-        );
-    }
+    // The API runtime is a current-thread Tokio runtime: every git child
+    // process runs on the blocking pool so it never stalls other requests.
+    let cache = state.companion_review_cache.clone();
+    let cache_session = session_id.clone();
+    let CompanionReviewGit {
+        repository,
+        limitations,
+    } = tokio::task::spawn_blocking(move || cache.review(&cache_session, inputs, Instant::now()))
+        .await
+        .unwrap_or_else(|_| {
+            let mut repository = unavailable_review_repository("git_unavailable");
+            repository.files = Some(Vec::new());
+            CompanionReviewGit {
+                repository,
+                limitations: vec!["git_unavailable".to_owned()],
+            }
+        });
     let validations = timeline
         .as_ref()
         .map(|page| review_validations(&page.events))
@@ -3814,7 +4063,45 @@ async fn companion_session_result(
         .into_iter()
         .filter(|e| e.started_at >= context.turn_started_at.unwrap_or(0))
         .collect::<Vec<_>>();
-    Json(json!({ "schemaVersion": 1, "sessionId": session_id, "result": result, "activities": activities })).into_response()
+    // "What you said" for the current turn: the user's own sanitized prompt,
+    // held only in Runtime memory. A prompt from an earlier turn is never
+    // returned for the current one.
+    let prompt = context.turn_started_at.and_then(|turn_started_at| {
+        state
+            .store
+            .session_prompt(&session_id, turn_started_at, now_millis())
+    });
+    // The latest Agent message at any point of the turn (the start of it,
+    // within the result excerpt bounds), unlike `result`, which only a
+    // finished turn has.
+    let now = now_millis();
+    let latest = (now.saturating_sub(context.last_event_at) <= LATEST_MESSAGE_WINDOW_MS)
+        .then(|| {
+            let query = actrealm_runtime::LatestMessageQuery {
+                session_id: session_id.clone(),
+                transcript: context.transcript_path.clone(),
+                turn_started_at: context.turn_started_at,
+                turn_ended_at: context.turn_ended_at,
+            };
+            state
+                .store
+                .latest_messages(
+                    std::slice::from_ref(&query),
+                    actrealm_runtime::LatestMessageForm::Full,
+                    now,
+                )
+                .remove(&session_id)
+        })
+        .flatten();
+    Json(json!({
+        "schemaVersion": 1,
+        "sessionId": session_id,
+        "result": result,
+        "activities": activities,
+        "prompt": prompt,
+        "latest": latest,
+    }))
+    .into_response()
 }
 
 #[derive(Default, Deserialize)]
@@ -3863,8 +4150,8 @@ async fn companion_reveal_artifact(
     #[cfg(target_os = "macos")]
     let revealed = tokio::task::spawn_blocking(move || {
         let mut command = ProcessCommand::new("/usr/bin/open");
-        command.arg("-R").arg(path);
-        wait_for_artifact_reveal(command, Duration::from_secs(3))
+        command.arg("-R").arg(path).stderr(Stdio::null());
+        wait_for_bounded_child(command, Duration::from_secs(3))
     })
     .await
     .unwrap_or(false);
@@ -3882,14 +4169,9 @@ async fn companion_reveal_artifact(
 
 // Starting `open` is not success: Launch Services can reject the request later.
 // Keep this bounded and off the HTTP executor, and reap children on every path.
-#[cfg(any(target_os = "macos", test))]
-fn wait_for_artifact_reveal(mut command: ProcessCommand, timeout: Duration) -> bool {
-    let Ok(mut child) = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
+// Stdout never reaches Runtime's own output; stderr is the caller's choice.
+fn wait_for_bounded_child(mut command: ProcessCommand, timeout: Duration) -> bool {
+    let Ok(mut child) = command.stdin(Stdio::null()).stdout(Stdio::null()).spawn() else {
         return false;
     };
     let deadline = Instant::now() + timeout;
@@ -3917,7 +4199,33 @@ async fn companion_jump_session(
     if !authorization.has_scope(COMPANION_SCOPE_JUMP) {
         return api_error(StatusCode::FORBIDDEN, "COMPANION_SCOPE_REQUIRED");
     }
-    process_jump_session(&state, &session_id)
+    process_jump_session_off_executor(state, session_id).await
+}
+
+/// Marks a task as seen after the user opened it from a Companion, typically
+/// after a successful jump from a history row, which carries no Attention ID.
+/// The session's latest completion/error reminder is acknowledged even when
+/// it was already auto-hidden and no longer appears in the snapshot.
+async fn companion_mark_session_seen(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(authorization) = companion_authorization(&state, &headers) else {
+        return api_error(StatusCode::UNAUTHORIZED, "COMPANION_UNAUTHORIZED");
+    };
+    if !authorization.has_scope(COMPANION_SCOPE_RESPOND) {
+        return api_error(StatusCode::FORBIDDEN, "COMPANION_SCOPE_REQUIRED");
+    }
+    if session_id.is_empty() || session_id.len() > 256 {
+        return api_error(StatusCode::BAD_REQUEST, "INVALID_SESSION_ID");
+    }
+    match state.store.mark_session_seen(&session_id, now_millis()) {
+        Ok(SessionSeen::Seen) => Json(json!({ "reviewState": "seen" })).into_response(),
+        Ok(SessionSeen::NoReminder) => Json(json!({ "reviewState": "none" })).into_response(),
+        Ok(SessionSeen::NotFound) => api_error(StatusCode::NOT_FOUND, "SESSION_NOT_FOUND"),
+        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "STORAGE_ERROR"),
+    }
 }
 
 async fn companion_command(
@@ -4271,6 +4579,22 @@ struct ReviewRepository {
     binary_files: Option<u64>,
     attribution: String,
     attribution_reason: String,
+    /// Companion review only: up to [`REVIEW_CHANGED_FILE_LIMIT`] changed
+    /// repository-relative paths with line statistics, never file content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    files: Option<Vec<ReviewChangedFile>>,
+}
+
+const REVIEW_CHANGED_FILE_LIMIT: usize = 20;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewChangedFile {
+    path: String,
+    insertions: u64,
+    deletions: u64,
+    /// `modified`, `added`, `deleted`, `renamed`, or `untracked`.
+    status: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4596,6 +4920,146 @@ fn parse_untracked_review_paths(output: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// Lists changed files between `base` and the working tree plus untracked
+/// paths, ordered by changed line count. Only repository-relative paths and
+/// numeric statistics leave Runtime; untracked file contents are never read,
+/// so their line counts are reported as zero. `status_output` is a
+/// `git status --porcelain=v2 -z` output the caller already holds for the
+/// same repository; without it the status is read here.
+fn review_changed_files(
+    repository_root: &FilePath,
+    base: Option<&str>,
+    status_output: Option<&[u8]>,
+) -> Vec<ReviewChangedFile> {
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(base) = base {
+        let statuses = run_git(
+            repository_root,
+            &[
+                "diff",
+                "--name-status",
+                "-z",
+                "-M",
+                "--no-ext-diff",
+                base,
+                "--",
+            ],
+        )
+        .map(|output| parse_git_name_status_z(&output))
+        .unwrap_or_default();
+        if let Ok(output) = run_git(
+            repository_root,
+            &["diff", "--numstat", "-z", "-M", "--no-ext-diff", base, "--"],
+        ) {
+            for (path, insertions, deletions) in parse_git_numstat_z(&output) {
+                if seen.insert(path.clone()) {
+                    let status = statuses.get(&path).copied().unwrap_or("modified");
+                    files.push(ReviewChangedFile {
+                        path,
+                        insertions,
+                        deletions,
+                        status,
+                    });
+                }
+            }
+        }
+    }
+    let status_output = match status_output {
+        Some(output) => Ok(output.to_vec()),
+        None => run_git(repository_root, &REVIEW_STATUS_ARGS),
+    };
+    if let Ok(output) = status_output {
+        for path in parse_untracked_review_paths(&output) {
+            if seen.insert(path.clone()) {
+                files.push(ReviewChangedFile {
+                    path,
+                    insertions: 0,
+                    deletions: 0,
+                    status: "untracked",
+                });
+            }
+        }
+    }
+    files.sort_by(|left, right| {
+        right
+            .insertions
+            .saturating_add(right.deletions)
+            .cmp(&left.insertions.saturating_add(left.deletions))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    files.truncate(REVIEW_CHANGED_FILE_LIMIT);
+    files
+}
+
+/// Parses `git diff --numstat -z`. A rename is emitted as an empty path
+/// followed by the old and new paths; the new path is reported. Binary files
+/// (`-`) count as zero lines.
+fn parse_git_numstat_z(output: &[u8]) -> Vec<(String, u64, u64)> {
+    let mut records = Vec::new();
+    let mut tokens = output.split(|byte| *byte == 0);
+    while let Some(token) = tokens.next() {
+        if token.is_empty() {
+            continue;
+        }
+        let mut fields = token.splitn(3, |byte| *byte == b'\t');
+        let (Some(insertions), Some(deletions), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let path = if path.is_empty() {
+            let _previous = tokens.next();
+            match tokens.next() {
+                Some(path) => path,
+                None => break,
+            }
+        } else {
+            path
+        };
+        if let Some(path) = safe_review_relative_path(path) {
+            records.push((
+                path,
+                parse_ascii_u64(insertions),
+                parse_ascii_u64(deletions),
+            ));
+        }
+    }
+    records
+}
+
+/// Parses `git diff --name-status -z` into the Companion status vocabulary.
+fn parse_git_name_status_z(output: &[u8]) -> HashMap<String, &'static str> {
+    let mut statuses = HashMap::new();
+    let mut tokens = output.split(|byte| *byte == 0);
+    while let Some(code) = tokens.next() {
+        let Some(&letter) = code.first() else {
+            continue;
+        };
+        let Some(first) = tokens.next() else {
+            break;
+        };
+        let path = if matches!(letter, b'R' | b'C') {
+            match tokens.next() {
+                Some(path) => path,
+                None => break,
+            }
+        } else {
+            first
+        };
+        let status = match letter {
+            b'A' | b'C' => "added",
+            b'D' => "deleted",
+            b'R' => "renamed",
+            _ => "modified",
+        };
+        if let Some(path) = safe_review_relative_path(path) {
+            statuses.insert(path, status);
+        }
+    }
+    statuses
+}
+
 fn safe_review_relative_path(value: &[u8]) -> Option<String> {
     let value = std::str::from_utf8(value).ok()?;
     if value.is_empty() || value.len() > 1_024 || value.chars().any(char::is_control) {
@@ -4722,6 +5186,212 @@ fn git_commit_count_since(repository_root: &FilePath, baseline_head: &str) -> Op
     value.trim().parse::<u64>().ok()
 }
 
+/// `git status` as the review routes run it.
+const REVIEW_STATUS_ARGS: [&str; 4] =
+    ["status", "--porcelain=v2", "-z", "--untracked-files=normal"];
+/// `git status` for the Companion review. `--branch` adds the HEAD commit and
+/// branch name as header records, so one call both feeds the review and
+/// fingerprints HEAD, branch and working tree state for the review cache.
+const COMPANION_REVIEW_STATUS_ARGS: [&str; 6] = [
+    "status",
+    "--porcelain=v2",
+    "-z",
+    "--branch",
+    "--no-ahead-behind",
+    "--untracked-files=normal",
+];
+/// How long a Companion review may reuse its git observations for the same
+/// session while HEAD, branch and working tree status stay unchanged. It only
+/// absorbs bursts of Display requests; anything older is recomputed.
+const COMPANION_REVIEW_CACHE_TTL: Duration = Duration::from_millis(2_500);
+const COMPANION_REVIEW_CACHE_LIMIT: usize = 32;
+
+/// Raw git observations from one repository inspection, reused by the
+/// Companion review instead of asking git again for the same answer.
+#[derive(Debug)]
+struct GitInspection {
+    repository_root: PathBuf,
+    full_head: Option<String>,
+    status_output: Vec<u8>,
+}
+
+/// The git-derived part of a Companion review.
+#[derive(Debug, Clone)]
+struct CompanionReviewGit {
+    repository: ReviewRepository,
+    limitations: Vec<String>,
+}
+
+/// Everything besides the git state itself that a Companion review depends
+/// on. A cached review is reused only for identical inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompanionReviewInputs {
+    turn_id: Option<String>,
+    working_directory: Option<PathBuf>,
+    baseline: Option<ReviewBaselineRecord>,
+    concurrent_active_sessions: u32,
+}
+
+struct CompanionReviewCacheEntry {
+    inputs: CompanionReviewInputs,
+    repository_root: PathBuf,
+    fingerprint: Vec<u8>,
+    computed_at: Instant,
+    review: CompanionReviewGit,
+}
+
+/// A short per-session cache for the Companion review, so a Display that
+/// polls or retries does not start a burst of git child processes. A hit
+/// costs one `git status` that must match the cached fingerprint exactly.
+#[derive(Clone, Default)]
+struct CompanionReviewCache {
+    entries: Arc<Mutex<HashMap<String, CompanionReviewCacheEntry>>>,
+}
+
+impl CompanionReviewCache {
+    /// Blocking: runs git. Call it from the blocking pool.
+    fn review(
+        &self,
+        session_id: &str,
+        inputs: CompanionReviewInputs,
+        now: Instant,
+    ) -> CompanionReviewGit {
+        let cached = self.entries.lock().ok().and_then(|entries| {
+            entries
+                .get(session_id)
+                .filter(|entry| {
+                    entry.inputs == inputs
+                        && now.saturating_duration_since(entry.computed_at)
+                            < COMPANION_REVIEW_CACHE_TTL
+                })
+                .map(|entry| {
+                    (
+                        entry.repository_root.clone(),
+                        entry.fingerprint.clone(),
+                        entry.review.clone(),
+                    )
+                })
+        });
+        if let Some((repository_root, fingerprint, review)) = cached {
+            if companion_review_fingerprint(&repository_root).as_deref()
+                == Some(fingerprint.as_slice())
+            {
+                return review;
+            }
+        }
+        let (review, inspection) = compute_companion_review_git(&inputs);
+        let Ok(mut entries) = self.entries.lock() else {
+            return review;
+        };
+        entries.retain(|_, entry| {
+            now.saturating_duration_since(entry.computed_at) < COMPANION_REVIEW_CACHE_TTL
+        });
+        let Some(inspection) = inspection else {
+            entries.remove(session_id);
+            return review;
+        };
+        if entries.len() >= COMPANION_REVIEW_CACHE_LIMIT && !entries.contains_key(session_id) {
+            let oldest = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.computed_at)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(
+            session_id.to_owned(),
+            CompanionReviewCacheEntry {
+                inputs,
+                fingerprint: status_fingerprint(&inspection.status_output),
+                repository_root: inspection.repository_root,
+                computed_at: now,
+                review: review.clone(),
+            },
+        );
+        review
+    }
+}
+
+fn status_fingerprint(status_output: &[u8]) -> Vec<u8> {
+    digest(&SHA256, status_output).as_ref().to_vec()
+}
+
+fn companion_review_fingerprint(repository_root: &FilePath) -> Option<Vec<u8>> {
+    run_git(repository_root, &COMPANION_REVIEW_STATUS_ARGS)
+        .ok()
+        .map(|output| status_fingerprint(&output))
+}
+
+/// The repository part of the Companion review: the same repository, base
+/// and attribution as the local review, plus `files`. The repository root,
+/// HEAD and status resolved by the inspection are reused for the file list,
+/// so no `rev-parse` or `status` runs twice. Also returns the inspection the
+/// cache fingerprints, when the repository was available.
+fn compute_companion_review_git(
+    inputs: &CompanionReviewInputs,
+) -> (CompanionReviewGit, Option<GitInspection>) {
+    let mut limitations = Vec::new();
+    let baseline = inputs.baseline.as_ref();
+    let (mut repository, inspection) = match (baseline, inputs.working_directory.as_deref()) {
+        (Some(baseline), _) => inspect_resolved_git_repository_with(
+            &baseline.repository_root,
+            inputs.concurrent_active_sessions,
+            &mut limitations,
+            &COMPANION_REVIEW_STATUS_ARGS,
+        ),
+        (None, Some(working_directory)) => inspect_git_repository_with(
+            working_directory,
+            inputs.concurrent_active_sessions,
+            &mut limitations,
+            &COMPANION_REVIEW_STATUS_ARGS,
+        ),
+        (None, None) => {
+            limitations.push("working_directory_unavailable".to_owned());
+            (
+                unavailable_review_repository("working_directory_unavailable"),
+                None,
+            )
+        }
+    };
+    if let Some(baseline) = baseline {
+        apply_review_baseline(
+            &mut repository,
+            baseline,
+            inputs.concurrent_active_sessions,
+            &mut limitations,
+        );
+    }
+    // Same repository and base as the local review/diff route, reduced to
+    // relative paths and line counts. A baseline whose repository identity
+    // changed yields no file list, exactly like review/diff.
+    let files = inspection
+        .as_ref()
+        .filter(|_| {
+            repository.state == "available"
+                && (baseline.is_none() || repository.baseline_state != "invalid")
+        })
+        .map(|inspection| {
+            let base = baseline
+                .and_then(|baseline| baseline.head.clone())
+                .or_else(|| inspection.full_head.clone());
+            review_changed_files(
+                &inspection.repository_root,
+                base.as_deref(),
+                Some(&inspection.status_output),
+            )
+        })
+        .unwrap_or_default();
+    repository.files = Some(files);
+    (
+        CompanionReviewGit {
+            repository,
+            limitations,
+        },
+        inspection,
+    )
+}
+
 fn unavailable_review_repository(reason: &str) -> ReviewRepository {
     ReviewRepository {
         state: "unavailable".to_owned(),
@@ -4742,6 +5412,7 @@ fn unavailable_review_repository(reason: &str) -> ReviewRepository {
         binary_files: None,
         attribution: "unavailable".to_owned(),
         attribution_reason: reason.to_owned(),
+        files: None,
     }
 }
 
@@ -4750,9 +5421,27 @@ fn inspect_git_repository(
     concurrent_active_sessions: u32,
     limitations: &mut Vec<String>,
 ) -> ReviewRepository {
+    inspect_git_repository_with(
+        working_directory,
+        concurrent_active_sessions,
+        limitations,
+        &REVIEW_STATUS_ARGS,
+    )
+    .0
+}
+
+/// Resolves the repository of `working_directory` once and inspects it,
+/// returning the git observations a caller may reuse instead of asking git
+/// again (the resolved root, the full HEAD and the status output).
+fn inspect_git_repository_with(
+    working_directory: &FilePath,
+    concurrent_active_sessions: u32,
+    limitations: &mut Vec<String>,
+    status_arguments: &[&str],
+) -> (ReviewRepository, Option<GitInspection>) {
     let Some(repository_root) = resolve_review_repository_root(working_directory, limitations)
     else {
-        return ReviewRepository {
+        let repository = ReviewRepository {
             state: "not_git".to_owned(),
             attribution_reason: limitations
                 .last()
@@ -4760,8 +5449,14 @@ fn inspect_git_repository(
                 .unwrap_or_else(|| "not_git_repository".to_owned()),
             ..unavailable_review_repository("repository_unavailable")
         };
+        return (repository, None);
     };
-    inspect_resolved_git_repository(&repository_root, concurrent_active_sessions, limitations)
+    inspect_resolved_git_repository_with(
+        &repository_root,
+        concurrent_active_sessions,
+        limitations,
+        status_arguments,
+    )
 }
 
 fn resolve_review_repository_root(
@@ -4805,18 +5500,39 @@ fn inspect_resolved_git_repository(
     concurrent_active_sessions: u32,
     limitations: &mut Vec<String>,
 ) -> ReviewRepository {
+    inspect_resolved_git_repository_with(
+        repository_root,
+        concurrent_active_sessions,
+        limitations,
+        &REVIEW_STATUS_ARGS,
+    )
+    .0
+}
+
+/// Inspects an already resolved repository. `status_arguments` is a
+/// `git status --porcelain=v2 -z` invocation; header records it may add
+/// (`--branch`) are ignored by the parsers.
+fn inspect_resolved_git_repository_with(
+    repository_root: &FilePath,
+    concurrent_active_sessions: u32,
+    limitations: &mut Vec<String>,
+    status_arguments: &[&str],
+) -> (ReviewRepository, Option<GitInspection>) {
     if !repository_root.is_dir() {
         limitations.push("working_directory_unavailable".to_owned());
-        return unavailable_review_repository("working_directory_unavailable");
+        return (
+            unavailable_review_repository("working_directory_unavailable"),
+            None,
+        );
     }
-    let status_output = match run_git(
-        repository_root,
-        &["status", "--porcelain=v2", "-z", "--untracked-files=normal"],
-    ) {
+    let status_output = match run_git(repository_root, status_arguments) {
         Ok(output) => output,
         Err(error) => {
             limitations.push(git_review_error_code(&error).to_owned());
-            return unavailable_review_repository(git_review_error_code(&error));
+            return (
+                unavailable_review_repository(git_review_error_code(&error)),
+                None,
+            );
         }
     };
     let status = parse_git_status(&status_output);
@@ -4859,7 +5575,7 @@ fn inspect_resolved_git_repository(
     if attribution != "no_changes" {
         limitations.push(attribution_reason.to_owned());
     }
-    ReviewRepository {
+    let repository = ReviewRepository {
         state: "available".to_owned(),
         baseline_state: "unavailable".to_owned(),
         baseline_captured_at: None,
@@ -4878,7 +5594,14 @@ fn inspect_resolved_git_repository(
         binary_files: numstat.as_ref().map(|value| value.binary_files),
         attribution: attribution.to_owned(),
         attribution_reason: attribution_reason.to_owned(),
-    }
+        files: None,
+    };
+    let inspection = GitInspection {
+        repository_root: repository_root.to_path_buf(),
+        full_head,
+        status_output,
+    };
+    (repository, Some(inspection))
 }
 
 fn full_git_head(repository_root: &FilePath) -> Option<String> {
@@ -5016,7 +5739,17 @@ fn git_review_error_code(error: &GitReviewError) -> &'static str {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Arguments of every review `git` invocation on this thread, so tests
+    /// can count child processes.
+    static REVIEW_GIT_TEST_LOG: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn run_git(working_directory: &FilePath, arguments: &[&str]) -> Result<Vec<u8>, GitReviewError> {
+    #[cfg(test)]
+    REVIEW_GIT_TEST_LOG.with(|log| log.borrow_mut().push(arguments.join(" ")));
     let mut child = ProcessCommand::new("/usr/bin/git")
         .arg("-C")
         .arg(working_directory)
@@ -5619,7 +6352,8 @@ async fn checkpoint_action(
                 &preflight.view.blockers.join(","),
             );
         }
-        return process_jump_session(&state, &checkpoint.session_id);
+        return process_jump_session_off_executor(state.clone(), checkpoint.session_id.clone())
+            .await;
     }
     let preflight = match checkpoint_preflight_for(&checkpoint, &request.action) {
         Ok(preflight) => preflight,
@@ -7159,7 +7893,16 @@ async fn jump_session(
     if !authorized_mutation(&state, &headers) {
         return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_MUTATION");
     }
-    process_jump_session(&state, &session_id)
+    process_jump_session_off_executor(state, session_id).await
+}
+
+/// Jumping waits on Launch Services or AppleScript, which can take minutes
+/// when an app does not answer. Keep it off the single API thread so
+/// snapshots and quota polling go on meanwhile.
+async fn process_jump_session_off_executor(state: AppState, session_id: String) -> Response {
+    tokio::task::spawn_blocking(move || process_jump_session(&state, &session_id))
+        .await
+        .unwrap_or_else(|_| api_error(StatusCode::CONFLICT, "JUMP_FAILED"))
 }
 
 fn process_jump_session(state: &AppState, session_id: &str) -> Response {
@@ -7178,7 +7921,7 @@ fn process_jump_session(state: &AppState, session_id: &str) -> Response {
         return api_error(StatusCode::CONFLICT, "JUMP_UNSUPPORTED");
     }
     for target in &targets {
-        if run_jump_target(target, session).is_ok_and(|success| success) {
+        if run_jump_target(target, session) {
             let capability = jump_target_capability(target);
             return Json(json!({
                 "success": true,
@@ -7297,6 +8040,10 @@ fn jump_targets(session: &SessionRecord) -> Vec<JumpTarget> {
         targets.push(JumpTarget::AppBundle("dev.warp.Warp-Stable".to_owned()));
     } else if session.term_surface.as_deref() == Some("claude_app")
         || bundle == "com.anthropic.claudefordesktop"
+        // Claude desktop's own background-only claude.app, recorded for
+        // sessions from before it was looked past and for other Agents run
+        // inside Claude desktop. Opening that bundle shows nothing.
+        || bundle == "com.anthropic.claude-code"
     {
         targets.push(JumpTarget::AppBundle(
             "com.anthropic.claudefordesktop".to_owned(),
@@ -7304,11 +8051,9 @@ fn jump_targets(session: &SessionRecord) -> Vec<JumpTarget> {
     }
 
     if targets.is_empty() {
-        if let Some(bundle) = session
-            .term_bundle_id
-            .as_deref()
-            .filter(|b| actrealm_core::valid_client_bundle_id(b))
-        {
+        if let Some(bundle) = session.term_bundle_id.as_deref().filter(|b| {
+            actrealm_core::valid_client_bundle_id(b) && !actrealm_core::interpreter_bundle_id(b)
+        }) {
             targets.push(JumpTarget::AppBundle(bundle.to_owned()));
         }
     }
@@ -7351,36 +8096,56 @@ fn safe_locator(value: &str) -> bool {
         })
 }
 
-fn run_jump_target(target: &JumpTarget, session: &SessionRecord) -> io::Result<bool> {
-    let status = match target {
-        JumpTarget::CodexThread(thread_id) => ProcessCommand::new("/usr/bin/open")
-            .arg(format!("codex://threads/{thread_id}"))
-            .status()?,
-        JumpTarget::ITermSession => ProcessCommand::new("/usr/bin/osascript")
-            .arg("-e")
-            .arg(ITERM_JUMP_SCRIPT)
-            .env(
-                "ACTREALM_JUMP_SESSION",
-                session.term_session_id.as_deref().unwrap_or_default(),
-            )
-            .env(
-                "ACTREALM_JUMP_TTY",
-                session.term_tty.as_deref().unwrap_or_default(),
-            )
-            .status()?,
-        JumpTarget::TerminalTty => ProcessCommand::new("/usr/bin/osascript")
-            .arg("-e")
-            .arg(TERMINAL_JUMP_SCRIPT)
-            .env(
-                "ACTREALM_JUMP_TTY",
-                session.term_tty.as_deref().unwrap_or_default(),
-            )
-            .status()?,
-        JumpTarget::AppBundle(bundle) => ProcessCommand::new("/usr/bin/open")
-            .args(["-b", bundle.as_str()])
-            .status()?,
+/// Long enough for `open` to start an app that was closed. A script waiting
+/// on an app that does not answer must still not hold a thread for good.
+const JUMP_TARGET_TIMEOUT: Duration = Duration::from_secs(10);
+/// The first AppleScript jump waits on the Automation prompt until the user
+/// answers it; killing it sooner would land on the app, not the tab.
+const JUMP_SCRIPT_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn run_jump_target(target: &JumpTarget, session: &SessionRecord) -> bool {
+    let timeout = match target {
+        JumpTarget::ITermSession | JumpTarget::TerminalTty => JUMP_SCRIPT_TIMEOUT,
+        JumpTarget::CodexThread(_) | JumpTarget::AppBundle(_) => JUMP_TARGET_TIMEOUT,
     };
-    Ok(status.success())
+    // Stderr stays with Runtime, so a refused permission still reaches the log.
+    wait_for_bounded_child(jump_command(target, session), timeout)
+}
+
+fn jump_command(target: &JumpTarget, session: &SessionRecord) -> ProcessCommand {
+    let tty = session.term_tty.as_deref().unwrap_or_default();
+    match target {
+        JumpTarget::CodexThread(thread_id) => {
+            let mut command = ProcessCommand::new("/usr/bin/open");
+            command.arg(format!("codex://threads/{thread_id}"));
+            command
+        }
+        JumpTarget::ITermSession => {
+            let mut command = ProcessCommand::new("/usr/bin/osascript");
+            command
+                .arg("-e")
+                .arg(ITERM_JUMP_SCRIPT)
+                .env(
+                    "ACTREALM_JUMP_SESSION",
+                    session.term_session_id.as_deref().unwrap_or_default(),
+                )
+                .env("ACTREALM_JUMP_TTY", tty);
+            command
+        }
+        JumpTarget::TerminalTty => {
+            let mut command = ProcessCommand::new("/usr/bin/osascript");
+            command
+                .arg("-e")
+                .arg(TERMINAL_JUMP_SCRIPT)
+                .env("ACTREALM_JUMP_TTY", tty);
+            command
+        }
+        JumpTarget::AppBundle(bundle) => {
+            let mut command = ProcessCommand::new("/usr/bin/open");
+            command.args(["-b", bundle.as_str()]);
+            command
+        }
+    }
 }
 
 const ITERM_JUMP_SCRIPT: &str = r#"
@@ -7995,6 +8760,14 @@ fn apply_live_codex_metrics(
 }
 
 fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
+    snapshot_value_and_sessions(state).map(|(value, _)| value)
+}
+
+/// The UI snapshot together with the session records it was built from, for
+/// projections that need fields the serialized sessions leave out.
+fn snapshot_value_and_sessions(
+    state: &AppState,
+) -> Result<(Value, Vec<SessionRecord>), StoreError> {
     let now = now_millis();
     state.codex.retry_unsynced_native_approvals();
     let snapshot = state
@@ -8237,6 +9010,25 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
                     Vec::new()
                 }),
             );
+            // `pass_through` returns a request to the original Agent UI only
+            // where the Provider still shows it there: a Hook waiter (Claude,
+            // Codex or Gemini Hooks) or a Kimi/Grok Connector request, which
+            // stays pending in the Provider until its own UI answers it. A
+            // request held by the managed Codex app-server channel has no such
+            // UI; passing it through answers Codex with an error instead.
+            let hand_back_available = reply_channel_active
+                && item.request_id.is_some_and(|request_id| {
+                    state
+                        .waiters
+                        .raw(request_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|raw| raw.get("_codex_server_request_method").is_none())
+                });
+            object.insert(
+                "handBackAvailable".to_owned(),
+                Value::Bool(hand_back_available),
+            );
         }
     }
     let quota_entries = quota_entries(state)?;
@@ -8326,7 +9118,7 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
             Value::Number(coarse_ui_timestamp(now).into()),
         );
     }
-    Ok(json!({
+    let value = json!({
         "sessions": sessions,
         "attention": attention,
         "asyncQuestions": state.codex.state.lock().ok().map(|mut s| s.async_questions.snapshot(now)).unwrap_or_default(),
@@ -8342,7 +9134,25 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
             "codexConnector": state.codex.capability_value(),
             "providerMatrix": provider_capability_matrix()
         }
-    }))
+    });
+    Ok((value, snapshot.sessions))
+}
+
+/// What the latest-message lookup needs to know about a session: its
+/// transcript (Claude Code) and its current turn. Sessions without an event
+/// in the last day are left out.
+fn latest_message_query(
+    session: &SessionRecord,
+    now: u64,
+) -> Option<actrealm_runtime::LatestMessageQuery> {
+    (now.saturating_sub(session.last_event_at) <= LATEST_MESSAGE_WINDOW_MS).then(|| {
+        actrealm_runtime::LatestMessageQuery {
+            session_id: session.id.clone(),
+            transcript: session.transcript_path.clone(),
+            turn_started_at: session.turn_started_at,
+            turn_ended_at: session.turn_ended_at,
+        }
+    })
 }
 
 fn coarse_ui_timestamp(value: u64) -> u64 {
@@ -8353,7 +9163,7 @@ fn companion_snapshot_value(
     state: &AppState,
     authorization: &CompanionAuthorization,
 ) -> Result<Value, StoreError> {
-    let source = snapshot_value(state)?;
+    let (source, records) = snapshot_value_and_sessions(state)?;
     let sessions = project_array_fields(
         source.get("sessions"),
         &[
@@ -8400,9 +9210,37 @@ fn companion_snapshot_value(
             "connectorThreadStatus",
             "facts",
             "lastEventAt",
+            "userTurnCount",
+            "taskRole",
+            "backgroundTasks",
         ],
     );
     let mut sessions = sessions;
+    // The application a session runs in, and its latest Agent message (the
+    // end of it, sanitized; memory-only like result excerpts).
+    let now = now_millis();
+    let queries = records
+        .iter()
+        .filter_map(|record| latest_message_query(record, now))
+        .collect::<Vec<_>>();
+    let mut latest =
+        state
+            .store
+            .latest_messages(&queries, actrealm_runtime::LatestMessageForm::Glance, now);
+    for row in &mut sessions {
+        let Some(record) = row["id"]
+            .as_str()
+            .and_then(|id| records.iter().find(|record| record.id == id))
+        else {
+            continue;
+        };
+        if let Some(object) = row.as_object_mut() {
+            object.insert("termApp".to_owned(), json!(record.term_app));
+            object.insert("termBundleId".to_owned(), json!(record.term_bundle_id));
+            object.insert("termSurface".to_owned(), json!(record.term_surface));
+            object.insert("lastMessage".to_owned(), json!(latest.remove(&record.id)));
+        }
+    }
     if let Ok(native) = state.codex.state.lock() {
         for row in &mut sessions {
             let latest = row["id"]
@@ -8457,11 +9295,13 @@ fn companion_snapshot_value(
             "reminderAcknowledgedAt",
             "reminderResolution",
             "retainAfterAck",
+            "awaitsReply",
             "createdAt",
             "resolution",
             "interaction",
             "remoteActionable",
             "allowedActions",
+            "handBackAvailable",
         ],
     );
     if !can_respond {
@@ -8469,6 +9309,7 @@ fn companion_snapshot_value(
             if let Some(object) = item.as_object_mut() {
                 object.insert("remoteActionable".to_owned(), Value::Bool(false));
                 object.insert("allowedActions".to_owned(), Value::Array(Vec::new()));
+                object.insert("handBackAvailable".to_owned(), Value::Bool(false));
             }
         }
     }
@@ -8492,6 +9333,11 @@ fn companion_snapshot_value(
             "capturedAt",
             "windowMessage",
             "reasonMessage",
+            "spentMinor",
+            "limitMinor",
+            "currency",
+            "currencyExponent",
+            "disabledReason",
         ],
     );
     let commands = project_array_fields(
@@ -8795,10 +9641,11 @@ fn observe_codex_questions(state: &AppState, scanner: &mut QuestionScanner) {
                     turn_id,
                     event,
                     at,
+                    awaits_reply,
                 } => {
                     if state
                         .store
-                        .observe_codex_turn_end(&thread_id, &turn_id, event, at)
+                        .observe_codex_turn_end(&thread_id, &turn_id, event, at, awaits_reply)
                         .unwrap_or(false)
                     {
                         current.async_questions.clear_thread(&thread_id, at);
@@ -8832,6 +9679,16 @@ fn observe_codex_questions(state: &AppState, scanner: &mut QuestionScanner) {
                         at,
                         "codex:final_response",
                     );
+                }
+                Observation::Message {
+                    session_id,
+                    text,
+                    at,
+                    is_final,
+                } => {
+                    state
+                        .store
+                        .observe_latest_message(&session_id, &text, at, is_final);
                 }
                 Observation::Clear { thread_id, at } => {
                     current.async_questions.clear_thread(&thread_id, at);
@@ -9176,13 +10033,10 @@ fn quota_entries(state: &AppState) -> Result<Vec<QuotaEntry>, StoreError> {
         if quota.oauth_last_result.as_ref().is_some_and(Result::is_err) {
             mark_claude_quota_stale(&mut entries);
         }
-        let fallback_codex = if official_codex
-            .as_ref()
-            .is_none_or(|(entries, _)| !has_standard_codex_quota(entries))
-        {
-            quota.collector.collect_codex(now)
-        } else {
+        let fallback_codex = if codex_official_is_current(official_codex.as_ref(), now) {
             Vec::new()
+        } else {
+            quota.collector.collect_codex(now)
         };
         let (codex_entries, codex_captured_at) = select_codex_quota_entries(
             &quota.entries,
@@ -9225,30 +10079,160 @@ fn oauth_poll_due(in_progress: bool, next_poll_at: u64, now: u64, force: bool) -
     !in_progress && (force || now >= next_poll_at)
 }
 
+/// Gives up on a Claude quota refresh that has stopped responding, so the
+/// next poll starts a new one instead of the quota freezing until restart.
+/// The old thread may still return later; its flag keeps it from renewing
+/// the credential, writing the cache, or touching this state.
+fn abandon_stuck_oauth_refresh(quota: &mut QuotaState, now: Instant) -> bool {
+    if !quota.oauth_refresh_in_progress
+        || quota.oauth_refresh_started_at.is_none_or(|started| {
+            now.saturating_duration_since(started) < CLAUDE_QUOTA_REFRESH_ABANDON
+        })
+    {
+        return false;
+    }
+    if let Some(abandoned) = quota.oauth_refresh_abandoned.take() {
+        abandoned.store(true, Ordering::Release);
+    }
+    quota.oauth_refresh_in_progress = false;
+    mark_claude_quota_stale(&mut quota.entries);
+    quota.oauth_last_result = Some(Err((
+        "CLAUDE_QUOTA_REFRESH_FAILED",
+        "The Claude quota refresh stopped responding and was restarted.".to_owned(),
+    )));
+    true
+}
+
+/// Claims the next Claude quota refresh when one is due: marks it running
+/// and hands over the collector, tied to the flag that can abandon it.
+fn claim_oauth_quota_refresh(
+    quota: &mut QuotaState,
+    now_ms: u64,
+    now: Instant,
+    force: bool,
+    poll_interval: Duration,
+) -> Option<(QuotaCollector, Arc<AtomicBool>)> {
+    abandon_stuck_oauth_refresh(quota, now);
+    if !oauth_poll_due(
+        quota.oauth_refresh_in_progress,
+        quota.oauth_next_poll_at,
+        now_ms,
+        force,
+    ) {
+        return None;
+    }
+    quota.oauth_refresh_in_progress = true;
+    quota.oauth_refresh_started_at = Some(now);
+    let abandoned = Arc::new(AtomicBool::new(false));
+    quota.oauth_refresh_abandoned = Some(abandoned.clone());
+    // Keep the previous failure visible until a successful response replaces it.
+    quota.oauth_next_poll_at = now_ms.saturating_add(poll_interval.as_millis() as u64);
+    // Keep credential-refresh cooldown and HTTP backoff across polls.
+    // Snapshot reads use an independent cache-only placeholder meanwhile.
+    let placeholder = QuotaCollector::new(quota.collector.paths().clone());
+    let mut collector = std::mem::replace(&mut quota.collector, placeholder);
+    collector.set_oauth_abandon_flag(abandoned.clone());
+    Some((collector, abandoned))
+}
+
+/// What a Claude quota refresh brings back to the shared state.
+struct OAuthQuotaOutcome {
+    collector: QuotaCollector,
+    result: Result<Vec<QuotaEntry>, QuotaError>,
+    official_codex: Option<(Vec<QuotaEntry>, u64)>,
+    fallback_codex: Vec<QuotaEntry>,
+    started_at: u64,
+}
+
+/// Writes a finished Claude quota refresh back, unless it was abandoned
+/// while stuck: then a newer refresh owns the state and nothing changes.
+fn finish_oauth_quota_refresh(
+    quota: &mut QuotaState,
+    store: &RuntimeStore,
+    abandoned: &AtomicBool,
+    outcome: OAuthQuotaOutcome,
+) {
+    if abandoned.load(Ordering::Acquire) {
+        return;
+    }
+    quota.collector = outcome.collector;
+    match outcome.result {
+        Ok(mut entries) => {
+            let captured_at = entries
+                .iter()
+                .filter_map(|entry| entry.captured_at)
+                .max()
+                .unwrap_or(outcome.started_at);
+            let (codex_entries, codex_captured_at) = select_codex_quota_entries(
+                &quota.entries,
+                quota.codex_rate_limits_captured_at,
+                outcome.official_codex,
+                outcome.fallback_codex,
+                now_millis(),
+            );
+            entries.extend(codex_entries);
+            // Kimi and Grok come from their own caches, as in quota_entries.
+            entries.extend(actrealm_quota::agents::read_agent_cache(
+                &quota.collector.paths().actrealm_home,
+                now_millis(),
+            ));
+            quota.entries = entries;
+            quota.codex_rate_limits_captured_at = codex_captured_at;
+            quota.claude_cache_modified_at = fs::metadata(quota.collector.paths().claude_cache())
+                .and_then(|metadata| metadata.modified())
+                .ok();
+            quota.refreshed_at = Some(Instant::now());
+            quota.oauth_last_result = Some(Ok(captured_at));
+        }
+        Err(error) => {
+            mark_claude_quota_stale(&mut quota.entries);
+            // Network may still be resuming after wake. Retry promptly,
+            // while the collector continues to enforce HTTP 429 backoff.
+            if matches!(&error, QuotaError::OAuthRequest(message)
+                if message != "credential was rejected" && message != "temporarily rate limited")
+            {
+                quota.oauth_next_poll_at = now_millis().saturating_add(10_000);
+            }
+            quota.oauth_last_result = Some(Err((
+                quota_refresh_error_code(&error),
+                quota_refresh_error_detail(&error),
+            )));
+        }
+    }
+    let persisted = quota
+        .entries
+        .iter()
+        .filter_map(quota_record)
+        .collect::<Vec<_>>();
+    if store.replace_quota_snapshots(persisted).is_err() {
+        quota.oauth_last_result = Some(Err((
+            "QUOTA_PERSIST_FAILED",
+            "Could not persist the quota snapshot".into(),
+        )));
+    }
+    quota.oauth_refresh_in_progress = false;
+    quota.oauth_refresh_abandoned = None;
+}
+
 fn start_oauth_quota_refresh(state: &AppState, force: bool) {
     if !state.claude_oauth_quota {
         return;
     }
     let now = now_millis();
-    let mut collector = {
+    let claimed = {
         let Ok(mut quota) = state.quota.lock() else {
             return;
         };
-        if !oauth_poll_due(
-            quota.oauth_refresh_in_progress,
-            quota.oauth_next_poll_at,
+        claim_oauth_quota_refresh(
+            &mut quota,
             now,
+            Instant::now(),
             force,
-        ) {
-            return;
-        }
-        quota.oauth_refresh_in_progress = true;
-        // Keep the previous failure visible until a successful response replaces it.
-        quota.oauth_next_poll_at = now.saturating_add(state.quota_poll_interval.as_millis() as u64);
-        // Keep credential-refresh cooldown and HTTP backoff across polls.
-        // Snapshot reads use an independent cache-only placeholder meanwhile.
-        let placeholder = QuotaCollector::new(quota.collector.paths().clone());
-        std::mem::replace(&mut quota.collector, placeholder)
+            state.quota_poll_interval,
+        )
+    };
+    let Some((mut collector, abandoned)) = claimed else {
+        return;
     };
     let quota_state = state.quota.clone();
     let store = state.store.clone();
@@ -9258,47 +10242,32 @@ fn start_oauth_quota_refresh(state: &AppState, force: bool) {
         .spawn(move || {
             let result = collector.refresh_claude_oauth(now);
             let official_codex = codex.rate_limit_entries();
-            let fallback_codex = if official_codex.as_ref()
-                .is_none_or(|(entries, _)| !has_standard_codex_quota(entries)) {
+            let fallback_codex = if codex_official_is_current(official_codex.as_ref(), now_millis())
+            {
+                Vec::new()
+            } else {
                 collector.collect_codex(now_millis())
-            } else { Vec::new() };
-            let Ok(mut quota) = quota_state.lock() else { return };
-            quota.collector = collector;
-            match result {
-                Ok(mut entries) => {
-                    let captured_at = entries.iter().filter_map(|entry| entry.captured_at).max().unwrap_or(now);
-                    let (codex_entries, codex_captured_at) = select_codex_quota_entries(
-                        &quota.entries, quota.codex_rate_limits_captured_at,
-                        official_codex, fallback_codex, now_millis(),
-                    );
-                    entries.extend(codex_entries);
-                    quota.entries = entries;
-                    quota.codex_rate_limits_captured_at = codex_captured_at;
-                    quota.claude_cache_modified_at = fs::metadata(quota.collector.paths().claude_cache())
-                        .and_then(|metadata| metadata.modified()).ok();
-                    quota.refreshed_at = Some(Instant::now());
-                    quota.oauth_last_result = Some(Ok(captured_at));
-                }
-                Err(error) => {
-                    mark_claude_quota_stale(&mut quota.entries);
-                    // Network may still be resuming after wake. Retry promptly,
-                    // while the collector continues to enforce HTTP 429 backoff.
-                    if matches!(&error, QuotaError::OAuthRequest(message)
-                        if message != "credential was rejected" && message != "temporarily rate limited") {
-                        quota.oauth_next_poll_at = now_millis().saturating_add(10_000);
-                    }
-                    quota.oauth_last_result = Some(Err((quota_refresh_error_code(&error), quota_refresh_error_detail(&error))));
-                }
-            }
-            let persisted = quota.entries.iter().filter_map(quota_record).collect::<Vec<_>>();
-            if store.replace_quota_snapshots(persisted).is_err() {
-                quota.oauth_last_result = Some(Err(("QUOTA_PERSIST_FAILED", "Could not persist the quota snapshot".into())));
-            }
-            quota.oauth_refresh_in_progress = false;
+            };
+            let Ok(mut quota) = quota_state.lock() else {
+                return;
+            };
+            finish_oauth_quota_refresh(
+                &mut quota,
+                &store,
+                &abandoned,
+                OAuthQuotaOutcome {
+                    collector,
+                    result,
+                    official_codex,
+                    fallback_codex,
+                    started_at: now,
+                },
+            );
         });
     if result.is_err() {
         if let Ok(mut quota) = state.quota.lock() {
             quota.oauth_refresh_in_progress = false;
+            quota.oauth_refresh_abandoned = None;
             quota.oauth_last_result = Some(Err((
                 "CLAUDE_QUOTA_REFRESH_FAILED",
                 "Could not start quota refresh".into(),
@@ -9315,6 +10284,19 @@ fn has_standard_codex_quota(entries: &[QuotaEntry]) -> bool {
     })
 }
 
+/// Whether the official app-server snapshot is recent enough to show on
+/// its own. Older snapshots mean the account read has been failing.
+fn codex_official_is_current(official: Option<&(Vec<QuotaEntry>, u64)>, now_ms: u64) -> bool {
+    official.is_some_and(|(entries, captured_at)| {
+        has_standard_codex_quota(entries)
+            && now_ms.saturating_sub(*captured_at) <= CODEX_OFFICIAL_QUOTA_FRESHNESS_MS
+    })
+}
+
+fn newest_capture(entries: &[QuotaEntry]) -> Option<u64> {
+    entries.iter().filter_map(|entry| entry.captured_at).max()
+}
+
 fn select_codex_quota_entries(
     previous: &[QuotaEntry],
     previous_captured_at: Option<u64>,
@@ -9322,40 +10304,64 @@ fn select_codex_quota_entries(
     fallback: Vec<QuotaEntry>,
     now_ms: u64,
 ) -> (Vec<QuotaEntry>, Option<u64>) {
-    if let Some((entries, captured_at)) = official.as_ref() {
-        if has_standard_codex_quota(entries) {
-            return (entries.clone(), Some(*captured_at));
-        }
+    let marker = official
+        .as_ref()
+        .map(|(_, captured_at)| *captured_at)
+        .or(previous_captured_at);
+    if codex_official_is_current(official.as_ref(), now_ms) {
+        let (entries, captured_at) = official.unwrap_or_default();
+        return (
+            entries
+                .into_iter()
+                .map(|entry| mark_reset_window_stale(entry, now_ms))
+                .collect(),
+            Some(captured_at),
+        );
     }
 
-    let retained = previous
-        .iter()
-        .filter(|entry| {
-            entry.provider == "codex"
-                && entry.source == CODEX_APP_SERVER_SOURCE
-                && entry
-                    .resets_at
-                    .is_some_and(|reset| reset.saturating_mul(1_000) > now_ms)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if has_standard_codex_quota(&retained) {
-        let marker = official
-            .as_ref()
-            .map(|(_, captured_at)| *captured_at)
-            .or(previous_captured_at);
-        return (
-            retained
-                .into_iter()
-                .map(|entry| {
-                    entry.mark_stale(
-                        "quota.reason.codex_refresh_failed",
-                        "Codex quota refresh failed. The last successfully captured values are shown.",
-                    )
-                })
-                .collect(),
-            marker,
-        );
+    // The account read is failing. Keep the last official values, labelled
+    // stale, unless a local rollout has recorded a newer reading since.
+    let window_open = |entry: &QuotaEntry| {
+        entry
+            .resets_at
+            .is_none_or(|reset| reset.saturating_mul(1_000) > now_ms)
+    };
+    let last_official = match official {
+        Some((entries, _)) if has_standard_codex_quota(&entries) => {
+            entries.into_iter().filter(window_open).collect::<Vec<_>>()
+        }
+        // The latest read lacked the standard plan (for example a Spark-only
+        // update); fall back to the previous official values while their
+        // known window is still open.
+        _ => previous
+            .iter()
+            .filter(|entry| {
+                entry.provider == "codex"
+                    && entry.source == CODEX_APP_SERVER_SOURCE
+                    && entry.resets_at.is_some()
+                    && window_open(entry)
+            })
+            .cloned()
+            .collect(),
+    };
+    if has_standard_codex_quota(&last_official) {
+        let rollout_is_newer = has_standard_codex_quota(&fallback)
+            && newest_capture(&fallback) > newest_capture(&last_official);
+        if !rollout_is_newer {
+            return (
+                last_official
+                    .into_iter()
+                    .map(|entry| {
+                        entry.mark_stale(
+                            "quota.reason.codex_refresh_failed",
+                            "Codex quota refresh failed. The last successfully captured values are shown.",
+                        )
+                    })
+                    .collect(),
+                marker,
+            );
+        }
+        return (fallback, marker);
     }
 
     (fallback, None)
@@ -9676,25 +10682,22 @@ mod tests {
 
     #[test]
     fn artifact_reveal_checks_exit_status_and_times_out() {
-        assert!(wait_for_artifact_reveal(
+        assert!(wait_for_bounded_child(
             ProcessCommand::new("/usr/bin/true"),
             Duration::from_secs(1)
         ));
-        assert!(!wait_for_artifact_reveal(
+        assert!(!wait_for_bounded_child(
             ProcessCommand::new("/usr/bin/false"),
             Duration::from_secs(1)
         ));
-        assert!(!wait_for_artifact_reveal(
+        assert!(!wait_for_bounded_child(
             ProcessCommand::new("/nonexistent/actrealm-reveal"),
             Duration::from_secs(1)
         ));
         let mut delayed = ProcessCommand::new("/bin/sleep");
         delayed.arg("10");
         let start = Instant::now();
-        assert!(!wait_for_artifact_reveal(
-            delayed,
-            Duration::from_millis(20)
-        ));
+        assert!(!wait_for_bounded_child(delayed, Duration::from_millis(20)));
         assert!(start.elapsed() < Duration::from_secs(2));
     }
 
@@ -9767,6 +10770,1156 @@ mod tests {
             let response = router(state.clone()).oneshot(companion_request("GET", &uri, token, Value::Null)).await.unwrap();
             assert!(json_body(response).await["result"].is_null());
         });
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn register_test_companion(state: &AppState, id: &str, token: &str, scopes: &[&str]) {
+        state
+            .companions
+            .lock()
+            .unwrap()
+            .registrations
+            .push(CompanionRegistration {
+                id: id.into(),
+                client_name: format!("{id} test"),
+                token_hash: secret_hash(token),
+                scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+                created_at: now_millis(),
+            });
+    }
+
+    fn test_git(repository: &FilePath, arguments: &[&str]) {
+        assert!(
+            ProcessCommand::new("/usr/bin/git")
+                .arg("-C")
+                .arg(repository)
+                .args([
+                    "-c",
+                    "user.name=ActRealm Test",
+                    "-c",
+                    "user.email=actrealm@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(arguments)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success(),
+            "git {arguments:?}"
+        );
+    }
+
+    fn test_git_repository(root: &FilePath) -> PathBuf {
+        let repository = root.join("repository");
+        fs::create_dir_all(&repository).unwrap();
+        assert!(ProcessCommand::new("/usr/bin/git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&repository)
+            .status()
+            .unwrap()
+            .success());
+        repository
+    }
+
+    #[test]
+    fn companion_seen_acknowledges_the_latest_reminder_once() {
+        let root = std::env::temp_dir().join(format!("actrealm-seen-api-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).unwrap();
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        let token = "abababababababababababababababababababababababababababababababab";
+        let read_only = "bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc";
+        register_test_companion(
+            &state,
+            "seen-client",
+            token,
+            &[COMPANION_SCOPE_SNAPSHOT, COMPANION_SCOPE_RESPOND],
+        );
+        register_test_companion(&state, "read-only", read_only, &[COMPANION_SCOPE_SNAPSHOT]);
+        let finish = |session: &str, at: u64| {
+            store
+                .ingest(BridgeRequest::from_hook_at(
+                    Provider::Claude,
+                    json!({
+                        "hook_event_name":"UserPromptSubmit","session_id":session,"turn_id":"t1",
+                        "cwd":root,"prompt":"finish","session_title":"Seen task"
+                    }),
+                    at,
+                ))
+                .unwrap();
+            store
+                .ingest(BridgeRequest::from_hook_at(
+                    Provider::Claude,
+                    json!({"hook_event_name":"Stop","session_id":session,"turn_id":"t1"}),
+                    at + 10,
+                ))
+                .unwrap()
+                .session_id
+        };
+        let now = now_millis();
+        // An open completion reminder (after-confirmation retention).
+        let open = finish("seen-open", now);
+        // A completion reminder the five-minute timer has already hidden.
+        store
+            .write_ui_settings(
+                r#"{"completionTaskHideMode":"afterDelay","completionAutoHideMinutes":5}"#,
+                now,
+            )
+            .unwrap();
+        let hidden = finish("seen-hidden", now - 20 * 60_000);
+        assert!(store.snapshot().unwrap().attention.iter().any(|item| {
+            item.session_id == hidden && item.resolution.as_deref() == Some("auto_hidden")
+        }));
+        // An interrupted turn raises no reminder.
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                json!({
+                    "hook_event_name":"UserPromptSubmit","session_id":"seen-none","turn_id":"t1",
+                    "cwd":root,"prompt":"stop"
+                }),
+                now,
+            ))
+            .unwrap();
+        let none = store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                json!({"hook_event_name":"TurnInterrupted","session_id":"seen-none","turn_id":"t1"}),
+                now + 10,
+            ))
+            .unwrap()
+            .session_id;
+        let review = |session: &str| {
+            store
+                .recent_tasks(0, 100, true)
+                .unwrap()
+                .into_iter()
+                .find(|task| task.id == session)
+                .unwrap()
+                .review_state
+        };
+        assert_eq!(review(&open), "unseen");
+        assert_eq!(review(&hidden), "unseen");
+        assert_eq!(review(&none), "none");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let post = |session: String, token: &'static str| {
+                let state = state.clone();
+                async move {
+                    router(state)
+                        .oneshot(companion_request(
+                            "POST",
+                            &format!("/api/v1/companion/sessions/{session}/seen"),
+                            token,
+                            Value::Null,
+                        ))
+                        .await
+                        .unwrap()
+                }
+            };
+            assert_eq!(
+                post(open.clone(), "wrong").await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+            let forbidden = post(open.clone(), read_only).await;
+            assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+            assert_eq!(
+                json_body(forbidden).await["error"]["code"],
+                "COMPANION_SCOPE_REQUIRED"
+            );
+            let missing = post("missing-session".to_owned(), token).await;
+            assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+            assert_eq!(
+                json_body(missing).await["error"]["code"],
+                "SESSION_NOT_FOUND"
+            );
+            for (session, expected) in [(&open, "seen"), (&hidden, "seen"), (&none, "none")] {
+                // Repeating the request changes nothing.
+                for _ in 0..2 {
+                    let response = post(session.clone(), token).await;
+                    assert_eq!(response.status(), StatusCode::OK, "{session}");
+                    assert_eq!(
+                        json_body(response).await,
+                        json!({"reviewState": expected}),
+                        "{session}"
+                    );
+                }
+            }
+        });
+        assert_eq!(review(&open), "seen");
+        assert_eq!(review(&hidden), "seen");
+        assert_eq!(review(&none), "none");
+        let snapshot = store.snapshot().unwrap();
+        let reminder = |session: &str| {
+            snapshot
+                .attention
+                .iter()
+                .find(|item| item.session_id == session && item.kind == "completion")
+                .unwrap()
+        };
+        // The open reminder was closed like an `ack` command, once.
+        assert_eq!(reminder(&open).state, "resolved");
+        assert_eq!(reminder(&open).resolution.as_deref(), Some("ack_hidden"));
+        assert_eq!(
+            snapshot
+                .commands
+                .iter()
+                .filter(|command| command.attention_id == reminder(&open).id)
+                .count(),
+            1
+        );
+        // The hidden one stays hidden and only records the acknowledgement.
+        assert_eq!(reminder(&hidden).state, "resolved");
+        assert_eq!(reminder(&hidden).resolution.as_deref(), Some("auto_hidden"));
+        assert!(reminder(&hidden).reminder_acknowledged_at.is_some());
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn companion_history_is_scoped_validated_and_main_only_by_default() {
+        let root = std::env::temp_dir().join(format!("actrealm-history-api-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).unwrap();
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        let token = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let jump_only = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        register_test_companion(&state, "history-client", token, &[COMPANION_SCOPE_SNAPSHOT]);
+        register_test_companion(&state, "jump-client", jump_only, &[COMPANION_SCOPE_JUMP]);
+        let at = now_millis();
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                json!({
+                    "hook_event_name":"UserPromptSubmit","session_id":"history-main","turn_id":"h1",
+                    "cwd":root,"prompt":"PRIVATE HISTORY PROMPT","session_title":"History main task"
+                }),
+                at,
+            ))
+            .unwrap();
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                json!({"hook_event_name":"TurnInterrupted","session_id":"history-main","turn_id":"h1"}),
+                at + 1,
+            ))
+            .unwrap();
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Codex,
+                json!({
+                    "hook_event_name":"UserPromptSubmit","session_id":"history-side","turn_id":"x1",
+                    "cwd":root,"prompt":"scripted batch"
+                }),
+                at + 2,
+            ))
+            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let get = |uri: String, token: &'static str| {
+                let state = state.clone();
+                async move {
+                    router(state)
+                        .oneshot(companion_request("GET", &uri, token, Value::Null))
+                        .await
+                        .unwrap()
+                }
+            };
+            let since = at.saturating_sub(60_000);
+            let uri = format!("/api/v1/companion/history?since={since}");
+            assert_eq!(
+                get(uri.clone(), "wrong").await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+            let forbidden = get(uri.clone(), jump_only).await;
+            assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+            assert_eq!(
+                json_body(forbidden).await["error"]["code"],
+                "COMPANION_SCOPE_REQUIRED"
+            );
+            for invalid in [
+                "/api/v1/companion/history".to_owned(),
+                "/api/v1/companion/history?since=".to_owned(),
+                "/api/v1/companion/history?since=yesterday".to_owned(),
+                "/api/v1/companion/history?since=-1".to_owned(),
+                format!("/api/v1/companion/history?since={since}&limit=0"),
+                format!("/api/v1/companion/history?since={since}&limit=201"),
+                format!("/api/v1/companion/history?since={since}&includeSide=yes"),
+            ] {
+                let response = get(invalid.clone(), token).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{invalid}");
+                assert_eq!(
+                    json_body(response).await["error"]["code"],
+                    "INVALID_HISTORY_LIMIT",
+                    "{invalid}"
+                );
+            }
+
+            let response = get(uri.clone(), token).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_body(response).await;
+            assert_eq!(body["schemaVersion"], 1);
+            assert!(body["generatedAt"].as_u64().unwrap() >= at);
+            let tasks = body["tasks"].as_array().unwrap();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0]["title"], "History main task");
+            assert_eq!(tasks[0]["taskRole"], "main");
+            assert_eq!(tasks[0]["userTurnCount"], 1);
+            assert_eq!(tasks[0]["status"], "interrupted");
+            assert_eq!(tasks[0]["reviewState"], "none");
+            assert!(tasks[0]["latestAttentionKind"].is_null());
+            assert!(!body.to_string().contains("PRIVATE HISTORY PROMPT"));
+            assert!(!body.to_string().contains(root.to_string_lossy().as_ref()));
+
+            let all =
+                json_body(get(format!("{uri}&includeSide=true&limit=200"), token).await).await;
+            let roles = all["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|task| task["taskRole"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(roles, vec!["side", "main"]);
+            // The side task has no Provider title; its prompt-derived Runtime
+            // title never reaches Companion history.
+            assert!(all["tasks"][0]["title"].is_null());
+            assert!(!all.to_string().contains("scripted batch"));
+            let later = json_body(
+                get(
+                    format!(
+                        "/api/v1/companion/history?since={}&includeSide=true",
+                        at + 2
+                    ),
+                    token,
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(later["tasks"].as_array().unwrap().len(), 1);
+
+            let snapshot =
+                json_body(get("/api/v1/companion/snapshot".to_owned(), token).await).await;
+            let sessions = snapshot["sessions"].as_array().unwrap();
+            let main = sessions
+                .iter()
+                .find(|session| session["providerTitle"] == "History main task")
+                .unwrap();
+            assert_eq!(main["userTurnCount"], 1);
+            assert_eq!(main["taskRole"], "main");
+            assert_eq!(main["execState"], "idle");
+            assert_eq!(
+                main["activityMessage"]["code"],
+                "session.activity.interrupted"
+            );
+            let side = sessions
+                .iter()
+                .find(|session| session["provider"] == "codex")
+                .unwrap();
+            assert_eq!(side["userTurnCount"], 1);
+            assert_eq!(side["taskRole"], "side");
+            assert!(snapshot["attention"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["kind"] != "error"));
+        });
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn companion_result_returns_only_the_current_turn_prompt() {
+        let root = std::env::temp_dir().join(format!("actrealm-prompt-api-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).unwrap();
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        let token = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        register_test_companion(&state, "prompt-client", token, &[COMPANION_SCOPE_SNAPSHOT]);
+        let at = now_millis();
+        let session = store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                json!({
+                    "hook_event_name":"UserPromptSubmit","session_id":"prompt-api","turn_id":"p1",
+                    "cwd":root,"prompt":"改按钮。\n把结算页的按钮改成圆角\napi_key=sk-live-should-never-leave"
+                }),
+                at,
+            ))
+            .unwrap()
+            .session_id;
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                json!({
+                    "hook_event_name":"Stop","session_id":"prompt-api","turn_id":"p1",
+                    "last_assistant_message":"按钮已改成圆角。"
+                }),
+                at + 1,
+            ))
+            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let uri = format!("/api/v1/companion/sessions/{session}/result");
+            let response = router(state.clone())
+                .oneshot(companion_request("GET", &uri, token, Value::Null))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_body(response).await;
+            assert_eq!(body["prompt"]["text"], "改按钮。\n把结算页的按钮改成圆角");
+            assert_eq!(body["prompt"]["truncated"], true);
+            assert_eq!(body["prompt"]["observedAt"], at);
+            assert!(!body.to_string().contains("sk-live"));
+            assert!(body["result"]["summary"].as_str().unwrap().contains("圆角"));
+
+            let snapshot = router(state.clone())
+                .oneshot(companion_request("GET", "/api/v1/companion/snapshot", token, Value::Null))
+                .await
+                .unwrap();
+            // Only the pre-existing first-sentence task title reaches the
+            // snapshot; the rest of the prompt does not.
+            let snapshot = json_body(snapshot).await.to_string();
+            assert!(!snapshot.contains("结算页"));
+            assert!(!snapshot.contains("sk-live"));
+
+            // A later turn without prompt text never shows the earlier prompt.
+            store
+                .ingest(BridgeRequest::from_hook_at(
+                    Provider::Claude,
+                    json!({"hook_event_name":"UserPromptSubmit","session_id":"prompt-api","turn_id":"p2"}),
+                    at + 2,
+                ))
+                .unwrap();
+            let body = json_body(
+                router(state.clone())
+                    .oneshot(companion_request("GET", &uri, token, Value::Null))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert!(body["prompt"].is_null());
+            assert!(body.get("prompt").is_some());
+        });
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn companion_review_lists_changed_files_without_content() {
+        let root = std::env::temp_dir().join(format!("actrealm-review-files-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).unwrap();
+        let repository = test_git_repository(&root);
+        fs::write(repository.join("app.txt"), "one\ntwo\nthree\n").unwrap();
+        fs::write(repository.join("obsolete.txt"), "gone\n").unwrap();
+        fs::write(
+            repository.join("old-name.txt"),
+            "stable line 1\nstable line 2\nstable line 3\nstable line 4\n",
+        )
+        .unwrap();
+        test_git(&repository, &["add", "."]);
+        test_git(&repository, &["commit", "-q", "-m", "baseline"]);
+        fs::write(
+            repository.join("app.txt"),
+            "one\nSECRET FILE CONTENT\nthree\nfour\nfive\n",
+        )
+        .unwrap();
+        fs::remove_file(repository.join("obsolete.txt")).unwrap();
+        test_git(&repository, &["mv", "old-name.txt", "new-name.txt"]);
+        fs::write(repository.join("added.txt"), "fresh\n").unwrap();
+        test_git(&repository, &["add", "added.txt"]);
+        fs::write(repository.join("scratch.txt"), "UNTRACKED CONTENT\n").unwrap();
+        fs::write(root.join("outside.txt"), "outside").unwrap();
+
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        let token = "abababababababababababababababababababababababababababababababab";
+        register_test_companion(&state, "review-client", token, &[COMPANION_SCOPE_SNAPSHOT]);
+        let session = store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Codex,
+                json!({
+                    "hook_event_name":"UserPromptSubmit","session_id":"review-files","turn_id":"r1",
+                    "cwd":repository,"prompt":"edit"
+                }),
+                now_millis(),
+            ))
+            .unwrap()
+            .session_id;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let response = router(state.clone())
+                .oneshot(companion_request(
+                    "GET",
+                    &format!("/api/v1/companion/sessions/{session}/review"),
+                    token,
+                    Value::Null,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let review = json_body(response).await;
+            let files = review["repository"]["files"].as_array().unwrap();
+            let summary = files
+                .iter()
+                .map(|file| {
+                    (
+                        file["path"].as_str().unwrap().to_owned(),
+                        file["insertions"].as_u64().unwrap(),
+                        file["deletions"].as_u64().unwrap(),
+                        file["status"].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                summary,
+                vec![
+                    ("app.txt".to_owned(), 3, 1, "modified".to_owned()),
+                    ("added.txt".to_owned(), 1, 0, "added".to_owned()),
+                    ("obsolete.txt".to_owned(), 0, 1, "deleted".to_owned()),
+                    ("new-name.txt".to_owned(), 0, 0, "renamed".to_owned()),
+                    ("scratch.txt".to_owned(), 0, 0, "untracked".to_owned()),
+                ]
+            );
+            let encoded = review.to_string();
+            assert!(!encoded.contains("SECRET FILE CONTENT"));
+            assert!(!encoded.contains("UNTRACKED CONTENT"));
+            assert!(!encoded.contains("outside"));
+            assert!(!encoded.contains(repository.to_string_lossy().as_ref()));
+        });
+
+        // The local review route keeps its existing shape.
+        {
+            let mut auth = state.auth.lock().unwrap();
+            auth.bootstrap_token = None;
+            auth.session_token = Some("test-session".to_owned());
+            auth.csrf_token = Some("test-csrf".to_owned());
+        }
+        rt.block_on(async {
+            let local = router(state.clone())
+                .oneshot(authorized_request(
+                    "GET",
+                    &format!("/api/v1/sessions/{session}/review"),
+                    Value::Null,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(local.status(), StatusCode::OK);
+            assert!(json_body(local).await["repository"].get("files").is_none());
+        });
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn companion_review_reuses_its_inspection_and_caches_unchanged_repositories() {
+        let root = std::env::temp_dir().join(format!("actrealm-review-cache-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).unwrap();
+        let repository = test_git_repository(&root);
+        fs::write(repository.join("app.txt"), "one\n").unwrap();
+        test_git(&repository, &["add", "."]);
+        test_git(&repository, &["commit", "-q", "-m", "baseline"]);
+        fs::write(repository.join("app.txt"), "one\ntwo\n").unwrap();
+        let inputs = CompanionReviewInputs {
+            turn_id: Some("turn-1".to_owned()),
+            working_directory: Some(repository.clone()),
+            baseline: None,
+            concurrent_active_sessions: 0,
+        };
+        let git_calls = || REVIEW_GIT_TEST_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()));
+        let files = |review: &CompanionReviewGit| {
+            review
+                .repository
+                .files
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|file| (file.path.clone(), file.insertions, file.status))
+                .collect::<Vec<_>>()
+        };
+        let status_probe = COMPANION_REVIEW_STATUS_ARGS.join(" ");
+        let cache = CompanionReviewCache::default();
+        let start = Instant::now();
+        git_calls();
+
+        // One review resolves the root, HEAD and status once and reuses them
+        // for the file list.
+        let first = cache.review("session", inputs.clone(), start);
+        let calls = git_calls();
+        let count = |prefix: &str| calls.iter().filter(|call| call.starts_with(prefix)).count();
+        assert_eq!(count("rev-parse --show-toplevel"), 1, "{calls:?}");
+        assert_eq!(count("rev-parse --verify HEAD"), 1, "{calls:?}");
+        assert_eq!(count("status"), 1, "{calls:?}");
+        assert_eq!(calls.len(), 8, "{calls:?}");
+        assert_eq!(first.repository.state, "available");
+        assert_eq!(files(&first), vec![("app.txt".to_owned(), 1, "modified")]);
+
+        // More lines in the already modified file leave HEAD, branch and the
+        // status unchanged: within the TTL the review is reused after a single
+        // status probe.
+        fs::write(repository.join("app.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        let reused = cache.review("session", inputs.clone(), start + Duration::from_secs(1));
+        assert_eq!(git_calls(), vec![status_probe.clone()]);
+        assert_eq!(files(&reused), files(&first));
+
+        // Past the TTL the review is recomputed.
+        let expired = cache.review("session", inputs.clone(), start + Duration::from_secs(4));
+        assert!(git_calls().len() > 1);
+        assert_eq!(files(&expired), vec![("app.txt".to_owned(), 3, "modified")]);
+
+        // A working tree change or a new HEAD invalidates it within the TTL.
+        fs::write(repository.join("notes.txt"), "draft").unwrap();
+        let untracked = cache.review(
+            "session",
+            inputs.clone(),
+            start + Duration::from_millis(4_500),
+        );
+        assert!(git_calls().len() > 1);
+        assert!(files(&untracked).contains(&("notes.txt".to_owned(), 0, "untracked")));
+        test_git(
+            &repository,
+            &["commit", "-q", "--allow-empty", "-m", "empty"],
+        );
+        let committed = cache.review("session", inputs.clone(), start + Duration::from_secs(5));
+        assert!(git_calls().len() > 1);
+        assert_ne!(committed.repository.head, untracked.repository.head);
+        let stable = cache.review(
+            "session",
+            inputs.clone(),
+            start + Duration::from_millis(5_500),
+        );
+        assert_eq!(git_calls(), vec![status_probe]);
+        assert_eq!(stable.repository.head, committed.repository.head);
+
+        // Another session or different inputs never share the entry.
+        cache.review(
+            "other-session",
+            inputs.clone(),
+            start + Duration::from_millis(5_500),
+        );
+        assert!(git_calls().len() > 1);
+        let concurrent = cache.review(
+            "session",
+            CompanionReviewInputs {
+                concurrent_active_sessions: 1,
+                ..inputs.clone()
+            },
+            start + Duration::from_millis(5_500),
+        );
+        assert!(git_calls().len() > 1);
+        assert_eq!(concurrent.repository.attribution, "concurrent_changes");
+
+        // A working directory outside git is not cached.
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let plain = CompanionReviewInputs {
+            working_directory: Some(outside),
+            ..inputs
+        };
+        let not_git = cache.review("plain", plain.clone(), start + Duration::from_secs(5));
+        assert_eq!(not_git.repository.state, "not_git");
+        assert_eq!(not_git.repository.files.as_deref(), Some(&[][..]));
+        assert!(!cache.entries.lock().unwrap().contains_key("plain"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn review_changed_files_are_ranked_by_changed_lines_and_bounded() {
+        let root = std::env::temp_dir().join(format!("actrealm-review-rank-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).unwrap();
+        let repository = test_git_repository(&root);
+        for index in 0..25 {
+            fs::write(repository.join(format!("file-{index:02}.txt")), "base\n").unwrap();
+        }
+        test_git(&repository, &["add", "."]);
+        test_git(&repository, &["commit", "-q", "-m", "baseline"]);
+        for index in 0..25 {
+            fs::write(
+                repository.join(format!("file-{index:02}.txt")),
+                "base\n".to_owned() + &"line\n".repeat(index + 1),
+            )
+            .unwrap();
+        }
+        let head = full_git_head(&repository).unwrap();
+        let files = review_changed_files(&repository, Some(&head), None);
+        assert_eq!(files.len(), REVIEW_CHANGED_FILE_LIMIT);
+        assert_eq!(files[0].path, "file-24.txt");
+        assert_eq!(files[0].insertions, 25);
+        assert_eq!(files[19].path, "file-05.txt");
+        assert!(files.iter().all(|file| file.status == "modified"));
+        assert!(review_changed_files(&root.join("missing"), Some(&head), None).is_empty());
+
+        let numstat =
+            parse_git_numstat_z(b"3\t1\tapp.txt\0-\t-\tlogo.png\x000\t0\t\0old.txt\0new.txt\0");
+        assert_eq!(
+            numstat,
+            vec![
+                ("app.txt".to_owned(), 3, 1),
+                ("logo.png".to_owned(), 0, 0),
+                ("new.txt".to_owned(), 0, 0),
+            ]
+        );
+        assert!(parse_git_numstat_z(b"1\t0\t../escape.txt\0").is_empty());
+        let statuses = parse_git_name_status_z(
+            b"M\0app.txt\0R090\0old.txt\0new.txt\0A\0a.txt\0D\0d.txt\0C075\0x\0y\0",
+        );
+        assert_eq!(statuses["app.txt"], "modified");
+        assert_eq!(statuses["new.txt"], "renamed");
+        assert_eq!(statuses["a.txt"], "added");
+        assert_eq!(statuses["d.txt"], "deleted");
+        assert_eq!(statuses["y"], "added");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Writes the real Companion responses that Display decodes in its own
+    /// tests. Set ACTREALM_CONTRACT_SAMPLE_DIR to export them; otherwise the
+    /// test only verifies the combined shape.
+    /// Formats epoch milliseconds the way Claude Code transcripts record
+    /// time (`2026-10-10T17:36:20.123Z`).
+    fn rfc3339_millis(value: u64) -> String {
+        let days = i64::try_from(value / 86_400_000).unwrap();
+        let in_day = value % 86_400_000;
+        let shifted = days + 719_468;
+        let era = shifted.div_euclid(146_097);
+        let day_of_era = shifted - era * 146_097;
+        let year_of_era =
+            (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+        let month_index = (5 * day_of_year + 2) / 153;
+        let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+        let month = if month_index < 10 {
+            month_index + 3
+        } else {
+            month_index - 9
+        };
+        let year = year_of_era + era * 400 + i64::from(month <= 2);
+        format!(
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+            in_day / 3_600_000,
+            in_day / 60_000 % 60,
+            in_day / 1_000 % 60,
+            in_day % 1_000
+        )
+    }
+
+    #[test]
+    fn companion_contract_samples_cover_display_agent_fields() {
+        let root = std::env::temp_dir().join(format!("actrealm-contract-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).unwrap();
+        let repository = test_git_repository(&root);
+        fs::write(
+            repository.join("Checkout.swift"),
+            "let radius = 4\nlet color = .blue\n",
+        )
+        .unwrap();
+        fs::write(repository.join("Legacy.swift"), "// legacy\n").unwrap();
+        test_git(&repository, &["add", "."]);
+        test_git(&repository, &["commit", "-q", "-m", "baseline"]);
+        fs::write(
+            repository.join("Checkout.swift"),
+            "let radius = 12\nlet color = .blue\nlet shadow = true\n",
+        )
+        .unwrap();
+        fs::remove_file(repository.join("Legacy.swift")).unwrap();
+        fs::write(repository.join("CheckoutTests.swift"), "// new test\n").unwrap();
+
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        let token = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        register_test_companion(
+            &state,
+            "display-contract",
+            token,
+            &[COMPANION_SCOPE_SNAPSHOT, COMPANION_SCOPE_JUMP],
+        );
+        let at = now_millis();
+        let vscode = |mut request: BridgeRequest| {
+            request.term = Some(actrealm_core::TermContext {
+                app: Some("Visual Studio Code".to_owned()),
+                bundle_id: Some("com.microsoft.VSCode".to_owned()),
+                surface: Some("editor".to_owned()),
+                ..Default::default()
+            });
+            request
+        };
+        let main_session = store
+            .ingest(vscode(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                json!({
+                    "hook_event_name":"UserPromptSubmit","session_id":"contract-main","turn_id":"m1",
+                    "cwd":repository,"prompt":"把结算页按钮改成 12 圆角，并补一个测试",
+                    "session_title":"Checkout button polish"
+                }),
+                at,
+            )))
+            .unwrap()
+            .session_id;
+        for (offset, event) in [(10, "PreToolUse"), (20, "PostToolUse")] {
+            store
+                .ingest(BridgeRequest::from_hook_at(
+                    Provider::Claude,
+                    json!({
+                        "hook_event_name":event,"session_id":"contract-main","turn_id":"m1",
+                        "cwd":repository,"tool_name":"Edit","tool_use_id":"edit-1",
+                        "tool_input":{"file_path":repository.join("Checkout.swift")}
+                    }),
+                    at + offset,
+                ))
+                .unwrap();
+        }
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                json!({
+                    "hook_event_name":"Stop","session_id":"contract-main","turn_id":"m1",
+                    "cwd":repository,
+                    "last_assistant_message":"按钮圆角已改为 12，并新增 CheckoutTests。\n\n要提交的话说一声。"
+                }),
+                at + 30,
+            ))
+            .unwrap();
+        store
+            .ingest(BridgeRequest::from_hook_at(
+                Provider::Codex,
+                json!({
+                    "hook_event_name":"UserPromptSubmit","session_id":"contract-side","turn_id":"s1",
+                    "cwd":repository,"prompt":"scripted lint batch"
+                }),
+                at + 40,
+            ))
+            .unwrap();
+        // A turn that ended while a background build and a subagent keep
+        // running; its latest message comes from the Claude Code transcript.
+        let transcript = root
+            .join(".claude/projects/-contract-background")
+            .join("contract-background.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            [
+                json!({"type":"user","message":{"role":"user","content":"跑一遍完整构建"}}),
+                json!({
+                    "type":"assistant","isSidechain":false,"timestamp":rfc3339_millis(at + 65),
+                    "message":{"id":"msg-1","role":"assistant","model":"claude-test","content":[
+                        {"type":"text","text":"完整构建已在后台运行，另开了一个子代理排查告警。结果出来前你可以先看别的。"}
+                    ]}
+                }),
+            ]
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>(),
+        )
+        .unwrap();
+        fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600)).unwrap();
+        let background_session = store
+            .ingest(vscode(BridgeRequest::from_hook_at(
+                Provider::Claude,
+                json!({
+                    "hook_event_name":"UserPromptSubmit","session_id":"contract-background",
+                    "cwd":repository,"transcript_path":transcript,"prompt":"跑一遍完整构建",
+                    "session_title":"Full build"
+                }),
+                at + 50,
+            )))
+            .unwrap()
+            .session_id;
+        for (offset, raw) in [
+            (
+                60,
+                json!({
+                    "hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"build",
+                    "tool_input":{"command":"cargo build --release"}
+                }),
+            ),
+            (
+                70,
+                json!({
+                    "hook_event_name":"Stop",
+                    "background_tasks":[
+                        {"id":"b1","type":"shell","status":"running","description":"release build","command":"cargo build --release"},
+                        {"id":"a1","type":"subagent","status":"running","description":"warnings","agent_type":"Explore"}
+                    ],
+                    "session_crons":[]
+                }),
+            ),
+        ] {
+            let mut raw = raw;
+            raw["session_id"] = json!("contract-background");
+            raw["cwd"] = json!(repository);
+            raw["transcript_path"] = json!(transcript);
+            store
+                .ingest(vscode(BridgeRequest::from_hook_at(
+                    Provider::Claude,
+                    raw,
+                    at + offset,
+                )))
+                .unwrap();
+        }
+        // Quota: Claude from the OAuth usage cache, with Extra Usage spend in
+        // minor currency units, and Codex from the official app-server read
+        // of a Pro account that has only a weekly window.
+        let claude_cache = state.quota.lock().unwrap().collector.paths().claude_cache();
+        fs::create_dir_all(claude_cache.parent().unwrap()).unwrap();
+        let claude_window = |window: &str, minutes: Value, used: f64, resets: Value| {
+            json!({
+                "window": window, "label": Value::Null, "windowMinutes": minutes,
+                "usedPct": used, "usedPctSource": "oauth_usage", "usedPctCapturedAt": at,
+                "resetsAt": resets, "resetSource": "oauth_usage", "resetCapturedAt": at
+            })
+        };
+        let five_hour_reset = at / 1_000 + 3 * 60 * 60;
+        let mut extra_usage = claude_window("extra_usage", Value::Null, 90.0, Value::Null);
+        extra_usage["label"] = json!("Extra usage");
+        extra_usage["spentMinor"] = json!(4_500);
+        extra_usage["limitMinor"] = json!(5_000);
+        extra_usage["currency"] = json!("USD");
+        extra_usage["currencyExponent"] = json!(2);
+        let claude_windows = vec![
+            claude_window("5h", json!(300), 5.0, json!(five_hour_reset)),
+            claude_window("7d", json!(10_080), 34.0, json!(at / 1_000 + 5 * 86_400)),
+        ];
+        let write_claude_cache = |windows: Vec<Value>, disabled: Value| {
+            let mut document = json!({
+                "schemaVersion": 1, "provider": "claude", "source": "oauth_usage",
+                "capturedAt": at, "windows": windows
+            });
+            if !disabled.is_null() {
+                document["extraUsageDisabled"] = disabled;
+            }
+            fs::write(&claude_cache, serde_json::to_vec(&document).unwrap()).unwrap();
+            state.quota.lock().unwrap().refreshed_at = None;
+        };
+        write_claude_cache(
+            [claude_windows.clone(), vec![extra_usage]].concat(),
+            Value::Null,
+        );
+        {
+            let mut codex = state.codex.state.lock().unwrap();
+            codex.rate_limits = Some(pro_weekly_only_rate_limits(13, at / 1_000 + 6 * 86_400));
+            codex.rate_limits_captured_at = Some(at);
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let samples = rt.block_on(async {
+            let mut samples = Vec::new();
+            for (name, uri) in [
+                ("snapshot.json", "/api/v1/companion/snapshot".to_owned()),
+                (
+                    "history.json",
+                    format!(
+                        "/api/v1/companion/history?since={}&limit=100&includeSide=true",
+                        at.saturating_sub(60_000)
+                    ),
+                ),
+                (
+                    "result.json",
+                    format!("/api/v1/companion/sessions/{main_session}/result"),
+                ),
+                (
+                    "review.json",
+                    format!("/api/v1/companion/sessions/{main_session}/review"),
+                ),
+            ] {
+                let response = router(state.clone())
+                    .oneshot(companion_request("GET", &uri, token, Value::Null))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{name}");
+                samples.push((name, json_body(response).await));
+            }
+            samples
+        });
+        // The same account after Extra Usage was turned off.
+        write_claude_cache(
+            claude_windows,
+            json!({"capturedAt": at, "reason": "user_disabled"}),
+        );
+        let extra_usage_off = rt.block_on(async {
+            let response = router(state.clone())
+                .oneshot(companion_request(
+                    "GET",
+                    "/api/v1/companion/snapshot",
+                    token,
+                    Value::Null,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            json_body(response).await
+        });
+        let mut samples = samples;
+        samples.push(("snapshot-extra-usage-off.json", extra_usage_off));
+        let sample = |name: &str| &samples.iter().find(|(file, _)| *file == name).unwrap().1;
+        let quota = |name: &str, provider: &str, window: &str| {
+            sample(name)["quota"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["provider"] == provider && entry["window"] == window)
+                .unwrap_or_else(|| panic!("{name}: {provider} {window}"))
+                .clone()
+        };
+        let extra = quota("snapshot.json", "claude", "extra_usage");
+        assert_eq!(extra["status"], "available");
+        assert_eq!(extra["usedPct"], 90.0);
+        assert_eq!(extra["spentMinor"], 4_500);
+        assert_eq!(extra["limitMinor"], 5_000);
+        assert_eq!(extra["currency"], "USD");
+        assert_eq!(extra["currencyExponent"], 2);
+        assert!(extra["capturedAt"].is_u64());
+        let five_hour = quota("snapshot.json", "claude", "5h");
+        assert_eq!(five_hour["resetsAt"], five_hour_reset);
+        assert!(five_hour.get("spentMinor").is_none());
+        let codex = quota("snapshot.json", "codex", "10080m");
+        assert_eq!(codex["status"], "available");
+        assert_eq!(codex["source"], CODEX_APP_SERVER_SOURCE);
+        assert_eq!(codex["windowMinutes"], 10_080);
+        assert_eq!(codex["planType"], "pro");
+        assert_eq!(codex["usedPct"], 13.0);
+        assert_eq!(codex["capturedAt"], coarse_ui_timestamp(at));
+        assert!(codex.get("credits").is_none());
+        let off = quota("snapshot-extra-usage-off.json", "claude", "extra_usage");
+        assert_eq!(off["status"], "unavailable");
+        assert!(off.get("usedPct").is_none());
+        assert_eq!(off["disabledReason"], "user_disabled");
+        assert_eq!(
+            off["reasonMessage"]["code"],
+            "quota.reason.extra_usage_disabled"
+        );
+        let main = sample("snapshot.json")["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == main_session.as_str())
+            .unwrap()
+            .clone();
+        assert_eq!(main["taskRole"], "main");
+        assert_eq!(main["userTurnCount"], 1);
+        assert_eq!(main["termApp"], "Visual Studio Code");
+        assert_eq!(main["termBundleId"], "com.microsoft.VSCode");
+        assert_eq!(main["termSurface"], "editor");
+        assert_eq!(main["backgroundTasks"], 0);
+        assert_eq!(
+            main["lastMessage"],
+            json!({
+                "text": "按钮圆角已改为 12，并新增 CheckoutTests。\n要提交的话说一声。",
+                "at": at + 30,
+                "final": true,
+                "truncated": false
+            })
+        );
+        let background = sample("snapshot.json")["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == background_session.as_str())
+            .unwrap()
+            .clone();
+        assert_eq!(background["execState"], "response_finished");
+        assert_eq!(background["backgroundTasks"], 2);
+        assert_eq!(
+            background["lastMessage"]["text"],
+            "完整构建已在后台运行，另开了一个子代理排查告警。结果出来前你可以先看别的。"
+        );
+        assert_eq!(background["lastMessage"]["at"], at + 65);
+        assert_eq!(background["lastMessage"]["final"], true);
+        assert!(sample("snapshot.json")["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["sessionId"] != background_session.as_str()));
+        let completion = sample("snapshot.json")["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["sessionId"] == main_session.as_str() && item["kind"] == "completion")
+            .unwrap()
+            .clone();
+        assert_eq!(completion["awaitsReply"], true);
+        let history = sample("history.json")["tasks"].as_array().unwrap();
+        let task = |id: &str| {
+            history
+                .iter()
+                .find(|task| task["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(history.len(), 3);
+        assert_eq!(task(&main_session)["reviewState"], "unseen");
+        assert_eq!(task(&main_session)["latestAttentionKind"], "completion");
+        // A finished task can be read from the history alone: where it ran
+        // and the end of its latest Agent message.
+        assert_eq!(task(&main_session)["termApp"], "Visual Studio Code");
+        assert_eq!(task(&main_session)["termBundleId"], "com.microsoft.VSCode");
+        assert_eq!(task(&main_session)["termSurface"], "editor");
+        assert_eq!(task(&main_session)["lastMessage"], main["lastMessage"]);
+        assert_eq!(
+            task(&background_session)["lastMessage"]["text"],
+            background["lastMessage"]["text"]
+        );
+        assert!(task(&main_session).get("transcriptPath").is_none());
+        let side = history
+            .iter()
+            .find(|task| task["provider"] == "codex")
+            .unwrap();
+        assert_eq!(side["taskRole"], "side");
+        assert!(side["title"].is_null());
+        assert_eq!(
+            sample("result.json")["prompt"]["text"],
+            "把结算页按钮改成 12 圆角，并补一个测试"
+        );
+        assert_eq!(
+            sample("result.json")["latest"],
+            json!({
+                "text": "按钮圆角已改为 12，并新增 CheckoutTests。\n要提交的话说一声。",
+                "at": at + 30,
+                "final": true,
+                "truncated": false
+            })
+        );
+        let files = sample("review.json")["repository"]["files"]
+            .as_array()
+            .unwrap();
+        assert_eq!(files[0]["path"], "Checkout.swift");
+        assert!(files.iter().any(|file| file["status"] == "deleted"));
+        assert!(files.iter().any(|file| file["status"] == "untracked"));
+        for (_, body) in &samples {
+            assert!(!body
+                .to_string()
+                .contains(repository.to_string_lossy().as_ref()));
+        }
+        if let Some(directory) = std::env::var_os("ACTREALM_CONTRACT_SAMPLE_DIR") {
+            let directory = PathBuf::from(directory);
+            fs::create_dir_all(&directory).unwrap();
+            for (name, body) in &samples {
+                fs::write(
+                    directory.join(name),
+                    serde_json::to_string_pretty(body).unwrap() + "\n",
+                )
+                .unwrap();
+            }
+        }
         drop(state);
         drop(store);
         fs::remove_dir_all(root).unwrap();
@@ -10324,6 +12477,125 @@ mod tests {
         assert!(!has_standard_codex_quota(&selected));
     }
 
+    /// The `account/rateLimits/read` shape Codex 0.162 returns for a Pro
+    /// account today: one weekly window, no five-hour window.
+    fn pro_weekly_only_rate_limits(used_percent: u64, resets_at: u64) -> Value {
+        let snapshot = json!({
+            "limitId": "codex",
+            "limitName": null,
+            "normalModelSlug": null,
+            "primary": {
+                "usedPercent": used_percent,
+                "windowDurationMins": 10080,
+                "resetsAt": resets_at
+            },
+            "secondary": null,
+            "credits": {"hasCredits": true, "unlimited": false, "balance": null},
+            "individualLimit": null,
+            "spendControlReached": false,
+            "planType": "pro",
+            "rateLimitReachedType": null
+        });
+        json!({
+            "ordinaryUsageAllowed": true,
+            "rateLimits": snapshot,
+            "rateLimitsByLimitId": {"codex": snapshot},
+            "rateLimitResetCredits": {"availableCount": 3, "credits": null}
+        })
+    }
+
+    #[test]
+    fn weekly_only_pro_snapshot_is_official_and_ages_into_stale() {
+        let now = 1_791_712_537_000;
+        let resets_at = 1_792_317_226;
+        let official = codex_app_server_entries(&pro_weekly_only_rate_limits(13, resets_at), now);
+        assert_eq!(official.len(), 1);
+        assert!(has_standard_codex_quota(&official));
+        let rollout = {
+            let mut entry = official[0].clone();
+            entry.source = "rollout_experimental".to_owned();
+            entry.used_pct = Some(9.0);
+            entry.remaining_pct = Some(91.0);
+            entry.captured_at = Some(now - 60 * 60 * 1_000);
+            entry
+        };
+
+        // A weekly-only snapshot is the account's standard quota.
+        let (selected, marker) = select_codex_quota_entries(
+            &[],
+            None,
+            Some((official.clone(), now)),
+            Vec::new(),
+            now + 60_000,
+        );
+        assert_eq!(marker, Some(now));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].status, "available");
+        assert_eq!(selected[0].source, CODEX_APP_SERVER_SOURCE);
+        assert_eq!(selected[0].window_minutes, Some(10_080));
+        assert_eq!(selected[0].captured_at, Some(now));
+        assert!(codex_official_is_current(
+            Some(&(official.clone(), now)),
+            now + 60_000
+        ));
+
+        // Reads have failed for longer than the freshness bound: the last
+        // official value stays, labelled stale, over an older rollout.
+        let later = now + CODEX_OFFICIAL_QUOTA_FRESHNESS_MS + 1;
+        assert!(!codex_official_is_current(
+            Some(&(official.clone(), now)),
+            later
+        ));
+        let (selected, marker) = select_codex_quota_entries(
+            &[],
+            None,
+            Some((official.clone(), now)),
+            vec![rollout.clone()],
+            later,
+        );
+        assert_eq!(marker, Some(now));
+        assert_eq!(selected[0].status, "stale");
+        assert_eq!(selected[0].source, CODEX_APP_SERVER_SOURCE);
+        assert_eq!(
+            selected[0].reason_code.as_deref(),
+            Some("quota.reason.codex_refresh_failed")
+        );
+        assert_eq!(selected[0].captured_at, Some(now));
+
+        // A rollout recorded after the last official read is newer truth.
+        let mut newer_rollout = rollout;
+        newer_rollout.captured_at = Some(later - 1_000);
+        let (selected, marker) = select_codex_quota_entries(
+            &[],
+            None,
+            Some((official, now)),
+            vec![newer_rollout],
+            later,
+        );
+        assert_eq!(marker, Some(now));
+        assert_eq!(selected[0].source, "rollout_experimental");
+        assert_eq!(selected[0].used_pct, Some(9.0));
+    }
+
+    #[test]
+    fn disabled_codex_manager_never_launches_codex_for_quota() {
+        let root = std::env::temp_dir().join(format!(
+            "actrealm-server-codex-disabled-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let manager = CodexManager::disabled(store.clone());
+        assert_eq!(
+            manager.refresh_rate_limits_quota_only(),
+            CodexQuotaRefresh::Failed
+        );
+        assert!(manager.rate_limit_entries().is_none());
+        drop(manager);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn async_question_answers_target_the_attached_turn_and_observation_stays_readonly() {
         let root = std::env::temp_dir().join(format!("actrealm-async-answer-{}", Uuid::now_v7()));
@@ -10519,6 +12791,8 @@ done
                 claude_cache_modified_at: None,
                 codex_rate_limits_captured_at: None,
                 oauth_refresh_in_progress: false,
+                oauth_refresh_started_at: None,
+                oauth_refresh_abandoned: None,
                 oauth_next_poll_at: 0,
                 oauth_last_result: None,
             })),
@@ -10540,6 +12814,7 @@ done
             review_collection_ready: Arc::new(AtomicBool::new(false)),
             review_consecutive_failures: Arc::new(AtomicUsize::new(0)),
             review_last_success_at: Arc::new(AtomicU64::new(0)),
+            companion_review_cache: CompanionReviewCache::default(),
             usage_test_control: None,
             data_paths: DataPaths {
                 cache: root.join("actrealm-home/cache"),
@@ -12221,6 +14496,35 @@ done
             .unwrap();
         assert_eq!(terminal.jump_label, "Open terminal");
         assert_eq!(jump_target(terminal), Some(JumpTarget::ITermSession));
+        // Commands are only built here, never run.
+        let iterm = jump_command(&JumpTarget::ITermSession, terminal);
+        assert_eq!(iterm.get_program(), "/usr/bin/osascript");
+        assert_eq!(
+            iterm.get_args().collect::<Vec<_>>(),
+            ["-e", ITERM_JUMP_SCRIPT]
+        );
+        assert!(iterm
+            .get_envs()
+            .any(|(key, value)| key == "ACTREALM_JUMP_SESSION"
+                && value == Some(std::ffi::OsStr::new("w0t0p0:ABC-123"))));
+        let Some(JumpTarget::CodexThread(thread_id)) = jump_target(exact) else {
+            panic!("Codex app sessions open their exact thread");
+        };
+        let codex = jump_command(&JumpTarget::CodexThread(thread_id.clone()), exact);
+        assert_eq!(codex.get_program(), "/usr/bin/open");
+        assert_eq!(
+            codex.get_args().collect::<Vec<_>>(),
+            [format!("codex://threads/{thread_id}").as_str()]
+        );
+        let bundle = jump_command(
+            &JumpTarget::AppBundle("com.microsoft.VSCode".to_owned()),
+            vscode_codex,
+        );
+        assert_eq!(bundle.get_program(), "/usr/bin/open");
+        assert_eq!(
+            bundle.get_args().collect::<Vec<_>>(),
+            ["-b", "com.microsoft.VSCode"]
+        );
         let app = snapshot
             .sessions
             .iter()
@@ -13344,6 +15648,10 @@ done
         assert_eq!(default_denied["allowedActions"], json!(["deny"]));
         assert_eq!(codex_declared["risk"], "high");
         assert_eq!(codex_declared["allowedActions"], json!(["approve", "deny"]));
+        // Every live Hook waiter can be handed back to the original Agent UI.
+        assert_eq!(declared["handBackAvailable"], true);
+        assert_eq!(default_denied["handBackAvailable"], true);
+        assert_eq!(codex_declared["handBackAvailable"], true);
 
         let companion = companion_snapshot_value(
             &state,
@@ -13366,6 +15674,7 @@ done
             companion_declared["allowedActions"],
             json!(["approve", "deny"])
         );
+        assert_eq!(companion_declared["handBackAvailable"], true);
 
         let read_only_companion = companion_snapshot_value(
             &state,
@@ -13399,7 +15708,7 @@ done
             .as_array()
             .unwrap()
             .iter()
-            .all(|item| item["allowedActions"] == json!([])));
+            .all(|item| item["allowedActions"] == json!([]) && item["handBackAvailable"] == false));
 
         state
             .waiters
@@ -13415,6 +15724,7 @@ done
             .unwrap();
         assert_eq!(declared["remoteActionable"], false);
         assert_eq!(declared["allowedActions"], json!([]));
+        assert_eq!(declared["handBackAvailable"], false);
 
         state
             .waiters
@@ -13431,6 +15741,96 @@ done
             .ticket
             .recv_timeout(Duration::from_secs(1));
 
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_codex_approvals_are_not_offered_for_hand_back() {
+        let root = std::env::temp_dir().join(format!("actrealm-hand-back-{}", Uuid::now_v7()));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        // A managed app-server approval: passing it through answers Codex with
+        // an RPC error instead of returning it to a Provider UI.
+        let managed = BridgeRequest::codex_approval_at(
+            "item/commandExecution/requestApproval",
+            json!({
+                "threadId":"managed-thread","turnId":"turn-1","itemId":"item-1",
+                "command":"cargo publish","cwd":"/tmp/project"
+            }),
+            now_millis(),
+        )
+        .unwrap();
+        let managed_id = managed.request_id.unwrap();
+        let managed_registration = state.waiters.register_at(&managed, now_millis()).unwrap();
+        store.ingest(managed).unwrap();
+        // A Hook approval in another session is handed back to its terminal.
+        let hook = BridgeRequest::from_hook_at(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"PermissionRequest","session_id":"hook-session",
+                "tool_name":"Bash","tool_input":{"command":"git push"}
+            }),
+            now_millis(),
+        );
+        let hook_id = hook.request_id.unwrap();
+        let hook_registration = state.waiters.register_at(&hook, now_millis()).unwrap();
+        store.ingest(hook).unwrap();
+        // A completion is never an approval.
+        for (event, at) in [("UserPromptSubmit", 0), ("Stop", 10)] {
+            store
+                .ingest(BridgeRequest::from_hook_at(
+                    Provider::Claude,
+                    json!({
+                        "hook_event_name":event,"session_id":"done-session","turn_id":"d1",
+                        "prompt":"done"
+                    }),
+                    now_millis() + at,
+                ))
+                .unwrap();
+        }
+
+        let companion = companion_snapshot_value(
+            &state,
+            &CompanionAuthorization {
+                id: "display".to_owned(),
+                scopes: vec![
+                    COMPANION_SCOPE_SNAPSHOT.to_owned(),
+                    COMPANION_SCOPE_RESPOND.to_owned(),
+                ],
+            },
+        )
+        .unwrap();
+        let attention = companion["attention"].as_array().unwrap();
+        let by_request = |request_id: Uuid| {
+            attention
+                .iter()
+                .find(|item| item["requestId"] == request_id.to_string())
+                .unwrap()
+        };
+        assert_eq!(
+            by_request(managed_id)["allowedActions"],
+            json!(["approve", "deny"])
+        );
+        assert_eq!(by_request(managed_id)["handBackAvailable"], false);
+        assert_eq!(by_request(hook_id)["handBackAvailable"], true);
+        let completion = attention
+            .iter()
+            .find(|item| item["kind"] == "completion")
+            .unwrap();
+        assert_eq!(completion["handBackAvailable"], false);
+
+        for (request_id, registration) in [
+            (managed_id, managed_registration),
+            (hook_id, hook_registration),
+        ] {
+            state
+                .waiters
+                .pass_through(request_id, "test_waiter_closed")
+                .unwrap();
+            let _ = registration.ticket.recv_timeout(Duration::from_secs(1));
+        }
         drop(state);
         drop(store);
         fs::remove_dir_all(root).unwrap();
@@ -13849,6 +16249,67 @@ done
     }
 
     #[test]
+    fn sessions_recorded_as_the_claude_code_bundle_open_claude_desktop() {
+        let root =
+            std::env::temp_dir().join(format!("actrealm-claude-code-jump-{}", Uuid::now_v7()));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let mut request = BridgeRequest::from_hook_at(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"UserPromptSubmit", "session_id":"claude-desktop-code", "prompt":"fixture"
+            }),
+            now_millis(),
+        );
+        // How Claude desktop sessions were recorded before 10/13.
+        request.term = Some(actrealm_core::TermContext {
+            app: Some("Claude Code".to_owned()),
+            bundle_id: Some("com.anthropic.claude-code".to_owned()),
+            surface: Some("desktop_app".to_owned()),
+            ..Default::default()
+        });
+        store.ingest(request).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let session = &snapshot.sessions[0];
+        assert_eq!(session.jump_capability, "app_only");
+        assert_eq!(
+            jump_targets(session),
+            [JumpTarget::AppBundle(
+                "com.anthropic.claudefordesktop".to_owned()
+            )]
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sessions_recorded_under_python_never_open_python() {
+        let root = std::env::temp_dir().join(format!("actrealm-python-jump-{}", Uuid::now_v7()));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let thread = Uuid::now_v7().to_string();
+        let mut request = BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"UserPromptSubmit", "session_id":thread, "prompt":"fixture"
+            }),
+            now_millis(),
+        );
+        // How a Codex started by a python3 script was recorded before 10/13.
+        request.term = Some(actrealm_core::TermContext {
+            app: Some("Python".to_owned()),
+            bundle_id: Some("org.python.python".to_owned()),
+            surface: Some("desktop_app".to_owned()),
+            ..Default::default()
+        });
+        store.ingest(request).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let session = &snapshot.sessions[0];
+        assert_eq!(session.jump_capability, "exact_conversation");
+        assert_eq!(jump_targets(session), [JumpTarget::CodexThread(thread)]);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn codex_native_waiting_flag_opens_and_resolves_attention() {
         let root = std::env::temp_dir().join(format!(
             "actrealm-server-native-approval-{}-{}",
@@ -14112,6 +16573,79 @@ done
         assert_eq!(resolved.sessions[0].exec_state, "thinking");
         assert_eq!(resolved.sessions[0].approval_owner, None);
 
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_connector_turn_end_takes_the_final_answer_reply_judgement() {
+        let root = std::env::temp_dir().join(format!(
+            "actrealm-server-connector-awaits-reply-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = Arc::new(Mutex::new(CodexManagerState::default()));
+        let waiters = WaiterRegistry::default();
+        let notify = |method: &str, params: Value| {
+            update_codex_notification(
+                &state,
+                &store,
+                &waiters,
+                ServerNotification {
+                    method: method.to_owned(),
+                    params,
+                },
+            );
+        };
+        for (thread, answer_turn, answer, expected) in [
+            ("asks", "turn-1", "Tests pass. Should I push?", true),
+            ("asks-zh", "turn-1", "测试都过了。要提交的话说一声。", true),
+            ("reports", "turn-1", "Done, all tests pass.", false),
+            // A final answer recorded for another turn is not this turn's.
+            ("stale", "turn-0", "Should I push?", false),
+        ] {
+            notify(
+                "turn/started",
+                json!({"threadId": thread, "turn": {"id": "turn-1"}}),
+            );
+            notify(
+                "item/completed",
+                json!({
+                    "threadId": thread, "turnId": answer_turn,
+                    "item": {"type": "agentMessage", "id": "answer", "phase": "final_answer", "text": answer}
+                }),
+            );
+            notify(
+                "turn/completed",
+                json!({"threadId": thread, "turn": {"id": "turn-1", "status": "completed", "items": []}}),
+            );
+            let snapshot = store.snapshot().unwrap();
+            let session = snapshot
+                .sessions
+                .iter()
+                .find(|session| session.provider_session_id == thread)
+                .unwrap();
+            assert_eq!(session.exec_state, "response_finished", "{thread}");
+            let completion = snapshot
+                .attention
+                .iter()
+                .find(|item| item.session_id == session.id && item.kind == "completion")
+                .unwrap();
+            assert_eq!(completion.awaits_reply, expected, "{thread}");
+            // The answer stays the Codex final response; the Stop built from
+            // `turn/completed` does not observe it again as Hook text.
+            if answer_turn == "turn-1" {
+                assert_eq!(
+                    store
+                        .session_result(&session.id, 0, now_millis())
+                        .unwrap()
+                        .source,
+                    "codex:app_server_final"
+                );
+            }
+        }
+        assert!(state.lock().unwrap().final_answer_awaits_reply.is_empty());
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }
@@ -14541,6 +17075,161 @@ done
     }
 
     #[test]
+    fn stuck_claude_quota_refresh_is_abandoned_so_polling_resumes() {
+        let root = std::env::temp_dir().join(format!("actrealm-quota-stuck-{}", Uuid::now_v7()));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        let started = Instant::now();
+        let abandoned = Arc::new(AtomicBool::new(false));
+        {
+            let mut quota = state.quota.lock().unwrap();
+            quota.entries = vec![serde_json::from_value(json!({
+                "provider": "claude", "window": "5h", "status": "available",
+                "usedPct": 25.0, "source": "oauth_usage", "capturedAt": 1_000
+            }))
+            .unwrap()];
+            quota.oauth_refresh_in_progress = true;
+            quota.oauth_refresh_abandoned = Some(abandoned.clone());
+            quota.oauth_next_poll_at = 0;
+
+            // Without a start time there is nothing to measure.
+            let late = started + CLAUDE_QUOTA_REFRESH_ABANDON;
+            assert!(!abandon_stuck_oauth_refresh(&mut quota, late));
+
+            // A slow refresh is left alone.
+            quota.oauth_refresh_started_at = Some(started);
+            let slow = late - Duration::from_millis(1);
+            assert!(!abandon_stuck_oauth_refresh(&mut quota, slow));
+            assert!(quota.oauth_refresh_in_progress);
+            assert!(!abandoned.load(Ordering::Acquire));
+            assert_eq!(quota.entries[0].status, "available");
+
+            // One that stopped responding is given up on, and the next poll is due.
+            assert!(abandon_stuck_oauth_refresh(&mut quota, late));
+            assert!(abandoned.load(Ordering::Acquire));
+            assert!(quota.oauth_refresh_abandoned.is_none());
+            assert!(oauth_poll_due(
+                quota.oauth_refresh_in_progress,
+                quota.oauth_next_poll_at,
+                now_millis(),
+                false
+            ));
+            assert_eq!(quota.entries[0].status, "stale");
+            assert_eq!(quota.entries[0].used_pct, Some(25.0));
+            assert!(matches!(
+                &quota.oauth_last_result,
+                Some(Err(("CLAUDE_QUOTA_REFRESH_FAILED", _)))
+            ));
+            // Nothing running: nothing to abandon.
+            assert!(!abandon_stuck_oauth_refresh(
+                &mut quota,
+                late + CLAUDE_QUOTA_REFRESH_ABANDON
+            ));
+        }
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn next_claude_quota_claim_replaces_a_stuck_refresh_at_once() {
+        let root = std::env::temp_dir().join(format!("actrealm-quota-claim-{}", Uuid::now_v7()));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        let poll = Duration::from_secs(60);
+        let started = Instant::now();
+        let stuck = Arc::new(AtomicBool::new(false));
+        {
+            let mut quota = state.quota.lock().unwrap();
+            quota.oauth_refresh_in_progress = true;
+            quota.oauth_refresh_started_at = Some(started);
+            quota.oauth_refresh_abandoned = Some(stuck.clone());
+            quota.oauth_next_poll_at = 1_000;
+
+            // Within the limit nothing new starts, not even when forced.
+            let slow = started + poll;
+            assert!(claim_oauth_quota_refresh(&mut quota, 2_000, slow, true, poll).is_none());
+            assert!(!stuck.load(Ordering::Acquire));
+
+            // Past it the stuck refresh is abandoned and the next one claimed.
+            let late = started + CLAUDE_QUOTA_REFRESH_ABANDON;
+            let (_collector, fresh) =
+                claim_oauth_quota_refresh(&mut quota, 400_000, late, false, poll)
+                    .expect("a new refresh replaces the stuck one");
+            assert!(stuck.load(Ordering::Acquire));
+            assert!(!fresh.load(Ordering::Acquire));
+            assert!(quota.oauth_refresh_in_progress);
+            assert_eq!(quota.oauth_refresh_started_at, Some(late));
+            assert!(quota
+                .oauth_refresh_abandoned
+                .as_ref()
+                .is_some_and(|flag| Arc::ptr_eq(flag, &fresh)));
+            assert_eq!(quota.oauth_next_poll_at, 460_000);
+        }
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finished_claude_quota_refresh_keeps_agent_quota_unless_abandoned() {
+        let root = std::env::temp_dir().join(format!("actrealm-quota-finish-{}", Uuid::now_v7()));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        let home = root.join("actrealm-home");
+        fs::create_dir_all(home.join("cache")).unwrap();
+        let now = now_millis();
+        fs::write(
+            home.join("cache/kimi-quota.json"),
+            serde_json::to_vec(&json!([{
+                "provider": "kimi", "window": "7d", "status": "available",
+                "usedPct": 30.0, "source": "kimi_api", "capturedAt": now
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+        let claude: QuotaEntry = serde_json::from_value(json!({
+            "provider": "claude", "window": "5h", "status": "available",
+            "usedPct": 40.0, "source": "oauth_usage", "capturedAt": now
+        }))
+        .unwrap();
+        let outcome = || OAuthQuotaOutcome {
+            collector: QuotaCollector::new(QuotaPaths {
+                actrealm_home: home.clone(),
+                codex_sessions: root.join("none"),
+            }),
+            result: Ok(vec![claude.clone()]),
+            official_codex: None,
+            fallback_codex: Vec::new(),
+            started_at: now,
+        };
+        {
+            let mut quota = state.quota.lock().unwrap();
+            quota.oauth_refresh_in_progress = true;
+
+            // Abandoned while stuck: a newer refresh owns the state.
+            finish_oauth_quota_refresh(&mut quota, &store, &AtomicBool::new(true), outcome());
+            assert!(quota.entries.is_empty());
+            assert!(quota.oauth_refresh_in_progress);
+            assert!(quota.oauth_last_result.is_none());
+
+            // Finished: Claude's rows are replaced and Kimi's stay.
+            finish_oauth_quota_refresh(&mut quota, &store, &AtomicBool::new(false), outcome());
+            let providers = quota
+                .entries
+                .iter()
+                .map(|entry| entry.provider.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(providers, ["claude", "kimi"]);
+            assert!(!quota.oauth_refresh_in_progress);
+            assert!(matches!(quota.oauth_last_result, Some(Ok(captured)) if captured == now));
+        }
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn manual_refresh_joins_background_job_and_returns_its_actual_outcome() {
         let root = std::env::temp_dir().join(format!("actrealm-quota-join-{}", Uuid::now_v7()));
         let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
@@ -14563,6 +17252,7 @@ done
                 {
                     let mut quota = state.quota.lock().unwrap();
                     quota.oauth_refresh_in_progress = true;
+                    quota.oauth_refresh_started_at = Some(Instant::now());
                     quota.oauth_last_result = None;
                 }
                 let completed = state.quota.clone();
@@ -14680,6 +17370,193 @@ done
         }));
         drop(manager);
         drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_quota_keeps_refreshing_after_a_failed_credential_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "actrealm-server-codex-restart-failed-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let launches = root.join("launches");
+        let executable = root.join("fake-codex");
+        fs::write(
+            &executable,
+            format!(
+                r#"#!/bin/sh
+printf 'x' >> '{}'
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{{"id":1,"result":{{"userAgent":"codex_cli_rs/0.144.6"}}}}'
+      ;;
+    *'"method":"account/rateLimits/read"'*)
+      printf '%s\n' '{{"id":2,"result":{{"rateLimits":{{"limitId":"codex","planType":"pro","primary":{{"usedPercent":26,"windowDurationMins":10080,"resetsAt":1788757309}}}}}}}}'
+      ;;
+  esac
+done
+"#,
+                launches.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        warm_codex_test_executable(&executable);
+        let _ = fs::remove_file(&launches);
+        let auth = root.join("auth.json");
+        fs::write(&auth, "{\"account\":\"before\"}").unwrap();
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let manager = CodexManager {
+            connector: None,
+            executable: Some(executable),
+            state: Arc::new(Mutex::new(CodexManagerState::default())),
+            store: store.clone(),
+            waiters: WaiterRegistry::default(),
+            auth_path: Some(auth.clone()),
+            auth_stamp: credential_stamp(&auth),
+        };
+        let replacement = root.join("auth.json.new");
+        fs::write(&replacement, "{\"account\":\"after, signed in again\"}").unwrap();
+        fs::rename(&replacement, &auth).unwrap();
+
+        // The change first asks for a Runtime restart, without reading quota.
+        assert_eq!(
+            manager.refresh_rate_limits(),
+            CodexQuotaRefresh::CredentialsChanged
+        );
+        assert!(!launches.exists());
+
+        // Runtime restarts itself first: nothing to ask the user yet.
+        assert_eq!(manager.capability_value()["restartRequired"], false);
+
+        // That restart failed. Later polls still read the official quota,
+        // and never ask for a second restart.
+        manager.mark_credential_restart_failed();
+        let capability = manager.capability_value();
+        assert_eq!(capability["restartRequired"], true);
+        assert_eq!(capability["restartReason"], "credentials_changed");
+        assert_eq!(manager.refresh_rate_limits(), CodexQuotaRefresh::Refreshed);
+        let (entries, _) = manager.rate_limit_entries().unwrap();
+        assert!(entries.iter().any(|entry| entry.used_pct == Some(26.0)));
+        assert_eq!(fs::read_to_string(&launches).unwrap(), "x");
+        // The quota error clears; the connection still needs a restart.
+        let capability = manager.capability_value();
+        assert_eq!(capability["rateLimitsError"], Value::Null);
+        assert_eq!(capability["restartRequired"], true);
+        let state = manager.state.lock().unwrap();
+        assert!(state.credential_change_handled);
+        assert_eq!(state.status, "unavailable");
+        drop(state);
+        drop(manager);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_lost_codex_connection_asks_for_a_runtime_restart() {
+        let mut state = CodexManagerState {
+            status: "connected".to_owned(),
+            ..CodexManagerState::default()
+        };
+        mark_codex_connection_lost(&mut state, "request");
+        assert_eq!(state.status, "unavailable");
+        assert_eq!(state.restart_reason, Some("connection_lost"));
+        // The second channel closing does not change the reason.
+        mark_codex_connection_lost(&mut state, "notification");
+        assert_eq!(state.restart_reason, Some("connection_lost"));
+
+        // Closed for changed credentials: Runtime restarts itself.
+        let mut changed = CodexManagerState {
+            credential_change_handled: true,
+            ..CodexManagerState::default()
+        };
+        mark_codex_connection_lost(&mut changed, "request");
+        assert_eq!(changed.restart_reason, None);
+        // Its restart already failed: that reason stays.
+        changed.restart_reason = Some("credentials_changed");
+        mark_codex_connection_lost(&mut changed, "notification");
+        assert_eq!(changed.restart_reason, Some("credentials_changed"));
+    }
+
+    #[test]
+    fn codex_connections_that_close_ask_for_a_runtime_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "actrealm-server-codex-closed-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let handshake = r#"IFS= read -r line || exit 0
+printf '%s\n' '{"id":1,"result":{"userAgent":"codex_cli_rs/0.144.6"}}'
+IFS= read -r line || exit 0
+"#;
+        let connect = |name: &str, tail: &str| {
+            let executable = root.join(name);
+            fs::write(&executable, format!("#!/bin/sh\n{handshake}{tail}\n")).unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            warm_codex_test_executable(&executable);
+            let (connector, channels) =
+                CodexConnector::connect(&executable, &root.join("unused.sock")).unwrap();
+            let store = RuntimeStore::open(root.join(format!("{name}.sqlite"))).unwrap();
+            let state = Arc::new(Mutex::new(CodexManagerState {
+                status: "connected".to_owned(),
+                ..CodexManagerState::default()
+            }));
+            let waiters = WaiterRegistry::default();
+            spawn_codex_handlers(
+                connector.clone(),
+                channels,
+                Arc::clone(&state),
+                store.clone(),
+                waiters.clone(),
+            );
+            CodexManager {
+                connector: Some(connector),
+                executable: Some(executable),
+                state,
+                store,
+                waiters,
+                auth_path: None,
+                auth_stamp: None,
+            }
+        };
+
+        // The app-server exits after the handshake.
+        let exits = connect("exits", "exit 0");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while exits.capability_value()["restartReason"] != "connection_lost" {
+            assert!(
+                Instant::now() < deadline,
+                "the closed connection was never reported"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(exits.capability_value()["restartRequired"], true);
+        assert_eq!(exits.state.lock().unwrap().status, "unavailable");
+
+        // A launcher whose child keeps the output open: shutting it down
+        // never closes the connection, yet the restart is still asked for.
+        let held = root.join("held.pid");
+        let launcher = connect(
+            "launcher",
+            &format!("sleep 30 &\nprintf '%s' $! > '{}'\nwait", held.display()),
+        );
+        assert_eq!(launcher.capability_value()["restartRequired"], false);
+        launcher.connector.as_ref().unwrap().shutdown();
+        let capability = launcher.capability_value();
+        assert_eq!(capability["restartRequired"], true);
+        assert_eq!(capability["restartReason"], "connection_lost");
+        if let Some(pid) = fs::read_to_string(&held)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+        {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        drop(exits);
+        drop(launcher);
         fs::remove_dir_all(root).unwrap();
     }
 

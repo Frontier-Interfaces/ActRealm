@@ -109,6 +109,10 @@ pub(crate) fn session_activity(
             "session.activity.interrupted"
         }
         "failed" => "session.activity.failed",
+        // A user interruption idles the session; it is not a failure.
+        "idle" if session.activity.as_deref() == Some("Turn interrupted") => {
+            "session.activity.interrupted"
+        }
         "idle"
             if matches!(
                 session.activity.as_deref(),
@@ -331,6 +335,7 @@ mod tests {
             reminder_acknowledged_at: None,
             reminder_resolution: None,
             retain_after_ack: false,
+            awaits_reply: false,
             created_at: 1,
             resolution: None,
             remote_actionable: false,
@@ -374,6 +379,7 @@ mod tests {
             reminder_acknowledged_at: None,
             reminder_resolution: None,
             retain_after_ack: false,
+            awaits_reply: false,
             created_at: 1,
             resolution: None,
             remote_actionable: false,

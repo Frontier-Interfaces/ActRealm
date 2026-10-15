@@ -790,6 +790,9 @@
 "quota.reason.codex_window_missing" = "No verifiable quota window was found in the Codex rollout.";
 "quota.reason.claude_refresh_failed" = "Claude quota refresh failed. The last successfully captured values are shown.";
 "quota.reason.codex_refresh_failed" = "Codex quota refresh failed. The last successfully captured values are shown.";
+"quota.reason.codex_rollout_stale" = "Codex quota comes from an old local session record; usage on other devices is not included.";
+"quota.reason.window_reset" = "This quota window has reset since the value was captured; waiting for a fresh update.";
+"quota.reason.extra_usage_disabled" = "Extra usage is turned off for this account.";
 "额度更新结果：%@" = "Quota update result: %@";
 "本机请求失败（HTTP %@）" = "Local request failed (HTTP %@)";
 "请求失败（%@）" = "Request failed (%@)";

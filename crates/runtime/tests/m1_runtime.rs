@@ -6,8 +6,8 @@ use actrealm_core::{
 };
 use actrealm_runtime::{
     ApprovalAction, AttentionAction, CommandState, EventSpool, InstanceError, ReviewBaselineInput,
-    RuntimeInstanceGuard, RuntimeStore, SessionUsageDailyRecord, SessionUsageRecord, SpoolError,
-    StoreError, TaskCheckpointInput, WaiterRegistry,
+    RuntimeInstanceGuard, RuntimeStore, SessionSeen, SessionUsageDailyRecord, SessionUsageRecord,
+    SpoolError, StoreError, TaskCheckpointInput, WaiterRegistry,
 };
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -3765,7 +3765,9 @@ fn subagent_counts_and_background_stop_state_are_fact_based() {
         .iter()
         .find(|session| session.provider_session_id == "background-session")
         .unwrap();
-    assert_eq!(background.exec_state, "tool_running");
+    // The turn is over: the session waits for the user while the shell runs.
+    assert_eq!(background.exec_state, "response_finished");
+    assert_eq!(background.background_tasks, 1);
     assert_eq!(
         background.activity.as_deref(),
         Some("1 background tasks still running")
@@ -3774,6 +3776,535 @@ fn subagent_counts_and_background_stop_state_are_fact_based() {
         .attention
         .iter()
         .all(|attention| attention.session_id != background.id));
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Ends a Claude turn that read a file with `stop` and returns the session's
+/// execution state and activity, its completion Attention (and whether that
+/// awaits a reply), and the state the turn ended in.
+fn stop_after_work(
+    root: &std::path::Path,
+    session: &str,
+    stop: Value,
+) -> (String, Option<String>, Option<bool>, String) {
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    ingest_tool_turn(&store, Provider::Claude, session, "t1", 1_000);
+    let mut stop = stop;
+    stop["hook_event_name"] = json!("Stop");
+    stop["session_id"] = json!(session);
+    stop["turn_id"] = json!("t1");
+    stop["cwd"] = json!("/tmp/example-project");
+    let stopped = store.ingest(hook(Provider::Claude, stop, 1_100)).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let state = snapshot
+        .sessions
+        .iter()
+        .find(|item| item.id == stopped.session_id)
+        .unwrap();
+    let completion = snapshot
+        .attention
+        .iter()
+        .find(|item| item.session_id == stopped.session_id && item.kind == "completion")
+        .map(|item| item.awaits_reply);
+    let (exec_state, activity) = (state.exec_state.clone(), state.activity.clone());
+    drop(store);
+    let turn_state = Connection::open(root.join("data.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT turns.state FROM turns JOIN sessions ON sessions.id = turns.session_id
+             WHERE sessions.provider_session_id = ?1 ORDER BY turns.ordinal DESC LIMIT 1",
+            [session],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    (exec_state, activity, completion, turn_state)
+}
+
+#[test]
+fn only_running_background_work_holds_back_the_completion() {
+    let root = temp_root("background-status");
+    let task = |id: &str, status: &str| json!({"id": id, "type": "shell", "status": status});
+    let finished = [
+        "completed",
+        "failed",
+        "killed",
+        "stopped",
+        "cancelled",
+        "done",
+        "Completed",
+    ]
+    .iter()
+    .enumerate()
+    .map(|(index, status)| task(&format!("done-{index}"), status))
+    .collect::<Vec<_>>();
+
+    // Every listed task has finished: the turn is complete.
+    let (state, activity, completion, turn) = stop_after_work(
+        &root,
+        "finished-only",
+        json!({"background_tasks": finished.clone(), "session_crons": []}),
+    );
+    assert_eq!(state, "response_finished");
+    assert_eq!(activity.as_deref(), Some("Turn completed"));
+    assert_eq!(completion, Some(false));
+    assert_eq!(turn, "response_finished");
+
+    // One running task still holds the completion back; the turn ends all
+    // the same and the session waits for the user.
+    for status in [
+        "running",
+        "pending",
+        "queued",
+        "in_progress",
+        "In-Progress",
+        "started",
+    ] {
+        let session = format!("active-{status}");
+        let (state, activity, completion, turn) = stop_after_work(
+            &root,
+            &session,
+            json!({"background_tasks": [task("bg", status)], "session_crons": []}),
+        );
+        assert_eq!(state, "response_finished", "{status}");
+        assert_eq!(turn, "response_finished", "{status}");
+        assert_eq!(
+            activity.as_deref(),
+            Some("1 background tasks still running"),
+            "{status}"
+        );
+        assert_eq!(completion, None, "{status}");
+    }
+
+    // A mixed list counts only the running ones; an item without a status
+    // (a cron job, an unknown shape) still counts as before.
+    let mut mixed = finished.clone();
+    mixed.push(task("bg-running", "running"));
+    mixed.push(json!({"id": "bg-unknown", "type": "shell"}));
+    let (state, activity, completion, _) = stop_after_work(
+        &root,
+        "mixed",
+        json!({
+            "background_tasks": mixed,
+            "session_crons": [
+                {"id": "cron-1", "schedule": "0 9 * * 1-5", "recurring": true, "prompt": "check"},
+                {"id": "cron-2", "schedule": "0 9 * * *", "recurring": false, "prompt": "x", "status": "completed"}
+            ]
+        }),
+    );
+    assert_eq!(state, "response_finished");
+    assert_eq!(
+        activity.as_deref(),
+        Some("3 background tasks still running")
+    );
+    assert_eq!(completion, None);
+
+    // A cron job alone keeps the old behaviour.
+    let (state, _, completion, _) = stop_after_work(
+        &root,
+        "cron-only",
+        json!({
+            "background_tasks": [],
+            "session_crons": [{"id": "cron", "schedule": "*/5 * * * *", "recurring": true, "prompt": "loop"}]
+        }),
+    );
+    assert_eq!((state.as_str(), completion), ("response_finished", None));
+
+    // Ambient work Claude Code keeps running on its own never holds a turn
+    // open: the live-update monitor of a published Artifact (the shape
+    // Claude Code 2.1.292 reports), memory consolidation, the auto-mode scan.
+    let (state, activity, completion, _) = stop_after_work(
+        &root,
+        "artifact-monitor",
+        json!({
+            "background_tasks": [
+                {
+                    "id": "m1", "type": "monitor", "status": "running",
+                    "description": "live updates for artifact https://claude.ai/code/artifact/x (subscription)"
+                },
+                {"id": "d1", "type": "dream", "status": "running", "description": "memory"},
+                {"id": "a1", "type": "auto-mode scan", "status": "pending", "description": "scan"}
+            ],
+            "session_crons": []
+        }),
+    );
+    assert_eq!(state, "response_finished");
+    assert_eq!(activity.as_deref(), Some("Turn completed"));
+    assert_eq!(completion, Some(false));
+    // Any other monitor (a Monitor tool watch, an MCP monitor) is real work.
+    let (_, activity, completion, _) = stop_after_work(
+        &root,
+        "mcp-monitor",
+        json!({
+            "background_tasks": [{
+                "id": "m2", "type": "monitor", "status": "running",
+                "description": "watch deploy", "server": "ci", "tool": "watch"
+            }]
+        }),
+    );
+    assert_eq!(
+        (activity.as_deref(), completion),
+        (Some("1 background tasks still running"), None)
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_stop_with_background_work_ends_the_turn_until_the_next_one_starts() {
+    let root = temp_root("background-turn-end");
+    let database = root.join("data.sqlite");
+    let store = RuntimeStore::open(&database).unwrap();
+    let session = "background-wait";
+    ingest_tool_turn(&store, Provider::Claude, session, "t1", 1_000);
+    let stopped = claude_event(
+        &store,
+        session,
+        json!({
+            "hook_event_name": "Stop",
+            "turn_id": "t1",
+            "last_assistant_message": "Started the long build in the background.",
+            "background_tasks": [
+                {"id": "a1", "type": "subagent", "status": "running", "description": "PRIVATE TASK", "agent_type": "Explore"},
+                {"id": "a2", "type": "subagent", "status": "running", "description": "PRIVATE TASK"},
+                {"id": "b1", "type": "shell", "status": "pending", "description": "PRIVATE", "command": "PRIVATE COMMAND"},
+                {"id": "m1", "type": "monitor", "status": "running", "description": "live updates for artifact https://example.test/a"},
+                {"id": "x1", "type": "MCP task", "status": "running", "description": "PRIVATE"}
+            ],
+            "session_crons": [{"id": "c1", "schedule": "*/5 * * * *", "recurring": true, "prompt": "PRIVATE PROMPT"}]
+        }),
+        1_100,
+    );
+    let state = |store: &RuntimeStore| {
+        let session = store
+            .snapshot()
+            .unwrap()
+            .sessions
+            .into_iter()
+            .find(|item| item.id == stopped)
+            .unwrap();
+        (
+            session.exec_state,
+            session.activity,
+            session.background_tasks,
+            session.turn_ended_at,
+        )
+    };
+    // Five active items (the Artifact monitor is ambient; the cron job has no
+    // status and counts): the turn ended, nothing runs in the foreground and
+    // no completion is raised.
+    assert_eq!(
+        state(&store),
+        (
+            "response_finished".to_owned(),
+            Some("5 background tasks still running".to_owned()),
+            5,
+            Some(1_100)
+        )
+    );
+    assert!(store
+        .snapshot()
+        .unwrap()
+        .attention
+        .iter()
+        .all(|item| item.session_id != stopped));
+    let serialized = serde_json::to_value(store.snapshot().unwrap().sessions).unwrap();
+    assert!(serialized
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["backgroundTasks"] == 5));
+
+    // A background subagent keeps calling tools: still the turn that ended.
+    for (offset, event) in [(0, "PreToolUse"), (10, "PostToolUse")] {
+        claude_event(
+            &store,
+            session,
+            json!({
+                "hook_event_name": event, "tool_name": "Bash", "tool_use_id": "sub-bash",
+                "tool_input": {"command": "cargo build"},
+                "agent_id": "a1", "agent_type": "Explore"
+            }),
+            2_000 + offset,
+        );
+    }
+    claude_event(
+        &store,
+        session,
+        json!({"hook_event_name": "SubagentStop", "agent_id": "a1", "agent_type": "Explore"}),
+        3_000,
+    );
+    assert_eq!(state(&store).0, "response_finished");
+    assert_eq!(state(&store).3, Some(1_100));
+
+    // The task notification wakes the main Agent with a new prompt.
+    claude_event(
+        &store,
+        session,
+        json!({"hook_event_name": "UserPromptSubmit", "prompt": "<task-notification>done</task-notification>"}),
+        4_000,
+    );
+    let (exec_state, _, background_tasks, turn_ended_at) = state(&store);
+    assert_eq!(
+        (exec_state.as_str(), background_tasks, turn_ended_at),
+        ("thinking", 0, None)
+    );
+    drop(store);
+
+    // Only the kinds and states of the background work are kept, for
+    // diagnosis; no description, command or prompt.
+    let summary = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT summary FROM events WHERE type = 'turn.stopped'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        summary,
+        "background: subagent running\u{d7}2, shell pending\u{d7}1, monitor running ambient\u{d7}1, mcp_task running\u{d7}1, cron\u{d7}1"
+    );
+    let contents = fs::read(&database).unwrap();
+    for private in ["PRIVATE TASK", "PRIVATE COMMAND", "PRIVATE PROMPT"] {
+        assert!(!contents
+            .windows(private.len())
+            .any(|window| window == private.as_bytes()));
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_main_agent_tool_after_the_stop_still_reopens_the_turn() {
+    let root = temp_root("background-main-tool");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    ingest_tool_turn(&store, Provider::Claude, "main-tool", "t1", 1_000);
+    let session = claude_event(
+        &store,
+        "main-tool",
+        json!({
+            "hook_event_name": "Stop", "turn_id": "t1",
+            "background_tasks": [{"id": "b1", "type": "shell", "status": "running"}]
+        }),
+        1_100,
+    );
+    // A Stop Hook that blocks makes the main Agent continue the same turn.
+    claude_event(
+        &store,
+        "main-tool",
+        json!({
+            "hook_event_name": "PreToolUse", "tool_name": "Read", "tool_use_id": "main-read",
+            "tool_input": {"file_path": "/tmp/example-project/file.rs"}
+        }),
+        1_200,
+    );
+    let snapshot = store.snapshot().unwrap();
+    let state = snapshot
+        .sessions
+        .iter()
+        .find(|item| item.id == session)
+        .unwrap();
+    assert_eq!(state.exec_state, "tool_running");
+    assert_eq!(state.background_tasks, 0);
+    assert_eq!(state.turn_ended_at, None);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn an_idle_prompt_ends_a_turn_whose_stop_was_lost() {
+    let root = temp_root("idle-prompt-turn-end");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let state = |store: &RuntimeStore, id: &str| {
+        let snapshot = store.snapshot().unwrap();
+        let session = snapshot.sessions.iter().find(|item| item.id == id).unwrap();
+        (session.exec_state.clone(), session.turn_ended_at)
+    };
+    // The turn's Stop never arrived.
+    ingest_tool_turn(&store, Provider::Claude, "lost-stop", "t1", 1_000);
+    let session = claude_event(
+        &store,
+        "lost-stop",
+        json!({
+            "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_use_id": "bash",
+            "tool_input": {"command": "ls"}
+        }),
+        1_100,
+    );
+    assert_eq!(state(&store, &session).0, "tool_running");
+    claude_event(&store, "lost-stop", idle_prompt_notification(), 61_100);
+    assert_eq!(
+        state(&store, &session),
+        ("response_finished".to_owned(), Some(61_100))
+    );
+    assert!(store
+        .snapshot()
+        .unwrap()
+        .attention
+        .iter()
+        .all(|item| item.session_id != session));
+
+    // A pending approval still needs the user: the notification changes
+    // nothing.
+    ingest_tool_turn(&store, Provider::Claude, "approval", "t1", 1_000);
+    let session = claude_event(
+        &store,
+        "approval",
+        json!({
+            "hook_event_name": "PermissionRequest", "tool_name": "Bash",
+            "tool_input": {"command": "git push"}
+        }),
+        1_100,
+    );
+    let before = state(&store, &session);
+    claude_event(&store, "approval", idle_prompt_notification(), 61_100);
+    assert_eq!(state(&store, &session), before);
+    assert_eq!(before.0, "awaiting_approval");
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_session_waiting_with_background_work_stays_listed_for_a_day() {
+    let root = temp_root("background-listed");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let hour = 60 * 60 * 1000;
+    ingest_tool_turn(&store, Provider::Claude, "waiting", "t1", 1_000);
+    let waiting = claude_event(
+        &store,
+        "waiting",
+        json!({
+            "hook_event_name": "Stop", "turn_id": "t1",
+            "background_tasks": [{"id": "b1", "type": "shell", "status": "running"}]
+        }),
+        1_100,
+    );
+    let listed = |cutoff: u64| {
+        store
+            .ui_snapshot(cutoff)
+            .unwrap()
+            .sessions
+            .iter()
+            .any(|item| item.id == waiting)
+    };
+    // The regular 30-minute retention has passed; the session still waits.
+    assert!(listed(1_100 + 2 * hour));
+    assert!(listed(1_100 + 24 * hour));
+    assert!(!listed(1_100 + 25 * hour));
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_final_question_marks_the_completion_as_awaiting_a_reply() {
+    let root = temp_root("awaits-reply");
+    // A question with nothing left running.
+    let (state, _, completion, turn) = stop_after_work(
+        &root,
+        "question",
+        json!({"last_assistant_message": "测试都过了。\n\n要提交的话说一声。"}),
+    );
+    assert_eq!(
+        (state.as_str(), completion, turn.as_str()),
+        ("response_finished", Some(true), "response_finished")
+    );
+
+    // A plain report.
+    let (_, _, completion, _) = stop_after_work(
+        &root,
+        "report",
+        json!({"last_assistant_message": "已完成，测试全部通过。"}),
+    );
+    assert_eq!(completion, Some(false));
+
+    // A question while a background task still runs: the user is needed, so
+    // the completion is raised; the session keeps reporting the running work.
+    let (state, activity, completion, _) = stop_after_work(
+        &root,
+        "question-background",
+        json!({
+            "last_assistant_message": "Build is still running in the background. Should I push once it is green?",
+            "background_tasks": [{"id": "bg", "type": "shell", "status": "running"}],
+            "session_crons": []
+        }),
+    );
+    assert_eq!(state, "response_finished");
+    assert_eq!(
+        activity.as_deref(),
+        Some("1 background tasks still running")
+    );
+    assert_eq!(completion, Some(true));
+
+    // Without a question the running task still holds the completion back.
+    let (_, _, completion, _) = stop_after_work(
+        &root,
+        "report-background",
+        json!({
+            "last_assistant_message": "Started the build in the background.",
+            "background_tasks": [{"id": "bg", "type": "shell", "status": "running"}]
+        }),
+    );
+    assert_eq!(completion, None);
+
+    // A question inside a code block is not addressed to the user.
+    let (_, _, completion, _) = stop_after_work(
+        &root,
+        "code-question",
+        json!({"last_assistant_message": "已完成。\n\n```\nfoo?\n```"}),
+    );
+    assert_eq!(completion, Some(false));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_codex_turn_end_from_the_session_file_carries_the_reply_judgement() {
+    let root = temp_root("codex-file-awaits-reply");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    for (thread, awaits_reply) in [("asks", true), ("reports", false)] {
+        ingest_tool_turn(&store, Provider::Codex, thread, "turn-1", 1_000);
+        assert!(store
+            .observe_codex_turn_end(thread, "turn-1", "Stop", 2_000, awaits_reply)
+            .unwrap());
+    }
+    let snapshot = store.snapshot().unwrap();
+    for (thread, awaits_reply) in [("asks", true), ("reports", false)] {
+        let session = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.provider_session_id == thread)
+            .unwrap();
+        assert_eq!(session.exec_state, "response_finished");
+        let completion = snapshot
+            .attention
+            .iter()
+            .find(|item| item.session_id == session.id && item.kind == "completion")
+            .unwrap();
+        assert_eq!(completion.awaits_reply, awaits_reply, "{thread}");
+    }
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_worktree_session_is_labelled_with_its_repository() {
+    let root = temp_root("worktree-project");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let mut raw = json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "worktree-session",
+        "cwd": "/tmp/ActRealm/Display.worktrees/main",
+        "prompt": "check"
+    });
+    store
+        .ingest(hook(Provider::Claude, raw.clone(), 1_000))
+        .unwrap();
+    raw["hook_event_name"] = json!("PermissionRequest");
+    raw["tool_name"] = json!("Bash");
+    raw["tool_input"] = json!({"command": "git push"});
+    store.ingest(hook(Provider::Claude, raw, 1_100)).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.sessions[0].project.as_deref(), Some("Display"));
+    assert_eq!(snapshot.attention[0].project.as_deref(), Some("Display"));
     drop(store);
     fs::remove_dir_all(root).unwrap();
 }
@@ -3967,7 +4498,7 @@ fn new_activity_resolves_stale_completion_and_error_without_hiding_running_state
     assert_eq!(completion.state, "resolved");
     assert_eq!(
         completion.resolution.as_deref(),
-        Some("superseded_by_activity")
+        Some("superseded_by_prompt")
     );
     assert_eq!(resumed.sessions[0].exec_state, "thinking");
 
@@ -4025,7 +4556,7 @@ fn new_activity_resolves_stale_completion_and_error_without_hiding_running_state
         .find(|item| item.kind == "error")
         .unwrap();
     assert_eq!(error.state, "resolved");
-    assert_eq!(error.resolution.as_deref(), Some("superseded_by_activity"));
+    assert_eq!(error.resolution.as_deref(), Some("superseded_by_prompt"));
     assert_eq!(recovered.sessions[0].exec_state, "tool_running");
 
     drop(store);
@@ -4089,6 +4620,11 @@ fn a_tool_start_reopens_an_automatically_continued_codex_turn() {
             && item.state == "resolved"
             && item.resolution.as_deref() == Some("superseded_by_activity")
     }));
+    // The turn continued on its own; the user has not seen its result.
+    assert_eq!(
+        store.recent_tasks(0, 10, true).unwrap()[0].review_state,
+        "unseen"
+    );
 
     drop(store);
     fs::remove_dir_all(root).unwrap();
@@ -5252,19 +5788,19 @@ fn codex_rollout_terminal_events_repair_only_the_matching_current_turn() {
         ))
         .unwrap();
     assert!(!store
-        .observe_codex_turn_end("thread", "older-turn", "StopFailure", 2000)
+        .observe_codex_turn_end("thread", "older-turn", "StopFailure", 2000, false)
         .unwrap());
     assert!(!store
-        .observe_codex_turn_end("thread", "turn-1", "StopFailure", 999)
+        .observe_codex_turn_end("thread", "turn-1", "StopFailure", 999, false)
         .unwrap());
     assert!(store
-        .observe_codex_turn_end("thread", "turn-1", "StopFailure", 2000)
+        .observe_codex_turn_end("thread", "turn-1", "StopFailure", 2000, false)
         .unwrap());
     let failed = &store.snapshot().unwrap().sessions[0];
     assert_eq!(failed.exec_state, "failed");
     assert_eq!(failed.turn_ended_at, Some(2000));
     assert!(!store
-        .observe_codex_turn_end("thread", "turn-1", "StopFailure", 2000)
+        .observe_codex_turn_end("thread", "turn-1", "StopFailure", 2000, false)
         .unwrap());
     store
         .ingest(request_at(
@@ -5277,11 +5813,11 @@ fn codex_rollout_terminal_events_repair_only_the_matching_current_turn() {
         ))
         .unwrap();
     assert!(!store
-        .observe_codex_turn_end("thread", "turn-1", "Stop", 4000)
+        .observe_codex_turn_end("thread", "turn-1", "Stop", 4000, false)
         .unwrap());
     assert_eq!(store.snapshot().unwrap().sessions[0].exec_state, "thinking");
     assert!(store
-        .observe_codex_turn_end("thread", "turn-2", "Stop", 4000)
+        .observe_codex_turn_end("thread", "turn-2", "Stop", 4000, false)
         .unwrap());
     assert_eq!(
         store.snapshot().unwrap().sessions[0].exec_state,
@@ -5383,6 +5919,1658 @@ fn codex_internal_memory_maintenance_is_not_a_user_task() {
         .unwrap();
     assert!(!user.suppressed);
     assert_eq!(store.snapshot().unwrap().sessions.len(), 1);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn hook(provider: Provider, raw: Value, at: u64) -> BridgeRequest {
+    BridgeRequest::from_hook_at(provider, raw, at)
+}
+
+fn ingest_tool_turn(store: &RuntimeStore, provider: Provider, session: &str, turn: &str, at: u64) {
+    for (offset, event) in [
+        (0, "UserPromptSubmit"),
+        (10, "PreToolUse"),
+        (20, "PostToolUse"),
+    ] {
+        let mut raw = json!({
+            "hook_event_name": event,
+            "session_id": session,
+            "turn_id": turn,
+            "cwd": "/tmp/example-project",
+        });
+        if event != "UserPromptSubmit" {
+            raw["tool_name"] = json!("Read");
+            raw["tool_use_id"] = json!(format!("{turn}-read"));
+            raw["tool_input"] = json!({ "file_path": "/tmp/example-project/file.rs" });
+        } else {
+            raw["prompt"] = json!("检查项目");
+        }
+        store.ingest(hook(provider, raw, at + offset)).unwrap();
+    }
+}
+
+#[test]
+fn user_interruption_idles_the_turn_without_an_error_attention() {
+    let root = temp_root("interrupt-idle");
+    let path = root.join("data.sqlite");
+    let store = RuntimeStore::open(&path).unwrap();
+    ingest_tool_turn(
+        &store,
+        Provider::Codex,
+        "interrupted-session",
+        "turn-1",
+        1_000,
+    );
+    store
+        .ingest(hook(
+            Provider::Codex,
+            json!({
+                "hook_event_name": "TurnInterrupted",
+                "session_id": "interrupted-session",
+                "turn_id": "turn-1",
+                "reason": "user pressed escape"
+            }),
+            1_100,
+        ))
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let session = &snapshot.sessions[0];
+    assert_eq!(session.exec_state, "idle");
+    assert_eq!(session.activity.as_deref(), Some("Turn interrupted"));
+    assert_eq!(session.turn_ended_at, Some(1_100));
+    assert!(
+        snapshot.attention.iter().all(|item| item.kind != "error"),
+        "an interruption must not raise an error attention"
+    );
+
+    // A late tool event from the interrupted turn neither reopens it nor
+    // opens a new implicit turn.
+    store
+        .ingest(hook(
+            Provider::Codex,
+            json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "interrupted-session",
+                "turn_id": "turn-1",
+                "tool_name": "Read",
+                "tool_use_id": "late-read",
+                "tool_input": { "file_path": "/tmp/example-project/file.rs" }
+            }),
+            1_200,
+        ))
+        .unwrap();
+    let late = store.snapshot().unwrap();
+    assert_eq!(late.sessions[0].exec_state, "idle");
+    assert_eq!(late.sessions[0].user_turn_count, 1);
+    let connection = Connection::open(&path).unwrap();
+    let (turns, state): (i64, String) = connection
+        .query_row("SELECT COUNT(*), MAX(state) FROM turns", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(turns, 1);
+    assert_eq!(state, "interrupted");
+
+    // Real failures still raise an error attention.
+    ingest_tool_turn(
+        &store,
+        Provider::Codex,
+        "interrupted-session",
+        "turn-2",
+        2_000,
+    );
+    store
+        .ingest(hook(
+            Provider::Codex,
+            json!({
+                "hook_event_name": "StopFailure",
+                "session_id": "interrupted-session",
+                "turn_id": "turn-2",
+                "error": "provider failed"
+            }),
+            2_100,
+        ))
+        .unwrap();
+    let failed = store.snapshot().unwrap();
+    assert_eq!(failed.sessions[0].exec_state, "failed");
+    assert!(failed
+        .attention
+        .iter()
+        .any(|item| item.kind == "error" && item.state == "open"));
+    assert_eq!(store.recent_tasks(0, 10, true).unwrap()[0].status, "failed");
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_new_prompt_alone_closes_open_completion_and_error_reminders() {
+    let root = temp_root("prompt-supersedes-reminders");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    ingest_tool_turn(
+        &store,
+        Provider::Claude,
+        "reminder-session",
+        "turn-1",
+        1_000,
+    );
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"Stop","session_id":"reminder-session","turn_id":"turn-1"}),
+            1_100,
+        ))
+        .unwrap();
+    assert!(store
+        .snapshot()
+        .unwrap()
+        .attention
+        .iter()
+        .any(|item| item.kind == "completion" && item.state == "open"));
+    ingest_tool_turn(
+        &store,
+        Provider::Claude,
+        "reminder-session",
+        "turn-2",
+        2_000,
+    );
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"StopFailure","session_id":"reminder-session","turn_id":"turn-2","error":"x"}),
+            2_100,
+        ))
+        .unwrap();
+    // Only the prompt arrives; no tool activity follows yet.
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"UserPromptSubmit","session_id":"reminder-session",
+                "turn_id":"turn-3","prompt":"继续"
+            }),
+            3_000,
+        ))
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    for kind in ["completion", "error"] {
+        let item = snapshot
+            .attention
+            .iter()
+            .find(|item| item.kind == kind)
+            .unwrap();
+        assert_eq!(item.state, "resolved", "{kind}");
+        assert_eq!(
+            item.resolution.as_deref(),
+            Some("superseded_by_prompt"),
+            "{kind}"
+        );
+    }
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn sessions_report_user_turns_and_main_or_side_task_role() {
+    let root = temp_root("task-role");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    // Titled and driven by two user prompts: main.
+    for (turn, at) in [("t1", 1_000), ("t2", 2_000)] {
+        store
+            .ingest(hook(
+                Provider::Claude,
+                json!({
+                    "hook_event_name":"UserPromptSubmit","session_id":"titled-main",
+                    "turn_id":turn,"cwd":"/tmp/example-project","prompt":"做任务",
+                    "session_title":"Refactor the review page"
+                }),
+                at,
+            ))
+            .unwrap();
+    }
+    // A scripted Codex run: user prompt but no Provider title.
+    store
+        .ingest(hook(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"UserPromptSubmit","session_id":"untitled-script",
+                "turn_id":"s1","cwd":"/tmp/example-project","prompt":"run batch"
+            }),
+            1_500,
+        ))
+        .unwrap();
+    // A titled fork that never received a prompt; a tool event opens an
+    // implicit turn that is not a user turn.
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"SessionStart","session_id":"titled-fork",
+                "cwd":"/tmp/example-project","session_title":"Refactor (fork)"
+            }),
+            1_600,
+        ))
+        .unwrap();
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"PreToolUse","session_id":"titled-fork",
+                "cwd":"/tmp/example-project","tool_name":"Read","tool_use_id":"f1",
+                "tool_input":{"file_path":"/tmp/example-project/a.rs"}
+            }),
+            1_700,
+        ))
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let by_provider_session = |id: &str| {
+        snapshot
+            .sessions
+            .iter()
+            .find(|session| session.provider_session_id == id)
+            .unwrap()
+            .clone()
+    };
+    let main = by_provider_session("titled-main");
+    assert_eq!(main.user_turn_count, 2);
+    assert_eq!(main.task_role, "main");
+    let script = by_provider_session("untitled-script");
+    assert_eq!(script.user_turn_count, 1);
+    assert_eq!(script.task_role, "side");
+    let fork = by_provider_session("titled-fork");
+    assert_eq!(fork.user_turn_count, 0);
+    assert_eq!(fork.task_role, "side");
+    let encoded = serde_json::to_value(&main).unwrap();
+    assert_eq!(encoded["userTurnCount"], 2);
+    assert_eq!(encoded["taskRole"], "main");
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn recent_tasks_cover_active_and_finished_work_with_review_state() {
+    let root = temp_root("recent-tasks");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let titled = |session: &str, turn: &str, at: u64| {
+        hook(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"UserPromptSubmit","session_id":session,"turn_id":turn,
+                "cwd":"/tmp/example-project","prompt":"PRIVATE PROMPT TEXT",
+                "session_title":format!("Task {session}")
+            }),
+            at,
+        )
+    };
+    // completed + unseen completion reminder
+    store.ingest(titled("done", "d1", 10_000)).unwrap();
+    ingest_tool_turn(&store, Provider::Claude, "done", "d1", 10_001);
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"Stop","session_id":"done","turn_id":"d1"}),
+            10_100,
+        ))
+        .unwrap();
+    // interrupted by the user: no reminder at all
+    store.ingest(titled("stopped", "s1", 11_000)).unwrap();
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"TurnInterrupted","session_id":"stopped","turn_id":"s1"}),
+            11_100,
+        ))
+        .unwrap();
+    // still running
+    store.ingest(titled("running", "r1", 12_000)).unwrap();
+    // waiting for approval
+    store.ingest(titled("waiting", "w1", 13_000)).unwrap();
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"PermissionRequest","session_id":"waiting","turn_id":"w1",
+                "cwd":"/tmp/example-project","tool_name":"Bash",
+                "tool_input":{"command":"rm -rf build"}
+            }),
+            13_100,
+        ))
+        .unwrap();
+    // failed, and the error reminder was acknowledged
+    store.ingest(titled("broken", "b1", 14_000)).unwrap();
+    let failure = store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"StopFailure","session_id":"broken","turn_id":"b1","error":"boom"}),
+            14_100,
+        ))
+        .unwrap();
+    store
+        .act_on_attention(
+            Uuid::now_v7(),
+            failure.attention_id.unwrap(),
+            AttentionAction::Ack,
+            14_200,
+        )
+        .unwrap();
+    // side task: untitled scripted run
+    store
+        .ingest(hook(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"UserPromptSubmit","session_id":"script","turn_id":"x1",
+                "cwd":"/tmp/example-project","prompt":"batch"
+            }),
+            15_000,
+        ))
+        .unwrap();
+    // older than `since`
+    store.ingest(titled("yesterday", "y1", 5_000)).unwrap();
+
+    let tasks = store.recent_tasks(9_000, 100, false).unwrap();
+    let ids = tasks
+        .iter()
+        .map(|task| task.title.clone().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        vec![
+            "Task broken",
+            "Task waiting",
+            "Task running",
+            "Task stopped",
+            "Task done"
+        ]
+    );
+    let find = |title: &str| {
+        tasks
+            .iter()
+            .find(|task| task.title.as_deref() == Some(title))
+            .unwrap()
+    };
+    let done = find("Task done");
+    assert_eq!(done.status, "completed");
+    assert_eq!(done.review_state, "unseen");
+    assert_eq!(done.latest_attention_kind.as_deref(), Some("completion"));
+    assert_eq!(done.completed_at, Some(10_100));
+    assert_eq!(done.task_role, "main");
+    assert_eq!(done.user_turn_count, 1);
+    let stopped = find("Task stopped");
+    assert_eq!(stopped.status, "interrupted");
+    assert_eq!(stopped.review_state, "none");
+    assert_eq!(stopped.latest_attention_kind, None);
+    assert_eq!(stopped.completed_at, Some(11_100));
+    let running = find("Task running");
+    assert_eq!(running.status, "running");
+    assert_eq!(running.completed_at, None);
+    assert_eq!(find("Task waiting").status, "waiting");
+    let broken = find("Task broken");
+    assert_eq!(broken.status, "failed");
+    assert_eq!(broken.review_state, "seen");
+    assert_eq!(broken.latest_attention_kind.as_deref(), Some("error"));
+
+    let with_side = store.recent_tasks(9_000, 100, true).unwrap();
+    assert_eq!(with_side.len(), 6);
+    assert_eq!(with_side[0].task_role, "side");
+    assert_eq!(with_side[0].status, "running");
+    assert_eq!(store.recent_tasks(9_000, 2, false).unwrap().len(), 2);
+    assert_eq!(store.recent_tasks(0, 100, false).unwrap().len(), 6);
+    assert!(store.recent_tasks(0, 0, false).is_err());
+
+    let encoded = serde_json::to_string(&with_side).unwrap();
+    assert!(!encoded.contains("PRIVATE PROMPT TEXT"));
+    assert!(!encoded.contains("rm -rf"));
+    assert!(!encoded.contains("/tmp/example-project"));
+    let first = serde_json::to_value(&tasks[0]).unwrap();
+    for key in [
+        "id",
+        "provider",
+        "project",
+        "title",
+        "taskRole",
+        "userTurnCount",
+        "status",
+        "startedAt",
+        "lastEventAt",
+        "completedAt",
+        "branch",
+        "validationState",
+        "reviewState",
+        "latestAttentionKind",
+        "jumpCapability",
+        "jumpLabel",
+    ] {
+        assert!(first.get(key).is_some(), "missing {key}");
+    }
+
+    // A side task without a Provider title has no history title, even though
+    // the snapshot keeps its Runtime title derived from the prompt.
+    assert_eq!(with_side[0].title, None);
+    let script = store
+        .snapshot()
+        .unwrap()
+        .sessions
+        .into_iter()
+        .find(|session| session.provider_session_id == "script")
+        .unwrap();
+    assert_eq!(script.title.as_deref(), Some("batch"));
+    assert_eq!(with_side[0].id, script.id);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn recent_task_review_state_is_seen_only_after_a_user_action_or_new_instruction() {
+    let root = temp_root("recent-review-state");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    store
+        .write_ui_settings(
+            r#"{"completionTaskHideMode":"afterDelay","completionAutoHideMinutes":5}"#,
+            1_000,
+        )
+        .unwrap();
+    // Each session finishes one turn and raises a completion reminder. Old
+    // timestamps let the five-minute auto-hide deadline pass by the time the
+    // snapshot refreshes time-driven Attention; recent ones keep it pending.
+    let finish = |session: &str, at: u64| -> (String, String) {
+        ingest_tool_turn(&store, Provider::Claude, session, "t1", at);
+        let stop = store
+            .ingest(hook(
+                Provider::Claude,
+                json!({"hook_event_name":"Stop","session_id":session,"turn_id":"t1"}),
+                at + 100,
+            ))
+            .unwrap();
+        (stop.session_id, stop.attention_id.unwrap())
+    };
+    let (auto_hidden, _) = finish("auto-hidden", 10_000);
+    let (acknowledged, ack_id) = finish("acknowledged", 11_000);
+    store
+        .act_on_attention(Uuid::now_v7(), &ack_id, AttentionAction::Ack, 11_200)
+        .unwrap();
+    let (dismissed, dismiss_id) = finish("dismissed", 12_000);
+    store
+        .act_on_attention(
+            Uuid::now_v7(),
+            &dismiss_id,
+            AttentionAction::Dismiss,
+            12_200,
+        )
+        .unwrap();
+    let (archived, _) = finish("archived", 13_000);
+    store.archive_task(&archived, 13_200).unwrap();
+    let (superseded, _) = finish("superseded", 14_000);
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"UserPromptSubmit","session_id":"superseded","turn_id":"t2",
+                "cwd":"/tmp/example-project","prompt":"next"
+            }),
+            14_300,
+        ))
+        .unwrap();
+    // Only the Agent's own activity follows: a new tool start in the same
+    // session closes the reminder without the user.
+    let (tool_only, _) = finish("tool-only", 14_500);
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"PreToolUse","session_id":"tool-only","turn_id":"t1",
+                "cwd":"/tmp/example-project","tool_name":"Bash",
+                "tool_input":{"command":"cargo test"}
+            }),
+            14_700,
+        ))
+        .unwrap();
+    // Other activity closes it first, and the user's next prompt follows.
+    let (resumed_then_prompted, _) = finish("resumed-then-prompted", 14_800);
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"SessionStart","session_id":"resumed-then-prompted","source":"resume"}),
+            14_920,
+        ))
+        .unwrap();
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"UserPromptSubmit","session_id":"resumed-then-prompted",
+                "turn_id":"t2","cwd":"/tmp/example-project","prompt":"next"
+            }),
+            14_940,
+        ))
+        .unwrap();
+    // A Codex Connector `turn/started` is the user's next instruction too.
+    ingest_tool_turn(&store, Provider::Codex, "connector", "t1", 17_000);
+    let connector = store
+        .ingest(hook(
+            Provider::Codex,
+            json!({"hook_event_name":"Stop","session_id":"connector","turn_id":"t1"}),
+            17_100,
+        ))
+        .unwrap()
+        .session_id;
+    store
+        .ingest(BridgeRequest::from_provider_event_at(
+            Provider::Codex,
+            "UserPromptSubmit",
+            "connector",
+            Some("t2"),
+            json!({"threadId":"connector","turn":{"id":"t2","status":"inProgress","items":[]}}),
+            17_200,
+        ))
+        .unwrap();
+    let (snoozed, snooze_id) = finish("snoozed", now);
+    store
+        .act_on_attention(
+            Uuid::now_v7(),
+            &snooze_id,
+            AttentionAction::Snooze,
+            now + 200,
+        )
+        .unwrap();
+    let (open, _) = finish("open", now + 1_000);
+    ingest_tool_turn(&store, Provider::Claude, "failed", "t1", 15_000);
+    let failed = store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"StopFailure","session_id":"failed","turn_id":"t1","error":"boom"}),
+            15_100,
+        ))
+        .unwrap()
+        .session_id;
+    ingest_tool_turn(&store, Provider::Claude, "quiet", "t1", 16_000);
+    let quiet = store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"TurnInterrupted","session_id":"quiet","turn_id":"t1"}),
+            16_100,
+        ))
+        .unwrap()
+        .session_id;
+
+    // Refresh time-driven Attention: the old, untouched and the acknowledged
+    // completion reminders are auto-hidden now.
+    let attention = store.snapshot().unwrap().attention;
+    let resolution = |session: &str| {
+        attention
+            .iter()
+            .filter(|item| item.session_id == session)
+            .map(|item| (item.state.clone(), item.resolution.clone()))
+            .next()
+    };
+    assert_eq!(
+        resolution(&auto_hidden),
+        Some(("resolved".to_owned(), Some("auto_hidden".to_owned())))
+    );
+    assert_eq!(
+        resolution(&acknowledged),
+        Some(("resolved".to_owned(), Some("auto_hidden".to_owned())))
+    );
+
+    let tasks = store.recent_tasks(0, 100, true).unwrap();
+    let review = |session: &str| {
+        tasks
+            .iter()
+            .find(|task| task.id == session)
+            .map(|task| task.review_state.as_str())
+            .unwrap()
+    };
+    let resolution_of = |session: &str| {
+        attention
+            .iter()
+            .find(|item| item.session_id == session && item.kind == "completion")
+            .and_then(|item| item.resolution.clone())
+    };
+    assert_eq!(
+        resolution_of(&superseded).as_deref(),
+        Some("superseded_by_prompt")
+    );
+    assert_eq!(
+        resolution_of(&connector).as_deref(),
+        Some("superseded_by_prompt")
+    );
+    assert_eq!(
+        resolution_of(&tool_only).as_deref(),
+        Some("superseded_by_activity")
+    );
+    assert_eq!(
+        resolution_of(&resumed_then_prompted).as_deref(),
+        Some("superseded_by_activity")
+    );
+    // Closed without the user: still unseen.
+    assert_eq!(review(&tool_only), "unseen");
+    assert_eq!(review(&auto_hidden), "unseen");
+    assert_eq!(review(&snoozed), "unseen");
+    assert_eq!(review(&open), "unseen");
+    assert_eq!(review(&failed), "unseen");
+    // A user action or a new instruction: seen.
+    assert_eq!(review(&acknowledged), "seen");
+    assert_eq!(review(&dismissed), "seen");
+    assert_eq!(review(&archived), "seen");
+    assert_eq!(review(&superseded), "seen");
+    assert_eq!(review(&connector), "seen");
+    assert_eq!(review(&resumed_then_prompted), "seen");
+    // No completion/error reminder at all.
+    assert_eq!(review(&quiet), "none");
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn history_status_keeps_the_last_turn_outcome_after_the_session_ends() {
+    let root = temp_root("history-status-session-end");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let session_end = |session: &str, at: u64| {
+        store
+            .ingest(hook(
+                Provider::Claude,
+                json!({"hook_event_name":"SessionEnd","session_id":session,"reason":"exit"}),
+                at,
+            ))
+            .unwrap()
+            .session_id
+    };
+    ingest_tool_turn(&store, Provider::Claude, "failed", "t1", 1_000);
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"StopFailure","session_id":"failed","turn_id":"t1","error":"boom"}),
+            1_100,
+        ))
+        .unwrap();
+    let failed = session_end("failed", 1_200);
+    ingest_tool_turn(&store, Provider::Claude, "interrupted", "t1", 2_000);
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"TurnInterrupted","session_id":"interrupted","turn_id":"t1"}),
+            2_100,
+        ))
+        .unwrap();
+    let interrupted = session_end("interrupted", 2_200);
+    ingest_tool_turn(&store, Provider::Claude, "completed", "t1", 3_000);
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"Stop","session_id":"completed","turn_id":"t1"}),
+            3_100,
+        ))
+        .unwrap();
+    let completed = session_end("completed", 3_200);
+
+    let snapshot = store.snapshot().unwrap();
+    assert!(snapshot
+        .sessions
+        .iter()
+        .all(|session| session.exec_state == "idle"));
+    let tasks = store.recent_tasks(0, 100, true).unwrap();
+    let status = |session: &str| {
+        tasks
+            .iter()
+            .find(|task| task.id == session)
+            .map(|task| task.status.as_str())
+            .unwrap()
+    };
+    assert_eq!(status(&failed), "failed");
+    assert_eq!(status(&interrupted), "interrupted");
+    assert_eq!(status(&completed), "completed");
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn history_center_keeps_reporting_user_interrupted_tasks_as_failed() {
+    let root = temp_root("history-center-interrupted");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    ingest_tool_turn(&store, Provider::Codex, "interrupted", "t1", 1_000);
+    let interrupted = store
+        .ingest(hook(
+            Provider::Codex,
+            json!({"hook_event_name":"TurnInterrupted","session_id":"interrupted","turn_id":"t1"}),
+            1_100,
+        ))
+        .unwrap()
+        .session_id;
+    ingest_tool_turn(&store, Provider::Codex, "completed", "t1", 2_000);
+    let stop = store
+        .ingest(hook(
+            Provider::Codex,
+            json!({"hook_event_name":"Stop","session_id":"completed","turn_id":"t1"}),
+            2_100,
+        ))
+        .unwrap();
+    store
+        .act_on_attention(
+            Uuid::now_v7(),
+            stop.attention_id.unwrap(),
+            AttentionAction::Ack,
+            2_200,
+        )
+        .unwrap();
+
+    let history = store.task_history(u64::MAX / 2, 100).unwrap();
+    let status = |session: &str| {
+        history
+            .iter()
+            .find(|task| task.id == session)
+            .map(|task| task.status.as_str())
+            .unwrap()
+    };
+    // The History center only knows completed/failed and keeps its previous
+    // answer for a user interruption; Companion history says interrupted.
+    assert_eq!(status(&interrupted), "failed");
+    assert_eq!(status(&stop.session_id), "completed");
+    let recent = store.recent_tasks(0, 100, true).unwrap();
+    assert_eq!(
+        recent
+            .iter()
+            .find(|task| task.id == interrupted)
+            .unwrap()
+            .status,
+        "interrupted"
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn an_acknowledged_reminder_stays_seen_after_later_non_prompt_activity() {
+    let root = temp_root("ack-survives-activity");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .write_ui_settings(
+            r#"{"completionTaskHideMode":"afterDelay","completionAutoHideMinutes":30}"#,
+            1_000,
+        )
+        .unwrap();
+    // Recent timestamps keep the 30-minute auto-hide deadline pending, so the
+    // later activity is what closes each reminder.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let review = |session: &str| {
+        store
+            .recent_tasks(0, 100, true)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == session)
+            .map(|task| task.review_state)
+            .unwrap()
+    };
+    for (index, (session, followup)) in [
+        (
+            "compact",
+            json!({"hook_event_name":"PreCompact","trigger":"manual"}),
+        ),
+        (
+            "resume",
+            json!({"hook_event_name":"SessionStart","source":"resume"}),
+        ),
+        (
+            "subagent",
+            json!({"hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"Explore"}),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = now + index as u64 * 1_000;
+        for acknowledged in [true, false] {
+            let session = format!("{session}-{acknowledged}");
+            ingest_tool_turn(&store, Provider::Claude, &session, "t1", at);
+            let stop = store
+                .ingest(hook(
+                    Provider::Claude,
+                    json!({"hook_event_name":"Stop","session_id":session,"turn_id":"t1"}),
+                    at + 100,
+                ))
+                .unwrap();
+            let attention_id = stop.attention_id.unwrap();
+            if acknowledged {
+                // A delayed completion: the acknowledgement keeps it open.
+                store
+                    .act_on_attention(
+                        Uuid::now_v7(),
+                        &attention_id,
+                        AttentionAction::Ack,
+                        at + 200,
+                    )
+                    .unwrap();
+                assert_eq!(review(&stop.session_id), "seen", "{session}");
+            }
+            let mut followup = followup.clone();
+            followup["session_id"] = json!(session);
+            store
+                .ingest(hook(Provider::Claude, followup, at + 300))
+                .unwrap();
+            let reminder = store
+                .snapshot()
+                .unwrap()
+                .attention
+                .into_iter()
+                .find(|item| item.id == attention_id)
+                .unwrap();
+            assert_eq!(reminder.state, "resolved", "{session}");
+            if acknowledged {
+                assert_eq!(
+                    reminder.resolution.as_deref(),
+                    Some("ack_hidden"),
+                    "{session}"
+                );
+                assert_eq!(
+                    reminder.reminder_acknowledged_at,
+                    Some(at + 200),
+                    "{session}"
+                );
+                assert_eq!(review(&stop.session_id), "seen", "{session}");
+            } else {
+                assert_eq!(
+                    reminder.resolution.as_deref(),
+                    Some("superseded_by_activity"),
+                    "{session}"
+                );
+                assert_eq!(review(&stop.session_id), "unseen", "{session}");
+            }
+        }
+    }
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_session_that_ends_mid_turn_reports_the_turn_as_interrupted() {
+    let root = temp_root("session-end-mid-turn");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let session_end = |session: &str, at: u64| {
+        store
+            .ingest(hook(
+                Provider::Claude,
+                json!({"hook_event_name":"SessionEnd","session_id":session,"reason":"prompt_input_exit"}),
+                at,
+            ))
+            .unwrap()
+            .session_id
+    };
+    // Esc in Claude Code reports no Hook; the user then exits.
+    ingest_tool_turn(&store, Provider::Claude, "mid-turn", "t1", 1_000);
+    let mid_turn = session_end("mid-turn", 1_100);
+    // A finished turn and a later implicit turn on the idle session (a
+    // Notification after a resume) still end as completed.
+    ingest_tool_turn(&store, Provider::Claude, "finished", "t1", 2_000);
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"Stop","session_id":"finished","turn_id":"t1"}),
+            2_100,
+        ))
+        .unwrap();
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"SessionStart","session_id":"finished","source":"resume"}),
+            2_200,
+        ))
+        .unwrap();
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"Notification","session_id":"finished",
+                "notification_type":"idle_prompt","message":"Claude is waiting for your input"
+            }),
+            2_300,
+        ))
+        .unwrap();
+    let finished = session_end("finished", 2_400);
+    // A SessionEnd delivered late, before newer activity, ends nothing.
+    ingest_tool_turn(&store, Provider::Claude, "late-end", "t1", 3_000);
+    let late_end = session_end("late-end", 2_900);
+
+    let tasks = store.recent_tasks(0, 100, true).unwrap();
+    let task = |session: &str| tasks.iter().find(|task| task.id == session).unwrap();
+    assert_eq!(task(&mid_turn).status, "interrupted");
+    assert_eq!(task(&mid_turn).completed_at, Some(1_100));
+    assert_eq!(task(&finished).status, "completed");
+    // The completion time stays the time of the Stop, not of the exit.
+    assert_eq!(task(&finished).completed_at, Some(2_100));
+    assert_eq!(task(&late_end).status, "running");
+    assert_eq!(task(&late_end).completed_at, None);
+    // The History center reports the interrupted turn as failed, like any
+    // other interruption.
+    let history = store.task_history(u64::MAX / 2, 100).unwrap();
+    assert_eq!(
+        history
+            .iter()
+            .find(|task| task.id == mid_turn)
+            .unwrap()
+            .status,
+        "failed"
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// The Companion status and completion time of a task, and its History
+/// center status (`None` while the History center does not list it yet).
+fn task_outcome(store: &RuntimeStore, session: &str) -> (String, Option<u64>, Option<String>) {
+    let recent = store
+        .recent_tasks(0, 100, true)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == session)
+        .unwrap();
+    let history = store
+        .task_history(u64::MAX / 2, 100)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == session)
+        .map(|task| task.status);
+    (recent.status, recent.completed_at, history)
+}
+
+fn claude_event(store: &RuntimeStore, session: &str, mut raw: Value, at: u64) -> String {
+    raw["session_id"] = json!(session);
+    raw["cwd"] = json!("/tmp/example-project");
+    store
+        .ingest(hook(Provider::Claude, raw, at))
+        .unwrap()
+        .session_id
+}
+
+fn idle_prompt_notification() -> Value {
+    json!({
+        "hook_event_name":"Notification",
+        "notification_type":"idle_prompt",
+        "message":"Claude is waiting for your input"
+    })
+}
+
+#[test]
+fn an_interrupted_turn_stays_interrupted_after_exit_resume_and_an_idle_notification() {
+    let root = temp_root("interrupted-resume-idle");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let end = json!({"hook_event_name":"SessionEnd","reason":"prompt_input_exit"});
+    let interrupted = || {
+        (
+            "interrupted".to_owned(),
+            Some(1_100),
+            Some("failed".to_owned()),
+        )
+    };
+    // Esc in Claude Code reports no Hook; the user then runs /exit.
+    ingest_tool_turn(&store, Provider::Claude, "esc", "t1", 1_000);
+    let session = claude_event(&store, "esc", end.clone(), 1_100);
+    assert_eq!(task_outcome(&store, &session), interrupted());
+    // `claude --continue`, then an idle notification a minute later opens an
+    // implicit turn without a prompt; it does not replace the interrupted one.
+    claude_event(
+        &store,
+        "esc",
+        json!({"hook_event_name":"SessionStart","source":"resume"}),
+        2_000,
+    );
+    assert_eq!(task_outcome(&store, &session), interrupted());
+    claude_event(&store, "esc", idle_prompt_notification(), 62_000);
+    assert_eq!(task_outcome(&store, &session), interrupted());
+    // A SessionEnd delivered late, before the notification, changes nothing.
+    claude_event(&store, "esc", end.clone(), 61_000);
+    assert_eq!(task_outcome(&store, &session), interrupted());
+    // The second /exit ends the implicit turn only.
+    claude_event(&store, "esc", end.clone(), 63_000);
+    assert_eq!(task_outcome(&store, &session), interrupted());
+    // The next prompt starts a new task outcome.
+    ingest_tool_turn(&store, Provider::Claude, "esc", "t2", 70_000);
+    claude_event(
+        &store,
+        "esc",
+        json!({"hook_event_name":"Stop","turn_id":"t2"}),
+        70_100,
+    );
+    let (status, completed_at, _) = task_outcome(&store, &session);
+    assert_eq!((status.as_str(), completed_at), ("completed", Some(70_100)));
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_completed_turn_stays_completed_after_later_exits_resumes_and_implicit_turns() {
+    let root = temp_root("completed-after-exit");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let end = || json!({"hook_event_name":"SessionEnd","reason":"prompt_input_exit"});
+    let resume = || json!({"hook_event_name":"SessionStart","source":"resume"});
+    let stop = || json!({"hook_event_name":"Stop","turn_id":"t1"});
+    let background_stop = |kind: &str| {
+        json!({
+            "hook_event_name":"Stop","turn_id":"t1",
+            "background_tasks":[{"id":"job-1","type":kind,"status":"running"}],
+            "session_crons":[]
+        })
+    };
+    let mut sessions = Vec::new();
+    let mut run = |session: &str, mut stop: Value, after_stop: Vec<(Value, u64)>| {
+        ingest_tool_turn(&store, Provider::Claude, session, "t1", 1_000);
+        stop["session_id"] = json!(session);
+        let stopped = store.ingest(hook(Provider::Claude, stop, 1_100)).unwrap();
+        // The user saw the completion, so the History center lists the task.
+        if let Some(attention_id) = stopped.attention_id {
+            store
+                .act_on_attention(Uuid::now_v7(), attention_id, AttentionAction::Ack, 1_150)
+                .unwrap();
+        }
+        let id = stopped.session_id;
+        for (raw, at) in after_stop {
+            claude_event(&store, session, raw, at);
+        }
+        sessions.push((session.to_owned(), id));
+    };
+    // Normal completion, then /exit.
+    run("exit", stop(), vec![(end(), 1_200)]);
+    // Completion, /exit, `claude --continue`, an idle notification, /exit.
+    run(
+        "resume-idle",
+        stop(),
+        vec![
+            (end(), 1_200),
+            (resume(), 2_000),
+            (idle_prompt_notification(), 62_000),
+            (end(), 63_000),
+        ],
+    );
+    // Completion while a background shell keeps running (the session stays
+    // busy), an idle notification a minute later, then /exit.
+    run(
+        "background-idle",
+        background_stop("shell"),
+        vec![(idle_prompt_notification(), 61_100), (end(), 70_000)],
+    );
+    // A background subagent finishes after the completion, then /exit.
+    run(
+        "background-subagent",
+        background_stop("agent"),
+        vec![
+            (
+                json!({"hook_event_name":"SubagentStop","agent_id":"agent-1","agent_type":"general-purpose"}),
+                5_000,
+            ),
+            (end(), 6_000),
+        ],
+    );
+    // Completion, /exit, `claude --continue`, /compact, /exit.
+    run(
+        "resume-compact",
+        stop(),
+        vec![
+            (end(), 1_200),
+            (resume(), 2_000),
+            (
+                json!({"hook_event_name":"PreCompact","trigger":"manual"}),
+                2_100,
+            ),
+            (
+                json!({"hook_event_name":"SessionStart","source":"compact"}),
+                2_200,
+            ),
+            (end(), 2_300),
+        ],
+    );
+    // A SessionEnd delivered late, before the Stop.
+    run("late-end", stop(), vec![(end(), 1_050)]);
+    for (name, session) in &sessions {
+        let (status, completed_at, history) = task_outcome(&store, session);
+        assert_eq!(status, "completed", "{name}");
+        assert_eq!(completed_at, Some(1_100), "{name}");
+        assert_eq!(history.as_deref(), Some("completed"), "{name}");
+    }
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_session_without_a_prompt_ends_its_working_turn_as_interrupted() {
+    let root = temp_root("promptless-session-end");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    // Hooks installed mid-turn: Runtime sees the Agent's tool, never a prompt.
+    let session = claude_event(
+        &store,
+        "promptless",
+        json!({
+            "hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"tool-1",
+            "tool_input":{"command":"cargo test"}
+        }),
+        1_000,
+    );
+    claude_event(
+        &store,
+        "promptless",
+        json!({"hook_event_name":"SessionEnd","reason":"prompt_input_exit"}),
+        1_100,
+    );
+    let (status, completed_at, _) = task_outcome(&store, &session);
+    assert_eq!(
+        (status.as_str(), completed_at),
+        ("interrupted", Some(1_100))
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Ingests a Hook event and acknowledges the completion or error Attention
+/// it raised, so the History center lists the task once it is idle.
+fn seen_event(store: &RuntimeStore, provider: Provider, session: &str, mut raw: Value, at: u64) {
+    raw["session_id"] = json!(session);
+    raw["cwd"] = json!("/tmp/example-project");
+    let result = store.ingest(hook(provider, raw, at)).unwrap();
+    if let Some(attention_id) = result.attention_id {
+        store
+            .act_on_attention(Uuid::now_v7(), attention_id, AttentionAction::Ack, at + 10)
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_turn_a_background_task_woke_keeps_its_own_outcome_after_exit_and_resume() {
+    let root = temp_root("woken-turn-outcome");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let end = || json!({"hook_event_name":"SessionEnd","reason":"prompt_input_exit"});
+    let resume = || json!({"hook_event_name":"SessionStart","source":"resume"});
+    let read = |id: &str, agent: bool| {
+        let mut raw = json!({
+            "hook_event_name":"PreToolUse","tool_name":"Read","tool_use_id":id,
+            "tool_input":{"file_path":"/tmp/example-project/file.rs"}
+        });
+        if agent {
+            raw["agent_id"] = json!("agent-1");
+            raw["agent_type"] = json!("general-purpose");
+        }
+        raw
+    };
+    // A prompt whose Stop leaves a background subagent running; the subagent
+    // works, finishes and wakes the main Agent, which works on without a
+    // prompt and then ends that woken turn itself.
+    let woken_turn = |session: &str, outcome: Value, at: u64| {
+        ingest_tool_turn(&store, Provider::Claude, session, "t1", 1_000);
+        seen_event(
+            &store,
+            Provider::Claude,
+            session,
+            json!({
+                "hook_event_name":"Stop","turn_id":"t1",
+                "background_tasks":[{"id":"job-1","type":"agent","status":"running"}],
+                "session_crons":[]
+            }),
+            1_100,
+        );
+        let id = claude_event(&store, session, read("sub-read", true), 2_000);
+        claude_event(
+            &store,
+            session,
+            json!({"hook_event_name":"SubagentStop","agent_id":"agent-1","agent_type":"general-purpose"}),
+            3_000,
+        );
+        claude_event(&store, session, read("main-read", false), 3_100);
+        seen_event(&store, Provider::Claude, session, outcome, at);
+        id
+    };
+    let failed = |at: u64| ("failed".to_owned(), Some(at), Some("failed".to_owned()));
+
+    // The woken turn fails (an API rate limit), then the user exits, runs
+    // `claude --continue`, gets an idle notification and exits again.
+    let session = woken_turn(
+        "fail-exit",
+        json!({"hook_event_name":"StopFailure","error":"rate_limit"}),
+        3_200,
+    );
+    let (status, completed_at, _) = task_outcome(&store, &session);
+    assert_eq!((status.as_str(), completed_at), ("failed", Some(3_200)));
+    claude_event(&store, "fail-exit", end(), 4_000);
+    assert_eq!(task_outcome(&store, &session), failed(3_200));
+    claude_event(&store, "fail-exit", resume(), 5_000);
+    assert_eq!(task_outcome(&store, &session), failed(3_200));
+    claude_event(&store, "fail-exit", idle_prompt_notification(), 65_000);
+    claude_event(&store, "fail-exit", end(), 66_000);
+    assert_eq!(task_outcome(&store, &session), failed(3_200));
+
+    // The same failure, then only `claude --continue`.
+    let session = woken_turn(
+        "fail-resume",
+        json!({"hook_event_name":"StopFailure","error":"rate_limit"}),
+        3_200,
+    );
+    claude_event(&store, "fail-resume", resume(), 5_000);
+    assert_eq!(task_outcome(&store, &session), failed(3_200));
+
+    // The woken turn completes a day later: the task completed then.
+    let session = woken_turn("late-stop", json!({"hook_event_name":"Stop"}), 90_000_000);
+    claude_event(&store, "late-stop", end(), 90_000_100);
+    assert_eq!(
+        task_outcome(&store, &session),
+        (
+            "completed".to_owned(),
+            Some(90_000_000),
+            Some("completed".to_owned())
+        )
+    );
+
+    // Codex: a completed prompt, a resume, a turn without a prompt that the
+    // user interrupts, then another resume.
+    let codex = |raw: Value, at: u64| seen_event(&store, Provider::Codex, "codex-woken", raw, at);
+    ingest_tool_turn(&store, Provider::Codex, "codex-woken", "t1", 1_000);
+    codex(json!({"hook_event_name":"Stop","turn_id":"t1"}), 1_100);
+    codex(resume(), 2_000);
+    codex(
+        json!({
+            "hook_event_name":"PreToolUse","turn_id":"t2","tool_name":"Bash",
+            "tool_use_id":"t2-bash","tool_input":{"command":"ls"}
+        }),
+        2_100,
+    );
+    codex(
+        json!({"hook_event_name":"TurnInterrupted","turn_id":"t2"}),
+        2_200,
+    );
+    let mut second_resume = resume();
+    second_resume["session_id"] = json!("codex-woken");
+    let session = store
+        .ingest(hook(Provider::Codex, second_resume, 3_000))
+        .unwrap()
+        .session_id;
+    assert_eq!(
+        task_outcome(&store, &session),
+        (
+            "interrupted".to_owned(),
+            Some(2_200),
+            Some("failed".to_owned())
+        )
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_session_without_a_prompt_keeps_its_outcome_after_exit_resume_and_an_idle_notification() {
+    let root = temp_root("promptless-resume");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let end = || json!({"hook_event_name":"SessionEnd","reason":"prompt_input_exit"});
+    let resume = || json!({"hook_event_name":"SessionStart","source":"resume"});
+    let tool = json!({
+        "hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"tool-1",
+        "tool_input":{"command":"cargo test"}
+    });
+    // Hooks installed mid-turn: Runtime sees the Agent's tool, never a prompt.
+    // The turn fails, the user exits, resumes, idles and exits again.
+    let failed = claude_event(&store, "promptless-fail", tool.clone(), 1_000);
+    seen_event(
+        &store,
+        Provider::Claude,
+        "promptless-fail",
+        json!({"hook_event_name":"StopFailure","error":"rate_limit"}),
+        1_100,
+    );
+    // The same without a Hook for the turn's end: Esc, then /exit.
+    let interrupted = claude_event(&store, "promptless-esc", tool, 1_000);
+    for session in ["promptless-fail", "promptless-esc"] {
+        claude_event(&store, session, end(), 2_000);
+        claude_event(&store, session, resume(), 3_000);
+        claude_event(&store, session, idle_prompt_notification(), 63_000);
+    }
+    let outcome = |session: &str| {
+        let (status, completed_at, _) = task_outcome(&store, session);
+        (status, completed_at)
+    };
+    assert_eq!(outcome(&failed), ("failed".to_owned(), Some(1_100)));
+    assert_eq!(
+        outcome(&interrupted),
+        ("interrupted".to_owned(), Some(2_000))
+    );
+    for session in ["promptless-fail", "promptless-esc"] {
+        claude_event(&store, session, end(), 64_000);
+    }
+    assert_eq!(outcome(&failed), ("failed".to_owned(), Some(1_100)));
+    assert_eq!(
+        outcome(&interrupted),
+        ("interrupted".to_owned(), Some(2_000))
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn history_center_keeps_an_interruption_failed_after_the_session_ends_or_resumes() {
+    let root = temp_root("history-center-interrupted-lifecycle");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let mut sessions = Vec::new();
+    for (provider, session, lifecycle) in [
+        (
+            Provider::Claude,
+            "claude-exit",
+            json!({"hook_event_name":"SessionEnd","reason":"exit"}),
+        ),
+        (
+            Provider::Codex,
+            "codex-resume",
+            json!({"hook_event_name":"SessionStart","source":"resume"}),
+        ),
+    ] {
+        ingest_tool_turn(&store, provider, session, "t1", 1_000);
+        store
+            .ingest(hook(
+                provider,
+                json!({"hook_event_name":"TurnInterrupted","session_id":session,"turn_id":"t1"}),
+                1_100,
+            ))
+            .unwrap();
+        let mut lifecycle = lifecycle;
+        lifecycle["session_id"] = json!(session);
+        sessions.push(
+            store
+                .ingest(hook(provider, lifecycle, 1_200))
+                .unwrap()
+                .session_id,
+        );
+    }
+    let history = store.task_history(u64::MAX / 2, 100).unwrap();
+    let recent = store.recent_tasks(0, 100, true).unwrap();
+    for session in &sessions {
+        let status = |tasks: Vec<(&String, &String)>| {
+            tasks
+                .into_iter()
+                .find(|(id, _)| *id == session)
+                .map(|(_, status)| status.clone())
+                .unwrap()
+        };
+        // Companion history says interrupted; the History center, which only
+        // knows completed/failed, keeps reporting it as failed.
+        assert_eq!(
+            status(recent.iter().map(|task| (&task.id, &task.status)).collect()),
+            "interrupted"
+        );
+        assert_eq!(
+            status(
+                history
+                    .iter()
+                    .map(|task| (&task.id, &task.status))
+                    .collect()
+            ),
+            "failed"
+        );
+    }
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn marking_a_task_seen_acknowledges_its_latest_reminder() {
+    let root = temp_root("mark-session-seen");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let finish = |session: &str, at: u64| {
+        ingest_tool_turn(&store, Provider::Claude, session, "t1", at);
+        store
+            .ingest(hook(
+                Provider::Claude,
+                json!({"hook_event_name":"Stop","session_id":session,"turn_id":"t1"}),
+                at + 100,
+            ))
+            .unwrap()
+    };
+    let review = |session: &str| {
+        store
+            .recent_tasks(0, 100, true)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == session)
+            .map(|task| task.review_state)
+            .unwrap()
+    };
+    // After-confirmation retention: seen closes the reminder like `ack`.
+    let confirmation = finish("confirmation", now).session_id;
+    // Delayed retention: an open reminder is only acknowledged, and an
+    // auto-hidden one stays hidden.
+    store
+        .write_ui_settings(
+            r#"{"completionTaskHideMode":"afterDelay","completionAutoHideMinutes":5}"#,
+            now,
+        )
+        .unwrap();
+    let delayed = finish("delayed", now).session_id;
+    let hidden = finish("hidden", now - 20 * 60_000).session_id;
+    // Closed by the Agent's own activity.
+    let superseded = finish("superseded", now - 60_000);
+    store
+        .ingest(hook(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"PreToolUse","session_id":"superseded","turn_id":"t1",
+                "tool_name":"Bash","tool_input":{"command":"cargo test"}
+            }),
+            now - 50_000,
+        ))
+        .unwrap();
+    let superseded = superseded.session_id;
+    ingest_tool_turn(&store, Provider::Claude, "quiet", "t1", now);
+    let quiet = store
+        .ingest(hook(
+            Provider::Claude,
+            json!({"hook_event_name":"TurnInterrupted","session_id":"quiet","turn_id":"t1"}),
+            now + 100,
+        ))
+        .unwrap()
+        .session_id;
+    let before = store.snapshot().unwrap();
+    for session in [&confirmation, &delayed, &hidden, &superseded] {
+        assert_eq!(review(session), "unseen", "{session}");
+    }
+
+    for _ in 0..2 {
+        for session in [&confirmation, &delayed, &hidden, &superseded] {
+            assert_eq!(
+                store.mark_session_seen(session, now + 1_000).unwrap(),
+                SessionSeen::Seen
+            );
+        }
+        assert_eq!(
+            store.mark_session_seen(&quiet, now + 1_000).unwrap(),
+            SessionSeen::NoReminder
+        );
+        assert_eq!(
+            store.mark_session_seen("missing", now + 1_000).unwrap(),
+            SessionSeen::NotFound
+        );
+    }
+    let snapshot = store.snapshot().unwrap();
+    let reminder = |session: &str| {
+        snapshot
+            .attention
+            .iter()
+            .find(|item| item.session_id == session && item.kind == "completion")
+            .unwrap()
+            .clone()
+    };
+    for session in [&confirmation, &delayed, &hidden, &superseded] {
+        assert_eq!(review(session), "seen", "{session}");
+        assert_eq!(
+            reminder(session).reminder_acknowledged_at,
+            Some(now + 1_000),
+            "{session}"
+        );
+    }
+    assert_eq!(review(&quiet), "none");
+    assert_eq!(
+        (
+            reminder(&confirmation).state.as_str(),
+            reminder(&confirmation).resolution.as_deref()
+        ),
+        ("resolved", Some("ack_hidden"))
+    );
+    assert_eq!(reminder(&delayed).state, "open");
+    assert_eq!(
+        reminder(&delayed).reminder_resolution.as_deref(),
+        Some("reminder_acknowledged")
+    );
+    assert_eq!(reminder(&hidden).resolution.as_deref(), Some("auto_hidden"));
+    assert_eq!(
+        reminder(&superseded).resolution.as_deref(),
+        Some("superseded_by_activity")
+    );
+    // Only the two open reminders were acknowledged through a command, once.
+    assert_eq!(snapshot.commands.len(), before.commands.len() + 2);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn turn_prompts_are_transient_sanitized_bounded_and_replaced_each_turn() {
+    for provider in [Provider::Claude, Provider::Codex] {
+        let root = temp_root("transient-prompt");
+        let path = root.join("data.sqlite");
+        let store = RuntimeStore::open(&path).unwrap();
+        let first = hook(
+            provider,
+            json!({
+                "hook_event_name":"UserPromptSubmit","session_id":"prompt-session","turn_id":"t1",
+                "cwd":"/tmp/example-project",
+                "prompt":"改首页。\n独立提示标记：把首页标题改成蓝色\npassword=hunter2-secret\n顺便看看 /Users/someone/private/notes.md"
+            }),
+            100,
+        );
+        let session = store.ingest(first.clone()).unwrap().session_id;
+        let prompt = store.session_prompt(&session, 100, 150).unwrap();
+        assert!(prompt.text.contains("独立提示标记：把首页标题改成蓝色"));
+        assert!(!prompt.text.contains("hunter2"));
+        assert!(!prompt.text.contains("/Users/someone"));
+        assert!(prompt.text.contains("<path>"));
+        assert!(
+            prompt.truncated,
+            "a removed credential line marks the prompt as partial"
+        );
+        assert_eq!(prompt.observed_at, 100);
+        assert!(store.session_prompt(&session, 101, 150).is_none());
+
+        // Only the pre-existing first-sentence task title ("改首页。") is
+        // persisted; the rest of the prompt stays in memory.
+        let export = store.export_json(150).unwrap().to_string();
+        assert!(!export.contains("独立提示标记"));
+        let spool = EventSpool::new(root.join("spool"));
+        spool.append(&first).unwrap();
+        spool
+            .drain(|request| {
+                assert!(request.raw.get("prompt").is_none());
+                true
+            })
+            .unwrap();
+        for file in [path.clone(), root.join("data.sqlite-wal")] {
+            if let Ok(bytes) = fs::read(&file) {
+                assert!(!String::from_utf8_lossy(&bytes).contains("首页标题改成蓝色"));
+            }
+        }
+
+        let long = "很".repeat(2_500);
+        store
+            .ingest(hook(
+                provider,
+                json!({
+                    "hook_event_name":"UserPromptSubmit","session_id":"prompt-session",
+                    "turn_id":"t2","prompt":long
+                }),
+                200,
+            ))
+            .unwrap();
+        let prompt = store.session_prompt(&session, 200, 250).unwrap();
+        assert_eq!(prompt.text.chars().count(), 2_000);
+        assert!(prompt.truncated);
+
+        // A new turn without prompt text leaves no stale prompt behind.
+        store
+            .ingest(hook(
+                provider,
+                json!({"hook_event_name":"UserPromptSubmit","session_id":"prompt-session","turn_id":"t3"}),
+                300,
+            ))
+            .unwrap();
+        assert!(store.session_prompt(&session, 0, 350).is_none());
+
+        store
+            .ingest(hook(
+                provider,
+                json!({
+                    "hook_event_name":"UserPromptSubmit","session_id":"prompt-session",
+                    "turn_id":"t4","prompt":"最后一轮"
+                }),
+                400,
+            ))
+            .unwrap();
+        assert_eq!(
+            store.session_prompt(&session, 400, 450).unwrap().text,
+            "最后一轮"
+        );
+        drop(store);
+        let store = RuntimeStore::open(&path).unwrap();
+        assert!(store.session_prompt(&session, 0, 500).is_none());
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn a_duplicate_prompt_report_supplies_text_for_the_same_turn() {
+    let root = temp_root("duplicate-prompt");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    // Connector `turn/started` arrives first without prompt text.
+    let started = store
+        .ingest(hook(
+            Provider::Codex,
+            json!({"hook_event_name":"UserPromptSubmit","session_id":"dup-thread","turn_id":"c1"}),
+            1_000,
+        ))
+        .unwrap();
+    assert!(started.inserted);
+    assert!(store
+        .session_prompt(&started.session_id, 1_000, 1_010)
+        .is_none());
+    // The prompt Hook for the same turn is a stored duplicate but carries text.
+    let hooked = store
+        .ingest(hook(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"UserPromptSubmit","session_id":"dup-thread","turn_id":"c1",
+                "prompt":"整理发布说明"
+            }),
+            1_005,
+        ))
+        .unwrap();
+    assert!(!hooked.inserted);
+    assert_eq!(
+        store
+            .session_prompt(&started.session_id, 1_000, 1_010)
+            .unwrap()
+            .text,
+        "整理发布说明"
+    );
+    assert_eq!(store.snapshot().unwrap().sessions[0].user_turn_count, 1);
+    // A later duplicate without text does not erase it.
+    store
+        .ingest(hook(
+            Provider::Codex,
+            json!({"hook_event_name":"UserPromptSubmit","session_id":"dup-thread","turn_id":"c1"}),
+            1_006,
+        ))
+        .unwrap();
+    assert!(store
+        .session_prompt(&started.session_id, 1_000, 1_010)
+        .is_some());
     drop(store);
     fs::remove_dir_all(root).unwrap();
 }
