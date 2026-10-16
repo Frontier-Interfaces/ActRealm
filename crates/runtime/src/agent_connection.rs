@@ -65,26 +65,8 @@ pub fn wait_for_agent_reply(
     stream: &UnixStream,
 ) -> Option<BridgeResponse> {
     loop {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let mut byte = 0u8;
-        let peek = unsafe {
-            libc::recv(
-                stream.as_raw_fd(),
-                (&mut byte as *mut u8).cast(),
-                1,
-                libc::MSG_PEEK | libc::MSG_DONTWAIT,
-            )
-        };
-        let disconnected = peek == 0
-            || (peek < 0
-                && !matches!(
-                    std::io::Error::last_os_error().raw_os_error(),
-                    Some(libc::EAGAIN) | Some(libc::EINTR)
-                ));
-        if disconnected || request.deadline_at.is_none_or(|deadline| now >= deadline) {
+        let now = now_millis();
+        if peer_disconnected(stream) || request.deadline_at.is_none_or(|deadline| now >= deadline) {
             let id = request.request_id.unwrap_or(request.id);
             let _ = waiters.pass_through(id, "connector_disconnected");
             let _ = store.expire_approval(id, "connector_disconnected", now);
@@ -97,6 +79,65 @@ pub fn wait_for_agent_reply(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
         }
     }
+}
+
+/// How a blocking Hook's wait for the user's reply ended.
+#[derive(Debug)]
+pub enum HookReplyWait {
+    Reply(BridgeResponse),
+    /// The Hook process closed its connection: the Provider cancelled the
+    /// call (Esc, closed window, ended session), so nobody can answer it.
+    Disconnected,
+    /// The deadline passed or the waiter was already released.
+    Expired,
+}
+
+/// Waits for the reply to a blocking Hook while watching the Hook's
+/// connection, so a question the Provider cancelled does not stay open in
+/// ActRealm until its deadline.
+pub fn wait_for_hook_reply(
+    ticket: &WaiterTicket,
+    stream: &UnixStream,
+    deadline_at: u64,
+) -> HookReplyWait {
+    loop {
+        if peer_disconnected(stream) {
+            return HookReplyWait::Disconnected;
+        }
+        if now_millis() >= deadline_at {
+            return HookReplyWait::Expired;
+        }
+        match ticket.recv_timeout(Duration::from_millis(100)) {
+            Ok(reply) => return HookReplyWait::Reply(reply),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return HookReplyWait::Expired,
+        }
+    }
+}
+
+fn peer_disconnected(stream: &UnixStream) -> bool {
+    let mut byte = 0u8;
+    let peek = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            (&mut byte as *mut u8).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    peek == 0
+        || (peek < 0
+            && !matches!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EAGAIN) | Some(libc::EINTR)
+            ))
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[cfg(test)]
@@ -204,5 +245,55 @@ mod tests {
         );
         drop(store);
         let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn a_question_hook_that_hangs_up_ends_the_wait() {
+        let waiters = WaiterRegistry::default();
+        let at = now_millis();
+        let question = |session: &str| {
+            BridgeRequest::from_hook_at(
+                Provider::Claude,
+                json!({
+                    "hook_event_name":"PreToolUse",
+                    "session_id":session,
+                    "tool_name":"AskUserQuestion",
+                    "tool_input":{"questions":[{
+                        "question":"Which release?",
+                        "header":"Release",
+                        "options":[{"label":"Runtime"},{"label":"Display"}],
+                        "multiSelect":false
+                    }]}
+                }),
+                at,
+            )
+        };
+
+        let answered = question("answered");
+        let registration = waiters.register_at(&answered, at).unwrap();
+        let (server, _peer) = UnixStream::pair().unwrap();
+        waiters
+            .pass_through(answered.request_id.unwrap(), "user")
+            .unwrap();
+        assert!(matches!(
+            wait_for_hook_reply(&registration.ticket, &server, at + 60_000),
+            HookReplyWait::Reply(_)
+        ));
+
+        let abandoned = question("abandoned");
+        let registration = waiters.register_at(&abandoned, at).unwrap();
+        let (server, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+        assert!(matches!(
+            wait_for_hook_reply(&registration.ticket, &server, at + 60_000),
+            HookReplyWait::Disconnected
+        ));
+
+        let expired = question("expired");
+        let registration = waiters.register_at(&expired, at).unwrap();
+        let (server, _peer) = UnixStream::pair().unwrap();
+        assert!(matches!(
+            wait_for_hook_reply(&registration.ticket, &server, at),
+            HookReplyWait::Expired
+        ));
     }
 }

@@ -10,8 +10,8 @@ use actrealm_installer::{
 };
 use actrealm_quota::{capture_claude_statusline, statusline_text, QuotaPaths};
 use actrealm_runtime::{
-    default_database_path, ApprovalAction, DiagnosticCapture, EventSpool, RuntimeInstanceGuard,
-    RuntimeStore, WaiterRegistry,
+    default_database_path, ApprovalAction, DiagnosticCapture, EventSpool, HookReplyWait,
+    RuntimeInstanceGuard, RuntimeStore, WaiterRegistry,
 };
 use actrealm_server::{ApiServer, ApiServerConfig, RuntimeRestartHandle, RuntimeRestartRequest};
 use actrealm_usage::{capture_claude_statusline_usage, UsagePaths};
@@ -1536,6 +1536,37 @@ fn serve(launch: ServeLaunch, service: bool) -> Result<ServeOutcome> {
                             );
                         }
                     }
+                    return;
+                }
+                if approval == ApprovalMode::Widget
+                    && matches!(
+                        request.blocking_kind,
+                        Some(
+                            BlockingRequestKind::ClaudeQuestion
+                                | BlockingRequestKind::ClaudeElicitation
+                        )
+                    )
+                {
+                    // Claude cancels a question's Hook when the user presses
+                    // Esc or closes the session; release it right away.
+                    let request_id = request.request_id.unwrap_or(request.id);
+                    let deadline_at = request
+                        .deadline_at
+                        .unwrap_or_else(|| now_millis().saturating_add(200));
+                    let reason = match actrealm_runtime::wait_for_hook_reply(
+                        &registration.ticket,
+                        &stream,
+                        deadline_at,
+                    ) {
+                        HookReplyWait::Reply(response) => {
+                            let _ = BridgeListener::write_response(&mut stream, &response);
+                            return;
+                        }
+                        HookReplyWait::Disconnected => "connector_disconnected",
+                        HookReplyWait::Expired => "deadline",
+                    };
+                    let _ = waiters.pass_through(request_id, reason);
+                    let _ = store.expire_approval(request_id, reason, now_millis());
                     return;
                 }
                 if approval == ApprovalMode::Widget {

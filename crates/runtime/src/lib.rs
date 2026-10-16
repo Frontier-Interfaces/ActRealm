@@ -2,7 +2,9 @@
 
 mod agent_connection;
 mod diagnostics;
-pub use agent_connection::{handle_agent_connection_event, wait_for_agent_reply};
+pub use agent_connection::{
+    handle_agent_connection_event, wait_for_agent_reply, wait_for_hook_reply, HookReplyWait,
+};
 mod fsutil;
 mod instance;
 mod latest;

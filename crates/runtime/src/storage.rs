@@ -6510,7 +6510,7 @@ fn ingest_transaction(
         occurred_at,
     )?;
 
-    let resolved_request_ids = reconcile_provider_handled_approval(
+    let mut resolved_request_ids = reconcile_provider_handled_approval(
         &transaction,
         &session_id,
         turn_id.as_deref(),
@@ -6518,6 +6518,13 @@ fn ingest_transaction(
         parsed.tool_name.as_deref(),
         occurred_at,
     )?;
+    resolved_request_ids.extend(close_abandoned_claude_questions(
+        &transaction,
+        &session_id,
+        request.provider,
+        parsed.kind,
+        occurred_at,
+    )?);
 
     let preserves_native_request = current_state == "awaiting_approval"
         && current_owner.as_deref() == Some("terminal")
@@ -12467,6 +12474,62 @@ fn reconcile_provider_handled_approval(
         }
     }
     Ok(resolved_request_ids)
+}
+
+/// A Claude question or elicitation waits on its own blocking Hook, and no
+/// later Provider event answers it. The session can still end, or the user
+/// can press Esc and send a new prompt, while the question is open; either
+/// means it left the screen. It then closes as `provider_closed` and its
+/// waiter is released instead of staying "asking" until the 24-hour deadline.
+fn close_abandoned_claude_questions(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    provider: Provider,
+    kind: EventKind,
+    occurred_at: i64,
+) -> Result<Vec<Uuid>, StoreError> {
+    if provider != Provider::Claude
+        || !matches!(
+            kind,
+            EventKind::SessionEnded
+                | EventKind::PromptSubmitted
+                | EventKind::Interrupted
+                | EventKind::Failed
+        )
+    {
+        return Ok(Vec::new());
+    }
+    let request_ids = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT request_id FROM attention_items
+                 WHERE session_id = ?1 AND kind = 'question'
+                   AND request_id IS NOT NULL AND state IN ('open', 'snoozed')",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([session_id], |row| row.get::<_, String>(0))
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+        rows
+    };
+    if request_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    transaction
+        .execute(
+            "UPDATE attention_items SET state = 'resolved', resolved_at = ?2,
+               expires_at = NULL, resolution = 'provider_closed'
+             WHERE session_id = ?1 AND kind = 'question'
+               AND request_id IS NOT NULL AND state IN ('open', 'snoozed')",
+            params![session_id, occurred_at],
+        )
+        .map_err(storage_error)?;
+    Ok(request_ids
+        .iter()
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect())
 }
 
 fn approval_detail(raw: &Value, tool_name: Option<&str>) -> Option<String> {

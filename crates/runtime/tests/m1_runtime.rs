@@ -4761,6 +4761,80 @@ fn a_new_prompt_closes_attention_left_open_by_the_previous_turn() {
 }
 
 #[test]
+fn an_ended_session_or_a_new_prompt_closes_an_unanswered_claude_question() {
+    let root = temp_root("abandoned-question");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let question = |session: &str, at: u64| {
+        BridgeRequest::from_hook_at(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"PreToolUse",
+                "session_id":session,
+                "prompt_id":"turn-1",
+                "cwd":"/tmp/example-project",
+                "tool_name":"AskUserQuestion",
+                "tool_input":{"questions":[{"question":"Which release?","header":"Release","options":[],"multiSelect":false}]}
+            }),
+            at,
+        )
+    };
+    let ended = question("ended-session", 70_000);
+    let ended_id = ended.request_id.unwrap();
+    store.ingest(ended).unwrap();
+    let prompted = question("prompted-session", 70_001);
+    let prompted_id = prompted.request_id.unwrap();
+    store.ingest(prompted).unwrap();
+    let open_questions = |store: &RuntimeStore| {
+        store
+            .snapshot()
+            .unwrap()
+            .attention
+            .iter()
+            .filter(|item| item.kind == "question" && item.state == "open")
+            .count()
+    };
+    assert_eq!(open_questions(&store), 2);
+
+    let result = store
+        .ingest(request_at(
+            Provider::Claude,
+            "SessionEnd",
+            "ended-session",
+            None,
+            None,
+            70_002,
+        ))
+        .unwrap();
+    assert_eq!(result.resolved_request_ids, vec![ended_id]);
+    assert_eq!(open_questions(&store), 1);
+
+    let result = store
+        .ingest(request_at(
+            Provider::Claude,
+            "UserPromptSubmit",
+            "prompted-session",
+            Some("turn-2"),
+            None,
+            70_003,
+        ))
+        .unwrap();
+    assert_eq!(result.resolved_request_ids, vec![prompted_id]);
+
+    let snapshot = store.snapshot().unwrap();
+    let questions = snapshot
+        .attention
+        .iter()
+        .filter(|item| item.kind == "question")
+        .collect::<Vec<_>>();
+    assert_eq!(questions.len(), 2);
+    assert!(questions.iter().all(|item| {
+        item.state == "resolved" && item.resolution.as_deref() == Some("provider_closed")
+    }));
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn successful_turn_without_write_tools_still_creates_completion_attention() {
     let root = temp_root("read-only-completion");
     let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
