@@ -11611,7 +11611,7 @@ mod tests {
                 json!({
                     "hook_event_name":"Stop","session_id":"contract-main","turn_id":"m1",
                     "cwd":repository,
-                    "last_assistant_message":"按钮圆角已改为 12，并新增 CheckoutTests。\n\n要提交的话说一声。"
+                    "last_assistant_message":"按钮圆角已改为 12，并新增 CheckoutTests。\n\n要提交吗？"
                 }),
                 at + 30,
             ))
@@ -11842,7 +11842,7 @@ mod tests {
         assert_eq!(
             main["lastMessage"],
             json!({
-                "text": "按钮圆角已改为 12，并新增 CheckoutTests。\n要提交的话说一声。",
+                "text": "按钮圆角已改为 12，并新增 CheckoutTests。\n要提交吗？",
                 "at": at + 30,
                 "final": true,
                 "truncated": false
@@ -11911,7 +11911,7 @@ mod tests {
         assert_eq!(
             sample("result.json")["latest"],
             json!({
-                "text": "按钮圆角已改为 12，并新增 CheckoutTests。\n要提交的话说一声。",
+                "text": "按钮圆角已改为 12，并新增 CheckoutTests。\n要提交吗？",
                 "at": at + 30,
                 "final": true,
                 "truncated": false
@@ -16664,7 +16664,7 @@ done
         };
         for (thread, answer_turn, answer, expected) in [
             ("asks", "turn-1", "Tests pass. Should I push?", true),
-            ("asks-zh", "turn-1", "测试都过了。要提交的话说一声。", true),
+            ("asks-zh", "turn-1", "测试都过了。要提交吗？", true),
             ("reports", "turn-1", "Done, all tests pass.", false),
             // A final answer recorded for another turn is not this turn's.
             ("stale", "turn-0", "Should I push?", false),

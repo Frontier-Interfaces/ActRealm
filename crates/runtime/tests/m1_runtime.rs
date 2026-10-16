@@ -4202,7 +4202,7 @@ fn a_final_question_marks_the_completion_as_awaiting_a_reply() {
     let (state, _, completion, turn) = stop_after_work(
         &root,
         "question",
-        json!({"last_assistant_message": "测试都过了。\n\n要提交的话说一声。"}),
+        json!({"last_assistant_message": "测试都过了。\n\n要提交吗？"}),
     );
     assert_eq!(
         (state.as_str(), completion, turn.as_str()),

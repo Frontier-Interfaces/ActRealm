@@ -3,7 +3,7 @@
 //!
 //! The check is conservative and runs on the message as the Provider reported
 //! it (Claude/Codex `Stop.last_assistant_message`, Codex `last_agent_message`).
-//! Only the last sentence of the last prose paragraph counts:
+//! Only the last paragraph of prose counts, and mostly its last sentence:
 //!
 //! 1. Fenced code blocks (backticks or tildes; an unclosed fence runs to the
 //!    end), headings, horizontal rules, table rows and block quotes are
@@ -25,12 +25,24 @@
 //!   non-letters on both sides.
 //!
 //! Request phrases are looked for in the last 2,048 bytes of the sentence.
+//! Quoted text (`「…」`, `『…』`, curly or straight double quotes) is a
+//! mention, not a request, and is left out.
 //!
-//! Questions and requests earlier in the message do not count, and neither
-//! does a conditional offer without an explicit request ("if you also think it
-//! is useless, I will delete it too", "if you want, I can add tests"): such a
-//! turn reads as completed. A conditional offer that asks for an answer ("say
-//! the word if you want it committed", "let me know if ...") does count.
+//! An earlier sentence of the same paragraph awaits a reply too when it is a
+//! question put to the user ("should we change it like this? there is also a
+//! more cautious way ..."): it ends with a question mark and ends with a
+//! question particle, addresses the user or names a choice, or holds an
+//! English request.
+//!
+//! Only a turn that explicitly waits for the user's answer awaits a reply
+//! (founder, 2026-10-16). An offer of more help completes the turn, whether
+//! or not it asks to be told: a conditional offer ("if you also think it is
+//! useless, I will delete it too", "if it still does not feel smooth, tell
+//! me", "say the word if you want it committed", "let me know if ...") and a
+//! "that is all it takes" offer ("to change the color, just tell me") read as
+//! completed. Tell me, say the word, want me to and let me know are offers in
+//! such a sentence; every other request, and every question, still counts.
+//! Questions and requests in earlier paragraphs never count.
 
 use std::collections::HashMap;
 
@@ -60,6 +72,62 @@ const CHINESE_REQUESTS: &[(&str, Placement)] = &[
     ("\u{884c}\u{5417}", Placement::Anywhere),
 ];
 
+/// Requests that only offer more help when the sentence makes them depend on
+/// something: tell me, say the word, want me to.
+const CHINESE_OFFERS: &[&str] = &[
+    "\u{544a}\u{8bc9}\u{6211}",
+    "\u{8bf4}\u{4e00}\u{58f0}",
+    "\u{8981}\u{6211}",
+];
+
+/// What makes an offer conditional: if (ru guo, yao shi, jia ru, wan yi,
+/// tang ruo, ruo shi), "... if so" (de hua), once (yi dan), if there is a
+/// problem (you wen ti, chu wen ti), if needed (you xu yao, xu yao shi).
+const CHINESE_CONDITIONS: &[&str] = &[
+    "\u{5982}\u{679c}",
+    "\u{8981}\u{662f}",
+    "\u{5047}\u{5982}",
+    "\u{4e07}\u{4e00}",
+    "\u{5018}\u{82e5}",
+    "\u{82e5}\u{662f}",
+    "\u{7684}\u{8bdd}",
+    "\u{4e00}\u{65e6}",
+    "\u{6709}\u{95ee}\u{9898}",
+    "\u{51fa}\u{95ee}\u{9898}",
+    "\u{6709}\u{9700}\u{8981}",
+    "\u{9700}\u{8981}\u{65f6}",
+];
+
+/// "That is all it takes" after an offer: jiu xing, ji ke, jiu hao.
+const CHINESE_ENOUGH: &[&str] = &["\u{5c31}\u{884c}", "\u{5373}\u{53ef}", "\u{5c31}\u{597d}"];
+
+/// What marks an earlier sentence ending in a question mark as a question to
+/// the user: you (two forms), whether or not (yao bu yao, shi bu shi, shi
+/// fou), want me to, which one (na ge, na zhong, na yi).
+const CHINESE_ASKING: &[&str] = &[
+    "\u{4f60}",
+    "\u{60a8}",
+    "\u{8981}\u{4e0d}\u{8981}",
+    "\u{662f}\u{4e0d}\u{662f}",
+    "\u{662f}\u{5426}",
+    "\u{8981}\u{6211}",
+    "\u{54ea}\u{4e2a}",
+    "\u{54ea}\u{79cd}",
+    "\u{54ea}\u{4e00}",
+];
+
+/// Question particles: ma, me, ne, ba.
+const QUESTION_PARTICLES: [char; 4] = ['\u{5417}', '\u{4e48}', '\u{5462}', '\u{5427}'];
+
+/// Quotation marks, opening and closing: corner brackets, white corner
+/// brackets, curly double quotes, straight double quotes.
+const QUOTES: [(char, char); 4] = [
+    ('\u{300c}', '\u{300d}'),
+    ('\u{300e}', '\u{300f}'),
+    ('\u{201c}', '\u{201d}'),
+    ('"', '"'),
+];
+
 /// English requests to the user. A bare "which" is not one: it is far more
 /// often a relative pronoun ("fixed the parser, which was dropping lines").
 const ENGLISH_REQUESTS: &[&str] = &[
@@ -81,6 +149,12 @@ const ENGLISH_REQUESTS: &[&str] = &[
     "which do you",
     "which would you",
 ];
+
+/// English requests that only offer more help in a conditional sentence.
+const ENGLISH_OFFERS: &[&str] = &["let me know"];
+
+/// What makes an English offer conditional.
+const ENGLISH_CONDITIONS: &[&str] = &["if", "in case", "whenever"];
 
 /// Particles after a phrase that turn it into a report about the past: de
 /// (the one you ...), le (done), guo (already).
@@ -176,10 +250,71 @@ fn clause_before(sentence: &str, start: usize, cut: bool) -> Option<&str> {
 /// True when the reply's last sentence asks the user something or asks the
 /// user to answer. See the module documentation for the exact rule.
 pub fn message_awaits_reply(message: &str) -> bool {
-    last_prose_line(message).is_some_and(|line| sentence_awaits_reply(last_sentence(&line)))
+    last_prose_line(message).is_some_and(|line| {
+        let start = last_sentence_start(&line);
+        sentence_awaits_reply(line[start..].trim())
+            || sentences(&line[..start]).into_iter().any(asks_user)
+    })
+}
+
+/// An earlier sentence of the last paragraph that puts a question to the
+/// user; see the module documentation.
+fn asks_user(sentence: &str) -> bool {
+    let sentence = without_quotes(sentence);
+    let trimmed = sentence.trim().trim_end_matches(is_trailing_noise);
+    if !trimmed.ends_with(['?', '\u{ff1f}']) {
+        return false;
+    }
+    let core = trimmed.trim_end_matches(|c| is_terminator(c) || is_trailing_noise(c));
+    core.ends_with(QUESTION_PARTICLES)
+        || CHINESE_ASKING.iter().any(|word| core.contains(word))
+        || english_request(core)
+}
+
+/// The sentences of `text`, each with its terminator.
+fn sentences(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut characters = text.char_indices().peekable();
+    while let Some((offset, c)) = characters.next() {
+        if is_sentence_boundary(c, characters.peek().map(|(_, next)| *next)) {
+            let end = offset + c.len_utf8();
+            if !text[start..end].trim().is_empty() {
+                out.push(&text[start..end]);
+            }
+            start = end;
+        }
+    }
+    if !text[start..].trim().is_empty() {
+        out.push(&text[start..]);
+    }
+    out
+}
+
+/// `text` with quoted spans blanked out. An opening mark without its closing
+/// mark is kept as it is.
+fn without_quotes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while let Some(c) = text[index..].chars().next() {
+        let close = QUOTES
+            .iter()
+            .find(|(open, _)| *open == c)
+            .map(|(_, close)| *close);
+        let after = index + c.len_utf8();
+        if let Some(end) = close.and_then(|close| text[after..].find(close).map(|at| after + at)) {
+            out.push(' ');
+            index = end + close.map_or(0, char::len_utf8);
+            continue;
+        }
+        out.push(c);
+        index = after;
+    }
+    out
 }
 
 fn sentence_awaits_reply(sentence: &str) -> bool {
+    let sentence = without_quotes(sentence);
     let trimmed = sentence.trim_end_matches(is_trailing_noise);
     let core = trimmed.trim_end_matches(|c| is_terminator(c) || is_trailing_noise(c));
     if trimmed[core.len()..].contains(['?', '\u{ff1f}']) {
@@ -199,10 +334,19 @@ fn sentence_awaits_reply(sentence: &str) -> bool {
 }
 
 fn chinese_request(sentence: &str, cut: bool) -> bool {
+    let conditional = CHINESE_CONDITIONS
+        .iter()
+        .any(|word| sentence.contains(word));
     CHINESE_REQUESTS.iter().any(|(phrase, placement)| {
-        sentence
-            .match_indices(phrase)
-            .any(|(start, _)| placement.allows(sentence, start, start + phrase.len(), cut))
+        sentence.match_indices(phrase).any(|(start, _)| {
+            let end = start + phrase.len();
+            let offer = CHINESE_OFFERS.contains(phrase)
+                && (conditional
+                    || CHINESE_ENOUGH
+                        .iter()
+                        .any(|word| sentence[end..].contains(word)));
+            !offer && placement.allows(sentence, start, end, cut)
+        })
     })
 }
 
@@ -214,13 +358,21 @@ fn english_request(sentence: &str) -> bool {
         }
         text.push_str(&word.to_ascii_lowercase());
     }
+    let conditional = ENGLISH_CONDITIONS
+        .iter()
+        .any(|word| contains_word(&text, word));
     ENGLISH_REQUESTS.iter().any(|phrase| {
-        text.match_indices(phrase).any(|(start, _)| {
-            let before = text[..start].chars().next_back();
-            let after = text[start + phrase.len()..].chars().next();
-            !before.is_some_and(|c| c.is_ascii_alphanumeric())
-                && !after.is_some_and(|c| c.is_ascii_alphanumeric())
-        })
+        !(conditional && ENGLISH_OFFERS.contains(phrase)) && contains_word(&text, phrase)
+    })
+}
+
+/// `phrase` occurs in `text` bounded by non-letters on both sides.
+fn contains_word(text: &str, phrase: &str) -> bool {
+    text.match_indices(phrase).any(|(start, _)| {
+        let before = text[..start].chars().next_back();
+        let after = text[start + phrase.len()..].chars().next();
+        !before.is_some_and(|c| c.is_ascii_alphanumeric())
+            && !after.is_some_and(|c| c.is_ascii_alphanumeric())
     })
 }
 
@@ -256,26 +408,29 @@ fn is_trailing_noise(c: char) -> bool {
     c.is_whitespace() || (!c.is_alphanumeric() && !is_terminator(c))
 }
 
-/// The text after the paragraph's last line break or sentence terminator,
-/// with the terminators that end it.
-fn last_sentence(paragraph: &str) -> &str {
+/// Where the paragraph's last sentence starts: after its last line break or
+/// sentence terminator, the terminators that end the paragraph aside.
+fn last_sentence_start(paragraph: &str) -> usize {
     let text = paragraph.trim_end_matches(is_trailing_noise);
     let body = text.trim_end_matches(|c| is_terminator(c) || is_trailing_noise(c));
     let mut start = 0;
     let mut characters = body.char_indices().peekable();
     while let Some((offset, c)) = characters.next() {
-        let boundary = match c {
-            '\n' => true,
-            '.' | '!' | '?' | ';' => characters
-                .peek()
-                .is_some_and(|(_, next)| next.is_whitespace()),
-            _ => is_terminator(c),
-        };
-        if boundary {
+        if is_sentence_boundary(c, characters.peek().map(|(_, next)| *next)) {
             start = offset + c.len_utf8();
         }
     }
-    text[start..].trim()
+    start
+}
+
+/// A line break, an ASCII terminator followed by whitespace, or any
+/// full-width terminator or ellipsis.
+fn is_sentence_boundary(c: char, next: Option<char>) -> bool {
+    match c {
+        '\n' => true,
+        '.' | '!' | '?' | ';' => next.is_some_and(char::is_whitespace),
+        _ => is_terminator(c),
+    }
 }
 
 /// The last line of prose, cleaned up. A line break ends a sentence, so the
@@ -535,11 +690,12 @@ mod tests {
     #[test]
     fn chinese_questions_and_requests_await_a_reply() {
         check(&[
-            ("要提交的话说一声。", true),
             ("测试全部通过。要不要我顺便提交", true),
             ("两个方案都能用，你选一个。", true),
             ("A 和 B 选哪个", true),
-            ("需要的话告诉我。", true),
+            ("哪个方案更合适，告诉我。", true),
+            ("标题栏还空着，告诉我填什么。", true),
+            ("还有一处没推，需要你决定。", true),
             ("请帮我确认一下", true),
             ("确认一下再合并。", true),
             ("你决定吧。", true),
@@ -556,6 +712,13 @@ mod tests {
             ("已经改完了（要推送吗？）", true),
             ("要提交吗？🙂", true),
             ("- 修好了 A\n- 补了测试\n\n要提交吗", true),
+            ("如果没问题，要我提交吗？", true),
+            // A question put to the user before the closing sentence.
+            (
+                "要照这个改吗？还有一个更保守的做法：只把「出问题再告诉我」这类算成做完。",
+                true,
+            ),
+            ("你打算接什么设备？把型号发给我。", true),
         ]);
     }
 
@@ -578,6 +741,21 @@ mod tests {
             ("这一步不需要我手动处理。", false),
             ("要不要我提交？\n\n已经提交并推送了。", false),
             ("为什么会失败？因为缓存过期了。", false),
+            // An offer of more help completes the turn (founder, 2026-10-16).
+            (
+                "不用再做别的。你试双指左滑时，如果滑开后一两秒自己收回去，或者还是觉得不顺，告诉我。",
+                false,
+            ),
+            ("要提交的话说一声。", false),
+            ("需要的话告诉我。", false),
+            ("你想修的话，告诉我一声，我先安排实测。", false),
+            ("关了的话，告诉我一声「继续」就行。", false),
+            ("要改灯光颜色，告诉我就行。", false),
+            ("有问题告诉我。", false),
+            ("要我继续的话说一声。", false),
+            // Quoted text is a mention.
+            ("我把「要不要」改成了「是否」。", false),
+            ("提示文案改成了“要我继续吗”。", false),
         ]);
     }
 
@@ -588,7 +766,8 @@ mod tests {
             ("All green. Should I push", true),
             ("Do you want me to open a PR.", true),
             ("Would you like me to update the docs", true),
-            ("Let me know if you want the old file removed.", true),
+            ("Let me know which one you prefer.", true),
+            ("Should I push it now? The branch is ready.", true),
             ("Please confirm the version bump.", true),
             ("Which one do you prefer.", true),
             ("SHALL I MERGE IT", true),
@@ -609,6 +788,8 @@ mod tests {
             ("Why did it fail? The cache was stale.", false),
             ("I fixed the parser, which was dropping lines.", false),
             ("If you want, I can also add tests.", false),
+            ("Let me know if you want the old file removed.", false),
+            ("If anything breaks, let me know.", false),
             ("Should I push?\n\nNever mind, I pushed it.", false),
             ("I renamed `isReady?` to `ready`.", false),
             ("The regex is `^a?$`", false),
